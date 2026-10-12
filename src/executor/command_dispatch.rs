@@ -44,10 +44,49 @@ impl Executor {
         let assignment_raws = (cmd.assignment_raws.len() == cmd.assignments.len())
             .then(|| cmd.assignment_raws.as_slice());
         let temporary_assignments = if standalone_assignments {
-            self.apply_permanent_assignments(&cmd.assignments, assignment_raws);
+            // GNU subst.c expand_word_error + execute_cmd.c: a failed
+            // assignment with no command word aborts the command list in
+            // every mode (the DISCARD jump); POSIX mode additionally EXITS
+            // the non-interactive shell (bash_variable_assignment_error,
+            // posix-mode notes item 35 — `ro=2` where ro is readonly).
+            let applied = self.apply_permanent_assignments(&cmd.assignments, assignment_raws);
+            if !applied && self.posix_assignment_failure_is_fatal() {
+                self.exit_code = 1;
+                return Err(ExecuteError::ExitCode(1));
+            }
             Vec::new()
         } else {
-            self.apply_temporary_assignments(&cmd.assignments, assignment_raws)
+            let (applied, assignments_failed) =
+                self.apply_temporary_assignments(&cmd.assignments, assignment_raws);
+            // POSIX-mode notes item 36, GNU 5.3 verified cell-by-cell with
+            // unbuffered per-process probes (the early "every command class
+            // exits" reading was a stdout pipe-buffering artifact — GNU's
+            // jump-exit does not flush it): a failed readonly tempenv
+            // assignment before a SPECIAL builtin exits the shell (status 1,
+            // `ro=2 :` — no further statement runs), while before an
+            // ordinary builtin, external or function the command is SKIPPED
+            // and the rest of the command list is abandoned with status 1
+            // (ksh93 emulation — GNU errors7.sub: `x=8 echo` runs nothing,
+            // `after non-special builtin: 1`; subshell forms exit the
+            // subshell with 1 and the parent continues). ExpansionFailure(1)
+            // is exactly that skip-and-abandon contract; the default mode
+            // keeps the historical apply-and-run.
+            if assignments_failed && self.posix_assignment_failure_is_fatal() {
+                self.exit_code = 1;
+                let special = cmd
+                    .words
+                    .first()
+                    .is_some_and(|word| is_posix_special_builtin(word));
+                // Restore the partial tempenv binds before unwinding: the
+                // skip-and-abandon path keeps the shell running, and an
+                // unbalanced tempenv mark would corrupt every later restore.
+                self.restore_temporary_assignments(applied);
+                if special {
+                    return Err(ExecuteError::ExitCode(1));
+                }
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            applied
         };
         if self.xtrace_enabled() && cmd.arithmetic_command.is_none() {
             // GNU dispatches `(( ))` to execute_arith_command, whose own
