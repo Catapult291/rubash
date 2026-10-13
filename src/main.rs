@@ -33,7 +33,25 @@ fn run_main() -> i32 {
     // Initialize locale state from environment (LC_ALL > LC_CTYPE > LANG)
     rubash::locale::init_locale();
 
+    // rubash#590: the bash.exe shim (src/bin/bash.rs) erases Windows argv[0]
+    // when it re-execs this engine, so the invocation face travels in
+    // NIU_INVOKED_AS (rubash#504 forwarded the sh/ash faces for the POSIX
+    // contract; #590 extends the forward to every shell face). GNU
+    // set_shell_name (shell.c:1778-1806) binds dollar_vars[0] AND the
+    // sh/su/rbash contracts to that same argv[0], so the forwarded name is
+    // the honest reconstruction of the erased argv[0]: it ranks ahead of the
+    // process argv[0] path and behind an explicit BASH_ARGV0 import
+    // (variables.c:1547-1555, which GNU itself ranks above argv[0]).
+    // Consumed BEFORE the executor imports the process environment — it
+    // describes how THIS process was invoked, never a shell variable or a
+    // child-inheritable setting (the same consume-on-read rule the niubash
+    // runtime host applies).
+    let invoked_as = env::var("NIU_INVOKED_AS").ok().filter(|v| !v.is_empty());
+    if invoked_as.is_some() {
+        env::remove_var("NIU_INVOKED_AS");
+    }
     let args: Vec<String> = env::args().collect();
+    let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());
     if let Some(name) = args
         .get(1)
         .and_then(|arg| arg.strip_prefix("--internal-"))
@@ -69,6 +87,13 @@ fn run_main() -> i32 {
     // AND shell_name, so "BASH_ARGV0=this-bash bash -c 'echo $0 $BASH_ARGV0'"
     // prints this-bash twice. The executable path is only the fallback when
     // the environment did not supply a value.
+    // rubash#590: the invocation face read above (NIU_INVOKED_AS, else
+    // argv[0]) reconstructs the argv[0] the shim erased, per GNU
+    // set_shell_name (shell.c:1778-1806): it feeds dollar_vars[0]/shell_name
+    // and apply_invocation_shell_mode below. It ranks behind an explicit
+    // BASH_ARGV0 import — variables.c:1547-1555 ranks the environment value
+    // above argv[0] ("BASH_ARGV0=this-bash bash -c 'echo $0 $BASH_ARGV0'"
+    // prints this-bash twice).
     match env::var("BASH_ARGV0")
         .ok()
         .filter(|value| !value.is_empty())
@@ -77,18 +102,19 @@ fn run_main() -> i32 {
             executor.set_env("BASH_ARGV0", &imported);
         }
         None => {
-            if let Some(shell_name) = args.first() {
+            if let Some(shell_name) = &invocation_name {
                 // rubash#331 (#224 legacy): a full-path argv[0] the parent
                 // handed over in Windows form is OUR produced `$0` value —
                 // render it POSIX (/d/...) so `-c 'echo $0'` matches the
-                // PWD family. Relative and bare names stay verbatim.
+                // PWD family. Relative and bare names stay verbatim; a
+                // shim-forwarded face is a bare name by construction.
                 let display = rubash::executor::shell_pwd_display_path(shell_name);
                 executor.set_env("__RUBASH_SHELL_NAME", &display);
                 executor.set_env("BASH_ARGV0", &display);
             }
         }
     }
-    apply_invocation_shell_mode(&mut executor, args.first().map(String::as_str));
+    apply_invocation_shell_mode(&mut executor, invocation_name.as_deref());
 
     if args.len() > 1 {
         return run_args(&mut executor, &args[1..], args.first().map(String::as_str));
