@@ -782,19 +782,29 @@ pub(crate) fn unclosed_input_close_char_posix(input: &str, posix: bool) -> Optio
                         // reads it through parse_matched_pair (P_ARITH,
                         // start_lineno), and its body takes the same
                         // literal-`$`-`{` rule as `$(( ` (rubash#533).
-                        stack.push(UnclosedDelim {
-                            close: ']',
-                            open_line: line,
-                            escapes: true,
-                            report_open: true,
-                            funsub: false,
-                            command: false,
-                            term_ready: false,
-                            case_depth_at_push: case_depth,
-                            array_list: false,
-                            pattern_paren: false,
-                            arith: true,
-                        });
+                        // Inside a dparen envelope (`$(( `/`(( ` — the
+                        // adjacent inner paren pushed with arith+`)') the
+                        // envelope's own parse_matched_pair(`(',`)') scan
+                        // consumes the text before any inner `$[` scan could
+                        // report (parse.y:4970 -> 3908-3915), so the `$[` is
+                        // opaque arith text here and the group's `)' verdict
+                        // stands (rubash#543 a1/a3, WSL GNU probes). The bare
+                        // `echo $[1+2` hunt keeps its `]'.
+                        if !top.is_some_and(|d| d.arith && d.close == ')') {
+                            stack.push(UnclosedDelim {
+                                close: ']',
+                                open_line: line,
+                                escapes: true,
+                                report_open: true,
+                                funsub: false,
+                                command: false,
+                                term_ready: false,
+                                case_depth_at_push: case_depth,
+                                array_list: false,
+                                pattern_paren: false,
+                                arith: true,
+                            });
+                        }
                         i += 1;
                     }
                     Some('\'')
@@ -4823,19 +4833,29 @@ pub(crate) fn close_char_residuals_advance(
                         // start_lineno), and its body takes the same
                         // literal-`$`-`{` rule as `$(( ` (rubash#533). The
                         // push is decided as soon as the `[` is visible.
-                        state.stack.push(UnclosedDelim {
-                            close: ']',
-                            open_line: state.line,
-                            escapes: true,
-                            report_open: true,
-                            funsub: false,
-                            command: false,
-                            term_ready: false,
-                            case_depth_at_push: state.case_depth,
-                            array_list: false,
-                            pattern_paren: false,
-                            arith: true,
-                        });
+                        // Inside a dparen envelope (`$(( `/`(( ` — the
+                        // adjacent inner paren pushed with arith+`)') the
+                        // envelope's own parse_matched_pair(`(',`)') scan
+                        // consumes the text before any inner `$[` scan could
+                        // report (parse.y:4970 -> 3908-3915), so the `$[` is
+                        // opaque arith text here and the group's `)' verdict
+                        // stands (rubash#543 a1/a3, WSL GNU probes). The bare
+                        // `echo $[1+2` hunt keeps its `]'.
+                        if !top.is_some_and(|d| d.arith && d.close == ')') {
+                            state.stack.push(UnclosedDelim {
+                                close: ']',
+                                open_line: state.line,
+                                escapes: true,
+                                report_open: true,
+                                funsub: false,
+                                command: false,
+                                term_ready: false,
+                                case_depth_at_push: state.case_depth,
+                                array_list: false,
+                                pattern_paren: false,
+                                arith: true,
+                            });
+                        }
                         i += 1;
                     }
                     Some('\'')

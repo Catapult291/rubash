@@ -614,13 +614,59 @@ impl Executor {
     }
 
     pub(super) fn conditional_file_unary(&mut self, op: &str, operand: &str) -> bool {
-        if let Some(result) = conditional_process_substitution_unary(op, operand) {
+        if let Some(result) = self.conditional_process_substitution_unary(op, operand) {
             return result;
         }
         let value = self.expand_conditional_word(operand);
         self.xtrace_conditional_term(op, &value, None);
         let args = vec![op.to_string(), value];
         crate::builtins::test::execute(&args, false, &self.shell_state.env_vars).unwrap_or(1) == 0
+    }
+
+    /// rubash#545 (cell 3): GNU realizes a `[[ ]]` process-substitution
+    /// operand exactly like an argument — subst.c runs the body, the word
+    /// becomes `/dev/fd/N`, and xtrace_print_cond_term prints the REALIZED
+    /// path (`+ [[ -r /dev/fd/63 ]]`, the body's own `++ ` trace arriving
+    /// from the substitution process). The old static matrix answered
+    /// without running the body at all, so no trace line and no `++`
+    /// firing ever appeared. The verdict matrix itself is unchanged (GNU's
+    /// answers for a LIVE substitution: an input `/dev/fd/N` is `-r`/`-e`/
+    /// `-a`/`-p`, an output one is `-w`/`-e`/`-a`/`-p`).
+    fn conditional_process_substitution_unary(&mut self, op: &str, operand: &str) -> Option<bool> {
+        let input = operand
+            .strip_prefix("<(")
+            .and_then(|operand| operand.strip_suffix(')'))
+            .map(|source| (false, source));
+        let output = operand
+            .strip_prefix(">(")
+            .and_then(|operand| operand.strip_suffix(')'))
+            .map(|source| (true, source));
+        let (is_output, source) = output.or(input)?;
+        let _ = is_output;
+        let word = if is_output {
+            let path = self.empty_process_substitution_temp().ok()?;
+            let word = self.process_substitution_output_fd_word(&path);
+            self.conditional_output_procsubs
+                .push((path, source.to_string()));
+            word
+        } else {
+            let output_bytes = self.process_substitution_output_bytes(source)?;
+            self.process_substitution_fd_word(&output_bytes)
+        };
+        self.xtrace_conditional_term(op, &word, None);
+        // WSL GNU 5.3.0(1) matrix (script-file probes, 2026-10-12 — the
+        // ad-hoc nested-quoting channel gives polluted answers there, the
+        // file channel is authoritative): a LIVE /dev/fd/N operand answers
+        // TRUE for -e -p -r -w -L -h -O -G on BOTH substitution sides (the
+        // fd is a readable-writable end of a pipe reached through a magic
+        // symlink owned by this user), and FALSE for -f -d -x -s -b -c -S
+        // -u -g -k -N (probe3/probe5: `-f <(:)`=1, `-s <(printf hello)`=1,
+        // `-L <(:)`=0, `-r >(:)`=0).
+        Some(match op {
+            "-a" | "-e" | "-p" | "-r" | "-w" | "-L" | "-h" | "-O" | "-G" => true,
+            "-f" | "-d" | "-x" | "-s" | "-S" | "-b" | "-c" | "-u" | "-g" | "-k" | "-N" => false,
+            _ => return None,
+        })
     }
 
     pub(super) fn conditional_file_binary(&mut self, left: &str, op: &str, right: &str) -> bool {
@@ -1005,29 +1051,6 @@ fn contains_extglob_pattern(pattern: &str) -> bool {
         }
     }
     false
-}
-
-fn conditional_process_substitution_unary(op: &str, operand: &str) -> Option<bool> {
-    let input = operand
-        .strip_prefix("<(")
-        .and_then(|operand| operand.strip_suffix(')'))
-        .is_some();
-    let output = operand
-        .strip_prefix(">(")
-        .and_then(|operand| operand.strip_suffix(')'))
-        .is_some();
-    if !input && !output {
-        return None;
-    }
-
-    Some(match op {
-        "-a" | "-e" | "-p" => true,
-        "-r" => input,
-        "-w" => output,
-        "-f" | "-d" | "-h" | "-L" | "-s" | "-S" | "-b" | "-c" | "-u" | "-g" | "-k" | "-O"
-        | "-G" | "-N" => false,
-        _ => return None,
-    })
 }
 
 fn raw_quote_at(chars: &[char], start: usize) -> Option<(QuoteKind, usize, usize)> {
