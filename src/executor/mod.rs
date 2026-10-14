@@ -308,6 +308,7 @@ use self::path::{
 // version.c:90 show_shell_version(): the --version banner prints the same
 // configure-time MACHTYPE triple the executor binds to $MACHTYPE; the bin
 // crate reuses it (main.rs --version, builtins/help.rs help listing).
+pub use self::support_names::bash_version_value;
 pub use self::support_names::machtype_value;
 
 // Identity persona (rubash#154): persona-aware OSTYPE/MACHTYPE/uname

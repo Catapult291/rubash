@@ -31,6 +31,7 @@ pub mod proc_vfs;
 pub mod script_driver;
 pub mod shell;
 pub mod token_str;
+pub mod usage;
 
 // Re-export commonly used types
 #[cfg(windows)]
