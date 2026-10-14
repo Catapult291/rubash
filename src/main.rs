@@ -639,28 +639,10 @@ struct LongOptionState {
 /// The long-option table of the contractual GNU 5.3.0 build
 /// (shell.c:254-284 with DEBUGGER and TRANSLATABLE_STRINGS enabled and
 /// WORDEXP_OPTION disabled - the same 16 entries the usage block lists).
-const LONG_OPTIONS: &[&str] = &[
-    "debug",
-    "debugger",
-    "dump-po-strings",
-    "dump-strings",
-    "help",
-    "init-file",
-    "login",
-    "noediting",
-    "noprofile",
-    "norc",
-    "posix",
-    "pretty-print",
-    "rcfile",
-    "restricted",
-    "verbose",
-    "version",
-];
-
-/// Long options that consume the following argv entry (type Charp in
-/// shell.c:264,274).
-const LONG_OPTIONS_WITH_VALUE: &[&str] = &["init-file", "rcfile"];
+// LONG_OPTIONS / LONG_OPTIONS_WITH_VALUE live in `rubash::usage` since the
+// #585 host-half move: the usage tables print from the lib so every
+// embedding binary answers identically.
+use rubash::usage::{LONG_OPTIONS, LONG_OPTIONS_WITH_VALUE};
 
 /// The set -o short-flag letters GNU's change_flag accepts
 /// (shell.c:966-971 reports any other character as an invalid option).
@@ -716,48 +698,20 @@ fn parse_long_options(
                 // show_shell_usage(stdout, 1)). Under a bash/sh invocation
                 // name the GNU usage contract prints (rc 0, stdout); under
                 // any other name the product help stays byte-identical.
-                match invocation_help_name(argv0) {
-                    Some(shell_name) => show_shell_help(executor, &shell_name),
+                match rubash::usage::invocation_help_name(argv0) {
+                    Some(shell_name) => rubash::usage::show_shell_help(
+                        &shell_name,
+                        executor.get_env("BASH_VERSION"),
+                    ),
                     None => print_usage(),
                 }
                 return (index, Some(0));
             }
             "version" => {
-                // GNU show_shell_version (version.c:88-90):
-                //   printf ("GNU bash, version %s (%s)\n",
-                //           shell_version_string (), MACHTYPE);
-                // shell_version_string() is "5.3.0(1)-release" (the
-                // -release suffix is part of $BASH_VERSION) and MACHTYPE is
-                // the configure host triple, so the banner carries exactly
-                // one "-release". WSL baseline:
-                //   GNU bash, version 5.3.0(1)-release (x86_64-pc-linux-gnu)
-                let version = executor
-                    .get_env("BASH_VERSION")
-                    .unwrap_or("5.3.0(1)-release")
-                    .to_string();
-                println!(
-                    "GNU bash, version {version} ({})",
-                    rubash::executor::machtype_value()
-                );
-                // version.c:91-104: the fsf copyright/license block follows
-                // the version line (rubash#240 — the banner was line 1 only).
-                println!("Copyright (C) 2025 Free Software Foundation, Inc.");
-                println!(
-                    "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>"
-                );
-                println!();
-                println!("This is free software; you are free to change and redistribute it.");
-                println!("There is NO WARRANTY, to the extent permitted by law.");
-                // rubash#488: the build fingerprint (and the Windows persona
-                // note) are appended AFTER the GNU block — everything above
-                // stays byte-identical to the bash 5.3 contract the
-                // ecosystem and the upstream .right assets gate on, while
-                // the extra lines trace this binary to its commit and
-                // profile so a dev build cannot pose as the installed
-                // release. One print site: --version has no tty/interactive
-                // branch (the banner is not shown at startup), so piped and
-                // terminal output carry the same lines.
-                println!("{}", rubash::build_info::version_appendix());
+                // GNU show_shell_version (version.c:88-104) — printed from
+                // `rubash::usage` since the #585 host-half move, so the niu
+                // launcher answers `bash --version` with the same bytes.
+                rubash::usage::show_shell_version(executor.get_env("BASH_VERSION"));
                 return (index, Some(0));
             }
             "login" => {
@@ -822,65 +776,9 @@ bash [GNU long option] [option] script-file ...
     eprintln!("	-abefhkmnptuvxBCEHPT or -o option");
 }
 
-/// The usage-contract shell name for this invocation, when `--help` must
-/// print the GNU usage form (issue #585). GNU keys the fork off argv[0]'s
-/// basename (shell.c set_shell_name): the `.exe` spelling is a Windows
-/// artifact and never reaches the usage lines, the `-` login marker is
-/// KEPT in the display name (empirical 5.3.0 oracle: `exec -a -bash bash
-/// --help` prints `Usage:\t-bash ...`), and the bash-vs-sh decision uses
-/// the dash-stripped lowercased stem so `-BASH.EXE` still forks. Any other
-/// name (rubash, niu, ...) returns None and keeps the product help.
-fn invocation_help_name(argv0: Option<&str>) -> Option<String> {
-    let basename = argv0?.rsplit(['/', '\\']).next()?;
-    let stem = if basename.len() >= 4 && basename.to_ascii_lowercase().ends_with(".exe") {
-        &basename[..basename.len() - 4]
-    } else {
-        basename
-    };
-    let decided = stem.strip_prefix('-').unwrap_or(stem);
-    match decided.to_ascii_lowercase().as_str() {
-        "bash" | "sh" => Some(stem.to_string()),
-        _ => None,
-    }
-}
-
-/// GNU show_shell_usage (shell.c:2057-2103) with extra=1 — the `--help`
-/// form, issue #585: printed to STDOUT and exited EXECUTION_SUCCESS
-/// (shell.c:477-482), unlike the usage-error form above (stderr, no
-/// version/extra block). The version line uses the engine's own version
-/// string and machtype in GNU's `version %s-(%s)` shape
-/// (shell.c:2071-2072 `_("GNU bash, version %s-(%s)\n")`); the long-option
-/// table is the engine's accepted LONG_OPTIONS set, and the Shell options
-/// block matches the usage-error contract byte for byte. The bash/sh names
-/// in the usage and `Type ...' lines follow the invocation (shell_name,
-/// shell.c:2084-2088, 2094-2095); the home-page lines keep GNU's literal
-/// `bash home page` text. No Windows-only resources are referenced: the
-/// same strings render in the unix cross-compile lanes.
-fn show_shell_help(executor: &Executor, shell_name: &str) {
-    let version = executor
-        .get_env("BASH_VERSION")
-        .unwrap_or("5.3.0(1)-release")
-        .to_string();
-    println!(
-        "GNU bash, version {version}-({})",
-        rubash::executor::machtype_value()
-    );
-    println!("Usage:\t{shell_name} [GNU long option] [option] ...");
-    println!("\t{shell_name} [GNU long option] [option] script-file ...");
-    println!("GNU long options:");
-    for name in LONG_OPTIONS {
-        println!("	--{name}");
-    }
-    println!("Shell options:");
-    println!("	-ilrsD or -c command or -O shopt_option		(invocation only)");
-    println!("	-abefhkmnptuvxBCEHPT or -o option");
-    println!("Type `{shell_name} -c \"help set\"' for more information about shell options.");
-    println!("Type `{shell_name} -c help' for more information about shell builtin commands.");
-    println!("Use the `bashbug' command to report bugs.");
-    println!();
-    println!("bash home page: <http://www.gnu.org/software/bash>");
-    println!("General help using GNU software: <http://www.gnu.org/gethelp/>");
-}
+// `invocation_help_name` and `show_shell_help` moved to `rubash::usage`
+// (issue #585 host-half): the niu launcher answers `bash --help` through
+// the lib so both binaries print byte-identical GNU usage.
 
 /// pretty_print_loop (eval.c:215-253): parse the script and print each
 /// command canonically (print_cmd.c) followed by one newline, then exit

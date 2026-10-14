@@ -48,7 +48,11 @@ pub(in crate::executor) fn shell_compatibility_level_value(
     level.parse::<u32>().unwrap_or(53)
 }
 
-pub(in crate::executor) fn bash_version_value() -> String {
+/// The `$BASH_VERSION` value the executor seeds (`5.3.0(1)-release` — the
+/// `-release` suffix is part of it, version.c's shell_version_string). Pub
+/// so `usage::show_shell_help`/`show_shell_version` fall back to the same
+/// literal when a caller has no executor (the #585 host-half embedders).
+pub fn bash_version_value() -> String {
     format!("{}(1)-release", BASH_COMPAT_VERSION)
 }
 
