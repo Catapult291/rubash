@@ -1246,6 +1246,22 @@ fn push_quoted_arg(cmdline: &mut Vec<u16>, arg: &str) {
     cmdline.push('"' as u16);
 }
 
+/// Encoded UTF-16 length of the command line `CreateProcessW` receives for
+/// `program` + `args`, excluding the terminating NUL. Mirrors the
+/// `push_quoted_arg` pass in `spawn_whitelisted` (same msvcrt quoting), so a
+/// caller can decide up front whether the line fits the 32767-unit
+/// lpCommandLine cap before spawning (niubash#362). Builds the buffer in
+/// memory only — no process is created.
+pub fn encoded_command_line_len(program: &std::path::Path, args: &[String]) -> usize {
+    let mut cmdline: Vec<u16> = Vec::new();
+    push_quoted_arg(&mut cmdline, &program.to_string_lossy());
+    for arg in args {
+        cmdline.push(' ' as u16);
+        push_quoted_arg(&mut cmdline, arg);
+    }
+    cmdline.len()
+}
+
 /// Spawn `spec.program` with exactly the whitelisted handles inheritable.
 /// All handles in `std_handles`/`extra_handles` must be marked inheritable
 /// (use `duplicate_handle_inheritable` / `open_null_device`); a

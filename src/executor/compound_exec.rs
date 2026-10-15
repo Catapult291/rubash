@@ -52,6 +52,35 @@ fn rubash_spawn_inherited_state(key: &str) -> bool {
     key.starts_with("__RUBASH_SETOPT_") || KEYS.contains(&key)
 }
 
+/// niubash#362: true when a respawned async `&` child's `-c`
+/// payload is too large to ride the OS command line / a single argv entry.
+///
+/// Windows caps the whole `CreateProcessW` lpCommandLine at 32767 UTF-16
+/// units, so measure the exact encoded length (program + `-c` + script).
+/// Unix caps one execve argument at MAX_ARG_STRLEN (32 pages * 4096 =
+/// 131072 bytes), so compare the raw byte length. Either way the caller
+/// switches to the temp-file transport (__RUBASH_CMD_FILE).
+#[cfg(windows)]
+fn respawn_source_needs_file(exe: &std::path::Path, source: &str) -> bool {
+    const CMDLINE_LIMIT: usize = 32_767;
+    // Headroom for the exe path, the "-c " separator and quoting growth.
+    const HEADROOM: usize = 256;
+    let args = ["-c".to_string(), source.to_string()];
+    crate::fd::encoded_command_line_len(exe, &args) + HEADROOM > CMDLINE_LIMIT
+}
+
+#[cfg(unix)]
+fn respawn_source_needs_file(_exe: &std::path::Path, source: &str) -> bool {
+    const ARG_STRLEN_LIMIT: usize = 131_072;
+    const HEADROOM: usize = 256;
+    source.len() + HEADROOM > ARG_STRLEN_LIMIT
+}
+
+#[cfg(not(any(unix, windows)))]
+fn respawn_source_needs_file(_exe: &std::path::Path, _source: &str) -> bool {
+    false
+}
+
 enum CoprocStderrForwardTarget {
     Stdout,
     Stderr,
@@ -411,6 +440,30 @@ impl Executor {
         strip_consumed_redirects(&mut child_command, &consumed);
         let source = self.background_command_source(&child_command);
 
+        // niubash#362: the serialized source (every function the
+        // parent carries + the command) rides the child's `-c` argument. When
+        // that exceeds the OS limit — CreateProcessW's 32767-unit
+        // lpCommandLine on Windows, or a single argv entry over MAX_ARG_STRLEN
+        // on Unix — hand the script to the child through a temp file named by
+        // __RUBASH_CMD_FILE instead. The child's entry point splices the file
+        // contents back into its `-c` operand before parsing
+        // (rubash::invocation::materialize_command_file), so argv semantics
+        // are unchanged. A function-heavy shell ("echo hello &" after
+        // oh-my-niu sourced hundreds of functions) otherwise dies with
+        // "File name too long".
+        let mut spawn_args = vec!["-c".to_string(), source.clone()];
+        let mut respawn_temp: Option<PathBuf> = None;
+        if respawn_source_needs_file(&exe, &source) {
+            if let Ok(path) = self.write_respawn_command_file(&source) {
+                env_map.insert(
+                    "__RUBASH_CMD_FILE".to_string(),
+                    path.to_string_lossy().into_owned(),
+                );
+                spawn_args[1] = String::new();
+                respawn_temp = Some(path);
+            }
+        }
+
         // GNU forks the async subshell: the child's fd table is a copy of the
         // parent's. std::process::Command cannot express a per-spawn handle
         // allowlist (its anonymous inherit-everything spawn leaked this
@@ -513,7 +566,7 @@ impl Executor {
 
         let spawn_result = crate::fd::spawn_whitelisted(&crate::fd::WhitelistedSpawn {
             program: exe.clone(),
-            args: vec!["-c".to_string(), source.clone()],
+            args: spawn_args,
             env: env_map.into_iter().collect(),
             std_handles,
             extra_handles,
@@ -521,7 +574,17 @@ impl Executor {
         for h in owned_handles {
             crate::fd::close_handle(h);
         }
-        let child = spawn_result?;
+        // A failed spawn never ran the child, so the out-of-band script file
+        // (niubash#362) was never read — remove it here instead of leaking it.
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(path) = &respawn_temp {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error.into());
+            }
+        };
         let pid = child.id();
         // rubash#169: the child holds a capture write end — registering its
         // pid lets the reap path (wait/refresh) drain the shared pipe into
@@ -934,6 +997,17 @@ impl Executor {
         }
         source.push_str(&bash_command_source_text(command));
         source
+    }
+
+    /// Write the serialized `-c` script of a respawned async `&` child to a
+    /// temp file for the out-of-band transport (niubash#362). The child
+    /// removes the file after reading it
+    /// (rubash::invocation::materialize_command_file); a spawn failure removes
+    /// it in the caller instead.
+    fn write_respawn_command_file(&self, source: &str) -> Result<PathBuf, ExecuteError> {
+        let path = self.respawn_command_temp_path()?;
+        fs::write(&path, source.as_bytes())?;
+        Ok(path)
     }
 
     pub(in crate::executor) fn execute_time_ast_command(

@@ -482,6 +482,48 @@ fn cli_flag_name(flag: char) -> Option<&'static str> {
     }
 }
 
+/// niubash#362: out-of-band transport for an over-long `-c`
+/// command string.
+///
+/// A respawned async `&` child is re-exec'd with the WHOLE serialized script
+/// (every function definition carried by the parent + the command) as its
+/// `-c` argument. On Windows that string becomes part of `CreateProcessW`'s
+/// lpCommandLine, which is capped at 32767 UTF-16 units, so a function-heavy
+/// shell (`echo hello &` after oh-my-niu sourced a few hundred functions)
+/// aborts the spawn with ERROR_FILENAME_EXCED_RANGE, surfaced as
+/// "File name too long". Unix has the analogous per-argument execve cap
+/// MAX_ARG_STRLEN (128 KiB). `compound_exec` (the spawn side) therefore
+/// writes such a script to a temp file and names it in the child
+/// environment as `__RUBASH_CMD_FILE`.
+///
+/// This runs at process entry, BEFORE argument parsing and before the
+/// executor imports the process environment, so it splices the file's
+/// contents back in as the operand following the first `-c` token — exactly
+/// as if the parent had passed `-c <script>` on the command line — and
+/// removes both the environment key and the temp file. Every downstream
+/// semantic (`BASH_EXECUTION_STRING`, command-string mode, diagnostics,
+/// `__RUBASH_IS_C`) therefore stays byte-identical to the argv path. A
+/// no-op when the key is absent.
+pub fn materialize_command_file(args: &mut Vec<String>) {
+    let Some(path) = std::env::var_os("__RUBASH_CMD_FILE") else {
+        return;
+    };
+    // Consume the key unconditionally so it can never leak to a grandchild
+    // or into the shell's variable table, even if the read below fails.
+    std::env::remove_var("__RUBASH_CMD_FILE");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    if let Some(index) = args.iter().position(|arg| arg == "-c") {
+        if index + 1 < args.len() {
+            args[index + 1] = contents;
+        } else {
+            args.push(contents);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +729,58 @@ mod tests {
             set(&["/etc/bash.bashrc"]),
         );
         assert_eq!(files, vec!["/etc/bash.bashrc", "custom.rc"]);
+    }
+}
+
+#[cfg(test)]
+mod command_file_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // These tests mutate the process environment, so they serialize among
+    // themselves (the key is only ever read by materialize_command_file, so
+    // no other test can observe it).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rubash-cmdfile-{}-{tag}.sh", std::process::id()))
+    }
+
+    #[test]
+    fn materialize_command_file_splices_operand_and_consumes_keys() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = scratch("splice");
+        std::fs::write(&path, "echo from-file\n").unwrap();
+        std::env::set_var("__RUBASH_CMD_FILE", path.to_string_lossy().as_ref());
+
+        let mut args = vec!["niu".to_string(), "-c".to_string(), String::new()];
+        materialize_command_file(&mut args);
+
+        assert_eq!(args, vec!["niu", "-c", "echo from-file\n"]);
+        assert!(std::env::var_os("__RUBASH_CMD_FILE").is_none());
+        assert!(
+            !path.exists(),
+            "the temp file must be removed after the read"
+        );
+    }
+
+    #[test]
+    fn materialize_command_file_is_noop_without_the_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("__RUBASH_CMD_FILE");
+        let mut args = vec!["niu".to_string(), "-c".to_string(), "echo hi".to_string()];
+        materialize_command_file(&mut args);
+        assert_eq!(args, vec!["niu", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn materialize_command_file_consumes_key_when_file_is_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // A stale key must never survive, and the argv operand stays as-is.
+        std::env::set_var("__RUBASH_CMD_FILE", "/nonexistent/rubash-cmd-file");
+        let mut args = vec!["niu".to_string(), "-c".to_string(), "echo hi".to_string()];
+        materialize_command_file(&mut args);
+        assert_eq!(args, vec!["niu", "-c", "echo hi"]);
+        assert!(std::env::var_os("__RUBASH_CMD_FILE").is_none());
     }
 }

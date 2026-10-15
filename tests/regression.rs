@@ -1001,3 +1001,53 @@ fn canary_bash_completion_bash_n_when_corpus_present() {
         "expected the offending line echo, stderr:\n{stderr}"
     );
 }
+
+/// niubash#362: `&` on a shell carrying a large function table
+/// must not die with "File name too long".
+///
+/// The async child is re-exec'd with the WHOLE function table serialized
+/// into its `-c` script (`compound_exec::background_command_source`). On
+/// Windows that string rides `CreateProcessW`'s lpCommandLine, capped at
+/// 32767 UTF-16 units, so a shell with a few thousand functions aborts the
+/// spawn with ERROR_FILENAME_EXCED_RANGE — surfaced as
+/// `niu: File name too long` — even for a trivial `echo hello &`. Unix has
+/// the analogous per-argument execve cap (MAX_ARG_STRLEN, 128 KiB). The
+/// spawn side now hands an over-budget script to the child through a temp
+/// file named by __RUBASH_CMD_FILE, and the entry point splices it back into
+/// the `-c` operand before parsing, so argv semantics are unchanged.
+///
+/// The generated script (~6000 functions, ~200 KB serialized) clears BOTH
+/// caps, so this fails pre-fix on Windows AND on Unix; the background child
+/// must still print its output and exit 0.
+#[test]
+fn background_command_with_large_function_table_runs() {
+    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("rubash-362-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    let mut script = String::new();
+    for i in 0..6000 {
+        script.push_str(&format!("f{i}() {{ local v={i}; : \"$v\"; }}\n"));
+    }
+    script.push_str("echo hello &\nwait\necho large-fn-status:$?\n");
+    std::fs::write(dir.join("big.sh"), &script).expect("write script");
+
+    let out = run_rubash_in(&dir, &["big.sh"], Duration::from_secs(60));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.timed_out, "timed out; stderr:\n{stderr}");
+    assert_eq!(out.code, Some(0), "stderr:\n{stderr}");
+    assert!(
+        stdout.contains("hello"),
+        "background child output missing; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("large-fn-status:0"),
+        "wait status wrong; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("File name too long") && !stderr.contains("Argument list too long"),
+        "spawn hit an argv/command-line cap; stderr:\n{stderr}"
+    );
+}

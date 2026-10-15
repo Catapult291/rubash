@@ -1034,6 +1034,22 @@ impl Executor {
     pub(in crate::executor) fn process_substitution_temp_path(
         &self,
     ) -> Result<PathBuf, ExecuteError> {
+        self.shell_temp_path("rubash-process-subst", ".tmp")
+    }
+
+    /// Unique path in the shell's temp dir for the niubash#362 out-of-band
+    /// `-c` transport: a serialized async-child script too large for the OS
+    /// command line / a single argv entry. The child removes the file after
+    /// reading it (rubash::invocation::materialize_command_file).
+    pub(in crate::executor) fn respawn_command_temp_path(&self) -> Result<PathBuf, ExecuteError> {
+        self.shell_temp_path("rubash-respawn-cmd", ".sh")
+    }
+
+    /// Resolve `$TMPDIR` (or the platform default) into a unique,
+    /// Windows-form path in an existing directory. Shared by the process
+    /// substitution materialization and the niubash#362 respawn transport so
+    /// the TMPDIR resolution and existence handling live in one place.
+    fn shell_temp_path(&self, prefix: &str, suffix: &str) -> Result<PathBuf, ExecuteError> {
         let dir_value = self
             .shell_state
             .env_vars
@@ -1048,10 +1064,7 @@ impl Executor {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        dir.push(format!(
-            "rubash-process-subst-{}-{nanos}.tmp",
-            std::process::id()
-        ));
+        dir.push(format!("{prefix}-{}-{nanos}{suffix}", std::process::id()));
         Ok(dir)
     }
 

@@ -50,7 +50,12 @@ fn run_main() -> i32 {
     if invoked_as.is_some() {
         env::remove_var("NIU_INVOKED_AS");
     }
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
+    // niubash#362: a respawned async `&` child too large for the
+    // OS command line arrives with its `-c` script named by
+    // __RUBASH_CMD_FILE; splice it back into argv here, before anything reads
+    // it and before the executor imports the process environment.
+    rubash::invocation::materialize_command_file(&mut args);
     let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());
     if let Some(name) = args
         .get(1)
