@@ -145,6 +145,122 @@ impl VariableStore {
         Ok(())
     }
 
+    /// rubash#616 (plan Phase 1a): replace the structured indexed cell while
+    /// PRESERVING the caller's keys. `replace_indexed_array` is dense by
+    /// position (it enumerates the values), which cannot carry a sparse
+    /// array across — `a=([5]=x [2]=y)` must stay `{2,5}`, not `{0,1}`
+    /// (GNU array.c array_insert keeps the real index). Same readonly
+    /// refusal as the dense form.
+    pub fn replace_indexed_array_entries<I, V>(
+        &mut self,
+        name: &str,
+        entries: I,
+    ) -> Result<(), &'static str>
+    where
+        I: IntoIterator<Item = (i64, V)>,
+        V: Into<String>,
+    {
+        let variable = self
+            .variables
+            .entry(name.to_string())
+            .or_insert_with(|| Variable {
+                value: ShellValue::IndexedArray(BTreeMap::new()),
+                ..Variable::scalar("")
+            });
+        if variable.readonly {
+            return Err("readonly variable");
+        }
+        if !matches!(variable.value, ShellValue::IndexedArray(_)) {
+            variable.value = ShellValue::IndexedArray(BTreeMap::new());
+        }
+        let ShellValue::IndexedArray(values) = &mut variable.value else {
+            unreachable!();
+        };
+        values.clear();
+        for (index, value) in entries {
+            values.insert(index, value.into());
+        }
+        Ok(())
+    }
+
+    /// rubash#616 (plan Phase 1a): extend an ALREADY-structured indexed cell
+    /// by one element without rebuilding the map. Returns `false` when the
+    /// cell is absent, of another shape, readonly, or when the resulting
+    /// size disagrees with `expected_len` (the caller's own parse of the
+    /// mirror it is about to render); the caller then performs the full
+    /// structured sync, which drops a refused cell. The size check keeps the
+    /// "complete or absent" invariant self-healing instead of trusting the
+    /// cell blindly: the element-write loop is the array battery's hot path
+    /// and a full `BTreeMap` rebuild per element made it measurably slower
+    /// than the pre-#616 baseline (GNU array.c:516 `array_insert` appends to
+    /// the ARRAY object in O(1)).
+    pub fn extend_indexed_element(
+        &mut self,
+        name: &str,
+        index: i64,
+        value: &str,
+        expected_len: usize,
+    ) -> bool {
+        let Some(variable) = self.variables.get_mut(name) else {
+            return false;
+        };
+        if variable.readonly {
+            return false;
+        }
+        let ShellValue::IndexedArray(entries) = &mut variable.value else {
+            return false;
+        };
+        entries.insert(index, value.to_string());
+        entries.len() == expected_len
+    }
+
+    /// rubash#616 (plan Phase 1a): refresh a complete indexed cell from a
+    /// freshly parsed mirror WITHOUT rebuilding it, when the new map is an
+    /// extension of the current one. This is the append-shaped case the
+    /// compound write path (`a+=(...)`) hits once per iteration; a full
+    /// rebuild there copies every value per write, which made the
+    /// compound-append battery measurably slower than the pre-#616 baseline
+    /// (GNU `array.c:516 array_insert` appends to the ARRAY object and
+    /// `array.h:121` counts it — nothing is re-serialised).
+    ///
+    /// The retained prefix is **verified key-by-key**, not assumed: a cell
+    /// that is not an exact prefix of `parsed` returns `false` and the caller
+    /// performs the full sync. That keeps this a cache-refresh, never a
+    /// second source of truth. Returns `true` only when the cell is now
+    /// exactly `parsed`.
+    pub fn extend_indexed_array_from_parsed(
+        &mut self,
+        name: &str,
+        parsed: &BTreeMap<usize, String>,
+    ) -> bool {
+        let Some(variable) = self.variables.get_mut(name) else {
+            return false;
+        };
+        if variable.readonly {
+            return false;
+        }
+        let ShellValue::IndexedArray(cell) = &mut variable.value else {
+            return false;
+        };
+        if parsed.len() < cell.len() {
+            return false;
+        }
+        if !cell.iter().zip(parsed.iter()).all(|((a, va), (b, vb))| {
+            i64::try_from(*b).map(|b| b == *a).unwrap_or(false) && va == vb
+        }) {
+            return false;
+        }
+        let tail = parsed
+            .iter()
+            .skip(cell.len())
+            .map(|(index, value)| (i64::try_from(*index).unwrap_or(i64::MAX), value.clone()))
+            .collect::<Vec<_>>();
+        for (index, value) in tail {
+            cell.insert(index, value);
+        }
+        true
+    }
+
     pub fn replace_associative_array<I, K, V>(
         &mut self,
         name: &str,
