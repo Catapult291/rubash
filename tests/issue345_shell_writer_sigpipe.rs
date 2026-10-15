@@ -229,3 +229,26 @@ fn compound_producer_pipestatus_is_sigpipe() {
     ));
     assert_terminates("compound producer PIPESTATUS", &out, "PS=141,0\n");
 }
+
+/// A shell-side consumer written as a trivial brace group (`{ head -1; }`) is
+/// reduced to its single external command so it joins the concurrent consumer
+/// chain instead of the sequential loop re-buffering the producer.
+#[test]
+fn brace_group_consumer_terminates() {
+    let head = resolve_tool("head");
+    let cat = resolve_tool("cat");
+
+    let plain = run_rubash_script(&format!(
+        "while :; do echo x; done 2>/dev/null | {{ \"{head}\" -1; }}\n"
+    ));
+    assert_terminates("while :; do echo x; done | { head -1; }", &plain, "x\n");
+
+    let chained = run_rubash_script(&format!(
+        "while :; do echo x; done 2>/dev/null | {{ \"{head}\" -1; }} | \"{cat}\"\n"
+    ));
+    assert_terminates(
+        "while :; do echo x; done | { head -1; } | cat",
+        &chained,
+        "x\n",
+    );
+}

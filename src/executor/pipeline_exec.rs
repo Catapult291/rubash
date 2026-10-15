@@ -1291,13 +1291,20 @@ impl Executor {
         }
         // Every downstream stage must be a concurrent-eligible external
         // member; otherwise the ordinary sequential path owns the pipeline.
+        // A consumer that is a trivial brace group around a single external
+        // command (`... | { head -1; }`) is reduced to that command so it can
+        // join the concurrent chain; otherwise the sequential loop would again
+        // re-buffer an unbounded producer (niubash#345).
         let mut specs = Vec::with_capacity(commands.len() - 1);
+        let mut consumers: Vec<&CommandNode> = Vec::with_capacity(commands.len() - 1);
         for (offset, command) in commands.iter().enumerate().skip(1) {
             let is_last = offset + 1 == commands.len();
-            let Some(spec) = self.concurrent_external_stage_spec(command, offset, is_last) else {
+            let consumer = self.unwrap_trivial_brace_group(command).unwrap_or(command);
+            let Some(spec) = self.concurrent_external_stage_spec(consumer, offset, is_last) else {
                 return Ok(None);
             };
             specs.push(spec);
+            consumers.push(consumer);
         }
         // A `/dev/`-family operand on a consumer needs the dev-fd
         // materializer the plain external spawner wires; bail to the
@@ -1310,17 +1317,62 @@ impl Executor {
         }) {
             return Ok(None);
         }
-        self.run_shell_writer_pipeline(commands, specs)?;
+        self.run_shell_writer_pipeline(commands, &consumers, specs)?;
         Ok(Some(()))
+    }
+
+    /// niubash#345: reduce a `{ cmd; }` wrapper with no group-level
+    /// redirects, assignments, or other modifiers to its single body command,
+    /// so a shell-side consumer such as `... | { head -1; }` can join the
+    /// concurrent external chain instead of the sequential loop re-buffering
+    /// the (unbounded) producer. A non-trivial group — multiple commands,
+    /// group redirects, a compound body — returns `None` and keeps the
+    /// sequential path.
+    #[cfg(windows)]
+    fn unwrap_trivial_brace_group<'a>(&self, command: &'a CommandNode) -> Option<&'a CommandNode> {
+        let group = command.brace_group.as_ref()?;
+        let inert = command.words.is_empty()
+            && command.assignments.is_empty()
+            && command.redirects.is_empty()
+            && command.redirect_out.is_none()
+            && command.append.is_none()
+            && command.redirect_in.is_none()
+            && command.redirect_err.is_none()
+            && command.redirect_err_append.is_none()
+            && command.heredoc.is_none()
+            && command.heredoc_redirects.is_empty()
+            && command.here_string.is_none()
+            && command.process_substitutions.is_empty()
+            && command.time_command.is_none()
+            && !command.subshell
+            && !command.inverted
+            && command.inverted_command.is_none();
+        if !inert || group.body.len() != 1 {
+            return None;
+        }
+        let inner = &group.body[0];
+        if inner.brace_group.is_some()
+            || inner.subshell
+            || inner.subshell_command.is_some()
+            || command_is_compound_pipeline_stage(inner)
+        {
+            return None;
+        }
+        Some(inner)
     }
 
     /// Spawn the external consumers on real OS pipes, run the in-process
     /// compound producer streaming its fd 1 into pipe 0, then reap the chain
     /// and publish the statuses. See `execute_shell_writer_pipeline`.
+    ///
+    /// `consumers` holds the effective command node for each downstream stage:
+    /// the stage itself, or the single external command inside a trivial
+    /// brace group it was reduced from (`... | { head -1; }`).
     #[cfg(windows)]
     fn run_shell_writer_pipeline(
         &mut self,
         commands: &[&CommandNode],
+        consumers: &[&CommandNode],
         specs: Vec<(std::path::PathBuf, String, Vec<String>)>,
     ) -> Result<(), ExecuteError> {
         use std::os::windows::io::AsRawHandle;
@@ -1352,7 +1404,7 @@ impl Executor {
                     &self.shell_state.env_vars,
                 )
             };
-            self.apply_external_environment(&commands[index + 1], &mut process);
+            self.apply_external_environment(&consumers[index], &mut process);
             // Consumer j's stdin is pipe[j]'s read end.
             {
                 let (read, _) = &mut pipes[index];
@@ -1503,7 +1555,7 @@ impl Executor {
         }
 
         if producer_error.is_none() {
-            let final_command = *commands.last().expect("pipeline has at least two stages");
+            let final_command = *consumers.last().expect("pipeline has at least two stages");
             self.write_pipeline_output(final_command, &results[last_index].0, false)?;
             if !results[last_index].1.is_empty() {
                 std::io::stderr().write_all(
