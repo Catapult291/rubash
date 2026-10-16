@@ -1,0 +1,2 @@
+CHILD_NSB=leakme
+echo "nosb-sees PLOCAL=[${PLOCAL:-unset}]"
