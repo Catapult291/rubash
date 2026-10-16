@@ -1,0 +1,54 @@
+# 性能对比账本（维护中）
+
+> 本文档是 rubash 相对 GNU Bash 5.3 的性能事实唯一入口：只记录**已合并、
+> 已门禁**的数字。归因细节与完整矩阵见各 issue 文档（`perf-issue-*.md`）；
+> 测量脚本在 `~/bench_niu/`（`sweep_618_keys.sh`、`sweep_616_keys.sh`、
+> `attrib_618.sh`）；回归电池在 `tests/`。
+>
+> 测量纪律（每次更新必须遵守）：同树 release 二进制、顺序轮换、
+> min-of-N；本地 GNU 是 5.3.20（仓库 oracle 是 WSL 5.3.0），语义以
+> `third_party/bash/` C 源码为准；主机从不满载（读数取 min 消除）。
+
+## 数组元素写：O(n²) → O(1) 均摊（已落地 #618 #616）
+
+`m[k$((i%K))]=$i` / `a[i%K]=$i`，N=20000 次写入，单次写成本（release）：
+
+| keys | assoc master | assoc branch | indexed master | indexed branch | GNU |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 44.75µs | 45.90µs | 14.80µs | 15.45µs | ~5µs |
+| 100 | 87.45µs | 47.85µs | 87.75µs | 20.85µs | ~5µs |
+| 1000 | 537.40µs | 48.90µs | 782.80µs | 20.45µs | ~5µs |
+| 5000 | 2341.35µs | 52.40µs | 3571.40µs | 20.60µs | ~5µs |
+| vs GNU | 445x | **9.9x** | 736x | **3.8x** | — |
+
+- 机制：元素写 O(1) 追加一段存储段，预算触发规范渲染压缩（串长 ≤ 2 倍
+  规范长度）；assoc 读零改动，indexed 读天然折叠。
+- 写路径分解（K=5000）：重渲染 73–75%，parse-memo 的 Vec 深拷贝
+  24–25%，字符串克隆 0.05% —— memo 化只去掉了扫描，修渲染不够。
+- 附带修好 O(n²) tokenizer（每段 collect 整个剩余输入；10001 段真解析
+  563ms→17.8ms 线性）。
+- 残留（非本 issue scope）：固定 pipeline 开销（K=1 即存在，与 scalar
+  同源）；K≤3 约 +1.5µs memo-miss 结构价（K≥5 转正）；4 处冷路径
+  collect；legacy 非前缀串仍数段（无生产者）。
+
+## 标量/展开/循环（归因完成，待修；issue 文档为准）
+
+| issue | 现状 | 第一杠杆 |
+| --- | --- | --- |
+| #607 arith-for 2.37x | 一半是 `:` 分发 +1.24µs/次 | 字面命令快分发 |
+| #608 param 扩展 | 主项已修好（7.3x→1.85x）；剩固定开销+显式 pattern 斜率 | patternless Fast 扩展 |
+| #609 scalar 赋值 | §1§3 已修好；剩 RHS walker+strip-clone+双存储 | 整词 `$name` 快 path |
+| #619 控制流 | 拆分子项；共用 #607 地板，先 #607 | 静态字面 case 快 path |
+
+详见各归因报告与 `docs/perf-issue-609.md`；本表只在落地后更新数字，
+归因阶段不写。
+
+## 方法（防遗忘）
+
+- failure-**set** diff，永不比 count；门禁串行 `--test-threads=1`；
+  单 binary 双开 cargo 必串行（ETXTBSY 会废掉整轮）。
+- 每个修复配 GNU 差分电池（master 基线先跑出 guard 分布）+ 回归测试
+  文件 + 全量门禁 + niubash 产品 A/B（只切 `[patch]`）。
+- 脏测量作废整轮：过期二进制、instrumented 二进制、中途改树。
+- 终端交错：后台 agent 完成的通知会插进正在看的测量输出——关键读数
+  一律落文件再读。

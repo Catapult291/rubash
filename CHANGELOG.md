@@ -6,8 +6,17 @@
 
 ## [Unreleased]
 
+### 性能
+
+- **关联数组元素写不再全量重渲染**（#618，PR #650）：`m[k]=v` 每次写曾做三次 O(keys) 操作（镜像字符串克隆、解析 memo 的 Vec 深拷贝、全量重渲染），填充数组是 O(n²)，K=5000 时单次写比 GNU 慢 433 倍。现改为 O(1) 追加一段 `[k]=v`，预算触发规范渲染压缩重复段（均摊 O(1)，串长不超 2 倍规范长度）；读路径零改动（追加永不过期）。K=5000 单次写快 45 倍，与 GNU 差距 445x→9.9x，key 数涨 5000 倍单次写仅漂 1.14x。附带修好一个 O(n²) tokenizer（每段 collect 整个剩余输入，10001 段真解析 563ms→17.8ms 线性）。50 例 GNU 差分电池 50/50；全量 failure-set 门禁与 niubash 产品 A/B 零差异。
+- **索引数组覆盖写不再全量重渲染**（#616，PR #652）：`a[i]=v` 同理 O(n²)，K=5000 时 674x。覆盖/稀疏跳跃同样 O(1) 追加（indexed 读路径天然折叠重复，BTreeMap last-wins，无需改解析/渲染；每次追加同步 typed cell；`declare -p` 等原文打印在有重复时才折叠重渲染）。K=5000 快 177 倍，与 GNU 差距 674x→3.8x。附带修好 `declare -a a=([5]=x [2]=y)` 种下 dense cell 导致后续元素写复刻的正确性 bug（另见 #651）。50 例差分电池 49/50（唯一分歧即 #651）；门禁与产品 A/B 零差异。
+
 ### 修复
 
+- **算术下标补上 `set -u` 检查（写路径）**（#639，PR #654）：`set -u; a[k]=v` 曾静默存储 rc 0。GNU 所有下标经 `evalexp → expr_streval` 统一设卡（`expr.c:1190-1216`）；写路径求值器补上与兄弟函数相同的 prologue，五处下游诊断在 flag 下静默， abort 走 FORCE_EOF 通道（`-c` 下 127、脚本 1），另用独立 cell 区分 DISCARD 以免状态错位。25 例差分电池 10/25→25/25；回归文件 `tests/issue639_nounset_subscript.rs`。
+- **复合赋值 `[@]`/`[*]` 报整词拒绝而非算术错**（#636，PR #656）：`a+=( [@]=q )` 曾报 `@: arithmetic syntax error`，GNU 在算术求值前整词拒绝（`arrayfunc.c:786-792`，`cannot assign to non-numeric index`）。两处 compound 臂加精确匹配 guard（不 abort，走 GNU break 语义：保留部分存储、eval 可包含）。15 例差分电池 4/15→14/15（剩 declare-abort 例归 #635）；回归文件 `tests/issue636_atstar_compound.rs`。
+- **`eval` 包含赋值 DISCARD 跳转**（#637，PR #657）：`eval 'a[-2]=q'` 曾结束整个脚本。GNU 在 eval 边界捕获 DISCARD（`evalstring.c:365,422-442`），eval 返回失败、调用者继续。新增 bad-subscript class marker，eval 边界精确吸收（算术/nounset 照常逃逸）；eval 内按行继续，返回末行状态。20 例差分电池 9/20→20/20；回归文件 `tests/issue637_eval_discard.rs`。
+- **declare/local 越界负下标 abort 而非静默丢弃**（#635，PR #658）：`declare -a a=( [-2]=q )` 曾打印 AFTER rc 0。builtin 解析器区分无头/越界，扫描中断并保留部分存储，报错词经 out-param 上浮到 Executor 层做 fatal 诊断+abort（复用 #637 原语实现 eval 包含）。20 例差分电池 6/20→20/20；回归文件 `tests/issue635_builtin_oob.rs`。`export`/`readonly` 的同类 abort  threading 记作后续。
 - **prompt 渲染不再破坏读者的 `$?`/PIPESTATUS**（#604）：交互驱动（niu 原生控制台通道，`expand_prompt_string_mut`）渲染 `PS1`/`PS2`/`PS0` 时，内嵌 `$(false)` 等命令替换的退出状态此前经赋值展开引擎的替换边界写入 `exit_code`，下一个命令的 `$?` 读到 1；GNU 的 prompt 渲染是读侧操作，从不动读者的状态（WSL GNU Bash 5.3.0 piped-`-i` 探针：`PS1='$(false)'` 渲染后 `echo $?` 仍打印渲染前的值）。修复：渲染通道快照并在收尾恢复 `$?` 与 PIPESTATUS——赋值 RHS 通道（`v=$(false)` → rc=1 的 POSIX 赋值退出规则）不受影响。附带 #604 的通道 parity 回归与相对性能上限测试（PS1 渲染路径 vs PROMPT_COMMAND 路径的中位耗时比值上限），并按 profile 数据澄清该 issue 的主刀：四主题 rr 成本为外部 spawn 数 × Windows spawn 地板（每次渲染 4-6 次 git spawn；裸 `std::process::Command` 对同一 git.exe 需 208.9ms，rubash 会话内 217.6ms），两条引擎通道执行同一替换体为 parity（同进程 dev 计 47/49/68ms，release 会话内逐次 git 209.7/217.6ms）。
 
 ## [1.4.0] - 2026-10-10
