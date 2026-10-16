@@ -858,11 +858,10 @@ impl Executor {
             && call_cmd.here_string.is_none()
             && self.virtual_fd_stdin_remaining(0).is_none()
             && self.function_stdin_remaining().is_some();
-        if let Some(input) = self.stdin_string_for_command_mut(call_cmd) {
-            return Ok((Some(input), carves_parent_stdin, None));
-        }
-
         let Some(redirect) = &call_cmd.redirect_in else {
+            if let Some(input) = self.stdin_string_for_command_mut(call_cmd) {
+                return Ok((Some(input), carves_parent_stdin, None));
+            }
             // A shell script read through `< file` still has the unread
             // portion of that virtual stdin available to commands it invokes.
             // The nested shell must consume it instead of the host process
@@ -924,13 +923,24 @@ impl Executor {
             return Ok((None, false, Some(FunctionCallStdinBinding { entry: saved })));
         }
         // A `<(cmd)` temp path is a draining stream, not a replayable
-        // file — serve the shared remainder (subst.c:7143).
-        let input = match self.procsub_stream_take(&path) {
-            Some(bytes) => crate::executor::substitution_metadata::bytes_to_shell_text(&bytes),
-            None => fs::read_to_string(&path)
-                .map_err(|error| crate::posix_errors::path_error(&target, error))?,
-        };
-        Ok((Some(input), false, None))
+        // file — serve the shared remainder (subst.c:7143). Ordinary files
+        // stay as real descriptors so a child inherits the open file
+        // description and its shared offset (redir.c:1169-1170).
+        if let Some(bytes) = self.procsub_stream_take(&path) {
+            return Ok((
+                Some(crate::executor::substitution_metadata::bytes_to_shell_text(
+                    &bytes,
+                )),
+                false,
+                None,
+            ));
+        }
+        let file = FileFd::open_read(path)
+            .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+        let saved = self.fd_table.entries.get(&0).cloned();
+        self.fd_table
+            .open_input(0, FdReadEndpoint::File(file), false);
+        Ok((None, false, Some(FunctionCallStdinBinding { entry: saved })))
     }
 
     fn restore_function_call_fd0(&mut self, binding: FunctionCallStdinBinding) {
