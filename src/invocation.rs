@@ -251,6 +251,9 @@ impl ShellInvocation {
     /// GNU shell.c:679-744 main saves -r across run_startup_files and activates
     /// it afterward through maybe_make_restricted (shell.c:1278).
     pub fn apply_to_executor_before_startup(&self, executor: &mut Executor) -> Result<(), String> {
+        if self.interactive {
+            executor.set_shopt_option("expand_aliases", true);
+        }
         // shell.c:497-503: --login/-l flips LOGIN_SHELL so the `logout`
         // builtin and exit path see a login shell.
         if self.login {
