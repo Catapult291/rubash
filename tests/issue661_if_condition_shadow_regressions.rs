@@ -22,7 +22,9 @@ fn run(source: &str) -> (String, i32) {
 
 #[test]
 fn shadowing_function_keeps_slow_path_under_errexit() {
-    let (out, code) = run("true() { return 1; }\nset -e\nif true; then echo THEN; else echo ELSE; fi\necho AFTER");
+    let (out, code) = run(
+        "true() { return 1; }\nset -e\nif true; then echo THEN; else echo ELSE; fi\necho AFTER",
+    );
     assert_eq!(out, "ELSE\nAFTER\n");
     assert_eq!(code, 0);
 }
