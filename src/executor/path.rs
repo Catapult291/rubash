@@ -920,22 +920,40 @@ pub fn external_command_for_named_program(
             // unixwin/niubash#164: a virtual-system-root operand (/usr/bin,
             // /etc/..., /tmp, /home/...) exists only in the shell's root
             // map and NO non-shell child resolves it, so it translates
-            // through the same map for every child class BEFORE the
-            // per-child dialect branches below. Real drive forms (/d/x,
-            // /cygdrive/d/x) join the same every-class translation with
-            // rubash#592; /mnt/d/x was already there (#444).
+            // through the same map for every non-coreutils child class
+            // BEFORE the per-child dialect branches below. Real drive forms
+            // (/d/x, /cygdrive/d/x) join the same every-class translation
+            // with rubash#592; /mnt/d/x was already there (#444).
+            //
+            // unixwin/niubash#346 ("coreutils own the shell tree"): the
+            // bundled coreutils (WinuxCmd, `posix_aware`) resolve the shell
+            // namespace themselves — WinuxCmd's native_path shell-tree layer
+            // mirrors shell_path_to_windows — so they receive these
+            // spellings verbatim and skip this funnel. Every other child
+            // class (native exes, cmd, MSYS/Cygwin tools) is untouched and
+            // still gets the native form.
             #[cfg(windows)]
-            if let Some(translated) =
-                translated_virtual_system_root_argument(arg, shell_wrapped, env_vars)
-            {
-                return translated;
+            if !posix_aware {
+                if let Some(translated) =
+                    translated_virtual_system_root_argument(arg, shell_wrapped, env_vars)
+                {
+                    return translated;
+                }
             }
             if preserve_native_args || shell_wrapped {
                 arg.clone()
             } else if posix_aware {
                 #[cfg(windows)]
-                if data_primary_positions.contains(&position) {
-                    return arg.clone();
+                {
+                    if data_primary_positions.contains(&position) {
+                        return arg.clone();
+                    }
+                    // A shell-tree spelling (virtual root, /mnt/X, bare "/")
+                    // is resolved by the coreutils' own shell-tree layer, so
+                    // hand it over verbatim.
+                    if windows_shell_namespace_argument(arg, env_vars) {
+                        return arg.clone();
+                    }
                 }
                 external_argument_path(arg, env_vars)
             } else {
@@ -1864,6 +1882,33 @@ fn translated_virtual_system_root_argument(
             .to_string_lossy()
             .into_owned()
     })
+}
+
+/// unixwin/niubash#346: whether an argument is a shell-tree spelling — the
+/// bare `/`, a virtual system root (`/usr`, `/etc`, `/tmp`, `/var/tmp`,
+/// `/home`, `/bin`, ...), the `/mnt/X` WSL drive form, or `/dev/*`. The
+/// bundled coreutils (WinuxCmd) resolve these through their own shell-tree
+/// layer (`native_path.cppm shell_tree_to_native_w`), so they must reach such
+/// a child verbatim. Every other child class still gets the native form via
+/// `translated_virtual_system_root_argument` plus `external_argument_path`.
+///
+/// Drive forms (`/d/x`, `/cygdrive/d/x`) are deliberately NOT included: they
+/// keep the engine translation from rubash#592, so the coreutils still receive
+/// the Windows spelling today's shipped toolchain is guaranteed to open.
+#[cfg(windows)]
+fn windows_shell_namespace_argument(arg: &str, env_vars: &HashMap<String, String>) -> bool {
+    if !arg.starts_with('/') {
+        return false;
+    }
+    let normalized = arg.replace('\\', "/");
+    if normalized == "/" {
+        return true;
+    }
+    if normalized == "/dev" || normalized.starts_with("/dev/") {
+        return true;
+    }
+    windows_virtual_system_root_argument(&normalized, env_vars)
+        || windows_mnt_drive_argument(&normalized)
 }
 
 fn dispatcher_command_name(command_name: &str) -> String {
@@ -4408,15 +4453,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_virtual_system_root_arguments_translate_for_every_child_class() {
-        // niubash#164 matrix {/usr, /usr/bin, /etc/..., /tmp, /home} x
-        // {dispatcher applet, under-tree applet exe, native exe, cmd.exe}:
-        // every NON-SHELL child class resolves virtual roots through the
-        // same root map (shell_path_to_windows — the funnel `cd` uses), so
-        // `ls /usr/bin | wc -l` lists the bundled tree instead of failing
-        // with rc=2 on the verbatim POSIX spelling. MSYS model evidence:
-        // Git Bash hands native children `D:/Git/usr/bin` for /usr/bin and
-        // the %TEMP% spelling for /tmp.
+    fn shell_tree_arguments_are_verbatim_for_coreutils_and_translate_for_others() {
+        // niubash#346 ("coreutils own the shell tree") x niubash#164 matrix:
+        // the bundled coreutils — the winuxcmd dispatcher and every applet
+        // under its tree (`posix_aware`) — resolve {/usr, /usr/bin, /etc/...,
+        // /tmp, /home, /mnt/X} through their own shell-tree layer
+        // (WinuxCmd native_path.cppm shell_tree_to_native_w), so those
+        // spellings reach them VERBATIM and render the POSIX face.
+        //
+        // Every other child class (native exes, cmd, MSYS/Cygwin tools) still
+        // resolves the same roots through the engine map (shell_path_to_windows
+        // — the map `cd` uses), so `ls /usr/bin | wc -l` lists the bundled tree
+        // instead of failing with rc=2 on the verbatim POSIX spelling. MSYS
+        // model evidence: Git Bash hands native children `D:/Git/usr/bin` for
+        // /usr/bin and the %TEMP% spelling for /tmp.
         let root = i164_fixture_root();
         let env_vars = i164_rooted_env(&root);
         let mut env_with_home = env_vars.clone();
@@ -4434,15 +4484,22 @@ mod tests {
             .join("i164.conf")
             .to_string_lossy()
             .into_owned();
-        let tmp_base = std::env::temp_dir().to_string_lossy().into_owned();
 
-        for (operand, expected) in [
-            ("/usr", usr.as_str()),
-            ("/usr/bin", usr_bin.as_str()),
-            ("/etc/i164.conf", etc_conf.as_str()),
+        // Coreutils class: the shell-tree spelling stays verbatim, in the
+        // dispatcher route and for an under-tree applet exe alike.
+        for operand in [
+            "/usr",
+            "/usr/bin",
+            "/etc/i164.conf",
+            "/tmp",
+            "/tmp/x",
+            "/home",
+            "/home/u/x",
+            "/mnt/c",
+            "/mnt/c/Users",
         ] {
             // Applet class 1: the winuxcmd dispatcher route (prepends the
-            // dispatch name, then the translated operand).
+            // dispatch name, then the verbatim operand).
             let (command, _) = external_command_for_named_program(
                 &dispatcher,
                 Some("ls"),
@@ -4453,18 +4510,23 @@ mod tests {
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(argv, vec!["ls".to_string(), expected.to_string()]);
+            assert_eq!(argv, vec!["ls".to_string(), operand.to_string()]);
 
             // Applet class 2: an applet executable under the WinuxCmd tree.
-            assert_eq!(child_argv(&applet, &[operand], &env_vars), vec![expected]);
+            assert_eq!(
+                child_argv(&applet, &[operand], &env_vars),
+                vec![operand.to_string()],
+                "coreutils operand {operand:?} must stay verbatim"
+            );
+        }
 
-            // Native exe: same form (this was already the Option B native
-            // behavior — pin it as the class invariant).
+        // Non-shell classes: the engine map still owns the same roots.
+        for (operand, expected) in [
+            ("/usr", usr.as_str()),
+            ("/usr/bin", usr_bin.as_str()),
+            ("/etc/i164.conf", etc_conf.as_str()),
+        ] {
             assert_eq!(child_argv(&native, &[operand], &env_vars), vec![expected]);
-
-            // cmd.exe: the root operand translates while /C switches stay
-            // verbatim (windows_cmd_switches_are_not_mapped_into_shell_root
-            // pins the switch half).
             assert_eq!(
                 child_argv(&cmd, &["/C", "echo", operand], &env_vars),
                 vec!["/C".to_string(), "echo".to_string(), expected.to_string()]
@@ -4474,11 +4536,11 @@ mod tests {
         // /tmp maps to the per-user temp base (niubash#94), not the install
         // tree — exactly the target MSYS uses for native children.
         assert_eq!(
-            child_argv(&dispatcher, &["/tmp"], &env_vars),
-            vec![tmp_base]
+            child_argv(&native, &["/tmp"], &env_vars),
+            vec![std::env::temp_dir().to_string_lossy().into_owned()]
         );
         assert_eq!(
-            child_argv(&applet, &["/tmp/x"], &env_vars),
+            child_argv(&native, &["/tmp/x"], &env_vars),
             vec![std::env::temp_dir()
                 .join("x")
                 .to_string_lossy()
@@ -4487,7 +4549,7 @@ mod tests {
 
         // /home maps to the real home's parent (HOME/USERPROFILE map).
         assert_eq!(
-            child_argv(&dispatcher, &["/home"], &env_with_home),
+            child_argv(&native, &["/home"], &env_with_home),
             vec![r"C:\Users".to_string()]
         );
         assert_eq!(
@@ -4514,13 +4576,14 @@ mod tests {
         // had none, WinuxCmd#1178; niugit existence-gates it), so the
         // engine funnel owns the form.
         //
-        // /mnt/c is deliberately NOT in this list: WinuxCmd's
-        // normalize_api_operand_w has no /mnt arm (it folds /cygdrive/d/...
-        // to /d/... and then maps a bare /X/... drive letter, a test
-        // /mnt/c cannot satisfy because 'm' is followed by 'n'), so a
-        // verbatim /mnt/c operand reaches the applet unresolvable. It is
-        // translated engine-side for every child class now; the pin lives
-        // in windows_mnt_drive_argument_translates_for_every_child.
+        // /mnt/c and the virtual roots (/usr, /etc, /tmp, /home) joined the
+        // verbatim class with niubash#346: the bundled coreutils resolve the
+        // whole shell tree in-child (WinuxCmd native_path.cppm
+        // shell_tree_to_native_w, which owns a /mnt arm), so they are no
+        // longer translated engine-side for the applet. The coreutils pins
+        // live in
+        // shell_tree_arguments_are_verbatim_for_coreutils_and_translate_for_others
+        // and windows_mnt_drive_argument_translates_for_non_coreutils_children.
         let root = i164_fixture_root();
         let env_vars = i164_rooted_env(&root);
         let dispatcher = root.join("usr").join("bin").join("winuxcmd.exe");
@@ -4734,13 +4797,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_mnt_drive_argument_translates_for_every_child() {
-        // WSL drive forms have no arm in WinuxCmd's normalize_api_operand_w
-        // (unlike /cygdrive/d/... which it folds, and /d/... which it maps),
-        // so the engine must translate them itself. Before this, `cd /mnt/c`
-        // worked (the builtin resolves through shell_path_to_windows, which
-        // owns a /mnt branch) while `ls /mnt/c` and every other external
-        // command failed — the form only reached a child verbatim.
+    fn windows_mnt_drive_argument_translates_for_non_coreutils_children() {
+        // WSL drive forms are resolved engine-side for every NON-coreutils
+        // child: before the /mnt pin, `cd /mnt/c` worked (the builtin
+        // resolves through shell_path_to_windows, which owns a /mnt branch)
+        // while `ls /mnt/c` and every other external command failed — the
+        // form only reached a child verbatim. niubash#346 moved the coreutils
+        // class to the child side: WinuxCmd's native_path shell-tree layer
+        // now owns a /mnt arm, so the bundled applets receive /mnt/X verbatim
+        // (see the assertions below).
         let root = i164_fixture_root();
         let env_vars = i164_rooted_env(&root);
         let dispatcher = root.join("usr").join("bin").join("winuxcmd.exe");
@@ -4778,18 +4843,24 @@ mod tests {
         // upper-cases it; the shape test is case-insensitive by construction).
         assert!(windows_mnt_drive_argument("/mnt/D"));
 
-        // The applet receives the Windows spelling, not the verbatim word.
-        let argv = child_argv(&dispatcher, &["/mnt/c"], &env_vars);
+        // Coreutils class (niubash#346): the applet resolves /mnt/X in its own
+        // shell-tree layer, so it receives the spelling verbatim.
+        for drive_form in ["/mnt/c", "/mnt/d/repo/x"] {
+            assert_eq!(
+                child_argv(&dispatcher, &[drive_form], &env_vars),
+                vec![drive_form.to_string()],
+                "{drive_form:?} must stay verbatim for the applet"
+            );
+        }
+        // Non-shell classes still get the engine translation.
+        let native = PathBuf::from("git.exe");
         assert_eq!(
-            argv,
-            vec![r"C:\".to_string()],
-            "/mnt/c must reach the applet as C:\\"
+            child_argv(&native, &["/mnt/c"], &env_vars),
+            vec![r"C:\".to_string()]
         );
-        let argv = child_argv(&dispatcher, &["/mnt/d/repo/x"], &env_vars);
         assert_eq!(
-            argv,
-            vec![r"D:\repo\x".to_string()],
-            "/mnt/d/repo/x must reach the applet as D:\\repo\\x"
+            child_argv(&native, &["/mnt/d/repo/x"], &env_vars),
+            vec![r"D:\repo\x".to_string()]
         );
 
         // The bare MSYS shapes: /cygdrive/d/x folds in the applet's own
@@ -4920,13 +4991,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn virtual_system_root_file_operands_resolve_executable_spelling() {
-        // The argv funnel hands every non-shell child class the RESOLVED
-        // spelling for a file operand that exists only as `<name>.exe`
-        // (`head -1 /usr/bin/seq` used to fail with "cannot open
-        // ...\usr\bin\seq", niubash#177), while directory operands keep the
-        // plain translated form and missing operands keep the original
-        // spelling for the child's own error.
+    fn shell_tree_file_operands_verbatim_for_coreutils_resolve_for_others() {
+        // niubash#346: the argv funnel used to hand every non-shell child the
+        // RESOLVED spelling for a file operand that exists only as
+        // `<name>.exe` (`head -1 /usr/bin/seq` used to fail with "cannot open
+        // ...\usr\bin\seq", niubash#177). The coreutils class now resolves
+        // that spelling in-child (WinuxCmd native_path.cppm
+        // shell_tree_to_native_w applies the same open order), so the engine
+        // hands them the shell-tree spelling VERBATIM; every other child class
+        // still gets the resolved native spelling.
         let root = i177_fixture_root();
         let env_vars = i164_rooted_env(&root);
         let dispatcher = root.join("usr").join("bin").join("winuxcmd.exe");
@@ -4938,28 +5011,44 @@ mod tests {
         let conf = root.join("etc").join("i177.conf");
         let missing = root.join("usr").join("bin").join("nope");
 
-        for program in [&dispatcher, &applet, &native] {
-            assert_eq!(
-                child_argv(program, &["/usr/bin/seq"], &env_vars),
-                vec![seq_exe.to_string_lossy().into_owned()],
-                "{program:?} must receive the resolved operand spelling"
-            );
-            assert_eq!(
-                child_argv(program, &["/usr/bin"], &env_vars),
-                vec![usr_bin.to_string_lossy().into_owned()],
-                "{program:?}: directory operand keeps the plain form"
-            );
-            assert_eq!(
-                child_argv(program, &["/etc/i177.conf"], &env_vars),
-                vec![conf.to_string_lossy().into_owned()],
-                "{program:?}: existing file operand keeps the plain form"
-            );
-            assert_eq!(
-                child_argv(program, &["/usr/bin/nope"], &env_vars),
-                vec![missing.to_string_lossy().into_owned()],
-                "{program:?}: missing under both spellings keeps the original"
-            );
+        // Coreutils class: verbatim shell-tree spellings (winuxcmd resolves
+        // the `.exe` leaf itself, and `ls -d` keeps the operand spelling).
+        for program in [&dispatcher, &applet] {
+            for operand in [
+                "/usr/bin/seq",
+                "/usr/bin",
+                "/etc/i177.conf",
+                "/usr/bin/nope",
+            ] {
+                assert_eq!(
+                    child_argv(program, &[operand], &env_vars),
+                    vec![operand.to_string()],
+                    "{program:?}: coreutils operand {operand:?} stays verbatim"
+                );
+            }
         }
+
+        // Non-shell class: the resolved native spelling.
+        assert_eq!(
+            child_argv(&native, &["/usr/bin/seq"], &env_vars),
+            vec![seq_exe.to_string_lossy().into_owned()],
+            "native child must receive the resolved .exe spelling"
+        );
+        assert_eq!(
+            child_argv(&native, &["/usr/bin"], &env_vars),
+            vec![usr_bin.to_string_lossy().into_owned()],
+            "native child: directory operand keeps the plain form"
+        );
+        assert_eq!(
+            child_argv(&native, &["/etc/i177.conf"], &env_vars),
+            vec![conf.to_string_lossy().into_owned()],
+            "native child: existing file operand keeps the plain form"
+        );
+        assert_eq!(
+            child_argv(&native, &["/usr/bin/nope"], &env_vars),
+            vec![missing.to_string_lossy().into_owned()],
+            "native child: missing under both spellings keeps the original"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4975,15 +5064,12 @@ mod tests {
         legacy.insert("__RUBASH_ARGV_DIALECT".to_string(), "legacy".to_string());
         let dispatcher = root.join("usr").join("bin").join("winuxcmd.exe");
 
-        // /mnt/c is deliberately NOT in this list: it never belonged to
-        // this test's boundary (windows_virtual_system_root_argument
-        // ("/mnt/c") == false, see the shape-class test below) and no
-        // WinuxCmd release resolves /mnt forms in its native layer (the
-        // issue-568 claim was Git Bash argv-conversion pollution; see the
-        // 2026-10-12 adjudication). The /mnt contract is owned exclusively
-        // by the #444 pin in windows_mnt_drive_argument_translates_for_every_child.
-        // /c/Windows moved out with rubash#592 (drive forms translate for
-        // the applet class too); /cygdrive/d/x stays — it folds in-child.
+        // /mnt/c is not listed here; its coreutils-verbatim contract is pinned
+        // by
+        // shell_tree_arguments_are_verbatim_for_coreutils_and_translate_for_others
+        // and windows_mnt_drive_argument_translates_for_non_coreutils_children.
+        // /c/Windows moved out with rubash#592 (drive forms translate for the
+        // applet class too); /cygdrive/d/x stays — it folds in-child.
         for verbatim in [
             "/cygdrive/d/x",
             "/",
@@ -5069,6 +5155,56 @@ mod tests {
             "/var/tmp/x",
             &unrooted
         ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_namespace_argument_shape_class() {
+        // niubash#346: the predicate that hands the bundled coreutils the
+        // spelling verbatim is the shell-tree class — virtual system roots,
+        // the temp namespaces, /home, the /mnt/X WSL drive form, the bare "/"
+        // and /dev/* — and nothing else. Drive forms (/d/x, /cygdrive/d/x)
+        // stay outside: they keep rubash#592's engine translation.
+        let root = i164_fixture_root();
+        let env_vars = i164_rooted_env(&root);
+
+        for shape in [
+            "/usr",
+            "/usr/bin",
+            "/etc/passwd",
+            "/tmp",
+            "/tmp/x",
+            "/var/tmp",
+            "/home",
+            "/home/u",
+            "/mnt/c",
+            "/mnt/d/repo/x",
+            "/",
+            "/dev",
+            "/dev/null",
+        ] {
+            assert!(
+                windows_shell_namespace_argument(shape, &env_vars),
+                "{shape:?} is a shell-tree spelling"
+            );
+        }
+        for shape in [
+            "/c/Windows",
+            "/d",
+            "/cygdrive/d/x",
+            "/nologo",
+            "/CN=test",
+            "relative/file",
+            r"\n",
+            "",
+        ] {
+            assert!(
+                !windows_shell_namespace_argument(shape, &env_vars),
+                "{shape:?} is not a shell-tree spelling"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
