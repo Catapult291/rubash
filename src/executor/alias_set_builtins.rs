@@ -12,8 +12,40 @@ impl Executor {
             &mut self.shell_state.aliases,
             &mut stderr,
         )?;
+        self.clear_alias_definition_lines(&cmd.words[1..]);
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
+    }
+
+    fn clear_alias_definition_lines(&mut self, args: &[String]) {
+        let mut index = 0;
+        let mut clear_all = false;
+        while let Some(arg) = args.get(index) {
+            if arg == "--" {
+                index += 1;
+                break;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                break;
+            }
+            if arg[1..].chars().all(|option| option == 'a') {
+                clear_all = true;
+            }
+            index += 1;
+        }
+
+        if clear_all {
+            self.shell_state
+                .env_vars
+                .retain(|name, _| !name.starts_with("__RUBASH_ALIAS_LINE_"));
+            return;
+        }
+
+        for name in &args[index..] {
+            self.shell_state
+                .env_vars
+                .remove(&format!("__RUBASH_ALIAS_LINE_{name}"));
+        }
     }
 
     pub(in crate::executor) fn execute_alias(
