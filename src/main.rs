@@ -131,7 +131,7 @@ fn run_main() -> i32 {
     // either way (shell.c:787-790 read_from_stdin). The stdin-script vs
     // interactive-reader split inside run_no_script_with_init mirrors the
     // same C: a non-tty stdin stays the script driver (shell.c:780-786).
-    run_no_script_with_init(&mut executor, None)
+    run_no_script_with_init(&mut executor, None, None)
 }
 
 fn print_usage() {
@@ -314,6 +314,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
     // the command string (`bash -c -l 'echo hi'`) keep being parsed as
     // options below, so remember that a command string is still owed.
     let mut pending_command = false;
+    let mut alias_expansion_override = None;
     // shell.c parse_short_options: `-s` only marks read_from_stdin and the
     // argv scan continues, so options AFTER `-s` (`bash -s -r`) still apply
     // and non-option words become positional parameters ($1, $2, ...; $0
@@ -414,6 +415,9 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                         eprintln!("bash: line 0: {option}: invalid shell option name");
                         return 2;
                     }
+                    if option == "expand_aliases" {
+                        alias_expansion_override = Some(args[index] == "-O");
+                    }
                     index += 2;
                 } else {
                     eprintln!("bash: {}: option requires an argument", args[index]);
@@ -477,6 +481,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                         executor.set_env("__RUBASH_SCRIPT_NAME", "bash");
                     }
                     executor.set_env("__RUBASH_IS_C", "1");
+                    apply_interactive_alias_default(executor, alias_expansion_override);
                     return run_command_string_with_init(executor, script, init_file.as_deref());
                 }
                 // shell.c: a non-option word after `-s` is a positional
@@ -497,6 +502,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     executor.set_env("__RUBASH_SCRIPT_NAME", script);
                     return run_pretty_print(executor, script);
                 }
+                apply_interactive_alias_default(executor, alias_expansion_override);
                 return run_script_file_with_init(
                     executor,
                     script,
@@ -517,7 +523,11 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
 
     if read_from_stdin {
         executor.set_positional_params(std::mem::take(&mut stdin_positionals));
-        return run_stdin_script_with_init(executor, init_file.as_deref());
+        return run_stdin_script_with_init(
+            executor,
+            init_file.as_deref(),
+            alias_expansion_override,
+        );
     }
 
     // shell.c:1830-1842 init_interactive: when -i is set, the shell
@@ -525,7 +535,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
     // prepare_interactive_history now runs inside run_no_script_with_init
     // (after the init file, matching shell.c:799-811 ordering) so the -c /
     // script / -s paths share it (rubash#151).
-    run_no_script_with_init(executor, init_file.as_deref())
+    run_no_script_with_init(executor, init_file.as_deref(), alias_expansion_override)
 }
 
 fn apply_cli_shell_flags(executor: &mut Executor, option: &str) -> bool {
@@ -1181,7 +1191,17 @@ fn apply_init_interactive_defaults(executor: &mut Executor) {
     executor.set_shell_option("emacs", true);
 }
 
-fn run_no_script_with_init(executor: &mut Executor, init_file: Option<&str>) -> i32 {
+fn apply_interactive_alias_default(executor: &mut Executor, explicit: Option<bool>) {
+    if executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
+        executor.set_shopt_option("expand_aliases", explicit.unwrap_or(true));
+    }
+}
+
+fn run_no_script_with_init(
+    executor: &mut Executor,
+    init_file: Option<&str>,
+    alias_expansion_override: Option<bool>,
+) -> i32 {
     // GNU shell.c:541-547: `forced_interactive (-i) || (no -c command and
     // no --wordexp and (no remaining operands or -s) and isatty(stdin) and
     // isatty(stderr))` -> init_interactive, which runs before the startup
@@ -1196,6 +1216,7 @@ fn run_no_script_with_init(executor: &mut Executor, init_file: Option<&str>) -> 
     {
         executor.set_env("__RUBASH_INTERACTIVE", "1");
     }
+    apply_interactive_alias_default(executor, alias_expansion_override);
     executor.inherit_process_stdin();
     apply_startup_job_control(executor);
     if executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
@@ -1237,7 +1258,11 @@ fn run_no_script_with_init(executor: &mut Executor, init_file: Option<&str>) -> 
     }
 }
 
-fn run_stdin_script_with_init(executor: &mut Executor, init_file: Option<&str>) -> i32 {
+fn run_stdin_script_with_init(
+    executor: &mut Executor,
+    init_file: Option<&str>,
+    alias_expansion_override: Option<bool>,
+) -> i32 {
     // GNU shell.c:541-547: the interactive test's second arm is
     // `(arg_index == argc) || read_from_stdin`; `-s` sets read_from_stdin,
     // so tty stdin + tty stderr make `bash -s` interactive too. Without
@@ -1248,6 +1273,7 @@ fn run_stdin_script_with_init(executor: &mut Executor, init_file: Option<&str>) 
     {
         executor.set_env("__RUBASH_INTERACTIVE", "1");
     }
+    apply_interactive_alias_default(executor, alias_expansion_override);
     executor.inherit_process_stdin();
     // Same ordering as the script-file path: shell.c:1969
     // initialize_job_control precedes stdin reader setup, and shell.c:547 +
