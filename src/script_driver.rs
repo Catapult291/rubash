@@ -118,6 +118,23 @@ pub fn run_script_with_history(
     run_script_with_history_in(executor, contents, session, redirect_cmd)
 }
 
+pub fn run_script_with_history_at_line_offset(
+    executor: &mut Executor,
+    contents: &str,
+    line_offset: usize,
+    redirect_cmd: Option<&CommandNode>,
+) -> i32 {
+    let session = Rc::new(RefCell::new(SessionHistory::new()));
+    run_script_with_history_in_tracked_at_line_offset(
+        executor,
+        contents,
+        session,
+        redirect_cmd,
+        line_offset,
+    )
+    .0
+}
+
 /// Same grouped driver with a host-owned session history (data plane).
 /// Hosts embedding rubash (niubash) preload the session from their own
 /// history file so `!!`/`!str` inside scripts expands against — and records
@@ -157,6 +174,16 @@ pub(crate) fn run_script_with_history_in_tracked(
     session: Rc<RefCell<SessionHistory>>,
     redirect_cmd: Option<&CommandNode>,
 ) -> (i32, bool) {
+    run_script_with_history_in_tracked_at_line_offset(executor, contents, session, redirect_cmd, 0)
+}
+
+fn run_script_with_history_in_tracked_at_line_offset(
+    executor: &mut Executor,
+    contents: &str,
+    session: Rc<RefCell<SessionHistory>>,
+    redirect_cmd: Option<&CommandNode>,
+    line_offset: usize,
+) -> (i32, bool) {
     executor.set_session_history(Some(session.clone()));
     let raw_lines: Vec<&str> = contents.split_inclusive('\n').collect();
     let mut index = 0usize;
@@ -181,7 +208,7 @@ pub(crate) fn run_script_with_history_in_tracked(
             executor,
             &session,
             &group,
-            start_line,
+            start_line.saturating_add(line_offset),
             redirect_cmd,
             false,
             feeder_tokens.take(),
