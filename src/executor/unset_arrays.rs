@@ -131,6 +131,11 @@ impl Executor {
         let mut function_status = 0;
         if !variable_only {
             for (_, name) in &names {
+                let variable_exists = self.shell_state.env_vars.contains_key(name)
+                    || self.shell_state.variables.get(name).is_some();
+                if !function_only && variable_exists {
+                    continue;
+                }
                 if marked_env_names(&self.shell_state.env_vars, READONLY_FUNCTIONS)
                     .iter()
                     .any(|readonly| readonly == name)
