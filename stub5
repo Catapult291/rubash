@@ -1,2 +1,0 @@
-#!/usr/bin/env bash
-stub_fn() { echo from-stub; }
