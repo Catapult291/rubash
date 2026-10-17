@@ -9,6 +9,19 @@ pub(crate) use support::is_supported_option;
 pub(crate) use support::SHOPT_OPTIONS;
 use support::{default_state, print_all_shopts, print_shopt, print_shopts_by_state};
 
+/// rubash#780: the startup `-O`/`+O` list form (`bash -O` with no option
+/// argument). GNU shell.c routes the argument-less case to the shopt table,
+/// so the bytes are the builtin's: `-O` renders `name<TAB>on|off` (the bare
+/// `shopt` listing, reusable=false), `+O` the `shopt -s|-u name` recreate
+/// list (the `shopt -p` listing, reusable=true).
+pub(crate) fn print_shopt_listing<W: Write>(
+    env_vars: &HashMap<String, String>,
+    reusable: bool,
+    stdout: &mut W,
+) -> io::Result<()> {
+    print_all_shopts(env_vars, reusable, stdout)
+}
+
 use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};

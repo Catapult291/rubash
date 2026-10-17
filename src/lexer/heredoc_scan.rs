@@ -148,10 +148,8 @@ fn skip_heredoc_in_chars_core(
         }
         index += 1;
     }
-    let mut delimiter = chars[delimiter_start..index]
-        .iter()
-        .collect::<String>()
-        .replace(['\'', '"', '\\'], "");
+    let mut delimiter =
+        dequote_heredoc_delimiter(&chars[delimiter_start..index].iter().collect::<String>());
     if strip_tabs {
         delimiter = delimiter.trim_start_matches('\t').to_string();
     }
@@ -255,4 +253,67 @@ fn skip_heredoc_in_chars_core(
         false,
         substitution_on_header,
     )
+}
+
+/// GNU `string_quote_removal` applied to a here-document delimiter word
+/// (rubash#738).
+///
+/// Quote characters are REMOVED — they are syntax, never delimiter text —
+/// while the characters they protect stay literal:
+///
+///   * outside quotes an unquoted `\X` contributes `X` (`<<\EOF` names
+///     `EOF`, `<<E\'OF` names `E'OF`, `<<a\\b` names `a\b`);
+///   * a single-quoted run contributes its bytes verbatim;
+///   * inside double quotes a backslash quotes only `$`, `` ` ``, `"`, `\`
+///     and newline; before anything else it stays part of the delimiter
+///     (GNU double-quote rules).
+///
+/// The previous blanket `replace(['\'', '"', '\\'], "")` dropped the
+/// protected characters too: `<<E\'OF` was read as `EOF`, the terminator
+/// `E'OF` never matched, and the heredoc ran to end-of-file — silently
+/// consuming the rest of the script with rc 0.
+pub(crate) fn dequote_heredoc_delimiter(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(c) = chars.next() {
+        if single {
+            if c == '\'' {
+                single = false;
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        if double {
+            match c {
+                '"' => double = false,
+                '\\' => match chars.peek().copied() {
+                    Some(next) if matches!(next, '$' | '`' | '"' | '\\') => {
+                        out.push(chars.next().unwrap());
+                    }
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    // A backslash before anything else is literal inside
+                    // double quotes (GNU: only $ ` " \ and newline quote).
+                    _ => out.push('\\'),
+                },
+                _ => out.push(c),
+            }
+            continue;
+        }
+        match c {
+            '\'' => single = true,
+            '"' => double = true,
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }

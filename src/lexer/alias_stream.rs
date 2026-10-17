@@ -1200,10 +1200,13 @@ fn redir_op_len(buf: &[char], pos: usize) -> usize {
 /// Strip quote syntax from a heredoc delimiter word for the body-line
 /// comparison (parse.y: the delimiter is remembered dequoted; a quoted
 /// delimiter only suppresses body expansion, not matching).
+///
+/// rubash#738: this used to drop every `\` along with the quote characters,
+/// so `<<E\'OF` compared against `EOF` and the heredoc ran to EOF. The
+/// shared helper performs GNU quote removal instead (an escaped character
+/// stays literal).
 fn dequote_heredoc_delimiter(word: &str) -> String {
-    word.chars()
-        .filter(|ch| !matches!(ch, '\'' | '"' | '\\'))
-        .collect()
+    super::dequote_heredoc_delimiter(word)
 }
 
 /// `{name}` redirection target prefix (exec {fd}>file).

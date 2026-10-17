@@ -222,7 +222,7 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
         let mut delimiter =
-            self.input[delimiter_start..self.position].replace(['\'', '"', '\\'], "");
+            super::dequote_heredoc_delimiter(&self.input[delimiter_start..self.position]);
         if strip_tabs {
             delimiter = delimiter.trim_start_matches('\t').to_string();
         }

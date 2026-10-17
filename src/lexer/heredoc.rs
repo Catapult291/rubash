@@ -51,6 +51,16 @@ pub(super) fn heredoc_delimiters(
                 }
                 dequoted
             };
+            // rubash#738: an escaped quote travels through the word walker as
+            // its DATA_* carrier (`<<E\'OF` reaches here as `E`+DATA_SQUOTE+
+            // `OF`), so the literal text has to be decoded before the body
+            // compares against it — otherwise the terminator `E'OF` never
+            // matched and the heredoc swallowed the rest of the script.
+            let value = crate::executor::markers::decode_word_position_carriers(&value)
+                // An escaped backslash (`<<a\\b` names `a\b`) travels as
+                // DATA_BACKSLASH; the shared decoder leaves it in place for
+                // the expansion walkers, so restore the literal here.
+                .replace(crate::executor::markers::DATA_BACKSLASH, "\\");
             HereDocDelimiter {
                 value,
                 quoted: context.quoted,

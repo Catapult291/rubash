@@ -420,8 +420,18 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     }
                     index += 2;
                 } else {
-                    eprintln!("bash: {}: option requires an argument", args[index]);
-                    return 2;
+                    // rubash#780: the `-o` sibling above (rubash#547). An
+                    // argument-less `-O`/`+O` is the LIST request, not a
+                    // usage error. Empirical GNU 5.3.0: `bash -O` prints
+                    // the shopt table (`name\tstate`, rc 0) and `bash +O`
+                    // the `shopt -u name` / `shopt -s name` recreate list
+                    // (rc 0) — the same bytes as `shopt` / `shopt -p` —
+                    // then startup continues normally.
+                    let recreate = args[index] == "+O";
+                    let mut stdout = io::stdout();
+                    let _ = executor.print_shopt_options_listing(recreate, &mut stdout);
+                    let _ = stdout.flush();
+                    index += 1;
                 }
             }
             "-c" => {

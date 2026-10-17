@@ -516,7 +516,7 @@ pub(in crate::executor) fn copy_command_substitution_heredoc(
         raw_delimiter.push(ch);
         source.push(ch);
     }
-    let mut delimiter = raw_delimiter.replace(['\'', '"', '\\'], "");
+    let mut delimiter = crate::lexer::dequote_heredoc_delimiter(&raw_delimiter);
     if strip_tabs {
         delimiter = delimiter.trim_start_matches('\t').to_string();
     }

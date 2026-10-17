@@ -35,6 +35,12 @@ pub struct ShellInvocation {
     /// that applies the invocation gets the same output. `None` means a normal
     /// `-o <name>` / `+o <name>` pair (recorded in `shell_flags`).
     pub list_shell_options: Option<bool>,
+    /// `-O`/`+O` with no following option word (rubash#780): the sibling of
+    /// `list_shell_options`, routed by GNU shell.c to the shopt table.
+    /// `Some(false)` is the `-O` name/state table (the `shopt` bytes),
+    /// `Some(true)` the `+O` `shopt -s|-u name` recreate list (the `shopt -p`
+    /// bytes). `None` means a normal `-O <name>` / `+O <name>` pair.
+    pub list_shopt_options: Option<bool>,
     pub restricted: bool,
     pub shell_flags: Vec<(String, bool)>,
     pub shopt_flags: Vec<(String, bool)>,
@@ -136,6 +142,7 @@ impl ShellInvocation {
             script: None,
             read_stdin: false,
             list_shell_options: None,
+            list_shopt_options: None,
             restricted: false,
             shell_flags: Vec::new(),
             shopt_flags: Vec::new(),
@@ -242,11 +249,21 @@ impl ShellInvocation {
                     }
                 }
                 "-O" | "+O" => {
-                    let name = expanded
-                        .get(i + 1)
-                        .ok_or_else(|| format!("{arg}: option requires an argument"))?;
-                    out.shopt_flags.push((name.clone(), arg == "-O"));
-                    i += 2;
+                    match expanded.get(i + 1) {
+                        Some(name) => {
+                            out.shopt_flags.push((name.clone(), arg == "-O"));
+                            i += 2;
+                        }
+                        // rubash#780: the `-o` sibling above — GNU shell.c
+                        // routes an argument-less `-O`/`+O` to the shopt
+                        // table (`-O` name/state, `+O` the recreate list)
+                        // instead of a usage error. Parsing continues; the
+                        // table is emitted while options are applied.
+                        None => {
+                            out.list_shopt_options = Some(arg == "+O");
+                            i += 1;
+                        }
+                    }
                 }
                 "-" | "--" => {
                     // GNU shell.c:905-911: a lone `-' or `--' ends option
@@ -353,6 +370,14 @@ impl ShellInvocation {
                 return Err(format!("{name}: invalid shell option name"));
             }
         }
+        if let Some(recreate) = self.list_shopt_options {
+            // rubash#780: the `-o` sibling. The `-O`/`+O` pairs parsed
+            // before the argument-less request are applied just above, so
+            // the table renders their live state exactly as GNU's
+            // left-to-right walk does; `+O` selects the recreate list
+            // (`shopt -s|-u name`).
+            let _ = self.write_shopt_options_listing(executor, &mut std::io::stdout());
+        }
         if self.debugger {
             // GNU bash --debugger enables extdebug so a debugger can install
             // its hooks; the host shell decides the rest.
@@ -417,6 +442,21 @@ impl ShellInvocation {
     ) -> std::io::Result<()> {
         if let Some(recreate) = self.list_shell_options {
             executor.print_shell_options_listing(recreate, out)?;
+        }
+        Ok(())
+    }
+
+    /// rubash#780: the argument-less `-O`/`+O` listing (the `-o` sibling in
+    /// `write_shell_options_listing`). `-O` renders the `name\tstate` shopt
+    /// table, `+O` the `shopt -s|-u name` recreate list. A no-op when the
+    /// invocation used `-O <name>` (`shopt_flags`) rather than the list form.
+    pub fn write_shopt_options_listing<W: std::io::Write>(
+        &self,
+        executor: &Executor,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        if let Some(recreate) = self.list_shopt_options {
+            executor.print_shopt_options_listing(recreate, out)?;
         }
         Ok(())
     }
@@ -506,19 +546,29 @@ fn parse_post_c_option(
             Ok(Some(index + 1))
         }
         "-o" | "+o" => {
-            let name = args
-                .get(index + 1)
-                .ok_or_else(|| format!("{arg}: option requires an argument"))?;
-            out.shell_flags.push((name.clone(), arg == "-o"));
-            Ok(Some(index + 2))
+            match args.get(index + 1) {
+                Some(name) => {
+                    out.shell_flags.push((name.clone(), arg == "-o"));
+                    Ok(Some(index + 2))
+                }
+                // rubash#780 sibling: argument-less `-o`/`+o` is the list
+                // request, exactly as in `ShellInvocation::parse`.
+                None => {
+                    out.list_shell_options = Some(arg == "+o");
+                    Ok(Some(index + 1))
+                }
+            }
         }
-        "-O" | "+O" => {
-            let name = args
-                .get(index + 1)
-                .ok_or_else(|| format!("{arg}: option requires an argument"))?;
-            out.shopt_flags.push((name.clone(), arg == "-O"));
-            Ok(Some(index + 2))
-        }
+        "-O" | "+O" => match args.get(index + 1) {
+            Some(name) => {
+                out.shopt_flags.push((name.clone(), arg == "-O"));
+                Ok(Some(index + 2))
+            }
+            None => {
+                out.list_shopt_options = Some(arg == "+O");
+                Ok(Some(index + 1))
+            }
+        },
         option if option.starts_with('-') || option.starts_with('+') => {
             let enabled = option.starts_with('-');
             let flags = &option[1..];

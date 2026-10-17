@@ -375,7 +375,7 @@ pub(crate) const GROUP_REDIRECT_INJECTED_MARK: &str = "\u{1e}group-redirect";
 /// characters they denote. These consumers own the final value — stdin
 /// content, strmatch subject — and have no later quote-removal pass, so
 /// leaving the carriers encoded leaks \x17/\x1a into output.
-pub(in crate::executor) fn decode_word_position_carriers(value: &str) -> String {
+pub(crate) fn decode_word_position_carriers(value: &str) -> String {
     // rubash#237 perf: the plain-word case (no marker byte present) is the
     // overwhelming majority — every `.replace` below would then be an
     // identity copy with a fresh String allocation per call. One scan

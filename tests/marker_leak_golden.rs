@@ -3,9 +3,10 @@ use std::process::{Command, Stdio};
 /// Golden leak assertions (governance 3.1/3.2): transport marker codepoints
 /// must never appear in stdout, `declare -p`, or xtrace output. C0 carrier
 /// bytes are indistinguishable from legitimate user data at the byte level,
-/// so the checks target the unambiguous classes: PUA codepoints (registry
-/// zone U+E000..=U+E3FF, UTF-8 lead EF 80..8F) and the named protocol
-/// strings (`__RUBASH_*`).
+/// so the checks target the unambiguous classes: PUA codepoints (the
+/// registry zone, U+E000..=U+E4FF — markers.rs currently tops out at
+/// U+E401, UTF-8 lead byte 0xEE) and the named protocol strings
+/// (`__RUBASH_*`).
 
 fn run(args: &[&str]) -> Vec<u8> {
     let child = Command::new(env!("CARGO_BIN_EXE_rubash"))
@@ -19,10 +20,14 @@ fn run(args: &[&str]) -> Vec<u8> {
 }
 
 fn assert_no_pua_marker(out: &[u8], ctx: &str) {
-    // U+E000..U+EFFF encodes as EF 80 80 .. EF BF BF; the registry zone is
-    // a subset but any private-use char reaching stdout is a leak signal.
+    // U+E000..=U+EFFF encodes as EE 80 80 .. EE BF BF. Every registered
+    // marker lives in that plane (lead byte 0xEE — the same predicate
+    // markers.rs `contains_word_marker_bytes` uses), so scan the whole
+    // plane: any private-use char from it reaching stdout is a leak signal.
+    // rubash#727: this used to test 0xEF (U+F000..=U+FFFF), which saw no
+    // registered marker at all and only ever fired on user data.
     for w in out.windows(3) {
-        if w[0] == 0xEF && (0x80..=0xBF).contains(&w[1]) {
+        if w[0] == 0xEE && (0x80..=0xBF).contains(&w[1]) {
             let cp = 0xE000 + (((w[1] & 0x3F) as u32) << 6) + ((w[2] & 0x3F) as u32);
             panic!("{ctx}: PUA codepoint U+{cp:04X} leaked into output: {out:?}");
         }
@@ -98,6 +103,11 @@ fn xtrace_carries_no_markers() {
 
     // PUA user data must trace as the literal char, not its E400
     // literal-char escape (the xtrace verbatim-word arm leaked it once).
+    // This output legitimately CONTAINS U+E314 — it is the user's own data —
+    // so the PUA-plane leak assertion cannot apply here (rubash#727 made it
+    // visible; before the fix it was blind). Assert the literal round-trip
+    // instead: exactly one char per traced word, no E400 escape, no named
+    // protocol string.
     let child_err = {
         let child = Command::new(env!("CARGO_BIN_EXE_rubash"))
             .args(["-c", "set -x; v=$'\\uE314Z'; echo \"$v\"; set +x"])
@@ -108,7 +118,17 @@ fn xtrace_carries_no_markers() {
             .expect("spawn rubash");
         child.wait_with_output().expect("wait rubash").stderr
     };
-    assert_clean(&child_err, "xtrace stderr (PUA word)");
+    let traced = String::from_utf8_lossy(&child_err);
+    assert!(
+        !traced.contains('\u{E400}'),
+        "PUA word traced through the E400 literal-char escape: {traced:?}"
+    );
+    assert_eq!(
+        traced.matches('\u{E314}').count(),
+        2,
+        "PUA data must trace literally once per traced word: {traced:?}"
+    );
+    assert_no_named_marker(&child_err, "xtrace stderr (PUA word)");
 }
 
 /// Reparse boundary: eval / alias / command-substitution bodies that
@@ -153,4 +173,21 @@ fn printf_paths_carry_no_markers() {
         "v='a\\$b'; printf '%q\\n' \"$v\"; printf '%s\\n' \"${v//\\\\/X}\"; printf '%b\\n' 'a\\x41b'",
     ]);
     assert_clean(&out, "printf");
+}
+
+/// rubash#727: the assertion must actually see the registry's codepoints
+/// (U+E000-based, UTF-8 lead byte 0xEE). Before the fix it tested 0xEF and
+/// therefore could not fire on any registered marker.
+#[test]
+#[should_panic(expected = "U+E301")]
+fn pua_assertion_sees_a_registered_marker() {
+    assert_no_pua_marker("\u{E301}".as_bytes(), "selftest");
+}
+
+/// rubash#727: and it must NOT fire on U+F000..=U+FFFF (lead byte 0xEF) —
+/// a different PUA block the registry never uses. The old predicate fired
+/// only on this false-positive path.
+#[test]
+fn pua_assertion_ignores_the_f000_block() {
+    assert_no_pua_marker("\u{F000}".as_bytes(), "selftest");
 }

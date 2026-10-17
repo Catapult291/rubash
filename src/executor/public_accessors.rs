@@ -283,6 +283,19 @@ impl Executor {
         )
     }
 
+    /// rubash#780: the startup `-O`/`+O` list form (`bash -O` with no option
+    /// argument). GNU shell.c routes the argument-less case to the shopt
+    /// table, so the bytes are the builtin's: `-O` renders `name<TAB>on|off`
+    /// (the bare `shopt` listing), `+O` the `shopt -s|-u name` recreate list
+    /// (the `shopt -p` listing).
+    pub fn print_shopt_options_listing<W: std::io::Write>(
+        &self,
+        recreate: bool,
+        stdout: &mut W,
+    ) -> std::io::Result<()> {
+        crate::builtins::shopt::print_shopt_listing(&self.shell_state.env_vars, recreate, stdout)
+    }
+
     pub fn shell_state_mut(&mut self) -> &mut crate::shell::ShellState {
         &mut self.shell_state
     }

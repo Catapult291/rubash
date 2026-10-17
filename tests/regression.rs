@@ -1051,3 +1051,97 @@ fn background_command_with_large_function_table_runs() {
         "spawn hit an argv/command-line cap; stderr:\n{stderr}"
     );
 }
+
+/// rubash#780: an argument-less `-O`/`+O` is the shopt LIST request, not a
+/// usage error — the sibling of the `-o`/`+o` case fixed in rubash#547.
+/// GNU 5.3.0 prints the shopt table (`name<TAB>state`, rc 0) for `-O` and
+/// the `shopt -u|-s name` recreate list for `+O`, then continues startup.
+/// Asserted against the engine's own builtin bytes so the check needs no
+/// GNU oracle: startup `-O` equals `shopt`, `+O` equals `shopt -p`.
+#[test]
+fn argument_less_capital_o_prints_the_shopt_listing() {
+    let dir = std::env::temp_dir().join(format!("rubash-780-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    let dash = run_rubash_in(&dir, &["-O"], Duration::from_secs(30));
+    let builtin = run_rubash_in(&dir, &["-c", "shopt"], Duration::from_secs(30));
+    assert_eq!(
+        dash.code,
+        Some(0),
+        "`-O` rc, stderr:\n{}",
+        String::from_utf8_lossy(&dash.stderr)
+    );
+    assert!(!dash.stdout.is_empty(), "`-O` printed nothing");
+    assert_eq!(
+        dash.stdout, builtin.stdout,
+        "`-O` must be the `shopt` bytes"
+    );
+
+    let plus = run_rubash_in(&dir, &["+O"], Duration::from_secs(30));
+    let builtin_p = run_rubash_in(&dir, &["-c", "shopt -p"], Duration::from_secs(30));
+    assert_eq!(
+        plus.code,
+        Some(0),
+        "`+O` rc, stderr:\n{}",
+        String::from_utf8_lossy(&plus.stderr)
+    );
+    assert!(!plus.stdout.is_empty(), "`+O` printed nothing");
+    assert_eq!(
+        plus.stdout, builtin_p.stdout,
+        "`+O` must be the `shopt -p` bytes"
+    );
+}
+
+/// rubash#738: a heredoc delimiter carrying an escaped quote or backslash is
+/// DEQUOTED (GNU quote removal), not stripped of those characters. Before
+/// the fix `<<E\'OF` named `EOF`, the terminator `E'OF` never matched, and
+/// the heredoc ran to end-of-file — silently eating the rest of the script
+/// with `rc 0` and a warning on a stream scripts rarely read.
+///
+/// Expected bytes are GNU Bash 5.3.0's: the terminator matches, the body is
+/// exactly `hello`, and execution continues after the heredoc.
+#[test]
+fn heredoc_delimiter_with_escaped_quote_or_backslash_terminates() {
+    let dir = std::env::temp_dir().join(format!("rubash-738-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    // `<<E\'OF` … `E'OF` — an escaped single quote is literal delimiter text.
+    std::fs::write(
+        dir.join("esc_quote.sh"),
+        "cat <<E\\'OF\nhello\nE'OF\necho after-quote\n",
+    )
+    .expect("write esc_quote");
+    let out = run_rubash_in(&dir, &["esc_quote.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "esc_quote rc, stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "hello\nafter-quote\n",
+        "esc_quote stdout (the heredoc must end at E'OF):\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("delimited by end-of-file"),
+        "esc_quote still ran to EOF:\n{stderr}"
+    );
+
+    // `<<a\\b` … `a\b` — the escaped backslash is a literal delimiter byte.
+    std::fs::write(
+        dir.join("esc_backslash.sh"),
+        "cat <<a\\\\b\na\\b\necho after-backslash\n",
+    )
+    .expect("write esc_backslash");
+    let out = run_rubash_in(&dir, &["esc_backslash.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "esc_backslash rc, stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "after-backslash\n",
+        "esc_backslash stdout (the heredoc must end at a\\b):\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("delimited by end-of-file"),
+        "esc_backslash still ran to EOF:\n{stderr}"
+    );
+}

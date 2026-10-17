@@ -27,6 +27,7 @@ pub(crate) use continuation::{
     comsub_residuals_advance, quotes_residuals_advance, CompoundResidualState, ComsubResidualState,
     QuotesResidualState,
 };
+pub(crate) use heredoc_scan::dequote_heredoc_delimiter;
 
 pub(crate) use alias_stream::{expand_aliases_in_source, AliasLookup};
 use brace_scan_cache::BraceScanCache;
