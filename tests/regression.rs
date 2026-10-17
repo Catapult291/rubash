@@ -1304,10 +1304,12 @@ fn here_string_inside_quoted_command_substitution_is_dequoted() {
     );
 }
 
-/// rubash#745: backtick bodies have exactly one escape rule — a backslash is
-/// special only before `$`, `` ` `` or `\`. Quote state does not take part,
-/// so `\\"` stays `\\"` for the parser's own double-quote pass, and a
-/// word-final `\\` keeps its character.
+/// rubash#745: a backtick body consumes the backslash before EVERY character
+/// (parse.y parse_matched_pair under P_BACKQUOTE), so `\"` becomes `"`, `\a`
+/// becomes `a` and `\\` becomes `\`. Only what follows the simplification
+/// matters — a body whose last character is a lone `\` keeps it, which is why
+/// the decoder doubles a word-final odd run before the re-parse terminates
+/// the text with a newline.
 ///
 /// The old decoder special-cased `\\"` while inside double quotes and emitted
 /// its quote marker directly, which made `"\\\\"` decode to `\"` instead of

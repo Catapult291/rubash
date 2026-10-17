@@ -133,32 +133,23 @@ pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> Str
             continue;
         }
 
-        // rubash#745: GNU parse.y parse_matched_pair under P_BACKQUOTE has
-        // exactly one rule — "backslash is only special if it precedes $, `,
-        // or \; otherwise it is a literal backslash". Quote state does NOT
-        // participate: `\"` inside backticks stays `\"` and is left to the
-        // parser, which then applies ordinary double-quote rules.
+        // rubash#745: inside a backtick body GNU consumes the backslash
+        // before ANY character (parse.y parse_matched_pair under
+        // P_BACKQUOTE), not only before `$`/`` ` ``/`\`: `\"` becomes `"`,
+        // `\a` becomes `a`, `\\` becomes `\`. exp.tests:146 pins the quote
+        // case — `recho "`echo \"Hello world!\"`"` runs `echo "Hello
+        // world!"` and prints `Hello world!`.
         //
         // The old arms special-cased `\\"` and `\"` while `double` was set
-        // and emitted DATA_DQUOTE directly. That skipped the parser's second
-        // pass, so `"\\\\"` (four backslashes in double quotes) decoded to
-        // `\"` instead of `\`, and a word-final `\\` lost its backslash
-        // entirely.
+        // and emitted DATA_DQUOTE directly, which skipped this step, so
+        // `"\\\\"` (four backslashes in double quotes) decoded to `\"`
+        // instead of `\`; and the generic arm pushed `\` + next, leaving the
+        // escape for a second pass that only strips it in some contexts.
         match chars.next() {
-            Some(next @ ('$' | '`' | '\\')) => {
-                push_backtick_source_char(&mut output, next, single);
-            }
             Some('\n') => {}
             Some('\r') if chars.peek().copied() == Some('\n') => {
                 chars.next();
             }
-            // GNU consumes the backslash before ANY character inside
-            // backticks, not only before `$`/`` ` ``/`\`: `echo \"x\"`
-            // inside a backtick body runs `echo "x"` and prints `x` without
-            // the quotes (exp.tests:146 pins it). Pushing `\` + next left the
-            // escape for the parser's second pass, which only strips it in
-            // some contexts — inside a surrounding double-quoted word the
-            // quotes survived as data.
             Some(next) => push_backtick_source_char(&mut output, next, single),
             None => output.push('\\'),
         }
