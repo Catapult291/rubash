@@ -152,10 +152,14 @@ pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> Str
             Some('\r') if chars.peek().copied() == Some('\n') => {
                 chars.next();
             }
-            Some(next) => {
-                output.push('\\');
-                push_backtick_source_char(&mut output, next, single);
-            }
+            // GNU consumes the backslash before ANY character inside
+            // backticks, not only before `$`/`` ` ``/`\`: `echo \"x\"`
+            // inside a backtick body runs `echo "x"` and prints `x` without
+            // the quotes (exp.tests:146 pins it). Pushing `\` + next left the
+            // escape for the parser's second pass, which only strips it in
+            // some contexts — inside a surrounding double-quoted word the
+            // quotes survived as data.
+            Some(next) => push_backtick_source_char(&mut output, next, single),
             None => output.push('\\'),
         }
     }
