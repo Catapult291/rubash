@@ -79,14 +79,20 @@ impl Executor {
         // builtins/exit.def:59-62: an interactive shell echoes "exit" (or
         // "logout" in a login shell) to stderr before parsing arguments;
         // CHECK_HELPOPT runs first, so `exit --help` stays silent. GNU's
-        // `interactive` C global is 0 while the startup files run (verified
-        // with gdb on WSL GNU 5.3.0: exit_builtin in a --rcfile sees
-        // interactive=0, interactive_shell=1) and for an `bash -i script`
-        // (shell.c:1715-1717 init_interactive_script -> init_noninteractive
-        // zeroes interactive while interactive_shell stays 1), so the echo
-        // is suppressed in those phases (rubash#297).
+        // condition is `interactive && sourcelevel == 0`: the echo is
+        // suppressed while a sourced file runs (`sourcelevel > 0`), which is
+        // why `bash --rcfile rc -i -c 'echo AFTER'` with `exit 3` in the rc
+        // prints nothing while a reader-phase `exit 3` still echoes
+        // (niubash#404). GNU's `interactive` C global is also 0 while the
+        // startup files run (verified with gdb on WSL GNU 5.3.0: exit_builtin
+        // in a --rcfile sees interactive=0, interactive_shell=1) and for an
+        // `bash -i script` (shell.c:1715-1717 init_interactive_script ->
+        // init_noninteractive zeroes interactive while interactive_shell
+        // stays 1), so the echo is suppressed in those phases too
+        // (rubash#297). `__RUBASH_IN_SOURCE` is the engine's sourcelevel.
         if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1")
             && self.get_env("__RUBASH_INTERACTIVE_FLAG_OFF").is_none()
+            && self.get_env("__RUBASH_IN_SOURCE").is_none()
             && cmd.words.get(1).map(String::as_str) != Some("--help")
         {
             let login = self.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1");

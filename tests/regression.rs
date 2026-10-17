@@ -1145,3 +1145,52 @@ fn heredoc_delimiter_with_escaped_quote_or_backslash_terminates() {
         "esc_backslash still ran to EOF:\n{stderr}"
     );
 }
+/// niubash#404 (rubash side): GNU's exit echo is `interactive &&
+/// sourcelevel == 0` (builtins/exit.def:59-62). A reader-phase `exit` prints
+/// "exit" to stderr; an `exit` inside a sourced file does not — which is why
+/// `bash --rcfile rc -i -c 'echo AFTER'` with `exit 3` in the rc stays
+/// silent while `bash -i -c 'exit 3'` echoes.
+#[test]
+fn interactive_exit_echo_is_suppressed_inside_a_sourced_file() {
+    let dir = std::env::temp_dir().join(format!("rubash-404-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+    std::fs::write(dir.join("rc.sh"), "echo RAN\nexit 3\n").expect("write rc");
+
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rubash"))
+            .args(args)
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", minimal_path())
+            .env("HOME", &dir)
+            .env("__RUBASH_INTERACTIVE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn rubash");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code(),
+        )
+    };
+
+    // Reader-phase exit: the echo is required.
+    let (_, stderr, code) = run(&["--norc", "-c", "exit 3"]);
+    assert_eq!(code, Some(3), "stderr:\n{stderr}");
+    assert!(
+        stderr.lines().any(|line| line == "exit"),
+        "reader-phase `exit` must echo \"exit\" (GNU exit.def:59-62): {stderr:?}"
+    );
+
+    // Exit inside the sourced file: no echo.
+    let (stdout, stderr, code) = run(&["--norc", "-c", ". rc.sh"]);
+    assert_eq!(code, Some(3), "stderr:\n{stderr}");
+    assert_eq!(stdout.trim_end(), "RAN", "stdout:\n{stdout}");
+    assert!(
+        !stderr.lines().any(|line| line == "exit"),
+        "an `exit` inside a sourced file must stay silent: {stderr:?}"
+    );
+}
