@@ -1717,6 +1717,13 @@ impl Executor {
                     raw.get(1..raw.len() - 1)
                         .is_some_and(command_substitution_spans_whole_word)
                 })
+                // rubash#744: a here-string body needs the real parser's
+                // word quote removal (`cat <<< 'here'` must yield `here`).
+                // This shortcut hands the body to the specialized expander,
+                // which keeps the quotes; decline so the body reaches the
+                // AST/parser path that embedded_mutations already routes
+                // here-string substitutions through.
+                .filter(|source| !source.contains("<<<"))
         }) {
             let output = self.expand_command_substitution_with_context(
                 source,

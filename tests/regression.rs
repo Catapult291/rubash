@@ -1275,3 +1275,95 @@ fn compound_declaration_marks_the_variable_as_an_array() {
         "`declare +a a=(x y)` diagnostic; stderr:\n{stderr}"
     );
 }
+
+/// rubash#744: a here-string inside a quoted whole-word `$(...)` must have
+/// its word quote-removed. The quoted-`$()` fast path in command_prepare
+/// handed the body straight to the specialized expander, which kept the
+/// quotes (`p "$(cat <<< 'here')"` printed `['here']`). The body now
+/// declines that shortcut when it carries `<<<`, so it reaches the AST path
+/// that already routes here-string substitutions through the real parser.
+#[test]
+fn here_string_inside_quoted_command_substitution_is_dequoted() {
+    let dir = std::env::temp_dir().join(format!("rubash-744-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                  p \"$(cat <<< 'here')\"\n\
+                  p $(cat <<< 'here')\n\
+                  p \"pre$(cat <<< 'here')post\"\n\
+                  p \"$(cat <<< \"a b\")\"\n";
+    std::fs::write(dir.join("here.sh"), script).expect("write script");
+    let out = run_rubash_in(&dir, &["here.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "[here]\n[here]\n[preherepost]\n[a b]\n",
+        "here-string quote removal; stderr:\n{stderr}"
+    );
+}
+
+/// rubash#745: backtick bodies have exactly one escape rule — a backslash is
+/// special only before `$`, `` ` `` or `\`. Quote state does not take part,
+/// so `\\"` stays `\\"` for the parser's own double-quote pass, and a
+/// word-final `\\` keeps its character.
+///
+/// The old decoder special-cased `\\"` while inside double quotes and emitted
+/// its quote marker directly, which made `"\\\\"` decode to `\"` instead of
+/// `\`, and dropped a trailing backslash completely.
+#[test]
+fn old_style_backtick_escape_rules_match_gnu() {
+    let dir = std::env::temp_dir().join(format!("rubash-745-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    // Word-final `\\`, four backslashes inside double quotes, an escaped
+    // non-special, and both already-correct shapes as controls.
+    let script = "q() { printf '[%s]|%s\\n' \"$1\" \"${#1}\"; }\n\
+                  b=`printf '%s' \\\\`; q \"$b\"\n\
+                  c=`printf '%s' \"\\\\\\\\\"`; q \"$c\"\n\
+                  d=`printf '%s' \\a`; q \"$d\"\n\
+                  e=`echo a\\\\b`; q \"$e\"\n\
+                  f=`printf '%s' '\\\\'`; q \"$f\"\n\
+                  g=$(printf '%s' \\\\); q \"$g\"\n";
+    std::fs::write(dir.join("bt.sh"), script).expect("write script");
+    let out = run_rubash_in(&dir, &["bt.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "[\\]|1\n[\\]|1\n[a]|1\n[ab]|2\n[\\]|1\n[\\]|1\n",
+        "backtick escape rules; stderr:\n{stderr}"
+    );
+}
+
+/// rubash#776: `read -N` binds the record to the first name verbatim — no
+/// IFS splitting, no whitespace strip — and leaves the rest empty. Before
+/// the fix the record went through the ordinary split path, so `-N3` on
+/// `AB\nC` lost the newline and `-N5` on `AB CD` split into two fields.
+#[test]
+fn read_capital_n_binds_the_record_without_splitting() {
+    let dir = std::env::temp_dir().join(format!("rubash-776-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+    std::fs::write(dir.join("in.txt"), "AB\nC").expect("write input");
+
+    // -N3 keeps the delimiter as data; -N5 keeps the space whole.
+    let script = "read -N3 c < in.txt; printf '<%s>|%s\\n' \"$c\" \"${#c}\"\n\
+                  read -N3 a b < in.txt; printf '[%s][%s]\\n' \"$a\" \"$b\"\n\
+                  printf 'AB CD' > in2.txt\n\
+                  read -N5 x y < in2.txt; printf '[%s][%s]\\n' \"$x\" \"$y\"\n\
+                  printf '  AB  ' > in3.txt\n\
+                  read -N6 s < in3.txt; printf '[%s]\\n' \"$s\"\n\
+                  read -n6 t < in3.txt; printf '[%s]\\n' \"$t\"\n";
+    std::fs::write(dir.join("n.sh"), script).expect("write script");
+    let out = run_rubash_in(&dir, &["n.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "<AB\n>|3\n[AB\n][]\n[AB CD][]\n[  AB  ]\n[AB]\n",
+        "read -N record binding; stderr:\n{stderr}"
+    );
+}

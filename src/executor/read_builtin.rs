@@ -2259,12 +2259,18 @@ impl Executor {
                 } else {
                     line
                 };
-                let assign_status = self.assign_read_scalar_names_with_field_count(
-                    &scalar_names,
-                    &line,
-                    raw,
-                    scalar_field_count,
-                );
+                let assign_status = if exact_char_limit {
+                    // rubash#776: `-N` binds the record whole (see
+                    // assign_read_exact_names); `-n` keeps IFS splitting.
+                    self.assign_read_exact_names(&scalar_names, &line, raw)
+                } else {
+                    self.assign_read_scalar_names_with_field_count(
+                        &scalar_names,
+                        &line,
+                        raw,
+                        scalar_field_count,
+                    )
+                };
                 if assign_status != 0 {
                     return self.finish_read_error(cmd, &stderr, assign_status);
                 }

@@ -778,6 +778,44 @@ impl Executor {
         self.assign_read_scalar_names_with_field_count(names, line, raw, names.len())
     }
 
+    /// rubash#776: GNU read.def under `-N` binds the record to the FIRST
+    /// name verbatim — no IFS splitting and no leading/trailing whitespace
+    /// strip — and leaves the remaining names empty. Probes against GNU
+    /// 5.3.0 with `printf 'AB\nC'`:
+    ///
+    ///   read -N3 a   -> a=`AB\n`     (the delimiter is data here)
+    ///   read -N3 a b -> a=`AB\n`, b=""
+    ///   read -N5 a b on `AB CD` -> a=`AB CD`, b=""   (no splitting)
+    ///   read -N6 a on `  AB  `  -> a=`  AB  `        (no strip)
+    ///   read -n3 a   -> a=`AB`                       (-n splits/strips)
+    ///
+    /// Backslash handling still applies without -r (`A\\B` -> `A\B`).
+    pub(in crate::executor) fn assign_read_exact_names(
+        &mut self,
+        names: &[String],
+        line: &str,
+        raw: bool,
+    ) -> i32 {
+        let value = if raw {
+            line.to_string()
+        } else {
+            unescape_read_backslashes(line)
+        };
+        let mut status = 0i32;
+        for (index, name) in names.iter().enumerate() {
+            let value = if index == 0 {
+                value.clone()
+            } else {
+                String::new()
+            };
+            if !self.apply_shell_assignment_command("read", name, value) {
+                status = if index + 1 < names.len() { 2 } else { 1 };
+                break;
+            }
+        }
+        status
+    }
+
     pub(in crate::executor) fn assign_read_scalar_names_with_field_count(
         &mut self,
         names: &[String],

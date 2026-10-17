@@ -133,32 +133,20 @@ pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> Str
             continue;
         }
 
-        if double {
-            let mut lookahead = chars.clone();
-            if lookahead.next() == Some('\\') && lookahead.next() == Some('"') {
-                chars.next();
-                chars.next();
-                output.push(crate::executor::markers::DATA_DQUOTE);
-                continue;
-            }
-        }
-
-        if double && chars.peek().copied() == Some('"') {
-            chars.next();
-            output.push(crate::executor::markers::DATA_DQUOTE);
-            continue;
-        }
-
+        // rubash#745: GNU parse.y parse_matched_pair under P_BACKQUOTE has
+        // exactly one rule — "backslash is only special if it precedes $, `,
+        // or \; otherwise it is a literal backslash". Quote state does NOT
+        // participate: `\"` inside backticks stays `\"` and is left to the
+        // parser, which then applies ordinary double-quote rules.
+        //
+        // The old arms special-cased `\\"` and `\"` while `double` was set
+        // and emitted DATA_DQUOTE directly. That skipped the parser's second
+        // pass, so `"\\\\"` (four backslashes in double quotes) decoded to
+        // `\"` instead of `\`, and a word-final `\\` lost its backslash
+        // entirely.
         match chars.next() {
             Some(next @ ('$' | '`' | '\\')) => {
                 push_backtick_source_char(&mut output, next, single);
-            }
-            // GNU parse.y parse_matched_pair consumes the backslash before
-            // any escaped character inside backticks, so `\"` becomes `"`
-            // (not `\"`). This lets `echo \"Hello\"` inside backticks parse
-            // as `echo "Hello"` with real double-quote delimiters.
-            Some('"') => {
-                push_backtick_source_char(&mut output, '"', single);
             }
             Some('\n') => {}
             Some('\r') if chars.peek().copied() == Some('\n') => {
@@ -170,6 +158,16 @@ pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> Str
             }
             None => output.push('\\'),
         }
+    }
+    // rubash#745: a word-final ODD run of backslashes. GNU hands the body to
+    // parse_and_execute with EOF immediately after it, so a lone trailing
+    // `\\` stays literal (`\`printf '%s' \\`` yields one backslash). The
+    // re-parse here terminates the text with a newline instead, where `\\`
+    // plus newline is a line continuation and the character disappears.
+    // Double it so the parser's own escape pass lands on the same single
+    // backslash; an even run already terminates on a literal backslash.
+    if output.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1 {
+        output.push('\\');
     }
     output
 }
