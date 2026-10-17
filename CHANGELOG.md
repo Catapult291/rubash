@@ -23,6 +23,7 @@
 - **`export`/`readonly` 补上越界负下标 abort**（#635 后续，PR #677）：`export -a a=( [-2]=q )` 曾打印 AFTER rc 0。`-a/-A` 委托内嵌 `declare_builtin`（`setattr.def:240-268`），`arrayfunc.c:804-809` any_failed + DISCARD（`subst.c:11169`）。复用 #658 原语：`oob_word` 上浮、操作数循环遇 OOB 即停、Executor 层裸诊断+exit 1+#637 abort。13 例新测试；18 例 GNU 探针矩阵 18/18；门禁与产品 A/B 零差异。
 - **算术票据快路**（#607 切片二，PR #671）：identity 字母 `(( ))` 仍付全票据。双门（语法形只读+状态门：写日志空、标识符 unset/纯十进制）跳过 shopt/nounset/标记/上下文/同步。dense 探针 ~5%（~200ns/eval），headline 不变。6 契约测试；门禁与产品 A/B 零差异。
 - **for-list 绑定补 dequote**（#675，PR #683）：`for p in "f*"` 绑了 `f`+CTLESC+`*`（长 3，全局 glob 死），只有双引号 for-list 路跳过解引用。绑定点统一走存储侧 dequote（`subst.c:4807`）。`casearm` 29/30→30/30，`ifcase` 55/55；门禁与产品 A/B 零差异。根因在 case 上游。
+- **quoted 复合元素保留引用态**（#377，PR #730）：`declare -a d3=("$x")` 存了 glob 结果。NoMatch 臂推解引用重包形式，消费端 glob 解引用文本丢引用态。现引号内序列化 CTLESC 保护；`=` 臂解保护判下标。文件 10/12→11/12（剩预存）；glob 34/34；门禁与产品 A/B 零差异。
 - **fd_redirects 并行竞态**（#667，PR #676）：6 测试并行红、串行绿。`external_fd_copy_bin_dir` 返回固定路径，多测试互删助手目录。现 pid+ThreadId+计数器唯一目录。并行 10/19→19/19（3x），串行 19/19。纯测试改动。
 - **平台专属测试分流**（#144/#363/#555，PR #692/#693/#694）：`cmd /c` 流合并 10 测、`#!/usr/bin/env` 9 测、反斜杠字面量 11 行——在非对应平台上注定红。整文件/逐行 `cfg(windows)` + `$I363_PROBE`/PATH 解析，可移植行全留。纯测试改动。
 - **测试进程 CWD 隔离**（#690，PR #691）：`cd` 内建 chdir 测试进程（语义正确），但 1586 测共用单进程 CWD，一个 `cd` 毒死后面全部相对 `target/` 用例（~990 失败摊满所有 part）。逐测 RAII `CwdGuard`（panic 安全），1589 处机械插入，零语义改动。`executor_tests` 串行 321/1229→1540/10（剩 10 全是预存环境/抖动）；门禁与产品 A/B 零差异。串行为限（CWD 进程全局）。
