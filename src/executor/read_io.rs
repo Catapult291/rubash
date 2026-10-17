@@ -95,6 +95,40 @@ impl Executor {
                 return None;
             }
         }
+        // rubash#721: `< /dev/fd/N` with N closed is an open failure, not an
+        // empty input. GNU opens the alias through the kernel and reports
+        // ENOENT (`read -r z < /dev/fd/6` -> "/dev/fd/6: No such file or
+        // directory", rc 1). The alias branch below stages an empty mirror,
+        // which made `read` see plain EOF and return 1 with no diagnostic.
+        if read_fd.is_none() {
+            for redirect in &cmd.redirects {
+                if redirect.kind != crate::parser::RedirectKind::Input
+                    || redirect.fd.unwrap_or(0) != 0
+                    || redirect.fd_var.is_some()
+                {
+                    continue;
+                }
+                let Some(source) = super::execution_misc::dev_stdio_redirect_fd(&redirect.target)
+                else {
+                    continue;
+                };
+                if !super::redirection::dup_source_fd_open(
+                    &self.fd_table,
+                    source,
+                    &std::collections::HashMap::new(),
+                ) {
+                    let mut stderr = Vec::new();
+                    let _ = writeln!(
+                        &mut stderr,
+                        "{}{}: No such file or directory",
+                        self.diagnostic_prefix(),
+                        redirect.target
+                    );
+                    let _ = self.write_redirected_command_stderr(cmd, &stderr);
+                    return None;
+                }
+            }
+        }
         // An unnumbered heredoc is the last stdin redirect, so it overrides
         // an earlier `<&fd`. An explicit `read -u N` still owns the input fd.
         if read_fd.is_none() {

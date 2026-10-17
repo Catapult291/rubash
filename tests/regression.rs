@@ -1367,3 +1367,59 @@ fn read_capital_n_binds_the_record_without_splitting() {
         "read -N record binding; stderr:\n{stderr}"
     );
 }
+
+/// rubash#721: `< /dev/fd/N` (or `/proc/self/fd/N`) with N closed is an open
+/// failure, not an empty input. GNU opens the alias through the kernel and
+/// reports ENOENT, abandoning the command with status 1.
+///
+/// Two independent sites staged an empty mirror instead: the compound fd-0
+/// preflight treated every alias as available (`while read … done < /dev/fd/6`
+/// ran zero iterations and reported 0), and the read builtin's alias branch
+/// saw plain EOF (bare rc 1, no diagnostic). A live descriptor must still
+/// read normally — the check is "is N open", not "is the word an alias".
+#[test]
+fn closed_dev_fd_operand_reports_no_such_file() {
+    let dir = std::env::temp_dir().join(format!("rubash-721-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+    std::fs::write(dir.join("live.txt"), "hi\n").expect("write input");
+
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    };
+
+    // read builtin over a closed alias.
+    let (stdout, stderr, code) = run("exec 6<&-\nread -r z < /dev/fd/6\necho rc=$?");
+    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+    assert_eq!(stdout, "rc=1", "read rc; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
+        "read must report the alias; stderr:\n{stderr}"
+    );
+
+    // Compound fd-0 input.
+    let (stdout, stderr, code) =
+        run("exec 6<&-\nwhile read -r l; do :; done < /dev/fd/6\necho rc=$?");
+    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+    assert_eq!(stdout, "rc=1", "loop rc; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
+        "the loop must report the alias; stderr:\n{stderr}"
+    );
+
+    // /proc spelling takes the same path.
+    let (stdout, stderr, code) = run("exec 6<&-\nread -r z < /proc/self/fd/6\necho rc=$?");
+    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+    assert_eq!(stdout, "rc=1", "proc rc; stderr:\n{stderr}");
+
+    // A live descriptor still serves its bytes.
+    let (stdout, stderr, code) =
+        run("exec 6< live.txt\nread -r z < /dev/fd/6\necho \"got=$z rc=$?\"");
+    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+    assert_eq!(stdout, "got=hi rc=0", "live fd; stderr:\n{stderr}");
+}

@@ -962,6 +962,18 @@ impl Executor {
     /// /dev/null, missing files, `<>` read-write opens — returns None and
     /// keeps the FUNCTION_STDIN text-mirror transport.
     fn compound_fd0_regular_file(&mut self, cmd: &CommandNode) -> Option<Rc<FileFd>> {
+        if std::env::var_os("RB_721").is_some() {
+            eprintln!(
+                "[721] compound_stdin_open_failure redirect_in={:?} redirects={:?}",
+                cmd.redirect_in
+                    .as_ref()
+                    .map(|r| format!("{} {:?}", r.target, r.kind)),
+                cmd.redirects
+                    .iter()
+                    .map(|r| format!("{} {:?}", r.target, r.kind))
+                    .collect::<Vec<_>>()
+            );
+        }
         let redirect = cmd.redirect_in.as_ref()?;
         if redirect.fd.unwrap_or(0) != 0 || redirect.fd_var.is_some() {
             return None;
@@ -1018,6 +1030,31 @@ impl Executor {
         if super::execution_misc::is_closed_redirect_target(&target) {
             return None;
         }
+        if let Some(source) = super::execution_misc::dev_stdio_redirect_fd(&target) {
+            // rubash#721: `/dev/fd/N` names descriptor N. GNU's open of the
+            // alias fails ENOENT when N is closed (redir.c
+            // redirection_error over the dangling /proc/self/fd magic
+            // symlink), and the compound is abandoned with that diagnostic.
+            // Treating every alias as available staged an empty mirror, so
+            // `while read ... done < /dev/fd/6` ran zero iterations and
+            // reported 0.
+            //
+            // This must run BEFORE the `&N` probe below:
+            // redirect_target_fd_and_move falls back to dev_stdio_redirect_fd
+            // for a word without `&`, so it answers Some for `/dev/fd/N` too
+            // and would short-circuit this check.
+            if !super::redirection::dup_source_fd_open(
+                &self.fd_table,
+                source,
+                &std::collections::HashMap::new(),
+            ) {
+                return Some(format!(
+                    "{}{target}: No such file or directory",
+                    self.diagnostic_prefix()
+                ));
+            }
+            return None;
+        }
         // `<&N` / `<&N-` dups are descriptor operations, not path opens —
         // their source validity is enforced by validate_builtin_dup_source
         // (builtins) and open_compound_numbered_input_redirects's dup_entry
@@ -1025,9 +1062,6 @@ impl Executor {
         // form with a bogus ENOENT (rubash#575: `exec cat <&0` inside a
         // command substitution must run, not abort).
         if super::execution_misc::redirect_target_fd_and_move(&target).is_some() {
-            return None;
-        }
-        if super::execution_misc::dev_stdio_redirect_fd(&target).is_some() {
             return None;
         }
         if redirect.append {
