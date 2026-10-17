@@ -48,24 +48,30 @@ impl Executor {
             return Ok(false);
         };
         let saved_path = self.use_standard_path_for_lookup(use_standard_path);
-        let mut status = 0;
+        // rubash#704 R6.2: `command -v`/`-V` use GNU's ANY-found rule
+        // (builtins/command.def: `if (describe_command (...) == 0)
+        // any_found++` -> EXECUTION_SUCCESS when one operand resolved).
+        // `type` is the all-found builtin and keeps its own accumulator
+        // below/elsewhere, so this loop must not double as it: the old
+        // shared "any miss sets status 1" made `command -v echo nosuch`
+        // return 1 while GNU returns 0.
+        let mut any_found = false;
         for name in &args[first_name..] {
             if !use_standard_path && !name.contains('/') && !name.contains('\\') {
                 crate::builtins::hash::bump_hashed_path_hit(&mut self.shell_state.env_vars, name);
             }
-            if !self.describe_name_with_io(name, mode, false, false, stdout)? {
-                status = 1;
-                if mode == TypeDescribeMode::Verbose {
-                    writeln!(
-                        stderr,
-                        "{}command: {name}: not found",
-                        self.diagnostic_prefix()
-                    )?;
-                }
+            if self.describe_name_with_io(name, mode, false, false, stdout)? {
+                any_found = true;
+            } else if mode == TypeDescribeMode::Verbose {
+                writeln!(
+                    stderr,
+                    "{}command: {name}: not found",
+                    self.diagnostic_prefix()
+                )?;
             }
         }
         self.restore_lookup_path(saved_path);
-        self.exit_code = status;
+        self.exit_code = if any_found { 0 } else { 1 };
         Ok(true)
     }
 

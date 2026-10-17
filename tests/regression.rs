@@ -1423,3 +1423,81 @@ fn closed_dev_fd_operand_reports_no_such_file() {
     assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
     assert_eq!(stdout, "got=hi rc=0", "live fd; stderr:\n{stderr}");
 }
+
+/// rubash#704 R6.2: `command -v`/`-V` use GNU's ANY-found rule
+/// (builtins/command.def increments any_found per resolved operand), so one
+/// miss among several operands still exits 0. `type` is the all-found
+/// builtin and is deliberately the opposite — the two shared an accumulator
+/// that made `command -v echo nosuch` return 1.
+#[test]
+fn command_describe_multi_operand_uses_any_found() {
+    let dir = std::env::temp_dir().join(format!("rubash-704-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let code = "command -v echo nosuch_xyz >/dev/null; echo v:$?\n\
+                command -v nosuch_xyz echo >/dev/null; echo v2:$?\n\
+                command -V echo nosuch_xyz >/dev/null 2>&1; echo V:$?\n\
+                command -v nosuch1 nosuch2 >/dev/null; echo miss:$?\n\
+                type echo nosuch_xyz >/dev/null 2>&1; echo type:$?";
+    let (stdout, stderr) = run(code);
+    assert_eq!(
+        stdout, "v:0\nv2:0\nV:0\nmiss:1\ntype:1",
+        "command describe status; stderr:\n{stderr}"
+    );
+}
+
+/// rubash#759: `dirs -l` is the LONG form (`$HOME` stays un-collapsed), not
+/// the one-per-line form. Only `-p` (and `-v`, which is already numbered)
+/// selects one entry per line. rubash treated `-l` as `-p`, so
+/// `dirs -l` printed three lines where GNU prints one.
+#[test]
+fn dirs_long_form_keeps_the_space_separator() {
+    let dir = std::env::temp_dir().join(format!("rubash-759-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).expect("create a");
+    std::fs::create_dir_all(dir.join("b")).expect("create b");
+
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    };
+
+    let long = run("cd a\npushd ../b >/dev/null\ndirs -l");
+    assert_eq!(
+        long.lines().count(),
+        1,
+        "`dirs -l` must stay on one line: {long:?}"
+    );
+    assert!(
+        long.contains(' '),
+        "`dirs -l` separates with spaces: {long:?}"
+    );
+
+    let per_line = run("cd a\npushd ../b >/dev/null\ndirs -p");
+    assert_eq!(
+        per_line.lines().count(),
+        2,
+        "`dirs -p` is one entry per line: {per_line:?}"
+    );
+
+    let numbered = run("cd a\npushd ../b >/dev/null\ndirs -v");
+    assert_eq!(
+        numbered.lines().count(),
+        2,
+        "`dirs -v` is numbered, one per line: {numbered:?}"
+    );
+    let long_numbered = run("cd a\npushd ../b >/dev/null\ndirs -l -v");
+    assert_eq!(
+        long_numbered, numbered,
+        "`dirs -l -v` renders like `dirs -v`"
+    );
+}

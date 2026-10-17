@@ -86,11 +86,15 @@ where
             let mut numbered = false;
             while let Some(arg) = args.get(flag_end).copied() {
                 match arg {
-                    // -l is consumed for validation parity; rubash's stack
-                    // always stores full paths, so the long form has no
-                    // separate rendering (GNU's ~-collapsing is the only
-                    // difference and rubash never collapses).
-                    "-l" | "-p" => printable = true,
+                    // rubash#759: -l is the LONG form, not the one-per-line
+                    // form. GNU dirs.def only widens the rendering (it stops
+                    // collapsing $HOME to ~); the separator stays a single
+                    // space, and -p alone selects one entry per line. rubash's
+                    // stack always stores full paths, so -l has no separate
+                    // rendering at all and must not set `printable`:
+                    // `dirs -l` printed three lines where GNU prints one.
+                    "-l" => {}
+                    "-p" => printable = true,
                     "-v" => numbered = true,
                     _ => break,
                 }
