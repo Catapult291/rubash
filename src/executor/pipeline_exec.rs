@@ -3156,16 +3156,35 @@ impl Executor {
                     .iter()
                     .map(|word| self.expand_word(word))
                     .collect();
+                // niubash#383: the stage input is transport text, so carrier
+                // bytes such as 0x1B/0x0C travel as U+E000+U+E0xx marker
+                // pairs (locale.rs:352). A bare `input.as_bytes().len()` or
+                // `input.bytes()` therefore measures the CARRIER encoding,
+                // not the payload: `printf '\033' | wc -c` reported 6. Byte
+                // and word counts must therefore run over exactly the payload
+                // bytes the external wc would receive
+                // (`shell_text_to_raw_bytes`, the same boundary its
+                // child-stdin write uses). The carrier encoding hides a
+                // whitespace byte (0x0C) inside U+E000+U+E0xx, so splitting on
+                // transport text counts `printf 'a\014b' | wc -w` as 1 where
+                // GNU reports 2, and payload must never be fed to
+                // `decode_to_visible_text` (internal-text decoder: a payload
+                // control byte maps to CTLESC and trips its postcondition,
+                // locale.rs:545). The line-count arm needs no decode:
+                // 0x0A is not a carrier byte, so every `\n` is already real.
                 // Only the single-flag fast paths are emulated inline; every
-                // other invocation (-w, -L, -m, --words, combined flags, file
+                // other invocation (-L, -m, --words, combined flags, file
                 // operands) must run the real external `wc`. Returning None
                 // here would abort the whole pipeline with the misleading
                 // "pipeline command could not execute" diagnostic.
                 if args.len() == 1 {
                     let value = match args[0].as_str() {
-                        "-c" => input.as_bytes().len(),
+                        "-c" => {
+                            crate::executor::substitution_metadata::shell_text_to_raw_bytes(input)
+                                .len()
+                        }
                         "-l" => input.bytes().filter(|byte| *byte == b'\n').count(),
-                        "-w" => input.split_whitespace().count(),
+                        "-w" => inline_wc_word_count(input),
                         _ => {
                             return self.execute_external_pipeline_stage(
                                 command,
@@ -3179,8 +3198,10 @@ impl Executor {
                 // Default (no operands) matches GNU wc: lines, words, bytes.
                 if args.is_empty() {
                     let lines = input.bytes().filter(|byte| *byte == b'\n').count();
-                    let words = input.split_whitespace().count();
-                    let bytes = input.as_bytes().len();
+                    let words = inline_wc_word_count(input);
+                    let bytes =
+                        crate::executor::substitution_metadata::shell_text_to_raw_bytes(input)
+                            .len();
                     return Ok(Some((
                         format!("{lines:>7} {words:>7} {bytes:>7}\n"),
                         String::new(),
@@ -3378,6 +3399,20 @@ pub(crate) fn command_is_compound_pipeline_stage(command: &CommandNode) -> bool 
         || command.conditional_command.is_some()
         || command.inverted_command.is_some()
         || command.background_command.is_some()
+}
+
+/// niubash#383: `wc -w` (and the flagless words field) must count words over
+/// the payload bytes the external wc would receive. It must NOT decode
+/// through `crate::locale::decode_to_visible_text`: that is an internal-text
+/// decoder, and a payload control byte (e.g. piped 0x11) decodes to CTLESC,
+/// tripping its `debug_assert!(!contains(CTLESC))` postcondition
+/// (locale.rs:545) and, without asserts, silently miscounting.
+fn inline_wc_word_count(input: &str) -> usize {
+    const ASCII_WHITESPACE: [u8; 6] = [b' ', b'\t', b'\n', 0x0B, 0x0C, b'\r'];
+    crate::executor::substitution_metadata::shell_text_to_raw_bytes(input)
+        .split(|byte| ASCII_WHITESPACE.contains(byte))
+        .filter(|word| !word.is_empty())
+        .count()
 }
 
 pub(in crate::executor) fn head_line_count(args: &[String]) -> Option<usize> {
