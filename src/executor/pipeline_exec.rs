@@ -2868,32 +2868,15 @@ impl Executor {
                     .map(|word| self.expand_word(word))
                     .collect::<Vec<_>>();
                 // GNU head with file operands ignores stdin and reads the
-                // files (`printf x | head -1 f*` prints the file header,
-                // not the pipe input). This inline arm can only count
-                // lines of the pipe input, so an operand-bearing
-                // invocation must run the real external head.
-                let mut cursor = 0;
-                while cursor < args.len() {
-                    let arg = args[cursor].as_str();
-                    if arg == "-c" || arg == "--bytes" {
-                        // Byte mode has no line-count representation; the
-                        // real head must run instead of silently emitting
-                        // whole lines.
-                        return self.execute_external_pipeline_stage(command, input, stdin_inherit);
-                    }
-                    if matches!(arg, "-n" | "-b") {
-                        cursor += 2;
-                        continue;
-                    }
-                    if arg.starts_with('-') {
-                        cursor += 1;
-                        continue;
-                    }
+                // files (`printf x | head -1 f*` prints the file header, not
+                // the pipe input), and byte mode has no line representation.
+                // Only the plain line-count shapes parse_head_line_count
+                // accepts may stay inline; every malformed/missing/negative
+                // count (niubash#708) declines so the real head reports it.
+                let Some(spec) = parse_head_line_count(&args) else {
                     return self.execute_external_pipeline_stage(command, input, stdin_inherit);
-                }
-                let count = head_line_count(&args).unwrap_or(10);
-                let output = input.split_inclusive('\n').take(count).collect::<String>();
-                Ok(Some((output, String::new(), 0)))
+                };
+                Ok(Some((spec.apply(input), String::new(), 0)))
             }
             "cat" => {
                 use crate::executor::external_file_builtins::{
@@ -3445,22 +3428,120 @@ pub(in crate::executor) fn head_line_count(args: &[String]) -> Option<usize> {
     None
 }
 
+/// Line selection for the inline `head` arms. GNU `head -n -N` prints all but
+/// the last N lines, which a plain `usize` cannot represent, so the count
+/// carries its sign.
+pub(in crate::executor) enum HeadLineCount {
+    First(usize),
+    AllButLast(usize),
+}
+
+impl HeadLineCount {
+    /// Apply the selection to transport text. Only `\n` (never a carrier byte)
+    /// delimits lines, so the split stays byte-exact.
+    pub(in crate::executor) fn apply(&self, input: &str) -> String {
+        match *self {
+            HeadLineCount::First(count) => input.split_inclusive('\n').take(count).collect(),
+            HeadLineCount::AllButLast(count) => {
+                let lines = input.split_inclusive('\n').collect::<Vec<_>>();
+                lines[..lines.len().saturating_sub(count)].concat()
+            }
+        }
+    }
+}
+
+/// Parse the inline-representable `head` argument shapes into a line
+/// selection, or `None` when the invocation must run the real external `head`.
+///
+/// niubash#708: the arm used to skip every `-…` word and then fall through
+/// `head_line_count(...).unwrap_or(10)`, so a malformed, missing or negative
+/// count silently printed the first ten lines with rc 0. Only the count forms
+/// that this arm can reproduce faithfully keep the fast path: `-n N` / `-nN`
+/// / `--lines=N` / `--lines N` / `-N` for a non-negative `N`, plus the GNU
+/// negative form `-n -N` (all but the last N lines). `-c`/`--bytes`, any
+/// unknown option, any operand and a missing count operand decline.
+pub(in crate::executor) fn parse_head_line_count(args: &[String]) -> Option<HeadLineCount> {
+    let mut count = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            // A trailing operand (`head -n 2 -- f`) reads the file, not the
+            // pipe; this arm only represents pipe input.
+            return None;
+        }
+        let value = if arg == "-n" || arg == "--lines" {
+            index += 1;
+            args.get(index)?
+        } else if let Some(value) = arg.strip_prefix("--lines=") {
+            value
+        } else if let Some(value) = arg.strip_prefix("-n") {
+            value
+        } else if let Some(value) = arg.strip_prefix('-') {
+            if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            count = Some(HeadLineCount::First(value.parse::<usize>().ok()?));
+            index += 1;
+            continue;
+        } else {
+            // A bare operand (file or `-`) is not representable inline.
+            return None;
+        };
+        count = Some(parse_head_count_operand(value)?);
+        index += 1;
+    }
+    Some(count.unwrap_or(HeadLineCount::First(10)))
+}
+
+fn parse_head_count_operand(value: &str) -> Option<HeadLineCount> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let count = digits.parse::<usize>().ok()?;
+    Some(if negative {
+        HeadLineCount::AllButLast(count)
+    } else {
+        HeadLineCount::First(count)
+    })
+}
+
 pub(in crate::executor) fn translate_tr(input: &str, source: &str, target: &str) -> String {
     let (Some(source_chars), Some(target_chars)) =
         (inline_expand_tr_set(source), inline_expand_tr_set(target))
     else {
         return input.to_string();
     };
-    input
-        .chars()
-        .map(|ch| {
-            source_chars
+    // niubash#707 (same class as niubash#383): `input` is transport text, so
+    // carrier bytes such as 0x0C and 0x1B travel as U+E000+U+E0xx marker
+    // pairs. A set built from the real characters (`[:cntrl:]`, `[:space:]`)
+    // never matches those pairs, so carried control bytes escaped translation.
+    // Decode to exactly the bytes the external `tr` would receive, run set
+    // membership on bytes, then re-encode so the output boundary decodes once.
+    let decoded = crate::executor::substitution_metadata::shell_text_to_raw_bytes(input);
+    // `inline_expand_tr_set` returns only ASCII for a representable set, so the
+    // char->byte narrowing is exact.
+    let source_bytes: Vec<u8> = source_chars.iter().map(|ch| *ch as u8).collect();
+    let target_bytes: Vec<u8> = target_chars.iter().map(|ch| *ch as u8).collect();
+    if source_bytes.is_empty() || target_bytes.is_empty() {
+        // `tr a ''` is a coreutils usage error and `tr '' x` a no-op; the
+        // guards keep the index arithmetic below panic-free either way.
+        return crate::executor::substitution_metadata::bytes_to_shell_text(&decoded);
+    }
+    let translated: Vec<u8> = decoded
+        .into_iter()
+        .map(|byte| {
+            source_bytes
                 .iter()
-                .position(|source_ch| *source_ch == ch)
-                .map(|index| target_chars[index.min(target_chars.len() - 1)])
-                .unwrap_or(ch)
+                .position(|source_byte| *source_byte == byte)
+                .map(|index| target_bytes[index.min(target_bytes.len() - 1)])
+                .unwrap_or(byte)
         })
-        .collect()
+        .collect();
+    crate::executor::substitution_metadata::bytes_to_shell_text(&translated)
 }
 
 /// Expands a `tr` set for the inline pipeline fast path. Returns `None` for
