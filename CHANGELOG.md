@@ -27,6 +27,8 @@
 - **fd_redirects 并行竞态**（#667，PR #676）：6 测试并行红、串行绿。`external_fd_copy_bin_dir` 返回固定路径，多测试互删助手目录。现 pid+ThreadId+计数器唯一目录。并行 10/19→19/19（3x），串行 19/19。纯测试改动。
 - **平台专属测试分流**（#144/#363/#555，PR #692/#693/#694）：`cmd /c` 流合并 10 测、`#!/usr/bin/env` 9 测、反斜杠字面量 11 行——在非对应平台上注定红。整文件/逐行 `cfg(windows)` + `$I363_PROBE`/PATH 解析，可移植行全留。纯测试改动。
 - **测试进程 CWD 隔离**（#690，PR #691）：`cd` 内建 chdir 测试进程（语义正确），但 1586 测共用单进程 CWD，一个 `cd` 毒死后面全部相对 `target/` 用例（~990 失败摊满所有 part）。逐测 RAII `CwdGuard`（panic 安全），1589 处机械插入，零语义改动。`executor_tests` 串行 321/1229→1540/10（剩 10 全是预存环境/抖动）；门禁与产品 A/B 零差异。串行为限（CWD 进程全局）。
+- **respawn 传输可写探针回退**（PR #752）：无 TMPDIR 且 `/tmp` 不可写（Android 有不可写的 `/tmp`）时临时文件建不出，回退内联 300KB `-c` 死于 E2BIG。存在性改可写性探针（pid+计数器），一次退到进程 temp dir、二次退 CWD。6000 函数后台任务恢复；无残留文件。
+- **Windows-only tmpdir 测试分流**（#328/#331，PR #750）：`/var/tmp` 映射与 TMPDIR 自注入引擎臂都是 `cfg(windows)`，测试在外失败。`#[cfg(windows)]` 门。纯测试改动。
 - **真 Unix stty**（#282，PR #732）：非 Windows 是空桩（恒 rc 0）。现 `isatty(0)` 探针（非终端全形态诊断+rc 1），终端下左到右执行（`size` 经 TIOCGWINSZ，raw 系经 termios），Windows 路不动。文件 2/4→4/4；门禁与产品 A/B 零差异。
 - **交互 rcfile 只 source 一次**（#312，PR #712）：`--rcfile gate.sh -i` 跑两遍 gate.sh。`run_startup_files` 已 source 后各驱动又直调一次。用 `__RUBASH_SOURCED_RC` 去重（空 HOME/非交互扩展/login 原样保留），`#297` exit 语义不变。append 探针 2→1；文件 6/9→9/9；门禁与产品 A/B 零差异。
 - **真 uid/euid 身份，去掉 root 模拟**（PR #698）：非 root 主机报 `UID`/`EUID` 0、`\$` 渲染 `#`。`uid_value` 回退硬编码 `"0"`（开发基线跑在 root 下的模拟）。现取真 `getuid()`/`geteuid()`（GNU `variables.c:984`，继承值保留，Windows 保持 0）。4 个 prompt 测试曾钉作者账号、`reader` 默认 prompt 钉 `#`，现按宿主校准。三方探针与 GNU 一致；门禁与产品 A/B 零差异。
