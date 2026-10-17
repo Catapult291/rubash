@@ -269,6 +269,13 @@ fn remove_shell_quotes_inner_cursor(raw: &str, posix: bool) -> String {
                 rest = &rest[1..];
             }
             b'$' => {
+                // rubash#742: an unbraced `$name` ends at the next `$` — the
+                // following `$'...'` / `$"..."` / `$other` is a new
+                // expansion, not name bytes. Without the marker the cooked
+                // text glues them together (`$v$'b'` became `$vb`).
+                if pending_name {
+                    out.push(PARAM_NAME_END_MARKER);
+                }
                 pending_name = false;
                 match rest.as_bytes().get(1) {
                     Some(&b'(') => {
@@ -348,6 +355,12 @@ fn remove_shell_quotes_inner_cursor(raw: &str, posix: bool) -> String {
                 rest = copy_backtick_body_cursor(&mut out, &rest[1..]);
             }
             b'\\' => {
+                // rubash#742: same boundary for a backslash escape. `$v\tb`
+                // is `$v` followed by the literal `tb`, not `${vtb}`; without
+                // the marker the name scan swallowed the escape's payload.
+                if pending_name {
+                    out.push(PARAM_NAME_END_MARKER);
+                }
                 pending_name = false;
                 let Some(&escaped) = rest.as_bytes().get(1) else {
                     // Trailing backslash: the original pushes it verbatim.
@@ -376,6 +389,21 @@ fn remove_shell_quotes_inner_cursor(raw: &str, posix: bool) -> String {
                     }
                     b'\\' => {
                         out.push(crate::executor::markers::DATA_BACKSLASH);
+                        rest = &rest[2..];
+                    }
+                    // rubash#742: escaped IFS whitespace is quoted data. GNU's
+                    // `\ ` yields one word ("AB b"), not two: the escaped
+                    // space must not field-split. The generic ASCII arm pushed
+                    // it bare, so the splitter saw an ordinary space.
+                    b' ' | b'\t' | b'\n' => {
+                        // The blank guard is the same carrier the ANSI-C
+                        // decoder uses for a decoded blank: field-split call
+                        // sites convert it to IFS_GLUE and boundary strips
+                        // drop it, so the byte stays literal word data. CTLESC
+                        // is the glob-metacharacter region and the splitter
+                        // does not consult it.
+                        out.push_str(crate::executor::markers::ANSI_C_IFS_GUARD_STR);
+                        out.push(char::from(escaped));
                         rest = &rest[2..];
                     }
                     b'*' | b'?' | b'[' | b']' | b'@' | b'+' | b'!' | b'(' | b')' | b'|' | b'/'

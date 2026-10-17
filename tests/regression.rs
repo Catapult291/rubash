@@ -1501,3 +1501,39 @@ fn dirs_long_form_keeps_the_space_separator() {
         "`dirs -l -v` renders like `dirs -v`"
     );
 }
+
+/// rubash#742: three word-level quote-removal arms in lexer/quotes.rs.
+///
+/// 1–2. An unbraced `$name` ends at the next `$` or backslash; the old scan
+///      cleared `pending_name` without emitting PARAM_NAME_END_MARKER, so the
+///      cooked text glued the neighbours into one longer name and silently
+///      returned another variable's value (`$v\tb` with vtb=QQ printed QQ).
+/// 3.   An escaped blank must stay literal data. `\ ` was pushed bare, so the
+///      splitter saw an ordinary space and the word became two arguments.
+#[test]
+fn unbraced_name_and_escaped_blank_keep_their_boundaries() {
+    let dir = std::env::temp_dir().join(format!("rubash-742-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    // `\t` here is a literal backslash + t, not a tab.
+    let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                  v=AB; vtb=QQ\n\
+                  p $v\\tb\n\
+                  q=$v\\tb; p \"$q\"\n\
+                  p ${v}\\tb\n\
+                  w='a b'; wb=QQ\n\
+                  p a$w$'b'\n\
+                  p $w$'b'\n\
+                  p $v\\ b\n\
+                  p ${v}\\ b\n";
+    std::fs::write(dir.join("q.sh"), script).expect("write script");
+    let out = run_rubash_in(&dir, &["q.sh"], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "[ABtb]\n[ABtb]\n[ABtb]\n[aa][bb]\n[a][bb]\n[AB b]\n[AB b]\n",
+        "word boundaries; stderr:\n{stderr}"
+    );
+}
