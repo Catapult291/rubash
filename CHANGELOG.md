@@ -19,6 +19,7 @@
 - **裸 `**` 全局排序**（#664，PR #674）：globstar 漫步深度优先，GNU `sh_sortglob` 全局重排。单 `**` 调用既有 `globsort_matches` 全局重排（C/POSIX 字节序 else live collation）。repro 与 GNU 逐字节一致；glob 电池 33/34→34/34（关 glob-12 观察）；门禁与产品 A/B 零差异。纯正确性片。
 - **数组元素 quote 单分配快路**（#680 切片一，PR #686）：`quote_array_value` 逐元素 2 marker 替换+解码扫描+`ansic_shouldquote`+4 链式替换。纯可打印 ASCII（`sh_double_quote` 转义集之外）直接渲染 `"value"` 单分配。seq100k mapfile ~181ms→~99ms（~1.8x）。矩阵 25/26（预存 NUL 分歧）；门禁与产品 A/B 零差异。
 - **mapfile 跳过整输入编解码往返**（#680 切片二，PR #688）：ASCII 无 carrier 字节输入解码/重编码皆恒等，直接切分（每段单分配）。seq1M −6%。4 契约测试（含 carrier 回退钉死 GNU 输出）；门禁与产品 A/B 零差异。
+- **glob 排序一次 locale 解析**（#681 切片 b，PR #689）：逐比较 3 env 查询提到逐排序一次；C 下字节序、非 C 走原比较器（结果恒等）。`LC_ALL=C` 300 文件循环 −22%，默认 locale 不变。契约测试；双 locale 电池 34/34；门禁与产品 A/B 零差异。
 - **`export`/`readonly` 补上越界负下标 abort**（#635 后续，PR #677）：`export -a a=( [-2]=q )` 曾打印 AFTER rc 0。`-a/-A` 委托内嵌 `declare_builtin`（`setattr.def:240-268`），`arrayfunc.c:804-809` any_failed + DISCARD（`subst.c:11169`）。复用 #658 原语：`oob_word` 上浮、操作数循环遇 OOB 即停、Executor 层裸诊断+exit 1+#637 abort。13 例新测试；18 例 GNU 探针矩阵 18/18；门禁与产品 A/B 零差异。
 - **算术票据快路**（#607 切片二，PR #671）：identity 字母 `(( ))` 仍付全票据。双门（语法形只读+状态门：写日志空、标识符 unset/纯十进制）跳过 shopt/nounset/标记/上下文/同步。dense 探针 ~5%（~200ns/eval），headline 不变。6 契约测试；门禁与产品 A/B 零差异。
 - **for-list 绑定补 dequote**（#675，PR #683）：`for p in "f*"` 绑了 `f`+CTLESC+`*`（长 3，全局 glob 死），只有双引号 for-list 路跳过解引用。绑定点统一走存储侧 dequote（`subst.c:4807`）。`casearm` 29/30→30/30，`ifcase` 55/55；门禁与产品 A/B 零差异。根因在 case 上游。
