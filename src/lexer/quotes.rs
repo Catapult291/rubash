@@ -352,7 +352,7 @@ fn remove_shell_quotes_inner_cursor(raw: &str, posix: bool) -> String {
             b'`' => {
                 pending_name = false;
                 out.push('`');
-                rest = copy_backtick_body_cursor(&mut out, &rest[1..]);
+                rest = copy_backtick_body_cursor(&mut out, &rest[1..], false);
             }
             b'\\' => {
                 // rubash#742: same boundary for a backslash escape. `$v\tb`
@@ -569,7 +569,7 @@ fn copy_dollar_paren_body_raw_cursor<'a>(out: &mut String, rest: &'a str) -> &'a
                 token_boundary = false;
             }
             '`' => {
-                let rem = copy_backtick_body_cursor(out, &rest[idx..]);
+                let rem = copy_backtick_body_cursor(out, &rest[idx..], true);
                 idx = rest.len() - rem.len();
                 word.clear();
                 word_boundary = false;
@@ -673,7 +673,7 @@ fn copy_double_quoted_raw_cursor(out: &mut String, rest: &str) -> usize {
 /// pushed. `\`+newline (and `\`+CRLF) inside the body is elided — the one
 /// place consumption is NOT verbatim, which is why this function returns the
 /// remainder instead of letting callers measure `out`.
-fn copy_backtick_body_cursor<'a>(out: &mut String, rest: &'a str) -> &'a str {
+fn copy_backtick_body_cursor<'a>(out: &mut String, rest: &'a str, dq: bool) -> &'a str {
     let bytes = rest.as_bytes();
     let mut idx = 0usize;
     while idx < bytes.len() {
@@ -684,6 +684,21 @@ fn copy_backtick_body_cursor<'a>(out: &mut String, rest: &'a str) -> &'a str {
             }
             b'\\' => match bytes.get(idx + 1) {
                 Some(&b'\n') => {
+                    idx += 2;
+                }
+                // rubash#745: when the backtick sits inside a double-quoted
+                // word, GNU has already consumed this escape while scanning
+                // the double quotes (parse.y parse_matched_pair in the dquote
+                // branch), so the body the backtick decoder sees holds a bare
+                // `"`. rubash copied the body verbatim and left `\"` for the
+                // backtick decoder, which keeps it — `recho "`echo \"x\"`"`
+                // then printed the quotes as data.
+                //
+                // Only `"` is folded here: `\\` and `\$` reach the same
+                // result either way (the backtick decoder strips them too),
+                // while folding them twice would not.
+                Some(&b'"') if dq => {
+                    out.push('"');
                     idx += 2;
                 }
                 Some(&b'\r') if bytes.get(idx + 2) == Some(&b'\n') => {
@@ -975,7 +990,7 @@ fn remove_double_quoted_into_cursor<'a>(
             b'`' if preserve_backticks => {
                 pending_name = false;
                 out.push('`');
-                rest = copy_backtick_body_cursor(&mut *out, &rest[1..]);
+                rest = copy_backtick_body_cursor(&mut *out, &rest[1..], true);
             }
             b'\\' => {
                 pending_name = false;

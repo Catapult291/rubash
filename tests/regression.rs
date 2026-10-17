@@ -1304,12 +1304,15 @@ fn here_string_inside_quoted_command_substitution_is_dequoted() {
     );
 }
 
-/// rubash#745: inside a backtick body the backslash is consumed before `$`, a
-/// backtick, another backslash and `"`; every other character keeps it. The
-/// quote arm is exactly what separates the two upstream cases:
+/// rubash#745: inside a backtick body the backslash is consumed only before
+/// `$`, a backtick or another backslash; every other character keeps it
+/// (parse.y parse_matched_pair under P_BACKQUOTE). A backtick that sits inside
+/// a double-quoted word is a separate layer: lexer::quotes consumes `\"` there,
+/// so the two upstream cases that look contradictory both hold —
 ///
-///   `echo 'a\' b`        keeps `\`  (comsub.tests)
-///   "`echo \"x\"`"        drops it   (exp.tests:146)
+///   recho `echo "(\")"`        keeps `\"`  (quote.tests:123)
+///   recho "`echo \"x\"`"        sees a bare quote (exp.tests:146)
+///   recho `echo 'a\' b`        keeps `\'`  (comsub.tests)
 ///
 /// A body whose last character is a lone `\` keeps it too, which is why the
 /// decoder doubles a word-final odd run before the re-parse terminates the

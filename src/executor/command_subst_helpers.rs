@@ -133,21 +133,23 @@ pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> Str
             continue;
         }
 
-        // rubash#745: inside a backtick body the backslash is consumed before
-        // `$`, a backtick, another backslash — and before `"`. Everything else
-        // keeps its backslash (parse.y parse_matched_pair under P_BACKQUOTE:
-        // "backslash is only special if it precedes $, `, or \"). The quote is
-        // the case GNU singles out: `comsub.tests` pins both sides,
+        // rubash#745: inside a backtick body the backslash is consumed only
+        // before `$`, a backtick or another backslash; everything else keeps
+        // it (parse.y parse_matched_pair under P_BACKQUOTE: "backslash is
+        // only special if it precedes $, `, or \"). `\"` therefore stays,
+        // and the double-quoted case is handled one layer up in
+        // lexer::quotes (a backtick inside a double-quoted word receives the
+        // already-consumed quote).
         //
         //   recho `echo 'a\' b`        -> argv[1]=<a\>  (backslash kept)
-        //   recho "`echo \"Hello!\"`"  -> Hello!         (quote unescaped)
+        //   recho `echo "(\")"`        -> (" )           (kept, dquote rules apply)
         //
         // The old arms special-cased `\\"` and `\"` while `double` was set
         // and emitted DATA_DQUOTE directly, which skipped this step, so
         // `"\\\\"` (four backslashes in double quotes) decoded to `\"`
         // instead of `\`.
         match chars.next() {
-            Some(next @ ('$' | '`' | '\\' | '"')) => {
+            Some(next @ ('$' | '`' | '\\')) => {
                 push_backtick_source_char(&mut output, next, single);
             }
             Some('\n') => {}
