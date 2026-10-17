@@ -465,6 +465,25 @@ where
         // (or is being made) an array (nameref20.sub: `declare ref=(X)`
         // creates `declare -a var`, nameref22.sub: `declare
         // array='(one two three)'` stays scalar).
+        // rubash#788: GNU records the W_COMPASSIGN shape before the attribute
+        // pass runs. `expand_declaration_argument` marks the operand as an
+        // array assignment and `find_or_make_array_variable`
+        // (arrayfunc.c:454-514) gives the variable att_array, so:
+        //
+        //   * a compound operand with NO -a/-A still becomes an array
+        //     (`declare a=(x y)` -> `declare -a a`, attrs [a]); and
+        //   * an explicit `+a` in the same command cannot undo it — the
+        //     attribute pass sees the array bit and refuses
+        //     (`declare +a a=(x y)` -> "cannot destroy array variables in
+        //     this way", attrs stay [a]).
+        //
+        // rubash wrote the indexed storage word but never set ARRAY_VARS, so
+        // the variable still READ as a scalar holding that raw storage text:
+        // `${a[0]}` returned `([0]="x" [1]="y")`, `${#a[@]}` was 1 and
+        // `${a[1]}` was empty (the golden_fnbody_strict_battery failure).
+        // An associative target keeps -A: the same list binds as key/value
+        // pairs there (`declare -A m; declare m=(x y)` -> `[x]="y"`).
+        let compound_operand = value.starts_with(COMPOUND_ASSIGNMENT_MARKER);
         let (value, compound_marked) =
             if let Some(compound) = value.strip_prefix(COMPOUND_ASSIGNMENT_MARKER) {
                 (compound, true)
@@ -675,6 +694,9 @@ where
         }
         variables.insert(var_name.to_string(), value.clone());
         unmark_typed(variables, DECLARED_UNSET_VARS, var_name);
+        if compound_operand && !assoc && !variables.is_marked(ASSOC_VARS, var_name) {
+            mark_typed(variables, ARRAY_VARS, var_name);
+        }
         // GNU err_badarraysub + any_failed (arrayfunc.c:804-809,
         // rubash#635): an out-of-range subscript stops the whole
         // declaration here; the partial store above stays, and the

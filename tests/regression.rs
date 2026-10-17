@@ -1194,3 +1194,84 @@ fn interactive_exit_echo_is_suppressed_inside_a_sourced_file() {
         "an `exit` inside a sourced file must stay silent: {stderr:?}"
     );
 }
+
+/// rubash#788: a W_COMPASSIGN operand makes the variable an array even with
+/// no `-a`/`-A` flag, and that array bit survives an explicit `+a` in the
+/// same command.
+///
+/// GNU runs the compound assignment at expand_declaration_argument ->
+/// find_or_make_array_variable (arrayfunc.c:454-514), i.e. BEFORE the
+/// attribute pass, so `declare a=(x y)` yields `declare -a a` and
+/// `declare +a a=(x y)` hits "cannot destroy array variables in this way"
+/// with the attribute left in place.
+///
+/// Before the fix rubash wrote the indexed storage word but never set
+/// ARRAY_VARS, so the variable still READ as a scalar holding the raw
+/// storage text: `${a[0]}` returned `([0]="x" [1]="y")`, `${#a[@]}` was 1
+/// and `${a[1]}` was empty. That is the `golden_fnbody_strict_battery`
+/// failure (`array-y` expected, `array-` printed) that kept the Windows
+/// regression job red.
+#[test]
+fn compound_declaration_marks_the_variable_as_an_array() {
+    let dir = std::env::temp_dir().join(format!("rubash-788-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    };
+
+    // Expected bytes are GNU Bash 5.3.0's: `${a@a}` is the attribute word,
+    // then `${#a[@]}`, then element 1.
+    for (code, expected) in [
+        // No -a/-A: the compound list alone makes it an array.
+        ("declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"", "a|2|y"),
+        (
+            "declare a=(x); declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+            "a|2|y",
+        ),
+        // A scalar promoted by a later compound append.
+        (
+            "declare a=x; declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+            "a|2|y",
+        ),
+        // The attribute pass sees the array bit, refuses +a, keeps the array.
+        (
+            "declare +a a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+            "a|2|y",
+        ),
+        // Function-scope declarations take the same path.
+        (
+            "f(){ local a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
+            "a|2|y",
+        ),
+        (
+            "f(){ declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
+            "a|2|y",
+        ),
+        // A quoted parenthesized STRING is not W_COMPASSIGN: still scalar.
+        ("declare a='(x y)'; echo \"${a@a}|${#a[@]}\"", "|1"),
+        // An associative target keeps -A and binds the list as key/value.
+        (
+            "declare -A a=([k]=v); echo \"${a@a}|${#a[@]}|${a[k]}\"",
+            "A|1|v",
+        ),
+    ] {
+        let (stdout, stderr, status) = run(code);
+        assert_eq!(stdout, expected, "`{code}` stdout; stderr:\n{stderr}");
+        assert_eq!(status, Some(0), "`{code}` rc; stderr:\n{stderr}");
+    }
+
+    // The refusal is a real diagnostic, not a silent no-op.
+    let (_, stderr, status) = run("declare +a a=(x y)");
+    assert_eq!(status, Some(1), "`declare +a` must fail; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("cannot destroy array variables in this way"),
+        "`declare +a a=(x y)` diagnostic; stderr:\n{stderr}"
+    );
+}
