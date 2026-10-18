@@ -799,6 +799,16 @@ pub(super) fn parse_parenthesized_function_body(
     let mut body = parse_function_body(&tokens[start + 1..i], diagnostic_text, source_line_offset);
     if let Some(first) = body.first_mut() {
         first.subshell = true;
+        // GNU execute_cmd.c:696 (SET_LINE_NUMBER(command->value.Subshell->line)):
+        // a body subshell's own line is its CLOSING `)` — the whole body
+        // runs under it as the ambient line_number, and the parent-side ERR
+        // adjudication after wait_for (execute_cmd.c:769) reports it as
+        // $LINENO. The flat `f() ( list )` region has no subshell node to
+        // carry that line, so the opener command records the close line as
+        // its end_line (rubash#720 form 2).
+        if first.end_line.is_none() {
+            first.end_line = tokens.get(i).map(|token| token.position);
+        }
     }
     if let Some(last) = body.last_mut() {
         last.subshell_end = true;

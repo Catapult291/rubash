@@ -578,6 +578,17 @@ pub struct Executor {
     /// to re-enter while it is set — an ERR trap action that itself fails
     /// must not recursively re-trigger the ERR trap (niubash #121).
     error_trap_running: bool,
+    /// GNU execute_cmd.c:1799-1806 (execute_in_subshell): a user-subshell
+    /// child whose whole body is a single simple or subshell command marks
+    /// that body CMD_NO_FORK; execute_cmd.c:662-663 then dispatches a
+    /// subshell body IN PLACE — no make_child, no wait_for, and therefore
+    /// no :769 run_error_trap in that frame. The forkless engine runs every
+    /// `( )` body in place already, so the frame boundary that GNU erased
+    /// is exactly the enclosing subshell whose body is one subshell
+    /// command: while this flag is set, a failing subshell command's
+    /// aggregate ERR adjudication is suppressed (rubash#720 form 1,
+    /// `( (false) )` fires 2 not 3).
+    subshell_fork_collapse: std::cell::Cell<bool>,
     /// GNU trap.c:124 trap_saved_exit_value — the shell status snapshot
     /// _run_trap_internal (trap.c:367) takes before running a trap action.
     /// get_exitstat (builtins/common.c:519, POSIX interp 1602) resolves a

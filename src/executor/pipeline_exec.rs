@@ -200,7 +200,24 @@ impl Executor {
             }
 
             let mut command = command.clone();
-            command.and_or = None;
+            // GNU execute_connection marks every &&/|| operand
+            // CMD_IGNORE_RETURN except the one the list finally executes —
+            // execute_cmd.c:2943 marks the lhs of every AND_AND/OR_OR
+            // connection and nesting propagates the flag down — and the
+            // simple-command ERR site refuses to fire on ignore_return
+            // (execute_cmd.c:1000). So a non-last element never fires the ERR
+            // trap (`set -E; g() ( false && true ); g` fires for the region
+            // and the call, never for `false`), while the last element keeps
+            // firing. The and_or marker is exactly that gate: set it on
+            // non-last elements, clear it on the last (rubash#720 CR round 2,
+            // GNU case 11).
+            if index < and_or_list.connectors.len() {
+                if command.and_or.is_none() {
+                    command.and_or = Some(true);
+                }
+            } else {
+                command.and_or = None;
+            }
             let commands = Ast {
                 commands: vec![command],
             };

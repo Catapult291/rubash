@@ -617,6 +617,15 @@ fn subshell_command_source_text(subshell_command: &SubshellCommand) -> String {
     format!("( {} )", bash_command_sequence_text(&subshell_command.body))
 }
 
+/// rubash#720 form 2: the print_cmd text of a FLAT `f() ( list )` region —
+/// the same shape subshell_command_source_text renders for a `( list )`
+/// node, because GNU's make_command_string of the subshell is what
+/// the_printed_command_except_trap carries at the :769 ERR wait
+/// (execute_cmd.c:703-710) and the flat region has no node of its own.
+pub(in crate::executor) fn flat_subshell_region_source_text(body: &[CommandNode]) -> String {
+    format!("( {} )", bash_command_sequence_text(body))
+}
+
 fn select_command_source_text(select_command: &SelectCommand) -> String {
     let body = command_body_source_text(
         select_command.body_kind,

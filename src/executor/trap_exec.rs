@@ -1283,6 +1283,38 @@ impl Executor {
         &mut self,
         command: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, None, None, false)
+    }
+
+    /// Run the ERR adjudication for a flat `f() ( list )` region boundary —
+    /// the rubash#720 form 2 fire. GNU runs a user subshell's completion ERR
+    /// check in the frame that waited for the fork, after wait_for
+    /// (execute_cmd.c:769-778), keyed on the subshell command itself: the
+    /// site checks user_subshell, was_error_trap, ignore_return, invert and
+    /// the status — there is NO &&/|| exemption there (probe: `f() ( false
+    /// && true ); f` fires). The forkless engine has no command node for
+    /// the region, so `command_text` carries the region's print_cmd text —
+    /// GNU's the_printed_command_except_trap is make_command_string of the
+    /// subshell, fixed by the fork preamble (execute_cmd.c:703-710) — and
+    /// `line` is the subshell's own close-paren line (execute_cmd.c:696
+    /// SET_LINE_NUMBER(command->value.Subshell->line), the line the :769
+    /// fire reports as $LINENO).
+    pub(crate) fn maybe_run_error_trap_for_flat_region(
+        &mut self,
+        command: &CommandNode,
+        command_text: String,
+        line: Option<usize>,
+    ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, Some(command_text), line, true)
+    }
+
+    fn maybe_run_error_trap_inner(
+        &mut self,
+        command: &CommandNode,
+        command_text_override: Option<String>,
+        line_override: Option<usize>,
+        bypass_and_or_gate: bool,
+    ) -> Result<(), ExecuteError> {
         // GNU trap.c run_error_trap (execute_cmd.c callers): the ERR trap
         // refuses to run while it is already in progress —
         // `signal_in_progress (ERROR_TRAP)` — so a failing command inside
@@ -1290,7 +1322,7 @@ impl Executor {
         // error_trap_running flag mirrors SIG_INPROGRESS.
         if self.exit_code == 0
             || command.inverted
-            || command.and_or().is_some()
+            || (command.and_or().is_some() && !bypass_and_or_gate)
             || self.suppress_errexit != 0
             || self.error_trap_running
             || self.host_internal_depth.get() > 0
@@ -1340,13 +1372,18 @@ impl Executor {
         // failed: a failing function call reports the function body's
         // last inner command (cond-error1.sub: `func` at line 28 reports
         // `[[ -z nonempty ]]`), and a failing pipeline reports its last
-        // stage (`true | false` reports `false`).
-        *self.shell_state.debug_trap_command.borrow_mut() = self
-            .shell_state
-            .env_vars
-            .get("__RUBASH_LAST_COMMAND")
-            .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
-            .cloned()
+        // stage (`true | false` reports `false`). The flat-region caller
+        // overrides with the region's own `( list )` text: GNU's
+        // except_trap at the :769 wait still holds make_command_string of
+        // the subshell from the fork preamble, not the body's last command.
+        *self.shell_state.debug_trap_command.borrow_mut() = command_text_override
+            .or_else(|| {
+                self.shell_state
+                    .env_vars
+                    .get("__RUBASH_LAST_COMMAND")
+                    .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
+                    .cloned()
+            })
             .or_else(|| {
                 Some(crate::executor::command_text::bash_command_source_text(
                     command,
@@ -1357,8 +1394,9 @@ impl Executor {
         // the ERR action's $LINENO print 8). The action AST re-parses with
         // position-1 lines, which set_current_line would otherwise clobber
         // the tracking value with — pin the action's node lines instead, the
-        // way run_debug_trap does.
-        let failed_line = command.line;
+        // way run_debug_trap does. The flat-region caller pins the subshell's
+        // close-paren line (execute_cmd.c:696, honored by the :769 fire).
+        let failed_line = line_override.or(command.line);
         let action = self.comsub_body_alias_splice(&action);
         let tokens = crate::lexer::tokenize(&action);
         let mut ast = crate::parser::parse(&tokens);
