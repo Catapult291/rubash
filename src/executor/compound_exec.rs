@@ -822,10 +822,32 @@ impl Executor {
         }
         // Expand with the same machinery the foreground dispatch uses; any
         // expansion failure falls back to the wrapper, whose child re-parses
-        // the source and reports the error exactly as before.
-        let expanded = match self.expand_command_words(command) {
+        // the source and reports the error exactly as before. The probe is
+        // SIDE-EFFECT-FREE: GNU expands the async child's words inside the
+        // forked child, so the parent never observes a failglob verdict —
+        // a probe hit used to print `no match` here (the wrapper child
+        // re-reported → doubled, 753.11 line 4) AND arm the parent-side
+        // evalerror discard, which swallowed the rest of the launch line
+        // (`set -- /no/such/*.zzz & echo BG_after` lost its echo). Suppress
+        // the report and restore the expansion latches on the Err path.
+        let saved_exit_code = self.exit_code;
+        let saved_expansion_failed = self.command_expansion_failed.get();
+        let saved_evalerror_pending = self.evalerror_pending.get();
+        let saved_failglob_pending = self.evalerror_failglob_pending.get();
+        let saved_evalerror_line = self.evalerror_line.get();
+        self.expansion_probe_active.set(true);
+        let probe = self.expand_command_words(command);
+        self.expansion_probe_active.set(false);
+        let expanded = match probe {
             Ok(expanded) => expanded,
-            Err(_) => return None,
+            Err(_) => {
+                self.exit_code = saved_exit_code;
+                self.command_expansion_failed.set(saved_expansion_failed);
+                self.evalerror_pending.set(saved_evalerror_pending);
+                self.evalerror_failglob_pending.set(saved_failglob_pending);
+                self.evalerror_line.set(saved_evalerror_line);
+                return None;
+            }
         };
         if self.shell_state.arithmetic_nounset_error.replace(false) {
             self.shell_state.arithmetic_expansion_error.set(false);
@@ -3220,9 +3242,20 @@ fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
 /// the parent. `${x:-v}` / `${x-v}` / `${x:?v}` are reads and stay on the
 /// fast path.
 fn parameter_expansion_assigns(raw: &str) -> bool {
+    // All indexing below is on the BYTE slice: every offset is a raw byte
+    // position (no char counting). UTF-8 continuation bytes are >= 0x80, so
+    // the two-byte "${" window can only match at a character boundary, and
+    // the identifier walk only advances over ASCII bytes — both keep
+    // `cursor` on a boundary by construction without slicing `raw`.
     let bytes = raw.as_bytes();
     let mut scan_from = 0usize;
-    while let Some(rel) = raw[scan_from..].find("${") {
+    while scan_from + 1 < bytes.len() {
+        let Some(rel) = bytes[scan_from..]
+            .windows(2)
+            .position(|window| window == b"${")
+        else {
+            break;
+        };
         let mut cursor = scan_from + rel + 2;
         let name_start = cursor;
         while cursor < bytes.len()
@@ -3230,11 +3263,16 @@ fn parameter_expansion_assigns(raw: &str) -> bool {
         {
             cursor += 1;
         }
-        if cursor > name_start {
-            let rest = &raw[cursor..];
-            if rest.starts_with('=') || rest.starts_with(":=") {
-                return true;
-            }
+        if cursor == name_start && cursor < bytes.len() && bytes[cursor] >= 0x80 {
+            // A multibyte character sits where the parameter name would be
+            // (`${中文=…}`): unicode names cannot be classified by the ASCII
+            // walk, so stay conservative and keep the wrapper.
+            return true;
+        }
+        if cursor > name_start
+            && (bytes[cursor..].starts_with(b"=") || bytes[cursor..].starts_with(b":="))
+        {
+            return true;
         }
         scan_from = name_start.max(scan_from + 1);
     }
