@@ -243,12 +243,15 @@ impl Executor {
     /// dequote (subst.c:4795+); no [[ ]] context consumes the field-
     /// splitting semantics it encodes.
     fn expand_conditional_word(&mut self, word: &str) -> String {
-        self.expand_word_mut(word)
-            .replace(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, "")
-            // A conditional word is a comparison VALUE: drop the
-            // ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) so both
-            // operands compare as their real text (rubash#379).
-            .replace(crate::executor::markers::ANSI_C_IFS_GUARD, "")
+        // A conditional word is a comparison VALUE: drop the
+        // ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) so both
+        // operands compare as their real text (rubash#379).
+        // E400-aware: user U+E401 data (E400 E401) must survive.
+        crate::executor::markers::strip_ansi_c_ifs_guard(
+            &self
+                .expand_word_mut(word)
+                .replace(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, ""),
+        )
     }
 
     fn conditional_status_with_metadata(

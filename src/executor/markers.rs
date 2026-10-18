@@ -790,8 +790,13 @@ pub(crate) fn dequote_ctlesc_pairs_cow(value: &str) -> std::borrow::Cow<'_, str>
 
 /// First codepoint of the registry zone a user char must never carry raw.
 pub(crate) const MARKER_ZONE_FIRST: u32 = 0xE000;
-/// Last codepoint of the registry zone (reserves headroom past E318).
-pub(crate) const MARKER_ZONE_LAST: u32 = 0xE3FF;
+/// Last codepoint of the registry zone. This covers ANSI_C_IFS_GUARD
+/// (U+E401): a user typing `$'\uE401'` must get the E400 literal escape,
+/// otherwise the char is indistinguishable from the internal guard and is
+/// silently stripped (rubash#735). The internal guard producer
+/// (lexer/quotes.rs) pushes ANSI_C_IFS_GUARD_STR directly, never via
+/// push_literal_char, so legitimate guards stay bare.
+pub(crate) const MARKER_ZONE_LAST: u32 = 0xE401;
 /// Introducer for the literal-char escape; sits just above the zone.
 pub(crate) const LITERAL_CHAR_ESCAPE: char = '\u{E400}';
 pub(crate) const LITERAL_CHAR_ESCAPE_STR: &str = "\u{E400}";
@@ -813,6 +818,57 @@ pub(crate) fn push_literal_char(output: &mut String, c: char) {
     output.push(c);
 }
 
+/// E400-aware ANSI_C_IFS_GUARD handling (rubash#735).
+///
+/// The guard (U+E401) marks lexer-decoded `$'...'` blanks. User data U+E401
+/// arrives E400-escaped (E400 E401) via push_literal_char. A naive
+/// `.replace(E401, "")` would eat the escaped char and leave a stray E400,
+/// so every guard consumer must walk the text with E400 escaping the next
+/// char: bare E401 is the guard, E400+E401 is user data.
+///
+/// Replace every bare (unescaped) ANSI_C_IFS_GUARD with `replacement`,
+/// copying E400-escaped pairs verbatim.
+pub(crate) fn replace_ansi_c_ifs_guard(value: &str, replacement: &str) -> String {
+    if !value.contains(ANSI_C_IFS_GUARD) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            out.push(ch);
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else if ch == ANSI_C_IFS_GUARD {
+            out.push_str(replacement);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Drop bare ANSI_C_IFS_GUARD markers, preserving E400-escaped user U+E401.
+pub(crate) fn strip_ansi_c_ifs_guard(value: &str) -> String {
+    replace_ansi_c_ifs_guard(value, "")
+}
+
+/// Borrowing form of [`strip_ansi_c_ifs_guard`] for hot paths: a value with
+/// no guard byte is returned borrowed.
+pub(crate) fn strip_ansi_c_ifs_guard_cow(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.contains(ANSI_C_IFS_GUARD) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    std::borrow::Cow::Owned(strip_ansi_c_ifs_guard(value))
+}
+
+/// Convert bare ANSI_C_IFS_GUARD to IFS_GLUE (field-splitter carrier),
+/// preserving E400-escaped user U+E401.
+pub(crate) fn ansi_c_ifs_guard_to_ifs_glue(value: &str) -> String {
+    replace_ansi_c_ifs_guard(value, IFS_GLUE_STR)
+}
+///
 /// `str::replace` that borrows when the needle is absent.
 ///
 /// GNU's expansion passes restore markers IN PLACE over C strings — a value

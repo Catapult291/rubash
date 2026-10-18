@@ -27,15 +27,17 @@ fn materialize_expanded_command_word(word: &str) -> String {
     // builtin argv (rubash#153 n26/n27).
     let word = crate::executor::markers::decode_word_position_carriers(&word);
     decode_command_substitution_payload(&restore_pathname_escape_markers(
-        &word
-            .replace(crate::executor::markers::PROTECTED_BACKSLASH, "\\")
-            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
-            .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
-            .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\"")
-            // Decoded `$'...'` blanks lose their split-protection guard
-            // here at the argv boundary (rubash#379); the blank itself is
-            // ordinary word data.
-            .replace(crate::executor::markers::ANSI_C_IFS_GUARD, ""),
+        // Decoded `$'...'` blanks lose their split-protection guard
+        // here at the argv boundary (rubash#379); the blank itself is
+        // ordinary word data. E400-aware: user U+E401 (E400 E401) survives
+        // (rubash#735).
+        &crate::executor::markers::strip_ansi_c_ifs_guard(
+            &word
+                .replace(crate::executor::markers::PROTECTED_BACKSLASH, "\\")
+                .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+                .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
+                .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\""),
+        ),
     ))
 }
 
@@ -2266,12 +2268,9 @@ impl Executor {
             // not to parameter-expansion results. ANSI_C_IFS_GUARD marks
             // decoded `$'...'` blanks — convert to IFS_GLUE so the splitter
             // treats them as literal field data (rubash#379).
-            let decoded = decoded
-                .replace(
-                    crate::executor::markers::ANSI_C_IFS_GUARD_STR,
-                    crate::executor::markers::IFS_GLUE_STR,
-                )
-                .to_string();
+            // E400-aware: user U+E401 (E400 E401) is data, not a guard
+            // (rubash#735).
+            let decoded = crate::executor::markers::ansi_c_ifs_guard_to_ifs_glue(&decoded);
             field_split_values_with_ifs(
                 &decoded,
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
