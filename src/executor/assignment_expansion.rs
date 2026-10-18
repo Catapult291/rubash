@@ -228,8 +228,26 @@ pub(in crate::executor) fn hoist_data_single_quotes(value: &str, marker: &str) -
     let chars_vec: Vec<(usize, char)> = value.char_indices().collect();
     let mut idx = 0;
     let mut in_span = false;
+    // rubash#733: hoist_data_double_quotes runs before this function, so a
+    // `'` inside a "..." region arrives with the quotes already replaced by
+    // the ASSIGN_DATA_DQUOTE (\u{E302}) sentinel. Track the sentinel as
+    // double-quote state: a `'` there is data (GNU parse.y:5305
+    // read_token_word never opens single-quote state inside "..."), not a
+    // span delimiter. Without this, the `'` in `("it's" '$h')` opened a
+    // span that closed at the `'` before `$h`, leaving `$h` unquoted (and
+    // the span swallowed the `"`-quoted `$h` in the `"$h"` variant).
+    let mut in_double = false;
+    const DQ_SENTINEL: char = crate::executor::markers::ASSIGN_DATA_DQUOTE;
     while idx < chars_vec.len() {
         let (_, ch) = chars_vec[idx];
+        // A double-quote sentinel outside a single-quoted span toggles the
+        // double-quote state; inside a span it is plain data.
+        if !in_span && ch == DQ_SENTINEL {
+            in_double = !in_double;
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
         // Inside a hoisted '...' span everything is literal data (GNU
         // arrayfunc.c:581 parse_string_to_word_list marks the whole word
         // W_QUOTED; subst.c:11881-11886 case '\'' -> add_quoted_string ->
@@ -277,7 +295,7 @@ pub(in crate::executor) fn hoist_data_single_quotes(value: &str, marker: &str) -
                 continue;
             }
         }
-        if ch == '\'' {
+        if ch == '\'' && !in_double {
             out.push_str(marker);
             in_span = !in_span;
         } else if in_span {
@@ -2772,6 +2790,14 @@ impl Executor {
         value: &str,
     ) -> Option<String> {
         let inner = value.strip_prefix('(')?.strip_suffix(')')?.trim();
+        // GNU arrayfunc.c:581 parse_string_to_word_list + subst.c:11881:
+        // a single-quoted whole-word element is literal data — the quotes
+        // suppress the expansion itself, not just field splitting. Do not
+        // claim it here; the plain-element path keeps it literal
+        // (rubash#733: `declare d1=('$h')` stores `$h`, not the value of h).
+        if inner.len() >= 2 && inner.starts_with('\'') && inner.ends_with('\'') {
+            return None;
+        }
         let unquoted_inner = strip_matching_quotes(inner);
         let is_quoted = unquoted_inner != inner;
         let parameter = if is_quoted { &unquoted_inner } else { inner };
