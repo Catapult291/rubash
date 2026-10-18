@@ -3856,7 +3856,15 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
                     // ${...} — copy through, skip the braced parameter body
                     output.push(ch);
                     index += 1;
-                    let end = skip_raw_braced_parameter(&chars, index + 1);
+                    // rubash#743 followup: the raw-skip helpers return
+                    // beyond-the-buffer sentinels for UNCLOSED quotes or
+                    // sub-scans ("scan to EOF"), and a sentineled end above
+                    // the buffer length panicked the copy loop below with an
+                    // index-out-of-bounds (`${v/\'/x}` in a word, probe
+                    // 2026-10-18). Clamp to the buffer: an unclosed body is
+                    // copied verbatim, which is exactly what GNU's word
+                    // contains at this stage.
+                    let end = skip_raw_braced_parameter(&chars, index + 1).min(chars.len());
                     while index < end {
                         output.push(chars[index]);
                         index += 1;

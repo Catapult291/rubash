@@ -1,5 +1,6 @@
 use super::super::*;
 use std::fs;
+use std::path::Path;
 
 #[test]
 fn test_exit_help_redirects_output_and_exits_usage() {
@@ -80,9 +81,15 @@ fn test_exit_too_many_arguments_redirects_stderr() {
 
     let result = executor.execute_ast(&ast);
 
+    // bash 5.3 (no_args -> set_exit_status(EX_BADUSAGE) + DISCARD): the
+    // whole tail of the command list is abandoned — `echo $?` never runs,
+    // the status file is never written, and the run's last status is the
+    // discard's 2. Under `-c` the same shape ends the shell with 1
+    // (run_one_command's DISCARD catch); this bare-executor run is the
+    // script/stdin face, so it just ends with $?=2.
     assert!(result.is_ok());
-    assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    assert_eq!(executor.last_exit_code(), 2);
+    assert!(!Path::new(&status_path).exists(), "the discarded echo never ran");
     assert!(fs::read_to_string(error_path)
         .unwrap()
         .contains("exit: too many arguments"));
