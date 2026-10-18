@@ -316,17 +316,23 @@ fn execute_source_with_args(
 
     let old_dollar_vars_changed = executor.shell_state.dollar_vars_changed_by_set;
     executor.shell_state.dollar_vars_changed_by_set = false;
-    // GNU builtins/source.def:208-216 unsets the DEBUG trap for the duration
-    // of a sourced file when function_trace_mode is off; the unwind-protect
-    // restores it only after source_file's run_return_trap (evalfile.c:395),
-    // so the sourced file's top-level commands and the RETURN-trap action's
-    // own DEBUG fire are suppressed together (dbg-support.tests:98 emits
-    // only `debug lineno: 98 main`, no fires inside dbg-support.sub).
+    // GNU builtins/source.def:209-217 (source_builtin): with functrace off
+    // the ENTRY DEBUG trap is snapshotted and restore_default_signal()d, so
+    // the file's own commands do not fire it — but the scoping is
+    // TABLE-driven, not a duration flag: a trap the file INSTALLS is live
+    // state and fires for the file's remaining commands (trap.c:750-756;
+    // rubash#797: bash-preexec sources install the preexec DEBUG trap and
+    // every later command in the same file must fire it). The unwind-protect
+    // (trap_if_untrapped) restores the entry trap only after source_file's
+    // run_return_trap (evalfile.c:395), so the RETURN-trap action still runs
+    // with the entry trap absent (dbg-support.tests:98 emits only
+    // `debug lineno: 98 main`, no fires inside dbg-support.sub).
     let functrace = crate::builtins::set::shell_option_enabled(&executor.env_vars(), "functrace");
-    let old_source_debug_suppressed = executor.source_debug_suppressed();
-    if !functrace {
-        executor.set_source_debug_suppressed(true);
-    }
+    let saved_entry_debug_trap = if functrace {
+        None
+    } else {
+        executor.source_entry_debug_trap_save()
+    };
     // GNU execute_cmd.c:5080: the source builtin holds sourcenest for its
     // whole execution — the sourced body AND the RETURN trap action at
     // evalfile.c:395 both run one nesting level deeper than the sourcer.
@@ -387,10 +393,13 @@ fn execute_source_with_args(
         None
     };
     executor.pop_source_nest();
+    // source.def:216's unwind-protect pops with run_unwind_frame("source"),
+    // after run_return_trap: the file's own install (or the RETURN action's)
+    // keeps SIG_TRAPPED and survives; otherwise the entry trap comes back.
+    executor.source_exit_debug_trap_restore(saved_entry_debug_trap);
     if let Some(return_trap_result) = return_trap_result {
         return_trap_result?;
     }
-    executor.set_source_debug_suppressed(old_source_debug_suppressed);
 
     if had_source_args {
         // GNU source.def uw_maybe_pop_dollar_vars: when the sourced script

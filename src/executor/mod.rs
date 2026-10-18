@@ -597,13 +597,6 @@ pub struct Executor {
     /// (print_pipeline JLIST_STANDARD), everything else is silent.
     /// (pid, signal, command text, foreground).
     pending_signal_notices: std::cell::RefCell<Vec<(u32, i32, String, bool)>>,
-    /// GNU builtins/source.def:208-216 unsets the DEBUG trap for the
-    /// duration of a sourced file when function_trace_mode is off; the
-    /// unwind-protect only restores it after source_file's run_return_trap
-    /// (evalfile.c:395), so the sourced file's top-level commands and the
-    /// RETURN-trap action's own DEBUG fire are suppressed together
-    /// (dbg-support.tests:98 emits only `debug lineno: 98 main`).
-    source_debug_suppressed: bool,
     /// Depth of `with_traps_suspended` scopes currently active. GNU has no
     /// notion of host housekeeping commands: when an embedding host runs
     /// internal commands through execute_ast (startup/shutdown hooks,

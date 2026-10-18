@@ -1530,7 +1530,6 @@ impl Executor {
             // SUBSHELL_COMSUB) never prints job-status notices, so the
             // fork copy starts with an empty notice list.
             pending_signal_notices: std::cell::RefCell::new(Vec::new()),
-            source_debug_suppressed: false,
             host_internal_depth: std::cell::Cell::new(self.host_internal_depth.get()),
             debug_trap_function_line: None,
             last_command_substitution_status: Cell::new(None),

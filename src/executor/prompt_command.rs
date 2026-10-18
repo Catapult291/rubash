@@ -134,8 +134,8 @@ impl crate::executor::Executor {
         self.set_env("__RUBASH_INTERACTIVE_FLAG_OFF", "1");
         // parse.y:3013/3021 execute_variable_command brackets the PC's
         // parse_and_execute with save_parser_state/restore_parser_state;
-        // the snapshot carries last_command_exit_value (parse.y:7221) and
-        // PIPESTATUS (:7223) and is written back at :7313/:7315 — a PC that
+        // the snapshot carries last_command_exit_value (parse.y:7248) and
+        // PIPESTATUS (:7250) and is written back at :7313/:7315 — a PC that
         // returns normally leaves $? and PIPESTATUS untouched (verified WSL
         // GNU 5.3.0 piped-`-i`: after PROMPT_COMMAND=false the next typed
         // command sees $? = the pre-PC value, 0). The restore line sits
@@ -144,6 +144,22 @@ impl crate::executor::Executor {
         // PC='exit 5' -> rc 5, PC='set -e; false' -> rc 1).
         let saved_exit_code = self.exit_code;
         let saved_pipestatus = self.shell_state.pipestatus.clone();
+        // parse.y:3017 execute_variable_command also snapshots `$_` around
+        // the PC's parse_and_execute (last_lastarg = save_lastarg();
+        // save_parser_state itself carries no lastarg — parse.y:7248/:7250
+        // cover only the exit value and PIPESTATUS) and :3022-3023 rebinds
+        // it on every normal return (bind_lastarg). Without the bracket, a
+        // PC whose text runs commands (bash-preexec's install string, wezterm
+        // user-var hooks — rubash#797's asset) leaves `$_` on the PC's OWN
+        // last command word, and the DEBUG trap installed by that PC then
+        // hands that leaked word to `preexec "$_"` instead of the last
+        // user-command word (verified WSL GNU 5.3.0 piped-`-i`: after
+        // PROMPT_COMMAND='bp_install' renders, the DEBUG trap's "$_" is
+        // still the last typed word — `trap -p DEBUG`'s DEBUG — while the
+        // unbracketed engine reported `bp_install`). bind_lastarg(NULL)
+        // binds the null string (execute_cmd.c:4192-4193), so an unset
+        // pre-PC `$_` comes back as "".
+        let saved_underscore = self.shell_variable_value("_");
         let (status, exit_shell) = match session {
             Some(session) => {
                 crate::script_driver::run_script_with_history_in_tracked(self, text, session, None)
@@ -167,6 +183,10 @@ impl crate::executor::Executor {
             // roll back to the pre-PC values on every normal return.
             self.exit_code = saved_exit_code;
             self.set_pipestatus(saved_pipestatus);
+            // parse.y:3022-3023 bind_lastarg(last_lastarg): `$_` likewise
+            // rolls back on the normal path only — the exit-jump longjmp
+            // skips the restore, same skip rule as the status above.
+            self.bind_underscore(saved_underscore.as_deref().unwrap_or(""));
         }
         status
     }
@@ -277,7 +297,7 @@ mod tests {
     // piped-`-i`: PC=([0]='echo A' [1]='exit' [2]='echo C') prints only A,
     // rc 0). parse.y:3013/3021 execute_variable_command brackets the run
     // with save_parser_state/restore_parser_state — last_command_exit_value
-    // and PIPESTATUS snapshot at parse.y:7221/:7223, restored at
+    // and PIPESTATUS snapshot at parse.y:7248/:7250, restored at
     // :7313/:7315 on every NORMAL return (verified: after PC='false' the
     // next typed command sees the pre-PC $?), and the restore is skipped
     // when the jump unwinds (verified: PC='exit 5' -> rc 5).
