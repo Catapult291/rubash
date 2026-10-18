@@ -8,34 +8,47 @@ use std::collections::HashMap;
 
 pub const QUOTED_ASSIGNMENT_VALUE: char = crate::executor::markers::QUOTED_WORD_VALUE_PREFIX;
 
-pub fn home_value(env_vars: &HashMap<String, String>) -> String {
-    // Bash's tilde expansion follows HOME when it is set. USERPROFILE is
-    // only a Windows fallback for shells that have no HOME value.
-    // On Windows, env::var("HOME") still returns the original process value
-    // after `unset HOME` because apply_required_windows_child_environment
-    // re-adds HOME from USERPROFILE. So only check env_vars for HOME.
-    if let Some(home) = env_vars.get("HOME").filter(|v| !v.is_empty()) {
-        return home.clone();
+/// The home directory tilde expansion glues, with GNU's missing-vs-empty
+/// distinction preserved. GNU lib/tilde/tilde.c:344-356 (tilde_expand_word):
+/// a leading `~` or `~/` is *always* translated to `sh_get_env_value("HOME")`
+/// — variables.c get_string_value reads the CURRENT variable cell at every
+/// expansion, and an existing-but-EMPTY value is still a value (the glue then
+/// yields the bare suffix, so `cd ~` becomes `cd ""` and reports "null
+/// directory", builtins/cd.def:338). Only a MISSING variable reaches the
+/// fallback chain — tilde.c:349-350 consults APPDATA on _WIN32, and
+/// tilde.c:354-356 sh_get_home_dir (variables.c:736) reads the passwd
+/// database, which is fixed for the uid and never tracks a reassigned $HOME.
+/// Rubash's stand-in for that fallback on Windows is USERPROFILE; on Unix
+/// there is none yet, so `None` means "GNU would consult the passwd database
+/// here and this host has no entry to offer" and callers keep the word
+/// verbatim.
+pub(crate) fn tilde_home(env_vars: &HashMap<String, String>) -> Option<String> {
+    if let Some(home) = env_vars.get("HOME") {
+        return Some(home.clone());
     }
     // USERPROFILE is a Windows-only fallback; it is not a shell variable
     // that can be unset, so the env::var fallback is safe there. Unix
     // never consults it (a stray USERPROFILE exported by cross-platform
-    // tooling must not hijack `~`), and returns the same empty default it
-    // always did when HOME is unset (audit/windows-hardcode).
+    // tooling must not hijack `~`).
     #[cfg(windows)]
     {
         if let Some(home) = env_vars.get("USERPROFILE").filter(|v| !v.is_empty()) {
-            return home.clone();
+            return Some(home.clone());
         }
         std::env::var("USERPROFILE")
             .ok()
             .filter(|value| !value.is_empty())
-            .unwrap_or_default()
     }
     #[cfg(not(windows))]
     {
-        String::new()
+        None
     }
+}
+
+/// Same value as `tilde_home`, flattened for callers (readline's ~/.inputrc,
+/// the `$(cd`/`pwd` fast path) that want "" when no home source exists.
+pub fn home_value(env_vars: &HashMap<String, String>) -> String {
+    tilde_home(env_vars).unwrap_or_default()
 }
 
 pub fn expand_word_prefix(word: &str, env_vars: &HashMap<String, String>) -> Option<String> {
@@ -229,11 +242,14 @@ pub(crate) fn expand_tilde_segment(segment: &str, env_vars: &HashMap<String, Str
     };
 
     if rest.is_empty() || rest.starts_with('/') {
-        let home = home_value(env_vars);
-        if home.is_empty() {
-            return segment.to_string();
-        }
-        return format!("{home}{rest}");
+        // GNU glue_prefix_and_suffix (tilde.c:304-317): the $HOME prefix
+        // glues even when it is the empty string — `HOME=; a=~/x` binds
+        // "/x", not the verbatim word. Only a missing fallback (no HOME and
+        // no passwd stand-in) leaves the segment verbatim.
+        return match tilde_home(env_vars) {
+            Some(home) => format!("{home}{rest}"),
+            None => segment.to_string(),
+        };
     }
 
     // GNU lib/tilde/tilde.c:361-410: `~user[/rest]` resolves through
@@ -267,6 +283,26 @@ mod tests {
         ]);
 
         assert_eq!(home_value(&env_vars), "C:/from-home");
+    }
+
+    /// rubash#754 family, GNU lib/tilde/tilde.c:344-356: a set-but-empty
+    /// HOME is a VALUE, not a missing variable. `~` expands to "" and `~/x`
+    /// to "/x"; only a MISSING variable reaches the USERPROFILE/passwd
+    /// fallback chain.
+    #[test]
+    fn empty_home_value_is_a_value_not_a_fallback_trigger() {
+        let env_vars = HashMap::from([("HOME".to_string(), String::new())]);
+
+        assert_eq!(home_value(&env_vars), "");
+        assert_eq!(expand_word_prefix("~", &env_vars), Some(String::new()));
+        assert_eq!(expand_word_prefix("~/x", &env_vars), Some("/x".to_string()));
+        assert_eq!(expand_tilde_segment("~/x", &env_vars), "/x");
+
+        // The USERPROFILE fallback still answers when HOME is MISSING.
+        #[cfg(windows)]
+        {
+            assert!(!home_value(&HashMap::new()).is_empty());
+        }
     }
 
     #[test]

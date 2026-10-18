@@ -184,14 +184,38 @@ where
                     set_pwd_from_stack(env_vars, &stack, true);
                 }
                 PushdOperand::Dir { dir, no_cd } => {
-                    let resolved_dir = normalize_stack_dir(&dir, env_vars);
-                    if !logical_dir_exists(&resolved_dir, env_vars) {
-                        writeln!(
-                            stderr,
-                            "{diagnostic_prefix}pushd: {dir}: No such file or directory"
-                        )?;
+                    // GNU pushd.def:296-302 delegates the Dir operand to
+                    // cd_builtin (`j = ((flags & NOCD) == 0) ? cd_builtin
+                    // (...) : EXECUTION_SUCCESS`), so an operand that
+                    // expanded to the empty string inherits cd.def:335's
+                    // verdict — `builtin_error ("null directory")` +
+                    // EXECUTION_FAILURE, with the prolog naming pushd, the
+                    // executing builtin. (`HOME=; pushd ~` used to silently
+                    // succeed as a no-op, rubash#754 family.)
+                    if dir.is_empty() && !no_cd {
+                        writeln!(stderr, "{diagnostic_prefix}pushd: null directory")?;
                         return Ok(EXECUTION_FAILURE);
                     }
+                    // pushd.def:301: with -n, cd_builtin is never called and
+                    // `add_dirstack_element (savestring (list->word->word))`
+                    // pushes the RAW operand word unconditionally — no
+                    // normalization, no existence probe (that probe lives on
+                    // the cd path only). An empty expansion therefore stays
+                    // "" on the stack (`HOME=; pushd -n ~` yields
+                    // `<cwd> ""`), and `pushd -n ./sub` stores "./sub".
+                    let resolved_dir = if no_cd {
+                        dir.clone()
+                    } else {
+                        let resolved = normalize_stack_dir(&dir, env_vars);
+                        if !logical_dir_exists(&resolved, env_vars) {
+                            writeln!(
+                                stderr,
+                                "{diagnostic_prefix}pushd: {dir}: No such file or directory"
+                            )?;
+                            return Ok(EXECUTION_FAILURE);
+                        }
+                        resolved
+                    };
                     let old_pwd = stack
                         .first()
                         .cloned()
