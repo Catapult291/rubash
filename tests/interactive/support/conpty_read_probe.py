@@ -194,6 +194,14 @@ def leg_t_partial_assign(s):
     # (The one-char path preserves every consumed keystroke in the record;
     # GNU's line discipline holds partial bytes, so its record is empty —
     # the assigned-partial contract is what the engine pins here.)
+    #
+    # NEXT-READER CONSEQUENCE of that divergence (not read.def:553
+    # equivalence — oracle WSL 5.3.0: the bytes GNU's deadline read left in
+    # the line discipline are handed to the NEXT reader once an Enter
+    # completes the held-back line — its `read b` saw B=[hello]; rubash
+    # consumed them into `a`, so the next reader only sees input typed after
+    # the timeout, B=[zzz]). Keep both models in mind before "aligning"
+    # either side; neither loses the bytes, they move to different owners.
     assert line and "RC=142" in line and "A=[hello]" in line, f"marker={line!r}"
 
 
