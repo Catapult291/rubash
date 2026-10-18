@@ -34,10 +34,13 @@ impl Executor {
             index += 1;
         }
 
+        // rubash#817: each definition carries a (line, read-generation)
+        // marker pair — clear both halves.
         if clear_all {
-            self.shell_state
-                .env_vars
-                .retain(|name, _| !name.starts_with("__RUBASH_ALIAS_LINE_"));
+            self.shell_state.env_vars.retain(|name, _| {
+                !name.starts_with("__RUBASH_ALIAS_LINE_")
+                    && !name.starts_with("__RUBASH_ALIAS_GEN_")
+            });
             return;
         }
 
@@ -45,6 +48,9 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .remove(&format!("__RUBASH_ALIAS_LINE_{name}"));
+            self.shell_state
+                .env_vars
+                .remove(&format!("__RUBASH_ALIAS_GEN_{name}"));
         }
     }
 
@@ -71,6 +77,13 @@ impl Executor {
         let Some(line) = line else {
             return;
         };
+        // rubash#817: the line alone is ambiguous across nested read units
+        // (a sourced file restarts at 1; an eval string renumbers
+        // caller_line + i - 1), so the definition also records the
+        // read-unit generation it was consumed by — the guard suppresses
+        // only when BOTH match, which is GNU's same-read rule
+        // (parse.y read-time expansion).
+        let generation = self.shell_state.read_generation;
         let mut index = 0;
         while let Some(arg) = args.get(index) {
             if arg == "--" {
@@ -86,6 +99,9 @@ impl Executor {
                     self.shell_state
                         .env_vars
                         .insert(format!("__RUBASH_ALIAS_LINE_{name}"), line.to_string());
+                    self.shell_state
+                        .env_vars
+                        .insert(format!("__RUBASH_ALIAS_GEN_{name}"), generation.to_string());
                 }
             }
             index += 1;

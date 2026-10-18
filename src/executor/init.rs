@@ -300,6 +300,8 @@ impl Executor {
                 local_typed_scopes: Vec::new(),
                 expanding_aliases: Vec::new(),
                 loop_depth: 0,
+                read_generation: 0,
+                read_generation_ceiling: 0,
                 command_number: 1,
                 function_depth: 0,
                 dollar_vars_changed_by_set: false,
