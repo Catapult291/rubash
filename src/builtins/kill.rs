@@ -1959,7 +1959,9 @@ pub fn child_pre_exec_reset() -> std::io::Result<()> {
     // (__RUBASH_BACKGROUND_WRAPPER), arrange for this child to die when the
     // wrapper dies. Without this, `kill $!` kills the wrapper but leaves
     // the actual work (grandchild) orphaned and running.
-    #[cfg(unix)]
+    // Note: prctl(PR_SET_PDEATHSIG) is Linux-specific; on macOS and other
+    // Unix the wrapper relies on the parent tracking instead (rubash#737).
+    #[cfg(target_os = "linux")]
     if std::env::var("__RUBASH_BACKGROUND_WRAPPER").as_deref() == Ok("1") {
         // PR_SET_PDEATHSIG: send SIGKILL to this process when its parent dies.
         const PR_SET_PDEATHSIG: i32 = 1;

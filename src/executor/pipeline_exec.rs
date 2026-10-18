@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(any(windows, unix))]
+#[cfg(windows)]
 use crate::executor::fd_table::FdEntry;
 
 fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (String, i32) {
