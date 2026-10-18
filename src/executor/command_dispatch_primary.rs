@@ -48,8 +48,13 @@ impl Executor {
             }
             "command" => self.execute_command_builtin_command(cmd)?,
             "builtin" => self.execute_builtin_direct_command(cmd),
+            // GNU Bash has no `sudo` builtin (issue #759 item 4): without an
+            // embedding-host elevation handler the word takes the PATH route
+            // like any external command; with one, the host-capability
+            // builtin intercepts it (introspection keeps reporting external,
+            // the docs/builtins.md §3 hidden-builtin contract).
             #[cfg(windows)]
-            "sudo" => {
+            "sudo" if self.elevation_handler.is_some() => {
                 if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, "sudo") {
                     self.execute_external(cmd)
                 } else {
@@ -169,20 +174,12 @@ impl Executor {
                 Ok(())
             }
             "set" => self.execute_set_command(cmd),
-            "setopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(cmd, true)?;
-                Ok(())
-            }
             "getopts" => {
                 self.exit_code = self.execute_getopts_command(cmd)?;
                 Ok(())
             }
             "shopt" => {
                 self.exit_code = self.execute_shopt(cmd)?;
-                Ok(())
-            }
-            "unsetopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(cmd, false)?;
                 Ok(())
             }
             "hash" => {

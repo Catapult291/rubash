@@ -81,7 +81,28 @@ impl Executor {
             return word.to_string();
         }
         EXPAND_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.expand_embedded_parameters_inner(word, false, false, true);
+        let result = self.expand_embedded_parameters_inner(word, false, false, true, false);
+        EXPAND_DEPTH.with(|d| d.set(depth));
+        result
+    }
+
+    /// Prompt-string second pass (GNU parse.y:6689 expand_prompt_string
+    /// hands the decoded prompt to word expansion with Q_DOUBLE_QUOTES):
+    /// the whole word behaves as if inside double quotes — quote characters
+    /// in it are DATA, `\$`/`\``/`\"`/`\\` are escaped literals, and
+    /// parameter/command/arithmetic/backtick expansion still runs (issue
+    /// #757: bare special parameters must expand, `shopt -u promptvars`
+    /// must gate the pass itself).
+    pub(in crate::executor) fn expand_embedded_parameters_double_quoted(
+        &self,
+        word: &str,
+    ) -> String {
+        let depth = EXPAND_DEPTH.with(|d| d.get());
+        if depth >= MAX_EXPAND_DEPTH {
+            return word.to_string();
+        }
+        EXPAND_DEPTH.with(|d| d.set(depth + 1));
+        let result = self.expand_embedded_parameters_inner(word, false, false, false, true);
         EXPAND_DEPTH.with(|d| d.set(depth));
         result
     }
@@ -112,7 +133,8 @@ impl Executor {
             return word.to_string();
         }
         EXPAND_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.expand_embedded_parameters_inner(word, heredoc, protect_ifs, false);
+        let result =
+            self.expand_embedded_parameters_inner(word, heredoc, protect_ifs, false, false);
         EXPAND_DEPTH.with(|d| d.set(depth));
         result
     }
@@ -123,6 +145,7 @@ impl Executor {
         heredoc: bool,
         protect_ifs: bool,
         preserve_quotes: bool,
+        double_quoted: bool,
     ) -> String {
         // TODO(subst.c/subst.h): This is a narrow parameter-expansion subset.
         // GNU Bash handles quoting state, operators like ${name:-word},
@@ -225,6 +248,28 @@ impl Executor {
             // case falls through to the default push below. Heredoc text
             // treats quotes as data.
             if ch == '\\' && !heredoc {
+                if double_quoted {
+                    // Double-quoted word context (subst.c:12177 set_word_flags
+                    // Q_DOUBLE_QUOTES): the backslash stays meaningful only
+                    // before $ ` " \ and newline (dq-escape set); anything
+                    // else keeps both characters (`"\p"` -> `\p`).
+                    match chars.peek().copied() {
+                        Some(escaped @ ('$' | '`' | '"' | '\\')) => {
+                            chars.next();
+                            output.push(escaped);
+                        }
+                        Some('\n') => {
+                            chars.next();
+                        }
+                        Some(other) => {
+                            chars.next();
+                            output.push('\\');
+                            output.push(other);
+                        }
+                        None => output.push('\\'),
+                    }
+                    continue;
+                }
                 if preserve_quotes {
                     // Compound RHS: keep the escape pair verbatim so the
                     // storage tokenizer + unquote pass apply GNU's
@@ -261,8 +306,12 @@ impl Executor {
             // Quotes that survive to expansion belong to parameter-expansion
             // bodies (the lexer keeps `${...}` verbatim): GNU removes them
             // here, with single-quoted content staying literal. Heredoc text
-            // treats quotes as data.
-            if !heredoc && ch == '"' {
+            // treats quotes as data. In the double-quoted word context both
+            // quote characters are data (parse.y:6689 passes the decoded
+            // prompt with Q_DOUBLE_QUOTES; an embedded `"` never opens a
+            // span — subst.c only re-enters quote state on the CTLESC-marked
+            // spans the word scanner produced, and a prompt word has none).
+            if !heredoc && ch == '"' && !double_quoted {
                 in_double = !in_double;
                 if preserve_quotes {
                     output.push('"');
@@ -270,7 +319,7 @@ impl Executor {
                 continue;
             }
 
-            if !heredoc && ch == '\'' && !in_double {
+            if !heredoc && ch == '\'' && !in_double && !double_quoted {
                 if preserve_quotes {
                     // A single-quoted element is literal text in GNU's raw
                     // token stream; keep the quote characters so the

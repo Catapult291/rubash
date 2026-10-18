@@ -100,7 +100,6 @@ const BUILTIN_NAMES: &[&str] = &[
     "readonly",
     "return",
     "set",
-    "setopt",
     "shift",
     "shopt",
     "source",
@@ -115,7 +114,6 @@ const BUILTIN_NAMES: &[&str] = &[
     "umask",
     "unalias",
     "unset",
-    "unsetopt",
     "wait",
 ];
 
@@ -127,7 +125,7 @@ pub fn builtin_names() -> &'static [&'static str] {
 }
 
 pub(in crate::executor) fn is_shell_builtin_name(name: &str) -> bool {
-    BUILTIN_NAMES.binary_search(&name).is_ok() || (cfg!(windows) && name == "sudo")
+    BUILTIN_NAMES.binary_search(&name).is_ok()
 }
 
 #[cfg(test)]

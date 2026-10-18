@@ -416,9 +416,17 @@ impl Executor {
             // keep their strip — a terminal-bound prompt must not carry
             // the width-accounting bytes; a script-visible transform
             // result must carry everything decode_prompt_string produced.
-            return self.expand_prompt_parameters(
-                &self.decode_prompt_string(strip_matching_quotes(value)),
-            );
+            // The second pass is parse.y:6683-6704: when `promptvars` (or
+            // posix mode) enables it, the decoded string expands as a
+            // double-quoted word (expand_prompt_string, parse.y:6689) — bare
+            // special parameters like `$?` included; with `shopt -u
+            // promptvars` there is NO expansion pass (dequote_string only),
+            // so `$var`/backtick text stays literal (issue #757).
+            let decoded = self.decode_prompt_string(strip_matching_quotes(value));
+            if self.prompt_expansion_enabled() {
+                return self.expand_embedded_parameters_double_quoted(&decoded);
+            }
+            return decoded;
         }
         apply_parameter_transform(value, transform)
     }

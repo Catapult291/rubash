@@ -2480,3 +2480,135 @@ mod issue_753 {
         );
     }
 }
+
+/// rubash#759 item 3: `shift` with a bad operand is a USAGE error (2), not
+/// a plain failure. GNU builtins/shift.def routes a non-numeric operand
+/// through get_numeric_arg (builtins/common.c:501-505 sh_neednumarg,
+/// get_numeric_arg returns 0 and shift_builtin answers
+/// `return (EX_USAGE)`) and a surplus operand through no_args
+/// (`set_exit_status (EX_BADUSAGE)`); only the shift-count-erange path
+/// returns EXECUTION_FAILURE.
+/// GNU 5.3.0 differential (WSL stdin probes 2026-10-18):
+///   ( set -- 1 2; shift x )    -> 2   (was 1)
+///   ( set -- 1 2; shift 1 2 )  -> 2   (was 1)
+///   ( set -- 1 2; shift -1 )   -> 1
+///   set -- 1 2 3; shift 99     -> 1
+#[test]
+fn shift_bad_operand_status_matches_gnu() {
+    let dir = case_scratch("759.shift");
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    };
+
+    let statuses = run("( set -- 1 2; shift x ) 2>/dev/null; echo \"shiftx:$?\"\n\
+         ( set -- 1 2; shift 1 2 ) 2>/dev/null; echo \"shift12:$?\"\n\
+         ( set -- 1 2; shift -1 ) 2>/dev/null; echo \"shiftneg:$?\"\n\
+         set -- 1 2 3; shift 99 2>/dev/null; echo \"shiftbig:$?\"");
+    assert_eq!(
+        statuses, "shiftx:2\nshift12:2\nshiftneg:1\nshiftbig:1",
+        "shift statuses"
+    );
+
+    // The diagnostics themselves keep GNU's wording (only the status
+    // changed): `shift: x: numeric argument required` and
+    // `shift: too many arguments`.
+    let out = run_rubash_in(
+        &dir,
+        &["-c", "set -- 1 2; shift x; shift 1 2"],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("shift: x: numeric argument required"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("shift: too many arguments"), "{stderr}");
+}
+
+/// rubash#759 item 4: GNU bash has no `setopt`/`unsetopt` builtins — a
+/// script probing `command -v setopt` to detect zsh must get the GNU
+/// answer. After the removal `setopt x` is command-not-found (127),
+/// `builtin setopt x` is not-a-shell-builtin (1), and `enable -a` lists
+/// exactly GNU's 61 builtin names.
+/// GNU 5.3.0 differential (WSL stdin probe 2026-10-18):
+///   command -v setopt    -> rc 1, no output   (was "setopt", rc 0)
+///   command -v unsetopt  -> rc 1, no output   (was "unsetopt", rc 0)
+///   enable -a | wc -l    -> 61                (was 64 on Windows)
+#[test]
+fn zsh_option_builtins_are_gone() {
+    let dir = case_scratch("759.setopt");
+
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "command -v setopt; echo \"v:$?\"\ncommand -v unsetopt; echo \"v:$?\"\nenable -a",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("v:1"), "command -v setopt misses");
+    assert_eq!(lines.next(), Some("v:1"), "command -v unsetopt misses");
+    let listed = lines.filter(|line| !line.trim().is_empty()).count();
+    assert_eq!(
+        listed, 61,
+        "enable -a must list exactly GNU's 61 builtin names: {stdout}"
+    );
+
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "setopt hist_ignore_dups null_glob; echo \"plain:$?\"\n\
+             shopt -q nullglob; echo \"nullglob:$?\"\n\
+             builtin unsetopt null_glob; echo \"builtin:$?\"",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout.trim_end(),
+        "plain:127\nnullglob:1\nbuiltin:1",
+        "setopt/unsetopt are plain unknown commands; option state untouched"
+    );
+    assert!(stderr.contains("setopt: command not found"), "{stderr}");
+    assert!(
+        stderr.contains("builtin: unsetopt: not a shell builtin"),
+        "{stderr}"
+    );
+}
+
+/// rubash#759 item 4 (sudo): GNU bash has no `sudo` builtin — `command -v
+/// sudo` resolves it on PATH like any external (WSL: /usr/bin/sudo). rubash
+/// keeps the Windows host-capability builtin behind an embedding-host
+/// elevation handler (the docs/builtins.md §3 hidden-builtin contract), so
+/// with no handler the name must classify as external everywhere. On a
+/// Windows box without sudo.exe that is rc 1 with no output; the invariant
+/// under test is "never reports a builtin".
+/// GNU 5.3.0 differential (WSL stdin probe 2026-10-18):
+///   command -v sudo -> /usr/bin/sudo (external), rc 0
+///   type -t sudo    -> file, rc 0
+#[test]
+fn sudo_is_not_reported_as_a_builtin() {
+    let dir = case_scratch("759.sudo");
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "command -v sudo; echo \"v:$?\"\ntype -t sudo; echo \"t:$?\"",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.lines().any(|line| line == "sudo"),
+        "`command -v sudo` must not report the bare builtin name: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sudo is a shell builtin"),
+        "`type sudo` must not report a builtin: {stdout}"
+    );
+}

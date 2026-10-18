@@ -40,9 +40,14 @@ impl Executor {
         // width-accounting delimiters, never terminal payload (see
         // strip_prompt_ignore_markers) — every render channel gets the
         // stripped form, not just the piped `-i` driver.
-        super::prompt_expansion::strip_prompt_ignore_markers(
-            &self.expand_prompt_parameters(&self.decode_prompt_string(value)),
-        )
+        let decoded = self.decode_prompt_string(value);
+        // parse.y:6683-6698: the expansion pass is promptvars/posix-gated.
+        let decoded = if self.prompt_expansion_enabled() {
+            self.expand_embedded_parameters_double_quoted(&decoded)
+        } else {
+            decoded
+        };
+        super::prompt_expansion::strip_prompt_ignore_markers(&decoded)
     }
 
     pub fn expand_prompt_string_mut(&mut self, value: &str) -> String {
@@ -59,9 +64,21 @@ impl Executor {
         let saved_exit_code = self.exit_code;
         let saved_pipestatus = self.shell_state.pipestatus.clone();
         let decoded = self.decode_prompt_string(value);
-        let rendered = super::prompt_expansion::strip_prompt_ignore_markers(
-            &self.expand_embedded_parameters_mut(&decoded),
-        );
+        // Same promptvars/posix gate as the transform channel (parse.y:6683):
+        // `shopt -u promptvars` stops the expansion pass entirely. The pass
+        // runs in the double-quoted word context (parse.y:6689
+        // expand_prompt_string(result, Q_DOUBLE_QUOTES, 0)) — the same
+        // contract the `@P` transform channel gets from
+        // expand_embedded_parameters_double_quoted.
+        let rendered = if self.prompt_expansion_enabled() {
+            self.expand_embedded_parameters_mut_with_context(
+                &decoded,
+                SubstitutionQuoteContext::DoubleQuoted,
+            )
+        } else {
+            decoded
+        };
+        let rendered = super::prompt_expansion::strip_prompt_ignore_markers(&rendered);
         self.exit_code = saved_exit_code;
         self.shell_state.pipestatus = saved_pipestatus;
         rendered

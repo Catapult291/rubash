@@ -255,7 +255,10 @@ fn test_shift_non_numeric_fails_without_changing_positional_params() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "1 2 one\n");
+    // rubash#759 item 3: a non-numeric operand is get_numeric_arg's usage
+    // error (builtins/common.c:501-505 + shift.def `return (EX_USAGE)`),
+    // status 2, and the positional parameters stay untouched.
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "2 2 one\n");
     let _ = fs::remove_file(output_path);
 }
 

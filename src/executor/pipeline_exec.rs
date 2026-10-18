@@ -1247,7 +1247,7 @@ impl Executor {
         if command
             .words
             .first()
-            .is_some_and(|word| crate::executor::builtin_names::is_shell_builtin_name(word))
+            .is_some_and(|word| self.routes_as_builtin(word))
         {
             return Ok(false);
         }
@@ -1712,7 +1712,7 @@ impl Executor {
         {
             return None;
         }
-        if crate::executor::builtin_names::is_shell_builtin_name(&expanded_name) {
+        if self.routes_as_builtin(&expanded_name) {
             return None;
         }
         // GNU never routes a pipeline member straight to the disk command:
@@ -2441,7 +2441,7 @@ impl Executor {
             {
                 return Ok(None);
             }
-            if crate::executor::builtin_names::is_shell_builtin_name(&expanded_name) {
+            if self.routes_as_builtin(&expanded_name) {
                 return Ok(None);
             }
             // Windows twin of the find_function-first bail-out below
@@ -3089,9 +3089,7 @@ impl Executor {
                         .into_iter()
                         .next()
                 })
-                .is_some_and(|expanded| {
-                    crate::executor::builtin_names::is_shell_builtin_name(&expanded)
-                });
+                .is_some_and(|expanded| self.routes_as_builtin(&expanded));
             if !builtin_stage {
                 return self.execute_external_pipeline_stage(command, input, stdin_inherit);
             }

@@ -73,20 +73,12 @@ impl Executor {
             }
             "eval" => self.execute_eval(cmd),
             "set" => self.execute_set_command(cmd),
-            "setopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(cmd, true)?;
-                Ok(())
-            }
             "getopts" => {
                 self.exit_code = self.execute_getopts_command(cmd)?;
                 Ok(())
             }
             "shopt" => {
                 self.exit_code = self.execute_shopt(cmd)?;
-                Ok(())
-            }
-            "unsetopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(cmd, false)?;
                 Ok(())
             }
             "enable" => {
@@ -99,8 +91,11 @@ impl Executor {
             "continue" => self.execute_loop_control(cmd, LoopControlKind::Continue),
             "command" => self.execute_command_builtin_without_aliases(cmd),
             "builtin" => self.execute_builtin_direct_command(cmd),
+            // GNU Bash has no `sudo` builtin (issue #759 item 4): `command
+            // sudo` resolves on PATH unless an embedding host registered an
+            // elevation handler.
             #[cfg(windows)]
-            "sudo" => {
+            "sudo" if self.elevation_handler.is_some() => {
                 self.exit_code = self.execute_sudo(cmd)?;
                 Ok(())
             }

@@ -82,6 +82,19 @@ impl Executor {
             && !crate::builtins::enable::is_disabled(&self.shell_state.env_vars, name)
     }
 
+    /// Execution-routing classification: the pure builtin table plus the
+    /// Windows `sudo` host builtin, which only exists while an embedding
+    /// host registered an elevation handler. Introspection surfaces
+    /// (`type`, `command -v`, `enable -a`, `compgen -b`) deliberately keep
+    /// reporting `sudo` as an external command — the same hidden-builtin
+    /// contract as `uname`/`arch` (docs/builtins.md §3) and GNU's own
+    /// behavior for names it resolves off PATH (issue #759 item 4: GNU has
+    /// no `sudo` builtin, `command -v sudo` finds /usr/bin/sudo).
+    pub(in crate::executor) fn routes_as_builtin(&self, name: &str) -> bool {
+        is_shell_builtin_name(name)
+            || (cfg!(windows) && name == "sudo" && self.elevation_handler.is_some())
+    }
+
     pub(in crate::executor) fn command_paths(&self, name: &str, force_path: bool) -> Vec<String> {
         if name.is_empty() {
             return Vec::new();

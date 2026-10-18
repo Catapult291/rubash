@@ -1061,6 +1061,7 @@ impl Executor {
         }
         let expanded = self.expand_word(first);
         crate::executor::builtin_names::is_shell_builtin_name(&expanded)
+            || self.routes_as_builtin(&expanded)
             || self.function_name_for_command_word(&expanded).is_some()
     }
 

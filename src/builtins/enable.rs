@@ -59,12 +59,9 @@ const ALL_BUILTINS: &[&str] = &[
     "readonly",
     "return",
     "set",
-    "setopt",
     "shift",
     "shopt",
     "source",
-    #[cfg(windows)]
-    "sudo",
     "suspend",
     "test",
     "times",
@@ -76,7 +73,6 @@ const ALL_BUILTINS: &[&str] = &[
     "umask",
     "unalias",
     "unset",
-    "unsetopt",
     "wait",
 ];
 const SPECIAL_BUILTINS: &[&str] = &[

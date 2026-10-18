@@ -182,20 +182,21 @@ fn test_bashopts_assignment_reports_readonly() {
     let _ = fs::remove_file(status_path);
 }
 
+// rubash#759 item 4: GNU bash 5.3.0 has no `setopt`/`unsetopt` builtins —
+// `setopt x` is `command not found` (127), `builtin setopt x` is
+// `not a shell builtin` (1), and neither touches shell option state
+// (`shopt -q nullglob` stays 1, `[[ -o braceexpand ]]` stays 0).
 #[test]
-fn test_setopt_tracks_compat_options_and_maps_shell_state() {
+fn test_setopt_is_not_a_builtin_and_leaves_options_untouched() {
     let _cwd_guard = CwdGuard::take();
-    let output_path = "target/rubash-setopt-zsh-options-output.txt";
+    let output_path = "target/rubash-setopt-not-builtin-output.txt";
+    let error_path = "target/rubash-setopt-not-builtin-error.txt";
     let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
     let input = format!(
-        "setopt hist_ignore_dups hist_ignore_space prompt_subst prompt_percent brace_expand null_glob; \
-         unsetopt prompt_percent; \
-         setopt > {output_path}; \
-         echo hist:$WINUXSH_HIST_IGNORE_DUPS:$WINUXSH_HIST_IGNORE_SPACE >> {output_path}; \
+        "setopt hist_ignore_dups null_glob 2> {error_path}; echo plain:$? > {output_path}; \
          shopt -q nullglob; echo nullglob:$? >> {output_path}; \
-         shopt -q promptvars; echo promptvars:$? >> {output_path}; \
-         [[ -o braceexpand ]]; echo brace:$? >> {output_path}; \
-         setopt no_null_glob; shopt -q nullglob; echo nullglob_off:$? >> {output_path}"
+         [[ -o braceexpand ]]; echo brace:$? >> {output_path}"
     );
     let tokens = tokenize(&input);
     let ast = parse(&tokens);
@@ -204,55 +205,30 @@ fn test_setopt_tracks_compat_options_and_maps_shell_state() {
     let result = executor.execute_ast(&ast);
 
     assert!(result.is_ok());
-    assert_eq!(executor.last_exit_code(), 0);
-    let output = fs::read_to_string(output_path).unwrap();
-    assert!(output.contains("hist_ignore_dups\n"));
-    assert!(output.contains("hist_ignore_space\n"));
-    assert!(output.contains("prompt_subst\n"));
-    assert!(!output.contains("prompt_percent\n"));
-    assert!(output.contains("hist:1:1\n"));
-    assert!(output.contains("nullglob:0\n"));
-    assert!(output.contains("promptvars:0\n"));
-    assert!(output.contains("brace:0\n"));
-    assert!(output.contains("nullglob_off:1\n"));
-    let _ = fs::remove_file(output_path);
-}
-
-#[test]
-fn test_command_and_builtin_setopt_update_same_state() {
-    let _cwd_guard = CwdGuard::take();
-    let output_path = "target/rubash-command-builtin-setopt-output.txt";
-    let _ = fs::remove_file(output_path);
-    let input = format!(
-        "command setopt null_glob; shopt -q nullglob; echo command:$? > {output_path}; \
-         builtin unsetopt null_glob; shopt -q nullglob; echo builtin:$? >> {output_path}"
-    );
-    let tokens = tokenize(&input);
-    let ast = parse(&tokens);
-    let mut executor = Executor::new();
-
-    let result = executor.execute_ast(&ast);
-
-    assert!(result.is_ok());
-    assert_eq!(executor.last_exit_code(), 0);
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        "command:0\nbuiltin:1\n"
+        "plain:127\nnullglob:1\nbrace:0\n"
+    );
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(
+        error.contains("setopt: command not found"),
+        "stderr: {error}"
     );
     let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
 }
 
 #[test]
-fn test_source_executes_setopt_without_host_preprocessing() {
+fn test_command_and_builtin_reject_setopt_names() {
     let _cwd_guard = CwdGuard::take();
-    let script_path = "target/rubash-setopt-source.rc";
-    let output_path = "target/rubash-setopt-source-output.txt";
-    let _ = fs::remove_file(script_path);
+    let output_path = "target/rubash-command-builtin-setopt-output.txt";
+    let error_path = "target/rubash-command-builtin-setopt-error.txt";
     let _ = fs::remove_file(output_path);
-    fs::write(script_path, "setopt hist_ignore_dups null_glob\n").unwrap();
+    let _ = fs::remove_file(error_path);
     let input = format!(
-        "source {script_path}; \
-         echo hist:$WINUXSH_HIST_IGNORE_DUPS > {output_path}; \
+        "command setopt null_glob 2> {error_path}; echo command:$? > {output_path}; \
+         builtin setopt null_glob 2>> {error_path}; echo builtin:$? >> {output_path}; \
+         builtin unsetopt null_glob 2>> {error_path}; echo builtinunset:$? >> {output_path}; \
          shopt -q nullglob; echo nullglob:$? >> {output_path}"
     );
     let tokens = tokenize(&input);
@@ -262,17 +238,65 @@ fn test_source_executes_setopt_without_host_preprocessing() {
     let result = executor.execute_ast(&ast);
 
     assert!(result.is_ok());
-    assert_eq!(executor.last_exit_code(), 0);
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        "hist:1\nnullglob:0\n"
+        "command:127\nbuiltin:1\nbuiltinunset:1\nnullglob:1\n"
     );
-    let _ = fs::remove_file(script_path);
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(
+        error.contains("setopt: command not found"),
+        "stderr: {error}"
+    );
+    assert!(
+        error.contains("builtin: setopt: not a shell builtin"),
+        "stderr: {error}"
+    );
+    assert!(
+        error.contains("builtin: unsetopt: not a shell builtin"),
+        "stderr: {error}"
+    );
     let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
 }
 
 #[test]
-fn test_setopt_invalid_option_reports_failure() {
+fn test_sourced_setopt_line_reports_command_not_found() {
+    let _cwd_guard = CwdGuard::take();
+    let script_path = "target/rubash-setopt-source.rc";
+    let output_path = "target/rubash-setopt-source-output.txt";
+    let error_path = "target/rubash-setopt-source-error.txt";
+    let _ = fs::remove_file(script_path);
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    fs::write(script_path, "setopt hist_ignore_dups null_glob\n").unwrap();
+    let input = format!(
+        "source {script_path} 2> {error_path}; \
+         echo src:$? > {output_path}; \
+         shopt -q nullglob; echo nullglob:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "src:127\nnullglob:1\n"
+    );
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(
+        error.contains("setopt: command not found"),
+        "stderr: {error}"
+    );
+    let _ = fs::remove_file(script_path);
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_setopt_operand_reports_command_not_found() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-setopt-invalid-output.txt";
     let error_path = "target/rubash-setopt-invalid-error.txt";
@@ -286,10 +310,12 @@ fn test_setopt_invalid_option_reports_failure() {
     let result = executor.execute_ast(&ast);
 
     assert!(result.is_ok());
-    assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "1\n");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "127\n");
     let error = fs::read_to_string(error_path).unwrap();
-    assert!(error.contains("setopt: no such option: no_such_option"));
+    assert!(
+        error.contains("setopt: command not found"),
+        "stderr: {error}"
+    );
     let _ = fs::remove_file(output_path);
     let _ = fs::remove_file(error_path);
 }

@@ -26,10 +26,11 @@ rubash 对一个命令词按优先级做三层处理：
    外部命令）。
 3. **外部命令**：沿 PATH 查找，由 winuxcmd 提供。
 
-## 二、真 builtin 清单（64 项）
+## 二、真 builtin 清单（62 项）
 
-GNU Bash 5.2 的 61 个 builtin **全部覆盖，无缺失**；下表加粗的是 rubash 的
-有意扩展（`env`、`setopt`、`unsetopt`），另有 Windows 专属 `sudo` 不计入 64。
+GNU Bash 5.3 的 61 个 builtin **全部覆盖，无缺失**；唯一加粗的扩展是 `env`
+（rubash#759 item 4 起不再携带 zsh 兼容别名）。另有 Windows 专属 `sudo`
+作为**隐藏 host builtin** 不计入 62（见第三节说明）。
 
 <!-- builtins-list
 .
@@ -79,7 +80,6 @@ readarray
 readonly
 return
 set
-setopt
 shift
 shopt
 source
@@ -94,16 +94,14 @@ ulimit
 umask
 unalias
 unset
-unsetopt
 wait
 -->
 
 | 类别 | 命令 |
 |---|---|
 | Bash 61 个 builtin（全部对齐） | `.` `:` `[` `alias` `bg` `bind` `break` `builtin` `caller` `cd` `command` `compgen` `complete` `compopt` `continue` `declare` `dirs` `disown` `echo` `enable` `eval` `exec` `exit` `export` `false` `fc` `fg` `getopts` `hash` `help` `history` `jobs` `kill` `let` `local` `logout` `mapfile` `popd` `printf` `pushd` `pwd` `read` `readarray` `readonly` `return` `set` `shift` `shopt` `source` `suspend` `test` `times` `trap` `true` `type` `typeset` `ulimit` `umask` `unalias` `unset` `wait` |
-| **扩展：zsh 兼容** | `setopt` `unsetopt`（配套 `src/builtins/zsh_options.rs`） |
 | **扩展：进程内 env** | `env`（`executor/external_inner.rs`，按 coreutils 语义实现：排序输出、`-0` 等；bash 中为外部命令） |
-| Windows 专属 | `sudo`（`#[cfg(windows)]`，不计入白名单常量） |
+| Windows 专属（隐藏 host builtin） | `sudo`（不在白名单内；introspection 报告外部命令，仅当嵌入宿主注册了 elevation handler 时才在执行层拦截） |
 
 说明：
 
