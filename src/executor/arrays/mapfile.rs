@@ -1,3 +1,5 @@
+use crate::lexer::ansi::is_assignment_carrier_byte;
+
 pub(in crate::executor) fn split_mapfile_input(
     input: &str,
     delimiter: Option<u8>,
@@ -12,22 +14,31 @@ pub(in crate::executor) fn split_mapfile_input(
     // each segment exactly once (subst.c raw-byte marker contract keeps
     // `-d $'\xff'` byte-exact).
     let delim = delimiter.unwrap_or(b'\n');
-    // Fast path (rubash#680 slice 2): when the input is pure ASCII with
-    // no carrier bytes and the delimiter is a plain ASCII byte, the
-    // decode is the identity copy (no LITERAL/RAW_BYTE escapes exist in
-    // ASCII) and the per-segment re-encode is the identity too (no
-    // marker-zone chars exist in ASCII; carrier bytes {0x0c,0x11,0x13,
-    // 0x14..=0x1f} are excluded above, and only they make
-    // bytes_to_shell_text differ from its input). Splitting the text
-    // directly then yields byte-identical values with one alloc per
-    // segment instead of a whole-input encode plus a per-segment decode
-    // scan. Anything else keeps the decode path below (rubash#117);
-    // NUL-delimited input stays there by contract (delim != 0).
+    // Fast path (rubash#680 slice 2, rescue/stash-perf-680 merge): when the
+    // delimiter is a plain non-NUL ASCII byte and the input carries no
+    // text-layer carrier byte and no 0xEE marker-zone lead, the decode is
+    // the identity (nothing to unescape) and the per-segment re-encode is
+    // the identity too (`bytes_to_shell_text` only rewrites carrier bytes
+    // and raw-byte markers — a Rust String input is always valid UTF-8, an
+    // ASCII delimiter can never cut a multi-byte sequence, and a valid
+    // UTF-8 segment re-encodes to itself because only carrier bytes make
+    // `push_escaped_text_with_carriers` differ from its input). Splitting
+    // the text directly then yields byte-identical values with one alloc
+    // per segment instead of a whole-input decode plus a per-segment
+    // encode scan — UTF-8 (CJK, accented) payloads ride the fast path,
+    // not just ASCII. The gate is the AUTHORITATIVE carrier set
+    // (`is_assignment_carrier_byte` — {0x0c, CTLESC 0x11, 0x13, 0x14..=0x1f},
+    // lexer/ansi.rs) plus the 0xEE lead of the U+E000..U+EFFF registry
+    // marker zone, so a future carrier registration automatically
+    // tightens the gate; NUL stays on the decode path by contract
+    // (delim != 0, rubash#117) and non-carrier C0 bytes (tab/LF/CR/VT…)
+    // encode to themselves.
     if delim != 0
         && delim.is_ascii()
-        && input
-            .bytes()
-            .all(|b| b.is_ascii() && !matches!(b, 0x0c | 0x11 | 0x13 | 0x14..=0x1f))
+        && !is_assignment_carrier_byte(u32::from(delim))
+        && input.bytes().all(|b| {
+            !is_assignment_carrier_byte(u32::from(b)) && b != 0xEE
+        })
     {
         let strip = trim_delimiter;
         let mut values = Vec::new();

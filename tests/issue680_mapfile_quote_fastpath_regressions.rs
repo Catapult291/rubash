@@ -44,3 +44,32 @@ fn mapfile_escape_values_fall_through() {
         "declare -a e=([0]=\"a\\$b\" [1]=\"a\\\"b\" [2]=\"a\\\\b\" [3]=\"a\\`b\")\n"
     );
 }
+
+/// rubash#680 slice-2 followup (rescue/stash-perf-680 fusion): multi-byte
+/// UTF-8 payloads ride the encoded-split fast path — the ASCII delimiter can
+/// never cut a multi-byte sequence and a valid UTF-8 segment re-encodes to
+/// itself, so `中文` values round-trip byte-identically. GNU 5.3.0 probe
+/// (2026-10-18): `declare -p` prints `[1]="中文 beta"` verbatim.
+#[test]
+fn mapfile_fastpath_rides_utf8_payloads() {
+    assert_eq!(
+        rubash("mapfile -t u <<< $'alpha\\n中文 beta\\ngamma'; declare -p u"),
+        "declare -a u=([0]=\"alpha\" [1]=\"中文 beta\" [2]=\"gamma\")\n"
+    );
+}
+
+/// The gate is the AUTHORITATIVE carrier set plus the 0xEE marker-zone lead:
+/// a carrier byte or a registry marker inside the stream falls back to the
+/// decode path (identical values, no fast-path corruption), while a
+/// non-carrier control byte (tab) still rides the fast path.
+#[test]
+fn mapfile_fastpath_gate_carriers_and_marker_zone() {
+    assert_eq!(
+        rubash("mapfile -t c <<< $'a\\fb\\ne\\021f\\nz'; declare -p c"),
+        "declare -a c=([0]=$'a\\fb' [1]=$'e\\021f' [2]=\"z\")\n"
+    );
+    assert_eq!(
+        rubash("mapfile -t t <<< $'x\\ty\\nz'; declare -p t"),
+        "declare -a t=([0]=$'x\\ty' [1]=\"z\")\n"
+    );
+}
