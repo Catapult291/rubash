@@ -461,41 +461,6 @@ impl Executor {
         Some(output.trim_capture_terminator().to_string())
     }
 
-    pub(in crate::executor) fn command_substitution_pipeline_output(
-        &self,
-        words: &[String],
-    ) -> Option<(String, i32)> {
-        if !words.iter().any(|word| word == "|") {
-            return None;
-        }
-
-        let stages = split_pipeline_words(words)?;
-        // GNU subst.c parses and executes the whole pipeline; this word-level
-        // shortcut only covers plain producer/filter stages. A stage carrying
-        // redirection syntax (`git symbolic-ref HEAD 2>/dev/null | sed ...`)
-        // would receive the redirect as a literal argument, and a stage whose
-        // head names a shell function must run the function, not an external
-        // program of the same name. Both fall back to the real parser
-        // (issue #70).
-        if stages
-            .iter()
-            .any(|stage| stage.iter().any(|word| command_word_carries_redirect(word)))
-        {
-            return None;
-        }
-        if let Some(head) = stages.first().and_then(|stage| stage.first()) {
-            if self.shell_state.functions.contains_key(head) {
-                return None;
-            }
-        }
-        let mut output = self.command_substitution_pipeline_first_stage(stages.first()?)?;
-        let mut status = 0;
-        for stage in stages.iter().skip(1) {
-            (output, status) = self.command_substitution_pipeline_filter(stage, &output)?;
-        }
-        Some((output.trim_capture_terminator().to_string(), status))
-    }
-
     pub(in crate::executor) fn timed_command_substitution_output(
         &self,
         words: &[String],
@@ -581,11 +546,6 @@ impl Executor {
                         .to_string(),
                 )
             }
-            Some(_) if words.iter().any(|word| word == "|") => {
-                let (output, status) = self.command_substitution_pipeline_output(words)?;
-                self.last_command_substitution_status.set(Some(status));
-                Some(output)
-            }
             Some("tty") | Some("/bin/tty") | Some("/usr/bin/tty") => {
                 let silent = words
                     .iter()
@@ -640,99 +600,6 @@ impl Executor {
                 Some(output.trim_capture_terminator().to_string())
             }
             Some(_) => self.run_external_command_substitution(words),
-        }
-    }
-
-    pub(in crate::executor) fn command_substitution_pipeline_first_stage(
-        &self,
-        words: &[String],
-    ) -> Option<String> {
-        match words.first().map(String::as_str)? {
-            "echo" => {
-                // GNU subst.c expand_words runs pathname expansion on each
-                // word of a pipeline stage inside a command substitution
-                // (`$(echo * | cat)` yields the directory listing). The
-                // printf arm beside this one already routes through
-                // expand_command_substitution_arg_values for that reason;
-                // the echo arm was still calling plain expand_word, so a
-                // literal glob pattern in the first stage stayed a literal.
-                let args: Vec<String> = words[1..]
-                    .iter()
-                    .flat_map(|word| self.expand_command_substitution_arg_values(word))
-                    .collect();
-                Some(echo_raw_output(&args))
-            }
-            "printf" => {
-                let expanded_args: Vec<String> = words[1..]
-                    .iter()
-                    .flat_map(|word| self.expand_command_substitution_arg_values(word))
-                    .collect();
-                let mut env_vars = self.shell_state.env_vars.clone();
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                let _ = crate::builtins::printf::execute_with_io(
-                    expanded_args.iter().map(String::as_str),
-                    &mut env_vars,
-                    &mut stdout,
-                    &mut stderr,
-                );
-                Some(bytes_to_shell_text(&stdout))
-            }
-            "cat" => {
-                if words.len() <= 1 || words[1..].iter().any(|word| word.starts_with('-')) {
-                    return None;
-                }
-                let mut output = String::new();
-                for word in &words[1..] {
-                    let path = self.expand_word(word);
-                    // `/dev/fd/N` (N>0) needs the real descriptor table —
-                    // full execution owns it; fd 0 is FUNCTION_STDIN when
-                    // that channel exists, else real execution drains the
-                    // inherited process stdin (subst.c:7143).
-                    if let Some(fd) = crate::executor::dev_fd_operands::dev_operand_fd(&path) {
-                        if fd != 0 || !self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
-                            return None;
-                        }
-                        output.push_str(&self.function_stdin_remaining().unwrap_or_default());
-                        continue;
-                    }
-                    // niubash#177: same operand resolution as the argv
-                    // funnel — a virtual-root file operand may exist only
-                    // under its `.exe` spelling on disk.
-                    if let Ok(value) =
-                        fs::read_to_string(crate::executor::path::windows_operand_file_path(
-                            shell_path_to_windows(&path, &self.shell_state.env_vars),
-                            &self.shell_state.env_vars,
-                        ))
-                    {
-                        output.push_str(&value);
-                    }
-                }
-                Some(output)
-            }
-            "command" => self
-                .command_describe_substitution_output(words)
-                .map(|mut output| {
-                    if !output.is_empty() {
-                        output.push('\n');
-                    }
-                    output
-                }),
-            _ => {
-                // Generic external command first stage. Do NOT spawn it here.
-                // This substitution fast path would need the real executor's
-                // full child environment (apply_env_command_environment sets
-                // every shell var); apply_child_environment only forwards
-                // exported/marked vars, and with that stripped environment a
-                // winuxcmd command such as `find` misbehaves and writes its
-                // output to stderr, which the capture discards — so
-                // `$(find ... | wc -l)` silently yields 0 (issue #76). Falling
-                // through lets command_list_substitution_output run the
-                // pipeline through the real executor, which captures it
-                // correctly. Builtin first stages (echo/printf/cat/command)
-                // above keep using this fast path.
-                return None;
-            }
         }
     }
 }

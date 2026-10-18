@@ -140,14 +140,14 @@ builtin），但实现是进程内执行 coreutils 语义、**没有外部回退
 同名辅助 builtin，正式发行版不包含）：`recho`、`zecho`（late dispatch）。
 它们不属于 fast-path，也不在白名单内。
 
-### 3.1 管线级 arm 与命令替换 filter arm
+### 3.1 管线级 arm
 
-除上面的隐藏 fast-path builtin 外，还有两组**不进 introspection 的进程内
-fast-path arm**，它们匹配的是命令在管线或命令替换中的出现位置，而不是
-命令词本身。这两组此前从未记录在本文件里；2026-10-17 的全量差分审计
+除上面的隐藏 fast-path builtin 外，还有一组**不进 introspection 的进程内
+fast-path arm**，它匹配的是命令在管线中的出现位置，而不是
+命令词本身。这一组此前从未记录在本文件里；2026-10-17 的全量差分审计
 （[`docs/audit/fast-path-differential.md`](audit/fast-path-differential.md)）
 清点了完整清单、每条 arm 接受的形态、decline 时的回退去向，以及已确认的
-逐 arm 分歧（带字节级证据）。下面两个机器块与该审计 §2 的代码清单一一对应，
+逐 arm 分歧（带字节级证据）。下面的机器块与该审计 §2 的代码清单一一对应，
 并由 `src/executor/builtin_names.rs` 的文档同步测试守护：arm 增删或改名而
 未同步本文件时，`cargo test --lib builtin_names` 会失败。
 
@@ -174,26 +174,6 @@ sed
 grep
 wc
 tr
--->
-
-**命令替换 filter arm**（`src/executor/command_substitution_values.rs` 的
-`match words.first()`）：`$( … | … )` 第二阶段命令词命中下表时进程内产出
-替换值，其余情形走 generic-external 回退分支（落回外部 winuxcmd 或 PATH 上
-的同名命令）。一个重要事实：审计 §2.5 发现该层 arm 在 `rubash#117` 的
-平凡性 gate 之后对普通 `$( … | … )` **不可达**（能抵达该 arm 的替换体
-不可能包含 `|`），即可观测的 `$( … | head/-c/wc/…)` 行为实际由上面的
-管线 arm 执行；本表描述的是代码中的形状与潜在风险，不是活跃行为
-（dead-code 登记在 issue #710）。
-
-<!-- substitution-fastpath-list
-sort
-sed
-tr
-head
-grep
-wc
-tail
-uniq
 -->
 
 ## 四、与 winuxcmd 的重叠
@@ -258,7 +238,6 @@ fc.exe/help.exe），全部经 `$(...)` 实测走 builtin；回归覆盖
 新增/修改 builtin 或 fast-path 时：
 
 1. 改 `src/executor/builtin_names.rs`（白名单或新分支）。
-2. 同步更新本文件的 `builtins-list` / `fastpath-list` 机器块；改管线级或
-   命令替换 arm（§3.1）时同步 `pipeline-fastpath-list` /
-   `substitution-fastpath-list`。
+2. 同步更新本文件的 `builtins-list` / `fastpath-list` 机器块；改管线级
+   arm（§3.1）时同步 `pipeline-fastpath-list`。
 3. 跑 `cargo test --lib builtin_names`，文档同步测试必须绿。

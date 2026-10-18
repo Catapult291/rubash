@@ -293,33 +293,10 @@ pub(in crate::executor) fn echo_command_substitution_output(args: &[String]) -> 
         .to_string()
 }
 
-pub(in crate::executor) fn echo_raw_output(args: &[String]) -> String {
-    bytes_to_shell_text(&echo_raw_output_bytes(args))
-}
-
 fn echo_raw_output_bytes(args: &[String]) -> Vec<u8> {
     let mut output = Vec::new();
     let _ = crate::builtins::echo::write_echo(args.iter().map(String::as_str), &mut output);
     output
-}
-
-pub(in crate::executor) fn split_pipeline_words(words: &[String]) -> Option<Vec<&[String]>> {
-    let mut stages = Vec::new();
-    let mut start = 0usize;
-    for (index, word) in words.iter().enumerate() {
-        if word == "|" {
-            if start == index {
-                return None;
-            }
-            stages.push(&words[start..index]);
-            start = index + 1;
-        }
-    }
-    if start >= words.len() {
-        return None;
-    }
-    stages.push(&words[start..]);
-    (stages.len() > 1).then_some(stages)
 }
 
 /// True when any word is a shell control/redirection operator that the
@@ -379,12 +356,6 @@ mod tests {
             echo_command_substitution_output(&args(&["-e", "a\\0b"])),
             "ab"
         );
-    }
-
-    #[test]
-    fn echo_raw_output_keeps_builtin_stdout_shape() {
-        assert_eq!(echo_raw_output(&args(&["-n", "hello"])), "hello");
-        assert_eq!(echo_raw_output(&args(&["hello"])), "hello\n");
     }
 
     #[test]
