@@ -350,6 +350,7 @@ impl Executor {
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
             line_env_os_value: std::cell::RefCell::new(None),
+            expansion_probe_active: std::cell::Cell::new(false),
             return_trap_running: false,
             signal_trap_running: false,
             error_trap_running: false,

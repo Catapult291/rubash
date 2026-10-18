@@ -822,10 +822,32 @@ impl Executor {
         }
         // Expand with the same machinery the foreground dispatch uses; any
         // expansion failure falls back to the wrapper, whose child re-parses
-        // the source and reports the error exactly as before.
-        let expanded = match self.expand_command_words(command) {
+        // the source and reports the error exactly as before. The probe is
+        // SIDE-EFFECT-FREE: GNU expands the async child's words inside the
+        // forked child, so the parent never observes a failglob verdict —
+        // a probe hit used to print `no match` here (the wrapper child
+        // re-reported → doubled, 753.11 line 4) AND arm the parent-side
+        // evalerror discard, which swallowed the rest of the launch line
+        // (`set -- /no/such/*.zzz & echo BG_after` lost its echo). Suppress
+        // the report and restore the expansion latches on the Err path.
+        let saved_exit_code = self.exit_code;
+        let saved_expansion_failed = self.command_expansion_failed.get();
+        let saved_evalerror_pending = self.evalerror_pending.get();
+        let saved_failglob_pending = self.evalerror_failglob_pending.get();
+        let saved_evalerror_line = self.evalerror_line.get();
+        self.expansion_probe_active.set(true);
+        let probe = self.expand_command_words(command);
+        self.expansion_probe_active.set(false);
+        let expanded = match probe {
             Ok(expanded) => expanded,
-            Err(_) => return None,
+            Err(_) => {
+                self.exit_code = saved_exit_code;
+                self.command_expansion_failed.set(saved_expansion_failed);
+                self.evalerror_pending.set(saved_evalerror_pending);
+                self.evalerror_failglob_pending.set(saved_failglob_pending);
+                self.evalerror_line.set(saved_evalerror_line);
+                return None;
+            }
         };
         if self.shell_state.arithmetic_nounset_error.replace(false) {
             self.shell_state.arithmetic_expansion_error.set(false);
