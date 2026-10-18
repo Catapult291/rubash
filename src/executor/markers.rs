@@ -131,6 +131,19 @@ pub(crate) const PARSE_ERROR_FIELD_SEP: char = '\u{1e}';
 /// codepoint — disjoint channel (token-body prefix position).
 pub(crate) const HEREDOC_WARNED_BODY_PREFIX: char = '\u{1e}';
 
+/// Parser reader-state sentinel for `update_compound_boundary_stack`:
+/// a case pattern list is being read (mirrors GNU PST_CASEPAT,
+/// parser.h:29, set at parse.y 3379/3396). NUL prefix cannot collide
+/// with any token value the stack otherwise holds. NUL cannot appear in
+/// transport text, so the sentinel is not user-reachable by construction.
+pub(crate) const CASE_PATTERN_EXPECT: &str = "\u{0}case-pattern";
+/// Entered right after `in' or a clause terminator: the NEXT token may be
+/// the optional clause-opening `(' (parse.y:1231).
+pub(crate) const CASE_PATTERN_MAY_OPEN: &str = "\u{0}case-pattern-may-open";
+/// An extglob `(' opened inside the pattern text (parse.y:5466 absorbs
+/// these into the pattern word in GNU; rubash's tokenizer emits them).
+pub(crate) const CASE_PATTERN_PAREN: &str = "\u{0}case-pattern-paren";
+
 /// Data `$` — dollar that must not re-trigger expansion.
 pub(crate) const DATA_DOLLAR: char = '\u{1f}';
 
@@ -396,12 +409,25 @@ pub(crate) fn decode_word_position_carriers(value: &str) -> String {
         .replace(ANSI_C_DQUOTE_MARKER, "\"")
 }
 
-/// Whether `value` contains any byte of the in-band carrier family: the C0
-/// range 0x11..=0x1f hosting every CTLESC/CTLNUL-port marker (see the
-/// constants above) or the UTF-8 lead byte 0xEE of the U+E000..U+EFFF PUA
-/// plane hosting the ANSI-C markers. A false positive only costs the
-/// un-guarded slow path; a false negative is impossible because no marker
-/// can be encoded without one of these bytes.
+/// Whether `value` contains any byte of the in-band word-text carrier
+/// family: the C0 range 0x11..=0x1f hosting every CTLESC/CTLNUL-port quote
+/// carrier (CTLESC, PARAM_NAME_END_MARKER, DATA_* 0x14..=0x1f) or the UTF-8
+/// lead byte 0xEE of the U+E000..U+EFFF PUA plane hosting the ANSI-C
+/// markers. A false positive only costs the un-guarded slow path; a false
+/// negative within the predicate's SCOPE is impossible and enforced by
+/// `word_marker_byte_predicate_scope_is_enforced` (rubash#728 §3): every
+/// char-marker in 0x01..=0xff is either in 0x11..=0x1f or in an explicitly
+/// listed out-of-scope domain.
+///
+/// Out of scope by domain (their owners decode them, and entry re-encoding
+/// disambiguates user bytes):
+/// - PROMPT_IGNORE_* (0x01/0x02): the readline prompt-ignore layer.
+/// - DEFERRED_COMPOUND_BODY (0x03), PREEXPANDED_STDIN_BODY (0x05),
+///   ARRAY_FIELD_SPLIT_MARKER (0x10): compound-assignment/heredoc/array
+///   element transport consumed by their own boundary helpers, never by
+///   the word-text decode chains this predicate gates.
+/// - CASE_PATTERN_* (NUL prefix): parser reader-state sentinels; NUL
+///   cannot appear in transport text.
 pub(in crate::executor) fn contains_word_marker_bytes(value: &str) -> bool {
     value
         .bytes()
@@ -725,6 +751,99 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
         boundaries: &[],
         user_reachable: true,
     },
+    // --- rubash#728: the registry must enumerate every carrier const the
+    // file declares (the audited gap: 12 carrier-shaped consts lived
+    // outside this table, so the self-consistency tests never saw them).
+    MarkerInfo {
+        name: "PATTERN_LITERAL_BACKSLASH",
+        code: PATTERN_LITERAL_BACKSLASH as u32,
+        boundaries: &[Boundary::Output],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "PARSE_ERROR_FIELD_SEP",
+        code: PARSE_ERROR_FIELD_SEP as u32,
+        boundaries: &[Boundary::Storage],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "HEREDOC_WARNED_BODY_PREFIX",
+        code: HEREDOC_WARNED_BODY_PREFIX as u32,
+        boundaries: &[Boundary::Reparse],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "ANSI_C_IFS_GUARD",
+        code: ANSI_C_IFS_GUARD as u32,
+        boundaries: &[Boundary::Storage],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "LITERAL_CHAR_ESCAPE",
+        code: LITERAL_CHAR_ESCAPE as u32,
+        boundaries: &[Boundary::Output],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "FAILED_SUBSCRIPT_SENTINEL",
+        code: 0xE200,
+        boundaries: &[Boundary::Output],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "QUOTED_HEREDOC_MARKER",
+        code: 0x5F,
+        boundaries: &[Boundary::Reparse, Boundary::Storage],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "COMSUB_PAYLOAD_PREFIX",
+        code: 0x5F,
+        boundaries: &[Boundary::Storage, Boundary::Reparse],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "COMPOUND_ASSIGNMENT_MARKER",
+        code: 0x5F,
+        boundaries: &[Boundary::Storage],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "GROUP_REDIRECT_INJECTED_MARK",
+        code: 0x1E,
+        boundaries: &[],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "QUOTED_WORD_VALUE_PREFIX",
+        code: QUOTED_WORD_VALUE_PREFIX as u32,
+        boundaries: &[Boundary::Output],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "HASH_ENV_FIELD_SEP",
+        code: HASH_ENV_FIELD_SEP as u32,
+        boundaries: &[],
+        user_reachable: true,
+    },
+    MarkerInfo {
+        name: "CASE_PATTERN_EXPECT",
+        code: 0x00,
+        boundaries: &[],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "CASE_PATTERN_MAY_OPEN",
+        code: 0x00,
+        boundaries: &[],
+        user_reachable: false,
+    },
+    MarkerInfo {
+        name: "CASE_PATTERN_PAREN",
+        code: 0x00,
+        boundaries: &[],
+        user_reachable: false,
+    },
 ];
 
 // ==========================================================================
@@ -1014,5 +1133,321 @@ mod tests {
             );
             assert!(chars.next().is_none());
         }
+    }
+
+    // =====================================================================
+    // rubash#728 — the registry is the single declaration point, and the
+    // table is machine-read rather than prose (746 case 728.1).
+    // =====================================================================
+
+    /// Carrier-shaped const literals declared in this file. Every one must
+    /// be either a MARKERS row, a `_STR` companion of a row, or an explicit
+    /// range bound (not itself a marker). A new carrier const that misses
+    /// the table fails here — the audited #728 gap (12 consts outside the
+    /// table) cannot regrow silently.
+    #[test]
+    fn registry_covers_every_carrier_const() {
+        let source = include_str!("markers.rs");
+        let row_names: Vec<&str> = MARKERS.iter().map(|m| m.name).collect();
+        // Range bounds are codepoint arithmetic, not markers.
+        const NON_MARKER_BOUNDS: [&str; 5] = [
+            "RAW_BYTE_MARKER_FIRST",
+            "RAW_BYTE_MARKER_LAST",
+            "BYTE_CHAR_BASE",
+            "MARKER_ZONE_FIRST",
+            "MARKER_ZONE_LAST",
+        ];
+        let mut declared: Vec<(String, String)> = Vec::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            let Some(rest) = line.strip_prefix("pub(crate) const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let is_char = tail.trim_start().starts_with("char");
+            let Some(eq) = tail.find('=') else { continue };
+            let literal = tail[eq + 1..].trim().trim_end_matches(';').trim();
+            let carrier = if is_char {
+                decode_rust_char_literal(literal)
+                    .is_some_and(|c| (c as u32) <= 0x1f || (0xE000..=0xEFFF).contains(&(c as u32)))
+            } else if tail.trim_start().starts_with("&str") {
+                literal.starts_with('"')
+                    && (literal.contains("__RUBASH")
+                        || decode_rust_str_first_codepoint(literal).is_some_and(|c| {
+                            (c as u32) <= 0x1f || (0xE000..=0xEFFF).contains(&(c as u32))
+                        }))
+            } else {
+                false
+            };
+            if carrier {
+                declared.push((name.to_string(), literal.to_string()));
+            }
+        }
+        assert!(
+            declared.len() >= 60,
+            "scanner regressed: expected the full carrier const set, saw {}",
+            declared.len()
+        );
+        let mut failures = Vec::new();
+        for (name, literal) in &declared {
+            let registered = row_names.contains(&name.as_str())
+                || (name.ends_with("_STR") && row_names.contains(&name.trim_end_matches("_STR")));
+            let bound = NON_MARKER_BOUNDS.contains(&name.as_str());
+            if !registered && !bound {
+                failures.push(format!("{name} = {literal} is not a MARKERS row"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "carrier consts outside the registry (rubash#728):\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// `user_reachable` is machine-read (746 case 728.1): a user-reachable
+    /// marker either is a single C0/ASCII byte — covered by the raw-byte
+    /// pair re-encode, asserted for every possible byte below — or a PUA
+    /// codepoint inside the E400 literal-char-escape zone, which is how
+    /// user data is disambiguated at entry (#735). A `user_reachable: true`
+    /// row outside both shapes has no re-encode story and must not exist.
+    #[test]
+    fn user_reachable_rows_have_an_entry_reencode_story() {
+        for byte in 0..=255u8 {
+            let encoded = encode_raw_byte_marker(byte);
+            let decoded =
+                crate::executor::substitution_metadata::decode_raw_byte_markers(encoded.as_bytes());
+            assert_eq!(decoded, vec![byte], "raw-byte pair lost byte {byte:#04x}");
+        }
+        for m in MARKERS {
+            if !m.user_reachable {
+                continue;
+            }
+            assert!(
+                m.code <= 0xff || is_marker_zone_char(char::from_u32(m.code).unwrap()),
+                "{} claims user_reachable at U+{:04X} but has no entry re-encode",
+                m.name,
+                m.code
+            );
+        }
+    }
+
+    /// `boundaries` is machine-read (746 case 728.1): a row that claims an
+    /// output/storage/reparse decode must be named by the decode machinery
+    /// that owns it — decode_to_visible_text for Output rows (the
+    /// sanctioned transport→visible decoder, governance 3.2), or an
+    /// explicitly listed owner for markers consumed by their own boundary
+    /// helper (echo's $'...' fast path, substitution_metadata, ...). The
+    /// owner lists are pinned: adding a row with a boundary requires
+    /// naming its decoder here, which is exactly the audit trail #728
+    /// asked for.
+    #[test]
+    fn boundary_claims_name_a_decoder() {
+        // Markers decode_to_visible_text consumes (verified live below).
+        const VISIBLE_DECODER_OUTPUTS: [&str; 22] = [
+            "RAW_BYTE_MARKER_ESCAPE",
+            "CTLESC",
+            "PARAM_NAME_END_MARKER",
+            "DATA_BACKSLASH",
+            "PROTECTED_ESCAPED_SQUOTE",
+            "DATA_SQUOTE",
+            "DATA_DQUOTE",
+            "PATTERN_LITERAL_BACKSLASH",
+            "DATA_BACKTICK",
+            "QUOTED_WORD_PREFIX",
+            "IFS_GLUE",
+            "STORAGE_WORD_PREFIX",
+            "DATA_DOLLAR",
+            "DEFERRED_COMPOUND_BODY",
+            "ARRAYREF_FLAG",
+            "PATSUB_QUOTED_VALUE_START",
+            "PATSUB_QUOTED_VALUE_END",
+            "PATSUB_QUOTED_AMP",
+            "PATSUB_QUOTED_BACKSLASH",
+            "QUOTED_NULL_MARKER",
+            "FAILED_SUBSCRIPT_SENTINEL",
+            "LITERAL_CHAR_ESCAPE",
+        ];
+        // Markers whose named boundary is consumed by their own helper
+        // (documented at the row): owner decode fn, not the visible decoder.
+        const OWN_BOUNDARY_DECODERS: [&str; 37] = [
+            "PROTECTED_BACKSLASH",         // builtins/echo.rs $'...' fast path
+            "PROTECTED_LITERAL_BACKSLASH", // embedded_parameters walker tail
+            "PROTECTED_LITERAL_DOLLAR",    // embedded_parameters walker tail
+            "ANSI_C_QUOTE_MARKER", // decode_word_position_carriers / eval_source_for_reparse
+            "ANSI_C_DQUOTE_MARKER", // (also in the visible decoder list)
+            "ANSI_C_IFS_GUARD",    // markers::strip_ansi_c_ifs_guard
+            "SUBSCRIPT_CARRIER",   // substitution_metadata subscript decode
+            "PARSE_ERROR_FIELD_SEP", // parse_error payload split
+            "HEREDOC_WARNED_BODY_PREFIX", // execution_misc heredoc body strip
+            "QUOTED_WORD_VALUE_PREFIX", // expand/tilde QUOTED_ASSIGNMENT_VALUE
+            "HASH_ENV_FIELD_SEP",  // builtins/hash env serialization
+            "DIR_STACK_FIELD_SEP", // builtins/pushd env serialization
+            "PROMPT_IGNORE_START", // readline prompt-ignore layer
+            "PROMPT_IGNORE_END",   // readline prompt-ignore layer
+            "PREEXPANDED_STDIN_BODY", // execution_misc body consumer + parser raw-byte pair
+            "ARRAY_FIELD_SPLIT_MARKER", // declare/storage/array element split
+            "QUOTED_HEREDOC_MARKER", // execution_misc.rs body strip (QUOTED_HEREDOC_MARKER replace)
+            "COMPOUND_ASSIGNMENT_MARKER", // types.rs compound-operand strip
+            "COMSUB_PAYLOAD_PREFIX", // execution_misc decode_command_substitution_payload
+            "CASE_PATTERN_EXPECT", // parser/support.rs boundary-stack sentinel
+            "CASE_PATTERN_MAY_OPEN", // parser/support.rs boundary-stack sentinel
+            "CASE_PATTERN_PAREN",  // parser/support.rs boundary-stack sentinel
+            // The ASSIGN_* family restores through the assignment_expansion
+            // storage-restore chain (rubash#295/#218 restore tails; the
+            // #811 fragment-boundary strip).
+            "ASSIGN_DATA_SQUOTE",
+            "ASSIGN_DATA_DQUOTE",
+            "ASSIGN_DATA_BACKTICK",
+            "ASSIGN_ESCAPED_DQUOTE",
+            "ASSIGN_ESCAPED_SQUOTE",
+            "ASSIGN_ESCAPED_BACKSLASH",
+            "ASSIGN_HOISTED_SQUOTE",
+            "ASSIGN_HOISTED_BACKSLASH",
+            "COMPOUND_EXPANSION_WS_TAG",
+            "ASSIGN_SQ_DOLLAR",
+            "ASSIGN_SQ_BACKTICK",
+            "ASSIGN_SQ_BACKSLASH",
+            "ASSIGN_EXPANSION_BACKSLASH",
+            "ASSIGN_EXPANSION_DQUOTE",
+            "ASSIGN_EXPANSION_SQUOTE",
+        ];
+        // Multi-char string rows register their FIRST codepoint; keep the
+        // table honest against the consts.
+        for (name, first) in [
+            ("FAILED_SUBSCRIPT_SENTINEL", FAILED_SUBSCRIPT_SENTINEL),
+            ("QUOTED_HEREDOC_MARKER", QUOTED_HEREDOC_MARKER),
+            ("COMSUB_PAYLOAD_PREFIX", COMSUB_PAYLOAD_PREFIX),
+            ("COMPOUND_ASSIGNMENT_MARKER", COMPOUND_ASSIGNMENT_MARKER),
+            ("GROUP_REDIRECT_INJECTED_MARK", GROUP_REDIRECT_INJECTED_MARK),
+            ("CASE_PATTERN_EXPECT", CASE_PATTERN_EXPECT),
+            ("CASE_PATTERN_MAY_OPEN", CASE_PATTERN_MAY_OPEN),
+            ("CASE_PATTERN_PAREN", CASE_PATTERN_PAREN),
+        ] {
+            let row = MARKERS
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from MARKERS"));
+            assert_eq!(
+                row.code,
+                first.chars().next().unwrap() as u32,
+                "{name} registered codepoint does not match its const"
+            );
+        }
+        for m in MARKERS {
+            if m.boundaries.is_empty() {
+                continue;
+            }
+            let named = VISIBLE_DECODER_OUTPUTS.contains(&m.name)
+                || OWN_BOUNDARY_DECODERS.contains(&m.name);
+            assert!(
+                named,
+                "{} claims boundaries {:?} but no decoder owns it (rubash#728)",
+                m.name, m.boundaries
+            );
+            // Live check for the visible-decoder claims: a bare marker char
+            // must not survive decode_to_visible_text unchanged. The E000
+            // introducer decodes as a PAIR (E000+E001 = byte 0x01); a bare
+            // introducer is a documented recovery passthrough.
+            if VISIBLE_DECODER_OUTPUTS.contains(&m.name) {
+                if m.name == "RAW_BYTE_MARKER_ESCAPE" {
+                    let pair = format!(
+                        "{}{}",
+                        char::from_u32(m.code).unwrap(),
+                        char::from_u32(RAW_BYTE_MARKER_FIRST).unwrap()
+                    );
+                    let decoded = crate::locale::decode_to_visible_text(&pair);
+                    // E000 + E001 is byte 0x00 (payload = FIRST + byte).
+                    assert_eq!(
+                        decoded, "\u{0}",
+                        "RAW_BYTE_MARKER_ESCAPE pair must decode to its byte"
+                    );
+                } else if m.name == "LITERAL_CHAR_ESCAPE" {
+                    // E400 + c restores c (bare E400 is a documented literal
+                    // passthrough).
+                    let pair = format!("{}x", char::from_u32(m.code).unwrap());
+                    assert_eq!(
+                        crate::locale::decode_to_visible_text(&pair),
+                        "x",
+                        "LITERAL_CHAR_ESCAPE pair must restore the escaped char"
+                    );
+                } else if let Some(ch) = char::from_u32(m.code) {
+                    let text = ch.to_string();
+                    let decoded = crate::locale::decode_to_visible_text(&text);
+                    assert_ne!(
+                        decoded, text,
+                        "{} claims Output/Storage decode but decode_to_visible_text passes it through",
+                        m.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// rubash#728 §3 — `contains_word_marker_bytes` documents a scope, so
+    /// the "false negative is impossible" claim is now falsifiable: every
+    /// char-marker below U+0100 must either live in the predicate's C0
+    /// range or belong to the explicitly documented out-of-scope domains.
+    /// A new marker below U+0100 that fits neither fails here.
+    #[test]
+    fn word_marker_byte_predicate_scope_is_enforced() {
+        const OUT_OF_SCOPE_DOMAINS: [&str; 8] = [
+            // readline prompt-ignore layer
+            "PROMPT_IGNORE_START",
+            "PROMPT_IGNORE_END",
+            // compound-assignment / heredoc / array-element transport
+            "DEFERRED_COMPOUND_BODY",
+            "PREEXPANDED_STDIN_BODY",
+            "ARRAY_FIELD_SPLIT_MARKER",
+            // parser reader-state sentinels (NUL prefix)
+            "CASE_PATTERN_EXPECT",
+            "CASE_PATTERN_MAY_OPEN",
+            "CASE_PATTERN_PAREN",
+        ];
+        for m in MARKERS {
+            // Only C0 codepoints are in the predicate's byte domain; a
+            // named-string row's first char ('_' etc.) is ordinary ASCII.
+            if m.code >= 0x20 {
+                continue;
+            }
+            let in_range = (0x11..=0x1f).contains(&m.code);
+            let out_of_scope = OUT_OF_SCOPE_DOMAINS.contains(&m.name);
+            assert!(
+                in_range || out_of_scope,
+                "{} at U+{:04X} is a word-text byte outside the \
+                 contains_word_marker_bytes scope and not a documented domain exception",
+                m.name,
+                m.code
+            );
+        }
+    }
+
+    /// Decode a Rust char literal like `'\u{E401}'` / `'\x15'` / `'a'`.
+    fn decode_rust_char_literal(literal: &str) -> Option<char> {
+        let inner = literal.strip_prefix('\'')?.strip_suffix('\'')?;
+        if let Some(hex) = inner.strip_prefix("\\u{") {
+            let hex = hex.strip_suffix('}')?;
+            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+        }
+        if let Some(hex) = inner.strip_prefix("\\x") {
+            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+        }
+        inner.chars().next()
+    }
+
+    /// First codepoint of a Rust string literal (escapes understood).
+    fn decode_rust_str_first_codepoint(literal: &str) -> Option<char> {
+        let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+        if let Some(hex) = inner.strip_prefix("\\u{") {
+            let hex = hex.split('}').next()?;
+            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+        }
+        if let Some(hex) = inner.strip_prefix("\\x") {
+            let hex: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            return u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+        }
+        inner.chars().next()
     }
 }

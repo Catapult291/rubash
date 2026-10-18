@@ -5,7 +5,7 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
     if let Some(verdict) = simple_glob_matches(pattern, word, false) {
         return verdict;
     }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
+    if sides_need_byte_char_matching(pattern, word) {
         let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
         let word: Vec<char> = flatten_word_to_byte_chars(word);
         return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
@@ -22,7 +22,7 @@ pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str
     if let Some(verdict) = simple_glob_matches(pattern, word, true) {
         return verdict;
     }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
+    if sides_need_byte_char_matching(pattern, word) {
         let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
         let word: Vec<char> = flatten_word_to_byte_chars(word);
         return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
@@ -161,18 +161,68 @@ fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
     )
 }
 
+/// Normalization gate for byte-level matching (rubash#729).
+///
+/// GNU matches patterns and words as BYTE strings (subst.c pat_substr /
+/// sm_loop.c gmatch walk `unsigned char` buffers). Rubash transport has
+/// SEVERAL spellings for the same byte: the raw-byte marker pair
+/// (E000+E0xx, the entry encoding), a CTLESC-quoted pair (a quoted span
+/// quote-protects each pair char), a literal C0 char (a
+/// `substitution_result_visible_text` decode that re-materialized the
+/// byte), and the `__RUBASH_CSB1_xx;` payload (protect_command_substitution_
+/// output). Two sides carrying DIFFERENT spellings of the same byte must
+/// still match — `[[ $v == *"$(printf '\001')"* ]]` failed because the word
+/// held the pair while the quoted command-substitution pattern held the
+/// decoded C0 char.
+///
+/// The gate fires when EITHER side names a byte-level spelling: a raw-byte
+/// marker (0xEE is the UTF-8 lead byte of the whole PUA marker plane), a
+/// command-substitution payload prefix, or a literal C0 char outside
+/// \t/\n (0x01..=0x1f, the carrier-collision block; \t/\n words are the
+/// common case and match un-flattened today, so they keep the fast path).
+/// Both sides are then flattened, so CTLESC quote marks dequote
+/// identically and a quoted word (`[[ "a*b" == a* ]]`) still matches.
+///
+/// #735 safety: a user `$'\uE4xx'` char arrives E400-prefixed
+/// (push_literal_char); normalization never consumes an E400 escape (it
+/// has no E000/E0xx-pair or CSB1 shape), so escaped user data flattens
+/// identically on both sides and can never be read as a marker.
+fn sides_need_byte_char_matching(pattern: &str, word: &str) -> bool {
+    fn carries(text: &str) -> bool {
+        text.contains(crate::executor::markers::COMSUB_PAYLOAD_PREFIX)
+            || text
+                .bytes()
+                .any(|b| b == 0xEE || (b < 0x20 && b != b'\t' && b != b'\n'))
+    }
+    carries(pattern) || carries(word)
+}
+
+/// U+E100+byte byte-char → the byte it carries, or None for any other char.
+fn byte_char_value(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if (BYTE_CHAR_BASE..BYTE_CHAR_BASE + 0x100).contains(&code) {
+        Some((code - BYTE_CHAR_BASE) as u8)
+    } else {
+        None
+    }
+}
+
 /// Base for byte-char representation: U+E100 + byte value. This PUA range is
 /// disjoint from the raw-byte marker range (U+E000-U+E100) and from ASCII
 /// pattern syntax chars (*, ?, \), so byte-chars never collide with syntax.
 pub(crate) use crate::executor::markers::BYTE_CHAR_BASE;
 
 /// Flatten a pattern to byte-chars for byte-level matching. Pattern syntax
-/// chars (*, ?, \, CTLESC) are kept as-is; raw-byte markers become byte-chars;
-/// other chars become their UTF-8 byte-chars (each byte as U+E1xx).
+/// chars (*, ?, \, [, ], CTLESC) are kept as-is; raw-byte markers become
+/// byte-chars; other chars become their UTF-8 byte-chars (each byte as
+/// U+E1xx). A CTLESC-quoted raw-byte marker pair (`CTLESC E000 [CTLESC]
+/// E0xx`, the quoted-span spelling of the pair) resolves to the single
+/// byte-char the pair carries.
 fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
+    let pattern = decode_payload_prefixes_to_pairs(pattern);
     let mut output = Vec::new();
     let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -187,36 +237,121 @@ fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
                             .expect("byte-char is valid"),
                     );
                 }
-                _ => {
-                    let mut encoded = [0; 4];
-                    for byte in ch.encode_utf8(&mut encoded).as_bytes() {
-                        output.push(
-                            char::from_u32(BYTE_CHAR_BASE + *byte as u32).expect("byte-char"),
-                        );
-                    }
-                }
+                _ => output.push(ch),
             }
-        } else if ch == '*' || ch == '?' || ch == '\\' || ch == crate::executor::markers::CTLESC {
-            output.push(ch);
-        } else if ch == crate::executor::markers::PATTERN_LITERAL_BACKSLASH {
-            // Backslash data marker → byte-char for 0x5C
-            output.push(char::from_u32(BYTE_CHAR_BASE + 0x5C).expect("byte-char"));
+        } else if ch == crate::executor::markers::CTLESC {
+            // CTLESC quotes the next pattern char (parse.y:5694-5706
+            // got_escaped_character). When the quoted unit is a raw-byte
+            // marker pair — the char after CTLESC is the E000 introducer
+            // and the one after that the payload (itself possibly
+            // CTLESC'd) — the pair collapses to its byte-char. Any other
+            // CTLESC stays: case_pattern_atom_matches owns the escape arm.
+            match try_consume_ctlesc_quoted_pair(&mut chars) {
+                Some(byte_char) => output.push(byte_char),
+                None => output.push(ch),
+            }
+        } else if (ch as u32) < 0x20 {
+            // A literal C0 char (0x01..=0x1f) is a re-materialized byte
+            // (substitution_result_visible_text / printf octal escapes):
+            // normalize to its byte-char so it meets the pair spelling of
+            // the same byte on the other side.
+            output.push(char::from_u32(BYTE_CHAR_BASE + ch as u32).expect("byte-char"));
         } else {
-            let mut encoded = [0; 4];
-            for byte in ch.encode_utf8(&mut encoded).as_bytes() {
-                output.push(char::from_u32(BYTE_CHAR_BASE + *byte as u32).expect("byte-char"));
-            }
+            // Verbatim: syntax chars (* ? [ ] \) stay for the matcher's
+            // operator arms, ASCII members stay so bracket class names
+            // ([[:cntrl:]]) recognize, multibyte chars stay as single
+            // chars (the word side keeps the same literals — a carried
+            // INVALID byte meets them through the chars_match byte map).
+            output.push(ch);
         }
     }
     output
 }
 
+/// Consume an optional CTLESC-quoted raw-byte marker pair starting at the
+/// cursor (which sits just past a leading CTLESC). Returns the byte-char
+/// when the shape `E000 [CTLESC] payload` (payload in E001..=E100) is
+/// present; otherwise the cursor is untouched and None is returned.
+fn try_consume_ctlesc_quoted_pair(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<char> {
+    use crate::executor::substitution_metadata::{
+        RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
+    };
+    let mut probe = chars.clone();
+    let introducer = probe.next()?;
+    if introducer as u32 != RAW_BYTE_MARKER_ESCAPE {
+        return None;
+    }
+    // The payload char of a quoted pair can itself be CTLESC-protected
+    // (quote_string protects every char of the quoted span).
+    let payload = match probe.next()? {
+        crate::executor::markers::CTLESC => probe.next()?,
+        direct => direct,
+    };
+    if !(RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(payload as u32)) {
+        return None;
+    }
+    *chars = probe;
+    Some(
+        char::from_u32(BYTE_CHAR_BASE + (payload as u32 - RAW_BYTE_MARKER_FIRST))
+            .expect("byte-char is valid"),
+    )
+}
+
+/// Rewrite the `__RUBASH_CSB1_xx;` payload spelling (protect_command_substitution_
+/// output) into the raw-byte marker pair the byte-char walk understands, so
+/// a command-substitution byte meets the same byte in any other spelling
+/// (rubash#729). A doubled introducer (a literal prefix in the protected
+/// output) re-emits the prefix text.
+fn decode_payload_prefixes_to_pairs(text: &str) -> String {
+    const PREFIX: &str = crate::executor::markers::COMSUB_PAYLOAD_PREFIX;
+    if !text.contains(PREFIX) {
+        return text.to_string();
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(PREFIX) {
+        output.push_str(&rest[..index]);
+        let after = &rest[index + PREFIX.len()..];
+        if let Some(escaped) = after.strip_prefix(PREFIX) {
+            output.push_str(PREFIX);
+            rest = escaped;
+        } else if after.len() >= 3 && after.as_bytes()[2] == b';' {
+            if let Ok(byte) = u8::from_str_radix(&after[..2], 16) {
+                output.push(
+                    char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
+                        .expect("sentinel is valid"),
+                );
+                output.push(
+                    char::from_u32(
+                        crate::executor::substitution_metadata::RAW_BYTE_MARKER_FIRST + byte as u32,
+                    )
+                    .expect("marker char is valid"),
+                );
+                rest = &after[3..];
+            } else {
+                output.push_str(PREFIX);
+                rest = after;
+            }
+        } else {
+            output.push_str(PREFIX);
+            rest = after;
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 /// Flatten a word to byte-chars for byte-level matching. Raw-byte markers
-/// become byte-chars; Unicode chars become their UTF-8 byte-chars.
+/// become byte-chars; Unicode chars become their UTF-8 byte-chars. A
+/// CTLESC-quoted pair (the quoted-span spelling of a carried byte) resolves
+/// to its byte-char, symmetric with the pattern side.
 fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
+    let word = decode_payload_prefixes_to_pairs(word);
     let mut output = Vec::new();
     let mut chars = word.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -231,20 +366,25 @@ fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
                             .expect("byte-char is valid"),
                     );
                 }
-                _ => {
-                    let mut encoded = [0; 4];
-                    for byte in ch.encode_utf8(&mut encoded).as_bytes() {
-                        output.push(
-                            char::from_u32(BYTE_CHAR_BASE + *byte as u32).expect("byte-char"),
-                        );
+                _ => output.push(ch),
+            }
+        } else if ch == crate::executor::markers::CTLESC {
+            match try_consume_ctlesc_quoted_pair(&mut chars) {
+                Some(byte_char) => output.push(byte_char),
+                // A CTLESC quoting an ordinary char is word-text quoting
+                // state (the CTLESC port); the quoted char is the data.
+                None => {
+                    if let Some(quoted) = chars.next() {
+                        output.push(quoted);
                     }
                 }
             }
+        } else if (ch as u32) < 0x20 {
+            // Literal C0 char = re-materialized byte (see the pattern side).
+            output.push(char::from_u32(BYTE_CHAR_BASE + ch as u32).expect("byte-char"));
         } else {
-            let mut encoded = [0; 4];
-            for byte in ch.encode_utf8(&mut encoded).as_bytes() {
-                output.push(char::from_u32(BYTE_CHAR_BASE + *byte as u32).expect("byte-char"));
-            }
+            // Verbatim literal (see the pattern side for the arity note).
+            output.push(ch);
         }
     }
     output
@@ -676,6 +816,25 @@ fn named_collating_symbol(name: &str) -> Option<char> {
 }
 
 fn chars_match(pattern: char, candidate: char, nocase: bool) -> bool {
+    // Byte-chars (U+E100+byte) compare by the byte they carry: a pattern
+    // byte-char meets a word byte-char as equal bytes, and a byte-char meets
+    // a literal char only when the literal IS that byte (rubash#729 — GNU
+    // matches bytes, subst.c/sm_loop.c walk unsigned char buffers). PUA
+    // marker chars (E200-E4xx) never equal a byte: their codepoints exceed
+    // 0xFF, so the `as u32` compare below stays false — #735 user data
+    // (E400-escaped) can never be claimed as a byte value.
+    if let (Some(p), Some(c)) = (byte_char_value(pattern), byte_char_value(candidate)) {
+        return p == c;
+    }
+    if let Some(p) = byte_char_value(pattern) {
+        return p as u32 == candidate as u32;
+    }
+    if let Some(c) = byte_char_value(candidate) {
+        // Only an ASCII literal can name the same byte (GNU compares
+        // bytes; a multibyte literal like U+00E9 is bytes C3 A9 in GNU and
+        // never equals a lone carried 0xE9).
+        return pattern.is_ascii() && pattern as u32 == c as u32;
+    }
     if nocase {
         pattern.eq_ignore_ascii_case(&candidate)
     } else {
@@ -684,6 +843,13 @@ fn chars_match(pattern: char, candidate: char, nocase: bool) -> bool {
 }
 
 fn comparable_char(ch: char, nocase: bool) -> char {
+    // Bracket ranges compare in byte order (sm_loop.c U_STRING_PRECOMPARE /
+    // unsigned char ranges): a byte-char participates as its byte value so
+    // `[$'\001'-$'\005']` covers the carried bytes, and a byte-char never
+    // falls inside a literal ASCII range it does not carry.
+    if let Some(byte) = byte_char_value(ch) {
+        return char::from(byte);
+    }
     if nocase {
         ch.to_ascii_lowercase()
     } else {
@@ -712,6 +878,14 @@ fn bracket_posix_class_matches(
 }
 
 fn posix_class_matches(class: &str, candidate: char) -> bool {
+    // A byte-char (U+E100+byte, the carried raw byte) classifies as its
+    // byte: [[:cntrl:]] must match a carried 0x01 exactly like GNU's
+    // iscntrl(byte) does (rubash#729 — subst.c/sm_loop.c classify raw
+    // bytes, glibc C-locale <ctype.h> tables).
+    let candidate = match byte_char_value(candidate) {
+        Some(byte) => char::from(byte),
+        None => candidate,
+    };
     match class {
         "alnum" => candidate.is_ascii_alphanumeric(),
         "alpha" => candidate.is_ascii_alphabetic(),
@@ -723,7 +897,9 @@ fn posix_class_matches(class: &str, candidate: char) -> bool {
         "lower" => candidate.is_ascii_lowercase(),
         "print" => candidate.is_ascii_graphic() || candidate == ' ',
         "punct" => candidate.is_ascii_punctuation(),
-        "space" => candidate.is_ascii_whitespace(),
+        // glibc C locale is_space: space, \t, \n, \v, \f, \r. Rust's
+        // is_ascii_whitespace excludes \v (0x0b) — GNU matches it.
+        "space" => matches!(candidate, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'),
         "upper" => candidate.is_ascii_uppercase(),
         "word" => candidate.is_ascii_alphanumeric() || candidate == '_',
         "xdigit" => candidate.is_ascii_hexdigit(),

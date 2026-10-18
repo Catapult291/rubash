@@ -5,7 +5,7 @@ issue-703	703	diverges	herdoc + pipeline inside quoted $( )
 issue-704	704	diverges	printf numeric / command -v multi / ~+ assignment / BASH_ARGC
 issue-733	733	diverges	compound-assignment quote leak between entries
 issue-734	734	diverges	assoc subscript via ANSI-C quoting
-issue-735	735	diverges	user-typed PUA collides with the marker registry
+issue-735	735	must-match	user-typed PUA collides with the marker registry (promoted 2026-10-13, #728/#729 round: still matches)
 issue-737	737	diverges	kill does not reach background shell children (stderr)
 issue-738	738	diverges	heredoc delimiter dequoted by dropping quotes
 issue-742	742	diverges	unbraced $name swallows a following backslash-escape
@@ -26,3 +26,5 @@ loc-l5-read-cr	772	diverges	issue #769: read -r strips a trailing CR
 lim-f5-fd-cap	773	diverges	issue #770: fd table caps at 1014 with 'cannot duplicate fd: Invalid argument'
 lim-f6-nul	773	diverges	issue #770: read counts NUL bytes (8 vs 6); comsub does not warn
 lim-f7-closed-fd0	773	diverges	issue #770: closed fd 0 then re-redirect -> Bad file descriptor
+carrier-729-cntrl	729	must-match	byte-char classes + removal/patsub on carried bytes (746 case 729.1/729.2)
+carrier-735-escape	735	must-match	user E4xx data E400 round-trip vs #729 normalization (746 case 735.1/735.2)

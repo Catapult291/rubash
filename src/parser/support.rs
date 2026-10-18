@@ -1,4 +1,5 @@
 use super::*;
+use crate::executor::markers::{CASE_PATTERN_EXPECT, CASE_PATTERN_MAY_OPEN, CASE_PATTERN_PAREN};
 use crate::lexer::{Token, TokenKind};
 
 pub(super) fn note_command_line(cmd: &mut CommandNode, token: &Token) {
@@ -294,14 +295,8 @@ const LOOP_BODY_TERMINATOR: &str = "done-or-brace";
 /// (only `esac' can match, and only when the previous token is not `|',
 /// parse.y:3181 Posix grammar rule 4). The NUL prefix cannot collide with
 /// any token value the stack otherwise holds.
-const CASE_PATTERN_EXPECT: &str = "\u{0}case-pattern";
-/// Entered right after `in' or a clause terminator: the NEXT token may be
-/// the optional clause-opening `(' (parse.y:1231), which is grammar, not
-/// extglob nesting.
-const CASE_PATTERN_MAY_OPEN: &str = "\u{0}case-pattern-may-open";
-/// An extglob `(' opened inside the pattern text (parse.y:5466 absorbs
-/// these into the pattern word in GNU; rubash's tokenizer emits them).
-const CASE_PATTERN_PAREN: &str = "\u{0}case-pattern-paren";
+// rubash#728: the sentinel consts moved to src/executor/markers.rs —
+// governance 3.1's single declaration point. The doc comments live there.
 
 /// The clause `)' that closes a pattern region: expected only when a
 /// pattern sentinel sits on top of the stack.

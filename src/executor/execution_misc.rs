@@ -960,7 +960,16 @@ pub(in crate::executor) fn command_substitution_value_needs_payload_protection(
         && !source.contains('`')
         && !value.contains(COMMAND_SUBSTITUTION_PAYLOAD_PREFIX)
         && value.chars().any(|ch| {
-            (crate::executor::markers::ARRAY_FIELD_SPLIT_MARKER..=DATA_DOLLAR).contains(&ch)
+            // Same byte set protect_command_substitution_output encodes
+            // (rubash#729): the registered C0 markers below 0x10 plus the
+            // 0x10..=0x1f carrier block.
+            matches!(
+                ch,
+                crate::executor::markers::PROMPT_IGNORE_START
+                    | crate::executor::markers::PROMPT_IGNORE_END
+                    | crate::executor::markers::DEFERRED_COMPOUND_BODY
+                    | crate::executor::markers::PREEXPANDED_STDIN_BODY
+            ) || (crate::executor::markers::ARRAY_FIELD_SPLIT_MARKER..=DATA_DOLLAR).contains(&ch)
         })
 }
 
@@ -972,7 +981,22 @@ pub(in crate::executor) fn protect_command_substitution_output(value: &str) -> S
     let mut output = String::with_capacity(escaped_value.len());
     for ch in escaped_value.chars() {
         match ch {
-            crate::executor::markers::ARRAY_FIELD_SPLIT_MARKER..=DATA_DOLLAR => output.push_str(
+            // C0 text-layer carrier bytes travel as CSB1 payloads, never as
+            // literal chars. 0x10..=0x1f was the original set; rubash#729
+            // adds the registered markers below it that a
+            // substitution_result_visible_text decode can re-materialize
+            // from the child's output: 0x01/0x02 (PROMPT_IGNORE_*), 0x03
+            // (DEFERRED_COMPOUND_BODY), 0x05 (PREEXPANDED_STDIN_BODY). A
+            // literal 0x01-0x05 escaping into pattern/word text is
+            // indistinguishable from those markers and gets claimed by
+            // their consumers. Whitespace and unregistered bytes (0x06-0x08,
+            // 0x09-0x0a, 0x0b, 0x0d-0x0f) carry no marker and stay literal
+            // so field splitting and line arms keep working.
+            crate::executor::markers::PROMPT_IGNORE_START
+            | crate::executor::markers::PROMPT_IGNORE_END
+            | crate::executor::markers::DEFERRED_COMPOUND_BODY
+            | crate::executor::markers::PREEXPANDED_STDIN_BODY
+            | crate::executor::markers::ARRAY_FIELD_SPLIT_MARKER..=DATA_DOLLAR => output.push_str(
                 &format!("{COMMAND_SUBSTITUTION_PAYLOAD_PREFIX}{:02x};", ch as u32),
             ),
             '`' => output.push(crate::executor::markers::DATA_BACKTICK),
