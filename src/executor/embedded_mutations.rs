@@ -1793,6 +1793,14 @@ impl Executor {
         source: &str,
         context: SubstitutionQuoteContext,
     ) -> SubstitutionOutput {
+        // rubash#815 profiler: the command-substitution frame (subst.c:7143
+        // command_substitute) for the assignment/parameter expansion
+        // dispatch — this entry runs shortcut bodies (function calls,
+        // heredocs, word lists) in the current shell, so the frame must open
+        // here rather than at the child-executor path. enter_comsub
+        // deduplicates against the &self wrapper entry this function calls
+        // into for its specialized routes.
+        let _profiler_comsub = super::profiler::enter_comsub();
         // GNU command_substitute (subst.c:7143) runs the body in a subshell:
         // arithmetic subscript writes queued inside never reach the parent
         // environment. Scope the deferred-write queue to this substitution.

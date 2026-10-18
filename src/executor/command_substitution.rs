@@ -582,6 +582,12 @@ impl Executor {
         source: &str,
         context: SubstitutionQuoteContext,
     ) -> String {
+        // rubash#815 profiler: the command-substitution frame (subst.c:7143
+        // command_substitute) — the fork face of the attribution three-way
+        // split. enter_comsub deduplicates the engine's nested dispatch
+        // entries (the mut typed dispatcher opens its own; the typed child
+        // path below routes through this one).
+        let _profiler_comsub = super::profiler::enter_comsub();
         self.last_command_substitution_status.set(Some(0));
         self.last_command_substitution_parse_error.set(false);
         // A command substitution is a subshell boundary: GNU runs the body
@@ -1233,6 +1239,10 @@ impl Executor {
 
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // rubash#815: the comsub frame is opened by the dispatch entries
+        // (expand_command_substitution_with_context / the mut typed
+        // dispatcher) — every route into this child executor passes one of
+        // them, so no second frame is opened here.
         // GNU subst.c:7393-7404 (command_substitute child): the body runs
         // through parse_and_execute inside the forked child, whose top_level
         // setjmp turns a fatal word-expansion longjmp (FORCE_EOF/DISCARD)
@@ -1671,6 +1681,9 @@ impl Executor {
         }
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // rubash#815 profiler: the `${ ... }` funsub runs as "nofork comsub"
+        // (subst.c:7101) — same independent fork-face frame as `$(...)`.
+        let _profiler_comsub = super::profiler::enter_comsub();
         // GNU subst.c:7101 runs the funsub body through parse_and_execute
         // ("nofork comsub") → evalstring.c:348 indirection_level++, so the
         // body's traces render one PS4 level deeper (`${ echo cur; }` under

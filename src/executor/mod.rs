@@ -98,6 +98,7 @@ pub mod identity;
 mod init;
 
 pub use init::RESPAWNED_CHILD;
+pub mod profiler;
 // rubash#331: the binary crate renders its self-produced path values
 // (BASH, argv[0]-derived $0) through the same POSIX-form display the
 // executor uses for $PWD.

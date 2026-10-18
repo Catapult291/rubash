@@ -273,6 +273,23 @@ impl Executor {
         args: &[String],
         call_cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#815 profiler: the function entry/exit seam (GNU
+        // execute_cmd.c:5200 execute_function). The Drop guard attributes
+        // every exit form — normal return, `return`, `exit`, and the
+        // expansion-failure / exit-code aborts — exactly once, so abort
+        // shapes land on the function boundary like GNU's unwind-protected
+        // frame restore does. Off path: one relaxed AtomicBool load.
+        let _profiler_frame = super::profiler::enter_function(name);
+        self.execute_function_dispatch(name, args, call_cmd)
+    }
+
+    /// The unprofiled body of [`Self::execute_function`] (seam wrapper above).
+    fn execute_function_dispatch(
+        &mut self,
+        name: &str,
+        args: &[String],
+        call_cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
         let Some(body) = self.shell_state.functions.get(name).cloned() else {
             return Ok(());
         };

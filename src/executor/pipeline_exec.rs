@@ -1228,6 +1228,12 @@ impl Executor {
             specs.push(spec);
         }
 
+        // rubash#815 profiler: the all-external concurrent pipeline spawns
+        // every member outside execute_external_pipeline_stage, so the spawn
+        // face gets one composite frame around spawn+wait. Per-element frames
+        // would break the profiler's stack discipline — the members' wall
+        // time overlaps, which a sequential frame stack cannot represent.
+        let _profiler_external_pipeline = super::profiler::enter_external("pipeline");
         let results = self.spawn_wait_concurrent_external_stages(commands, specs)?;
         let (_, stderr, _) = results.last().unwrap();
         self.write_pipeline_output(
@@ -3158,6 +3164,15 @@ impl Executor {
             }
         }
 
+        // rubash#815 profiler: the pipeline-stage dispatch point (GNU runs
+        // every element through execute_simple_command in its forked child,
+        // execute_cmd.c:2620 execute_pipeline -> 4617). Armed TENTATIVE like
+        // the top-level dispatch frame: the arms that re-route through the
+        // classified helpers cancel it (external stage guard, function
+        // entry, the builtin stage's re-dispatch through execute_command),
+        // and a pure inline fast-path arm (`echo`/`printf`/`tr`/...) is
+        // confirmed as a builtin when the stage returns.
+        let _profiler_stage = super::profiler::enter_prepared_command(name);
         match name {
             "true" | ":" => Ok(Some((String::new(), String::new(), 0))),
             "false" => Ok(Some((String::new(), String::new(), 1))),

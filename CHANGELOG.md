@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **脚本级函数级性能剖析器**（#815）：`niu --profile <script> [--profile-output <base>]`——解释器确定性插桩（非采样），在函数入口/出口（`execute_cmd.c:5200 execute_function` 家族）、简单命令分发点（`execute_cmd.c:624`，试探帧由真实分发自分类：函数/外部派发取消、其余确认为内建——无第二准入表）、外部 spawn 面、`( )` 子壳与 `$()` 命令替换独立栈帧（subst.c:7143）挂 Drop 守卫；return/exit/展开失败等中止形态经栈展开正确归因。运行时为 thread_local 调用树（self=elapsed−children，唯一 collapsed 路径聚合 count/self/total），归因三分离（内建/外部 spawn/子壳，self-time 切分面总和=100%）。输出文本调用树（self/children/calls 排序）+ collapsed-stack（flamegraph/speedscope 可渲染）；报告只写文件（默认进程 temp 目录，绝不 stdout/stderr）——profile 开启时 stdout/stderr/rc 与关闭逐字节一致。关闭路径开销=每缝一次 relaxed AtomicBool load，#607-#609 热路探针 A/B（master 对比）零回退。招牌验收：83 套件 GNU 差分全集 profiler 开启重跑，失败集与基线双向一致（scripts/check-profile-differential.sh 脚本化）。
+
 ### 性能
 
 - **字面单命令跳过词展开重建**（#607，PR #665）：每个简单命令在 `expand_command_words` 里付一次全量 `CommandNode` 重建（~1.34µs/次），裸 `:` 的展开恒为 identity。GNU 从不重建（`execute_cmd.c:4468` 跑存储的 SIMPLE_COM；`subst.c:13219` 无触发器文本无事可做）。白名单准入（单字面词、全部结构/重定向/赋值通道为空，`[`/`[[`/分发动词除外），共享 `preserves_word_metadata` 谓词（提取复用、永不复制），契约测试逐词锁定 fast==pipeline。`:` 循环 2.03x→1.77x GNU（~0.74µs/iter），`true` 1.86x→1.67x；`((1))` 路径按设计不动。门禁与 niubash 产品 A/B 零差异。
