@@ -2884,6 +2884,14 @@ impl Executor {
         cmd: &CommandNode,
         auto_close: bool,
     ) -> Result<bool, ExecuteError> {
+        // RESTRICTED_SHELL (#804 F1): the refusal must precede
+        // redir_varassign — GNU checks restricted before the varassign arm
+        // opens or creates the target — so `{v}> f` never materializes or
+        // truncates `f` on any applier path (simple-command preflight and
+        // the exec-with-operand site alike).
+        if self.reject_restricted_fd_var_redirects(cmd)? {
+            return Ok(true);
+        }
         let mut redirect_failed = false;
         self.fd_var_external_undo.clear();
         for redirect in &cmd.redirects {

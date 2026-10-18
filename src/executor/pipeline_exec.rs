@@ -2989,11 +2989,6 @@ impl Executor {
                 .map(Some);
         };
 
-        if let Some(restricted) = self.restricted_command_error(command, name) {
-            self.pipeline_stage_restricted_refused.set(true);
-            return Ok(Some((String::new(), restricted, 1)));
-        }
-
         // Bash applies a pipeline element's redirections before running the
         // command (redir.c do_redirection_internal runs for every command, and
         // the dup arms report failures through the already-redirected fd2).
@@ -3003,6 +2998,13 @@ impl Executor {
         // into the pipe. Run the same ordered redirect preflight the top-level
         // builtin path uses; with the stdout capture active, a 2>&1-routed
         // diagnostic lands in this stage's stdout (the pipe) like GNU's.
+        // #804 F2: the gate runs BEFORE the restricted scan — GNU's
+        // do_redirections (execute_builtin_or_function execute_cmd.c:5606)
+        // precedes the builtin, and per-entry it reports ambiguity before
+        // the RESTRICTED_REDIRECT refusal (redir.c:914 precedes :919), with
+        // the diagnostic routed through the dup already applied (`2>&1 >& f`
+        // reports into the pipe). The scan below therefore only speaks for
+        // the command-NAME forms the gate cannot see.
         let saved_capture = crate::executor::shell_options::begin_stdout_capture();
         // GNU applies the element's redirections before the command runs
         // (redir.c do_redirections in the forked element), so an invalid or
@@ -3041,6 +3043,11 @@ impl Executor {
             )));
         }
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
+
+        if let Some(restricted) = self.restricted_command_error(command, name) {
+            self.pipeline_stage_restricted_refused.set(true);
+            return Ok(Some((String::new(), restricted, 1)));
+        }
 
         // GNU execute_simple_command (execute_cmd.c): a pipeline element
         // whose words all expand to zero fields is a null command - its

@@ -72,11 +72,17 @@ fn compound_assignment_carrier_word_decodes_to_visible_text() {
 /// The carrier may sit mid-word and in user data; the decoder consumes the
 /// reserved string everywhere on the visible-text boundary (same reserved
 /// stance the assignment boundary takes for a leading occurrence:
-/// `x=__RUBASH_CA1__` already stores an empty value on master).
+/// `x=__RUBASH_CA1__` already stores an empty value on master, so the
+/// decoded word shape `x=` is what a display consumer must see).
 #[test]
 fn compound_assignment_carrier_is_consumed_wherever_it_rides() {
     assert_eq!(decode_to_visible_text("__RUBASH_CA1__(a b)"), "(a b)");
     assert_eq!(decode_to_visible_text("a__RUBASH_CA1__b"), "ab");
+    assert_eq!(
+        decode_to_visible_text("x=__RUBASH_CA1__"),
+        "x=",
+        "a leading carrier after `=` decodes to the stored-empty word shape"
+    );
     assert_eq!(decode_to_visible_text("x="), "x=");
     assert_eq!(
         decode_to_visible_text("__RUBASH_CA1_nearly__"),

@@ -390,3 +390,126 @@ fn pipeline_member_and_fd_var_spelling_match_gnu() {
     );
     drop_sandbox(&dir);
 }
+
+/// #804 F1: the fd-var spellings refuse BEFORE redir_varassign opens or
+/// creates anything — GNU's restricted check precedes the varassign arm,
+/// so `{v}> f` leaves no file and a pre-existing target keeps its bytes
+/// (no truncate-to-zero). Every applier path is pinned: the simple-command
+/// preflight, the exec builtin's stdio-only and with-operand sites, and a
+/// pipeline member.
+#[test]
+fn fd_var_write_spellings_never_materialize_the_target() {
+    let dir = sandbox("f1-fdvar");
+    let seed = dir.join("rb804-f1-seed.txt");
+    fs::write(&seed, "PRE-EXISTING-CONTENT\n").expect("seed target");
+
+    // fresh target: no file may appear; seeded target: content unchanged.
+    // (fresh, seeded) pairs per spelling, on the simple-command path.
+    for script in [
+        "echo hi {v}> rb804-f1.txt",
+        "echo hi {v}>> rb804-f1.txt",
+        "echo hi {v}<> rb804-f1.txt",
+        "echo hi {v}>| rb804-f1.txt",
+    ] {
+        fs::copy(&seed, dir.join("rb804-f1.txt")).expect("reseed target");
+        let out = run_r(&dir, script);
+        assert_eq!(out.status, 1, "{script}: {:?}", out.stderr);
+        assert!(
+            out.stderr.contains("v: restricted: cannot redirect output"),
+            "{script}: {:?}",
+            out.stderr
+        );
+        let leftover = fs::read_to_string(dir.join("rb804-f1.txt")).unwrap_or_default();
+        assert_eq!(
+            leftover, "PRE-EXISTING-CONTENT\n",
+            "{script} must not create or truncate the target"
+        );
+    }
+
+    // exec builtin, both its appliers: the stdio-only no-operand form and
+    // the with-operand redir_varassign site.
+    for script in [
+        "exec {v}> rb804-f1e.txt",
+        "exec cat {v}> rb804-f1e.txt < /dev/null",
+    ] {
+        let out = run_r(&dir, script);
+        assert!(
+            out.stderr.contains("v: restricted: cannot redirect output"),
+            "{script}: {:?}",
+            out.stderr
+        );
+        assert!(
+            !dir.join("rb804-f1e.txt").exists(),
+            "{script} materialized the target"
+        );
+    }
+
+    // pipeline member: the refusal precedes the member's wiring, so the
+    // target never appears (pipeline rc is the consumer's, like GNU).
+    let member = run_r(&dir, "echo piped | cat {v}> rb804-f1m.txt\n");
+    assert!(
+        member
+            .stderr
+            .contains("v: restricted: cannot redirect output"),
+        "{:?}",
+        member.stderr
+    );
+    assert!(
+        !dir.join("rb804-f1m.txt").exists(),
+        "member refusal materialized the target"
+    );
+
+    // read-only fd-var input stays allowed ({v}< is not in WRITE_REDIRECT).
+    let input = run_r(&dir, "echo shell-input-ok {v}< /dev/null\n");
+    assert_eq!(input.status, 0, "{:?}", input.stderr);
+    assert!(
+        input.stdout.contains("shell-input-ok"),
+        "{:?}",
+        input.stdout
+    );
+    drop_sandbox(&dir);
+}
+
+/// #804 F2: a pipeline member's redirect failure follows GNU's
+/// do_redirections order and stream routing — ambiguity beats the
+/// restricted refusal on the same entry (redir.c:914 precedes :919), and
+/// a refusal AFTER an applied `2>&1` rides the dup into the pipe (the
+/// consumer's stdin), not the shell's stderr. Neither case materializes.
+#[test]
+fn pipeline_member_redirect_failures_keep_gnu_order_and_routing() {
+    let dir = sandbox("f2-member");
+    // ambiguity first: no "restricted" wording anywhere.
+    let ambiguous = run_r(&dir, "echo hi > $unsetv | cat\n");
+    assert!(
+        ambiguous.stderr.contains("$unsetv: ambiguous redirect"),
+        "stderr: {:?}",
+        ambiguous.stderr
+    );
+    assert!(
+        !ambiguous.stderr.contains("restricted"),
+        "stderr: {:?}",
+        ambiguous.stderr
+    );
+    assert_eq!(ambiguous.status, 0, "pipeline rc is the consumer's");
+
+    // order routing: the refusal after `2>&1` lands in the pipe; nothing
+    // on stderr, no target file.
+    let routed = run_r(&dir, "echo hi 2>&1 >& rb804-f2.txt | cat\n");
+    assert!(
+        routed
+            .stdout
+            .contains("rb804-f2.txt: restricted: cannot redirect output"),
+        "the refusal rides the dup into the pipe: {:?}",
+        routed
+    );
+    assert!(
+        !routed.stderr.contains("restricted"),
+        "stderr must stay clean: {:?}",
+        routed.stderr
+    );
+    assert!(
+        !dir.join("rb804-f2.txt").exists(),
+        "the refused target must not materialize"
+    );
+    drop_sandbox(&dir);
+}

@@ -218,6 +218,44 @@ impl Executor {
     /// Diagnostics are order-routed (issue #250 semantics): only the
     /// redirects BEFORE the failing entry have applied, so a preceding
     /// `2>/dev/null` silences and a following one leaks.
+    /// RESTRICTED_SHELL pre-check for the fd-var redirect appliers
+    /// (#804 F1): GNU refuses the write directions BEFORE redir_varassign
+    /// opens or creates anything (redir.c:919 precedes the varassign arm),
+    /// so `{v}> f` / `{v}>> f` / `{v}<> f` / `{v}>| f` must not materialize
+    /// or truncate the target. Returns true when a refusal was reported
+    /// (status 1 set, diagnostic routed through the redirects BEFORE the
+    /// offending entry like issue #250); the caller skips the command.
+    /// Dup varassign spellings (`{v}>&N`) and read-only `{v}< f` are not
+    /// in WRITE_REDIRECT and stay allowed.
+    pub(in crate::executor) fn reject_restricted_fd_var_redirects(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<bool, ExecuteError> {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
+            return Ok(false);
+        }
+        let Some((index, redirect)) = cmd.redirects.iter().enumerate().find(|(_, redirect)| {
+            redirect.fd_var.is_some() && is_restricted_write_redirect(&redirect.kind)
+        }) else {
+            return Ok(false);
+        };
+        // redir.c:137-138: the varassign refusal names the variable. The
+        // target word still expands first (redirection_expand runs before
+        // the RESTRICTED_REDIRECT check), keeping the expansion side
+        // effects GNU would have.
+        let _ = self.expand_redirect_target(redirect);
+        let mut stderr = Vec::new();
+        writeln!(
+            &mut stderr,
+            "{}{}: restricted: cannot redirect output",
+            self.diagnostic_prefix(),
+            redirect.fd_var.as_deref().unwrap_or_default()
+        )?;
+        self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
+        self.exit_code = 1;
+        Ok(true)
+    }
+
     pub(in crate::executor) fn reject_invalid_redirects(
         &mut self,
         cmd: &CommandNode,
