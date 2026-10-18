@@ -1371,6 +1371,17 @@ impl Executor {
         cmd: &CommandNode,
         if_command: &IfCommand,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804): the compound's redirects apply before
+        // the body runs, so the refusal must land before any clone, splice
+        // or target creation — GNU leaves no file behind and never runs
+        // the body.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         if self.if_command_needs_alias_scan(if_command) {
             let flat = flatten_if_command_for_alias_scan(cmd, if_command);
             crate::builtins::source::execute_simple_if(self, &flat, 0)?;
@@ -1411,6 +1422,14 @@ impl Executor {
         cmd: &CommandNode,
         loop_command: &LoopCommand,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804): refuse before any splice or creation.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         let mut redirect_cmd = cmd.clone();
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
@@ -1466,6 +1485,19 @@ impl Executor {
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
         self.shell_state.loop_depth = 0;
+
+        // RESTRICTED_SHELL (#804): the subshell's redirects apply inside
+        // the child before the body (do_redirections precedes the list), so
+        // the refusal lands before any splice, anchor or target creation —
+        // nothing is created and the body never runs, like GNU's child
+        // dying at do_redirections with status 1.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
 
         // Assignment prefix (`x=1 (cmd)`, #452): GNU apply_shell_assignments
         // runs the prefix inside the forked child, so the values live only
@@ -2608,6 +2640,14 @@ impl Executor {
         // fields the cmd + case_command deep clones and the no-op redirect
         // application only add per-execution churn; keep the ambient line
         // binding (line_number = case_command->line) semantics intact.
+        // RESTRICTED_SHELL (#804): refuse before any splice or creation.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         if !compound_command_has_redirects(cmd) {
             let case_line = cmd.line;
             return self.with_ambient_line(case_line, |executor| {
@@ -2791,7 +2831,7 @@ fn if_condition_is_side_effect_free(condition: &[CommandNode]) -> bool {
 /// do. Mirrors every field consulted by materialize_compound_output_
 /// process_substitutions, apply_*_redirects, and with_command_input_redirects
 /// (rubash#619 fast path).
-fn compound_command_has_redirects(cmd: &CommandNode) -> bool {
+pub(in crate::executor) fn compound_command_has_redirects(cmd: &CommandNode) -> bool {
     cmd.redirect_in.is_some()
         || cmd.redirect_out.is_some()
         || cmd.append.is_some()

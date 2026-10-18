@@ -854,6 +854,13 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// Set by `restricted_command_error` when a sequential pipeline stage is
+    /// refused (#804): the driver then skips `route_pipeline_stage_streams`
+    /// for the stage, because the routing walk would OPEN the refused
+    /// redirect's target (`>& f`) and materialize the very file the
+    /// restricted shell must never create — GNU refuses the member inside
+    /// its subshell before do_redirections, so nothing opens.
+    pipeline_stage_restricted_refused: Cell<bool>,
     /// Tracks the source of the last heredoc EOF warning emitted from
     /// command_substitution_heredoc_output_mut_typed, to avoid duplicate
     /// warnings when the same comsub is expanded through multiple paths

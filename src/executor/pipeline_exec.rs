@@ -243,6 +243,26 @@ impl Executor {
         command: &CommandNode,
     ) -> Result<bool, ExecuteError> {
         if let Some(brace_group) = &command.brace_group {
+            // RESTRICTED_SHELL (#804): the group's do_redirections precede
+            // the body (GNU applies a compound's redirects before executing
+            // it, execute_cmd.c:5606 for the builtin/function class and
+            // do_redirection_internal for the group class), so a restricted
+            // shell refuses here — BEFORE apply_brace_group_redirects
+            // creates any target file or splices into the body — and skips
+            // the body with status 1 (GNU: `{ echo down; } >& f` leaves no
+            // file, prints "<f>: restricted: cannot redirect output", body
+            // never runs). Without this the group's mirrors went straight
+            // to create_redirect_output, materializing the file the
+            // restricted shell must never create.
+            if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted")
+                && compound_command_has_redirects(command)
+            {
+                if let Some(message) = self.restricted_compound_redirect_error(command)? {
+                    self.write_default_stderr(&message)?;
+                    self.exit_code = 1;
+                    return Ok(true);
+                }
+            }
             // GNU execute_cmd.c:826-828: cm_group is a shell control
             // structure, so `{ } <f` sets the sticky stdin_redir flag the
             // same way `while ... done <f` does — the check lives in
@@ -789,7 +809,14 @@ impl Executor {
             // below would re-open `>f` and truncate what the child wrote
             // live.
             let stage_fds_pre_wired = self.pipeline_stage_fds_pre_wired.replace(false);
+            // #804: a stage `restricted_command_error` refused must not have
+            // its write redirects materialized by the routing walk — GNU
+            // refuses the member inside its subshell BEFORE
+            // do_redirections, so `echo hi >& f | cat` never creates `f`
+            // (the refusal already rides `next_stderr`/`next_status`).
+            let stage_restricted_refused = self.pipeline_stage_restricted_refused.replace(false);
             if !stage_fds_pre_wired
+                && !stage_restricted_refused
                 && !command_is_compound_pipeline_stage(command)
                 && !in_shell_stage
             {
@@ -2963,6 +2990,7 @@ impl Executor {
         };
 
         if let Some(restricted) = self.restricted_command_error(command, name) {
+            self.pipeline_stage_restricted_refused.set(true);
             return Ok(Some((String::new(), restricted, 1)));
         }
 
@@ -3612,28 +3640,86 @@ impl Executor {
                 }
             }
         }
-        if name == "command"
-            && command
-                .words
-                .iter()
-                .skip(1)
-                .any(|word| self.expand_word(word) == "-p")
-        {
-            return Some(format!(
-                "{}command: -p: restricted\n",
-                self.diagnostic_prefix()
-            ));
+        if name == "command" {
+            // #804 gap 13: GNU strips the `command` prefix at
+            // execute_simple_command (CMD_COMMAND_BUILTIN pseudo-reserved
+            // prefix, execute_cmd.c) and dispatches the operand as the
+            // command, so the RESTRICTED_SHELL '/' scan at
+            // execute_disk_command (execute_cmd.c:5789) fires on the FIRST
+            // operand word — `command /bin/echo` reports
+            // "/bin/echo: restricted: cannot specify `/' in command names".
+            // Option forms mirror command_builtin's own option loop
+            // (command.def:68-103 + internal_getopt): `-p` in OPTION
+            // position is refused before anything else (sh_restricted("-p")
+            // — `command echo -p` treats the `-p` as echo's argument and
+            // runs it), `-v`/`-V` take the describe path that returns
+            // before any execution (command.def:104-118) so their operands
+            // are not checked, `--` ends the option list, and any other
+            // option is a usage error at the builtin that never reaches
+            // execution either.
+            let mut option_scan = true;
+            let mut verbose = false;
+            let mut operand: Option<String> = None;
+            for word in command.words.iter().skip(1) {
+                let value = self.expand_word(word);
+                if option_scan {
+                    match value.as_str() {
+                        "--" => {
+                            option_scan = false;
+                            continue;
+                        }
+                        "-p" => {
+                            return Some(format!(
+                                "{}command: -p: restricted\n",
+                                self.diagnostic_prefix()
+                            ));
+                        }
+                        "-v" | "-V" => {
+                            verbose = true;
+                            continue;
+                        }
+                        other if other.starts_with('-') && other.len() > 1 => continue,
+                        _ => option_scan = false,
+                    }
+                }
+                operand = Some(value);
+                break;
+            }
+            if !verbose {
+                if let Some(operand) = operand {
+                    if slash(&operand) {
+                        return Some(format!(
+                            "{}{}: restricted: cannot specify `/' in command names\n",
+                            self.diagnostic_prefix(),
+                            operand
+                        ));
+                    }
+                }
+            }
         }
         for redirect in &command.redirects {
-            let target = self.expand_redirect_target(redirect);
-            if redirect.fd_var.is_none() && redirect_target_fd(&target).is_none() && slash(&target)
+            // #804 gaps 11/12: GNU refuses the redirection DIRECTION, not a
+            // slash in the target (command.h:57 WRITE_REDIRECT over
+            // redir.c:919). The exact post-expansion resolution lives in the
+            // apply-time gate (reject_invalid_redirects, this file's stage
+            // sites run it right after this scan); the scan here decides the
+            // plain file directions and the dup words that are ALREADY
+            // decidable on the raw text (`>& out.txt`), so a refused member
+            // still diverts the concurrent fast paths to the sequential
+            // executor instead of spawning with the write wired natively.
+            // Read-only input stays allowed.
+            if !is_restricted_write_redirect(&redirect.kind)
+                && !is_raw_err_and_out_redirect(redirect)
             {
-                return Some(format!(
-                    "{}{}: restricted: cannot redirect output\n",
-                    self.diagnostic_prefix(),
-                    target
-                ));
+                continue;
             }
+            let target = self.expand_redirect_target(redirect);
+            let filename = target.strip_prefix('&').unwrap_or(&target);
+            return Some(format!(
+                "{}{}: restricted: cannot redirect output\n",
+                self.diagnostic_prefix(),
+                filename
+            ));
         }
         None
     }
