@@ -218,39 +218,65 @@ impl Executor {
     /// Diagnostics are order-routed (issue #250 semantics): only the
     /// redirects BEFORE the failing entry have applied, so a preceding
     /// `2>/dev/null` silences and a following one leaks.
-    /// RESTRICTED_SHELL pre-check for the fd-var redirect appliers
-    /// (#804 F1): GNU refuses the write directions BEFORE redir_varassign
-    /// opens or creates anything (redir.c:919 precedes the varassign arm),
-    /// so `{v}> f` / `{v}>> f` / `{v}<> f` / `{v}>| f` must not materialize
-    /// or truncate the target. Returns true when a refusal was reported
-    /// (status 1 set, diagnostic routed through the redirects BEFORE the
-    /// offending entry like issue #250); the caller skips the command.
-    /// Dup varassign spellings (`{v}>&N`) and read-only `{v}< f` are not
-    /// in WRITE_REDIRECT and stay allowed.
-    pub(in crate::executor) fn reject_restricted_fd_var_redirects(
+    /// RESTRICTED_SHELL pre-check for redirect MATERIALIZATION paths
+    /// (#804 F1/N2): GNU refuses the write directions BEFORE
+    /// redir_varassign / the compound entry opens or creates anything
+    /// (redir.c:919 precedes the varassign arm), and GNU 5.3 refuses the
+    /// FIRST restricted-write entry in the list — an earlier `> s1.txt`
+    /// or `2>/dev/null` is itself refused before a later `{v}> s2.txt`
+    /// matters. Scans the WHOLE ordered list, speaks at that first entry
+    /// (diagnostic routed through the redirects BEFORE it, issue #250
+    /// semantics — none of which are write forms, so nothing
+    /// materializes), sets status 1; the caller skips the command.
+    /// `{v}<` input and `{v}>&N` dups are not in WRITE_REDIRECT and stay
+    /// allowed.
+    pub(in crate::executor) fn reject_restricted_write_redirect_entry(
         &mut self,
         cmd: &CommandNode,
     ) -> Result<bool, ExecuteError> {
         if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
             return Ok(false);
         }
-        let Some((index, redirect)) = cmd.redirects.iter().enumerate().find(|(_, redirect)| {
-            redirect.fd_var.is_some() && is_restricted_write_redirect(&redirect.kind)
-        }) else {
+        let Some((index, redirect)) = cmd
+            .redirects
+            .iter()
+            .enumerate()
+            .find(|(_, redirect)| is_restricted_write_redirect(&redirect.kind))
+        else {
             return Ok(false);
         };
-        // redir.c:137-138: the varassign refusal names the variable. The
-        // target word still expands first (redirection_expand runs before
-        // the RESTRICTED_REDIRECT check), keeping the expansion side
-        // effects GNU would have.
-        let _ = self.expand_redirect_target(redirect);
         let mut stderr = Vec::new();
-        writeln!(
-            &mut stderr,
-            "{}{}: restricted: cannot redirect output",
-            self.diagnostic_prefix(),
-            redirect.fd_var.as_deref().unwrap_or_default()
-        )?;
+        if redirect.fd_var.is_some() {
+            // redir.c:137-138: the varassign refusal names the variable.
+            // The target word still expands first (redirection_expand runs
+            // before the RESTRICTED_REDIRECT check), keeping the expansion
+            // side effects GNU would have.
+            let _ = self.expand_redirect_target(redirect);
+            writeln!(
+                &mut stderr,
+                "{}{}: restricted: cannot redirect output",
+                self.diagnostic_prefix(),
+                redirect.fd_var.as_deref().unwrap_or_default()
+            )?;
+        } else {
+            let target = self.expand_redirect_target(redirect);
+            let raw_word = redirect
+                .target_metadata
+                .raw
+                .strip_prefix('&')
+                .unwrap_or(&redirect.target_metadata.raw);
+            let message_word: String =
+                if raw_word.contains("$(") || raw_word.contains("<(") || raw_word.contains(">(") {
+                    raw_word.to_owned()
+                } else {
+                    target.strip_prefix('&').unwrap_or(&target).to_owned()
+                };
+            writeln!(
+                &mut stderr,
+                "{}{message_word}: restricted: cannot redirect output",
+                self.diagnostic_prefix()
+            )?;
+        }
         self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
         self.exit_code = 1;
         Ok(true)

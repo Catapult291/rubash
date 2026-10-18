@@ -513,3 +513,90 @@ fn pipeline_member_redirect_failures_keep_gnu_order_and_routing() {
     );
     drop_sandbox(&dir);
 }
+
+/// #804 N1: the select loop refuses BEFORE its menu runs — GNU prints no
+/// menu and leaves no file (`select x in a; do :; done > f` → rc 1,
+/// `f: restricted: cannot redirect output`), for the plain and the fd-var
+/// spelling alike; the fd-var binder inside the compound input scope is
+/// covered too.
+#[test]
+fn select_loop_refuses_before_menu_or_materialization() {
+    let dir = sandbox("n1-select");
+    let plain = run_r(&dir, "select x in a; do :; done > rb804-sel.txt\n");
+    assert_eq!(plain.status, 1, "{:?}", plain.stderr);
+    assert!(
+        plain
+            .stderr
+            .contains("rb804-sel.txt: restricted: cannot redirect output"),
+        "stderr: {:?}",
+        plain.stderr
+    );
+    assert!(
+        !dir.join("rb804-sel.txt").exists(),
+        "the select target materialized"
+    );
+    let fd_var = run_r(&dir, "select x in a; do :; done {v}> rb804-selv.txt\n");
+    assert_eq!(fd_var.status, 1, "{:?}", fd_var.stderr);
+    assert!(
+        fd_var
+            .stderr
+            .contains("v: restricted: cannot redirect output"),
+        "stderr: {:?}",
+        fd_var.stderr
+    );
+    assert!(
+        !dir.join("rb804-selv.txt").exists(),
+        "the select fd-var target materialized"
+    );
+    drop_sandbox(&dir);
+}
+
+/// #804 N2: the materialization pre-check speaks at the FIRST
+/// restricted-write entry in the whole ordered list — an earlier plain
+/// write is the one named and is never created, and an earlier
+/// `2>/dev/null` is itself the refusal (GNU 5.3 refuses every
+/// WRITE_REDIRECT form, /dev/null included — nothing is silent).
+#[test]
+fn fd_var_refusal_speaks_at_the_first_restricted_write_entry() {
+    let dir = sandbox("n2-combo");
+    let out = run_r(&dir, "echo hi > rb804-s1.txt {v}> rb804-s2.txt\n");
+    assert_eq!(out.status, 1);
+    assert!(
+        out.stderr
+            .contains("rb804-s1.txt: restricted: cannot redirect output"),
+        "the earlier plain write is named: {:?}",
+        out.stderr
+    );
+    assert!(
+        !dir.join("rb804-s1.txt").exists() && !dir.join("rb804-s2.txt").exists(),
+        "neither target may materialize"
+    );
+
+    let append = run_r(&dir, "echo hi >> rb804-s1.txt {v}> rb804-s2.txt\n");
+    assert!(
+        append
+            .stderr
+            .contains("rb804-s1.txt: restricted: cannot redirect output"),
+        "stderr: {:?}",
+        append.stderr
+    );
+    assert!(
+        !dir.join("rb804-s1.txt").exists(),
+        "the append target materialized"
+    );
+
+    let devnull = run_r(&dir, "echo hi 2>/dev/null {v}> rb804-g.txt\n");
+    assert_eq!(devnull.status, 1);
+    assert!(
+        devnull
+            .stderr
+            .contains("/dev/null: restricted: cannot redirect output"),
+        "the 2>/dev/null entry is itself refused (GNU 5.3): {:?}",
+        devnull.stderr
+    );
+    assert!(
+        !dir.join("rb804-g.txt").exists(),
+        "the later fd-var target materialized"
+    );
+    drop_sandbox(&dir);
+}
