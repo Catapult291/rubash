@@ -2199,7 +2199,10 @@ impl Executor {
                     let associative = is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name)
                         || self.is_assoc_parameter_array(name);
                     if associative {
-                        let key = self.expand_subscript_string(raw_subscript);
+                        // Assignment entry: decoded `$'...'` backslashes are
+                        // CTLESC-quoted data in GNU and survive the pass
+                        // (expand_assignment_subscript_string; issue #734).
+                        let key = self.expand_assignment_subscript_string(raw_subscript);
                         let value = self.expand_quoted_parameter_word(assignment.value.as_str());
                         return vec![format!(
                             "{name}[{}]{}{value}",

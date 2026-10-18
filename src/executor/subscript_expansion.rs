@@ -91,6 +91,29 @@ const LITERAL_DOLLAR: char = crate::executor::markers::DATA_DOLLAR;
 impl Executor {
     /// One `expand_subscript_string` pass over the raw subscript text.
     pub(in crate::executor) fn expand_subscript_string(&self, raw: &str) -> String {
+        self.expand_subscript_string_inner(raw, false)
+    }
+
+    /// The assignment-word variant (`arrayfunc.c:392-398
+    /// assign_array_element_internal`, the `akey = expand_subscript_string
+    /// (sub, 0)` arm). GNU reaches `expand_subscript_string` from entries
+    /// whose `$'...'` spans are decoded at DIFFERENT phases: the assignment
+    /// word is decoded by the LEXER at parse time (parse.y:5551-5572
+    /// read_token_word's `$'` arm — `ansiexpand` at :5566 then
+    /// `sh_single_quote` re-quote), so the decoded bytes reach the runtime
+    /// pass as single-quoted word data and a decoded backslash survives
+    /// (`A[$'a\\b']=v` stores key `a\b`, byte-verified against GNU bash
+    /// 5.3.0). The `${A[...]}` reader hands the raw `$'...'` spelling to the
+    /// runtime decode WITHOUT that protection, so its decoded backslash is
+    /// re-read as escape syntax and drops (`${A[$'a\\b']}` keys on `ab` —
+    /// GNU's own write/read asymmetry, probed 2026-10-13). Only the
+    /// assignment entries use this variant; readers keep
+    /// [`Executor::expand_subscript_string`].
+    pub(in crate::executor) fn expand_assignment_subscript_string(&self, raw: &str) -> String {
+        self.expand_subscript_string_inner(raw, true)
+    }
+
+    fn expand_subscript_string_inner(&self, raw: &str, preserve_ansi_backslashes: bool) -> String {
         // Nothing expands inside a single-quoted span, so a subscript covered
         // entirely by single quotes is literal data: `A['$v']` keys on `$v`
         // and `A['a\b']` keeps the backslash.
@@ -104,7 +127,7 @@ impl Executor {
         // carrier-marked data form the embedded walker already consumes.
         let raw_owned;
         let raw = if raw.contains("$'") {
-            raw_owned = decode_ansi_c_spans(raw);
+            raw_owned = decode_ansi_c_spans(raw, preserve_ansi_backslashes);
             raw_owned.as_str()
         } else {
             raw
@@ -121,10 +144,19 @@ impl Executor {
         // cooked text only (GNU expand_subscript_string -> expand_string
         // yields plain bytes), so the tags come off here — otherwise a key
         // like `20 40 80` stores marker-laden bytes that never match the
-        // canonical form reads and the kvlist path produce.
-        let expanded = expanded
-            .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-            .replace(crate::executor::markers::IFS_GLUE, "");
+        // canonical form reads and the kvlist path produce. The decoded
+        // `$'...'` blank guard (E401) comes off with them: a resolved key is
+        // plain bytes in GNU (the CTLESC-quoted blank is word DATA whose
+        // protection the finished word drops), so `A[$'x\ty']` must store and
+        // look up the same clean key the `$k` / `"x<TAB>y"` spellings
+        // produce. E400-aware: user data U+E401 rides the E400 pair and
+        // survives (rubash#735; issue #734 item 2 — the marker leaked into
+        // `declare -p` through the stored key).
+        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(
+            &expanded
+                .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
+                .replace(crate::executor::markers::IFS_GLUE, ""),
+        );
         // A leading unquoted `~` tilde-expands; `x~` and `a:~` stay literal
         // and `"~"` never reaches here (its first character is the quote).
         if raw.starts_with('~') {
@@ -1324,7 +1356,15 @@ pub(super) fn scan_compound_subscript(
 /// expand_subscript_string -> expand_word_internal's ANSI-C arm). The decoded
 /// bytes pass through escape_decoded_ansi_c_quotes so quotes and `$` in the
 /// result stay DATA for the embedded-parameter walker.
-fn decode_ansi_c_spans(text: &str) -> String {
+///
+/// `preserve_backslashes` doubles the backslashes of the DECODED product so
+/// the following mask_subscript_escapes pass — which owns the token's quote
+/// removal — collapses them back to one literal backslash instead of eating
+/// the escape. This is the assignment-word entry only: GNU's lexer decoded
+/// the span at parse time with CTLESC protection (see
+/// [`Executor::expand_assignment_subscript_string`]), while the `${...}`
+/// reader's runtime decode is unprotected and its backslashes drop.
+fn decode_ansi_c_spans(text: &str, preserve_backslashes: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut output = String::with_capacity(text.len());
     let mut index = 0usize;
@@ -1367,7 +1407,12 @@ fn decode_ansi_c_spans(text: &str) -> String {
             }
             if closed {
                 let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
-                output.push_str(&crate::lexer::escape_decoded_ansi_c_quotes(&decoded));
+                let escaped = crate::lexer::escape_decoded_ansi_c_quotes(&decoded);
+                if preserve_backslashes && escaped.contains('\\') {
+                    output.push_str(&escaped.replace('\\', "\\\\"));
+                } else {
+                    output.push_str(&escaped);
+                }
                 index = inner_end + 1;
                 continue;
             }
