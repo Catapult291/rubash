@@ -600,3 +600,103 @@ fn fd_var_refusal_speaks_at_the_first_restricted_write_entry() {
     );
     drop_sandbox(&dir);
 }
+
+/// #804 round 3: ambiguity resolves BEFORE the restricted refusal on the
+/// SAME entry (redir.c:911-914 precede :919) at every refusal site —
+/// the materialization pre-check included, which used to pre-empt the
+/// gate and misreport `$unsetv: restricted: cannot redirect output`
+/// (empty word, wrong class) for the plain simple-command cell.
+#[test]
+fn ambiguity_precedes_the_restricted_refusal_everywhere() {
+    let dir = sandbox("r3-ambig");
+    // the cell the round-3 review flagged: simple command, empty-word
+    // target — GNU reports the ambiguity, never the restricted wording,
+    // and no file appears.
+    let simple = run_r(&dir, "echo hi > $unsetv\n");
+    assert!(
+        simple.stderr.contains("$unsetv: ambiguous redirect"),
+        "stderr: {:?}",
+        simple.stderr
+    );
+    assert!(
+        !simple.stderr.contains("restricted"),
+        "stderr: {:?}",
+        simple.stderr
+    );
+    assert_eq!(simple.status, 1);
+
+    // multi-field: GNU reports the RAW word.
+    let multi = run_r(&dir, "v=\"a b\"; > $v\n");
+    assert!(
+        multi.stderr.contains("$v: ambiguous redirect"),
+        "stderr: {:?}",
+        multi.stderr
+    );
+    assert!(!multi.stderr.contains("restricted"));
+
+    // varassign entry: the ambiguity reports under the VARIABLE name.
+    let fd_var_ambig = run_r(&dir, "{v}> $unset2\n");
+    assert!(
+        fd_var_ambig.stderr.contains("v: ambiguous redirect"),
+        "stderr: {:?}",
+        fd_var_ambig.stderr
+    );
+    assert!(!fd_var_ambig.stderr.contains("cannot redirect"));
+
+    // ambiguity on the first entry pre-empts a later restricted one, and
+    // the compound wrapper path is not ambiguity-blind.
+    for script in [
+        "echo hi > $unsetv {v}> rb804-r3.txt",
+        "while :; do :; done > $unsetv",
+    ] {
+        let out = run_r(&dir, script);
+        assert!(
+            out.stderr.contains("$unsetv: ambiguous redirect"),
+            "{script}: {:?}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.contains("restricted"),
+            "{script}: {:?}",
+            out.stderr
+        );
+        assert!(
+            !dir.join("rb804-r3.txt").exists(),
+            "{script} materialized the later target"
+        );
+    }
+
+    // the first-entry-restricted cell keeps its verdict (no ambiguity on
+    // the entry that speaks).
+    let first_restricted = run_r(&dir, "echo hi > rb804-r3b.txt > $unsetv\n");
+    assert!(
+        first_restricted
+            .stderr
+            .contains("rb804-r3b.txt: restricted: cannot redirect output"),
+        "stderr: {:?}",
+        first_restricted.stderr
+    );
+    assert!(!dir.join("rb804-r3b.txt").exists());
+
+    // pipeline members keep one message per failure, worded by the same
+    // rule (the routing walk stays silent for restricted-write entries).
+    for (script, word) in [
+        ("echo hi > $unsetv | cat", "$unsetv: ambiguous redirect"),
+        ("{v}> $unset2 | cat", "v: ambiguous redirect"),
+    ] {
+        let out = run_r(&dir, script);
+        let messages = out
+            .stderr
+            .lines()
+            .filter(|line| line.contains("ambiguous redirect"))
+            .count();
+        assert_eq!(messages, 1, "{script}: {:?}", out.stderr);
+        assert!(out.stderr.contains(word), "{script}: {:?}", out.stderr);
+        assert!(
+            !out.stderr.contains("restricted"),
+            "{script}: {:?}",
+            out.stderr
+        );
+    }
+    drop_sandbox(&dir);
+}
