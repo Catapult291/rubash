@@ -38,17 +38,11 @@ argv[1] = < >
 expect <-->
 argv[1] = <-->
 expect <>
-argv[1] = <>
 expect <>
-argv[1] = <>
 expect <>
-argv[1] = <>
 expect <>
-argv[1] = <>
 expect <>
-argv[1] = <>
 expect <>
-argv[1] = <>
 expect <abc>
 argv[1] = <abc>
 expect <abc>
@@ -298,7 +292,7 @@ graph
 yes
 a
 a
- val
+val
 val
  val
 no arg passed
@@ -343,8 +337,7 @@ argv[2] = <^C>
 argv[3] = <^C>
 argv[4] = <^C>
 argv[1] = <^A>
-argv[1] = <XY>
-argv[2] = <YX>
+argv[1] = <XY^AYX>
 argv[1] = <XY^AYX>
 argv[1] = <XY>
 argv[2] = <Y>
