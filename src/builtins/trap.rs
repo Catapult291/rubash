@@ -641,7 +641,11 @@ fn normalize_signal(signal: &str) -> Option<&'static str> {
         .find(|candidate| candidate.strip_prefix("SIG") == Some(name))
 }
 
-fn set_trap(env_vars: &mut HashMap<String, String>, signal: &str, action: &str) {
+/// GNU trap.c set_signal for the special traps. `pub(crate)` for the
+/// source builtin's entry-trap restore (source.def:216's
+/// uw_maybe_set_debug_trap -> trap.c:737-743 trap_if_untrapped ->
+/// set_signal).
+pub(crate) fn set_trap(env_vars: &mut HashMap<String, String>, signal: &str, action: &str) {
     // GNU trap.c set_signal: "A signal ignored on entry to the shell cannot
     // be trapped or reset, but no error is reported" (SIG_HARD_IGNORE).
     // Only real signals are hard-ignored; the EXIT/DEBUG/ERROR/RETURN
@@ -662,7 +666,9 @@ fn set_trap(env_vars: &mut HashMap<String, String>, signal: &str, action: &str) 
     }
 }
 
-fn remove_trap(env_vars: &mut HashMap<String, String>, signal: &str) {
+/// GNU trap.c restore_default_signal for the special traps. `pub(crate)`
+/// for the source builtin's entry-trap save (source.def:214-215).
+pub(crate) fn remove_trap(env_vars: &mut HashMap<String, String>, signal: &str) {
     if is_hard_ignored(env_vars, signal) {
         return;
     }

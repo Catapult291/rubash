@@ -898,8 +898,13 @@ impl Executor {
     /// (execute_cmd.c:5270: no trace attribute and functrace off), so fires
     /// for compound-command sub-parts (for / arith-for expressions) only
     /// happen at the top level or inside inheriting functions.
-    /// GNU builtins/source.def:208-216 additionally unsets the DEBUG trap
-    /// for the whole duration of a sourced file when functrace is off.
+    /// GNU builtins/source.def:208-216 unsets the ENTRY DEBUG trap for a
+    /// sourced file when functrace is off — the same TABLE-driven shape as
+    /// the function case, so a trap the file INSTALLS fires like any other
+    /// command (trap.c:750-756: "If the function or sourced file changes
+    /// the DEBUG trap, SIG_TRAPPED will be set and we don't bother
+    /// restoring the original trap string"); only the entry trap's absence
+    /// is scoped (rubash#797).
     /// Whether the DEBUG trap is in execution scope at the current context.
     /// Function-level suppression is table-driven: execute_function removes
     /// the inherited DEBUG trap at entry unless the function carries the
@@ -911,7 +916,7 @@ impl Executor {
     /// substitution-internal commands do not fire, with functrace they do
     /// (dbg-support.tests caller echoes carry the debug lines).
     pub(crate) fn debug_trap_in_scope(&self) -> bool {
-        if self.source_debug_suppressed || self.host_internal_depth.get() > 0 {
+        if self.host_internal_depth.get() > 0 {
             return false;
         }
         if self.shell_state.subshell_depth.get() > 0 {
@@ -963,12 +968,33 @@ impl Executor {
         crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "functrace")
     }
 
-    pub(crate) fn set_source_debug_suppressed(&mut self, value: bool) {
-        self.source_debug_suppressed = value;
+    /// GNU builtins/source.def:209-217 (source_builtin): snapshot the ENTRY
+    /// DEBUG trap and `restore_default_signal (DEBUG_TRAP)` it, so the
+    /// sourced file's commands do not fire the trap that was live at entry
+    /// (functrace off). The live trap table decides every fire inside the
+    /// file — a trap the file INSTALLS fires normally (trap.c:750-756).
+    /// Returns the entry action for `source_exit_debug_trap_restore`.
+    pub(crate) fn source_entry_debug_trap_save(&mut self) -> Option<String> {
+        let entry = crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG");
+        if entry.is_some() {
+            crate::builtins::trap::remove_trap(&mut self.shell_state.env_vars, "DEBUG");
+        }
+        entry
     }
 
-    pub(crate) fn source_debug_suppressed(&self) -> bool {
-        self.source_debug_suppressed
+    /// GNU trap.c:737-763 (trap_if_untrapped via uw_maybe_set_debug_trap,
+    /// popped by source.def:216's unwind-protect after source_file's
+    /// run_return_trap): the ENTRY trap comes back only when the file left
+    /// the DEBUG trap untrapped — an install (by the file or its RETURN
+    /// action) survives with SIG_TRAPPED semantics.
+    pub(crate) fn source_exit_debug_trap_restore(&mut self, entry: Option<String>) {
+        if let Some(action) = entry {
+            if crate::builtins::trap::active_trap_action_ref(&self.shell_state.env_vars, "DEBUG")
+                .is_none()
+            {
+                crate::builtins::trap::set_trap(&mut self.shell_state.env_vars, "DEBUG", &action);
+            }
+        }
     }
 
     pub(crate) fn run_pending_signal_traps(&mut self) -> Result<(), ExecuteError> {
