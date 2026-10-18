@@ -134,8 +134,8 @@ impl crate::executor::Executor {
         self.set_env("__RUBASH_INTERACTIVE_FLAG_OFF", "1");
         // parse.y:3013/3021 execute_variable_command brackets the PC's
         // parse_and_execute with save_parser_state/restore_parser_state;
-        // the snapshot carries last_command_exit_value (parse.y:7221) and
-        // PIPESTATUS (:7223) and is written back at :7313/:7315 — a PC that
+        // the snapshot carries last_command_exit_value (parse.y:7248) and
+        // PIPESTATUS (:7250) and is written back at :7313/:7315 — a PC that
         // returns normally leaves $? and PIPESTATUS untouched (verified WSL
         // GNU 5.3.0 piped-`-i`: after PROMPT_COMMAND=false the next typed
         // command sees $? = the pre-PC value, 0). The restore line sits
@@ -146,7 +146,7 @@ impl crate::executor::Executor {
         let saved_pipestatus = self.shell_state.pipestatus.clone();
         // parse.y:3017 execute_variable_command also snapshots `$_` around
         // the PC's parse_and_execute (last_lastarg = save_lastarg();
-        // save_parser_state itself carries no lastarg — parse.y:7221/:7223
+        // save_parser_state itself carries no lastarg — parse.y:7248/:7250
         // cover only the exit value and PIPESTATUS) and :3022-3023 rebinds
         // it on every normal return (bind_lastarg). Without the bracket, a
         // PC whose text runs commands (bash-preexec's install string, wezterm
@@ -157,7 +157,7 @@ impl crate::executor::Executor {
         // PROMPT_COMMAND='bp_install' renders, the DEBUG trap's "$_" is
         // still the last typed word — `trap -p DEBUG`'s DEBUG — while the
         // unbracketed engine reported `bp_install`). bind_lastarg(NULL)
-        // binds the null string (execute_cmd.c:4188-4190), so an unset
+        // binds the null string (execute_cmd.c:4192-4193), so an unset
         // pre-PC `$_` comes back as "".
         let saved_underscore = self.shell_variable_value("_");
         let (status, exit_shell) = match session {
@@ -297,7 +297,7 @@ mod tests {
     // piped-`-i`: PC=([0]='echo A' [1]='exit' [2]='echo C') prints only A,
     // rc 0). parse.y:3013/3021 execute_variable_command brackets the run
     // with save_parser_state/restore_parser_state — last_command_exit_value
-    // and PIPESTATUS snapshot at parse.y:7221/:7223, restored at
+    // and PIPESTATUS snapshot at parse.y:7248/:7250, restored at
     // :7313/:7315 on every NORMAL return (verified: after PC='false' the
     // next typed command sees the pre-PC $?), and the restore is skipped
     // when the jump unwinds (verified: PC='exit 5' -> rc 5).

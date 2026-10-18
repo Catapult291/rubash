@@ -969,28 +969,39 @@ impl Executor {
     }
 
     /// GNU builtins/source.def:209-217 (source_builtin): snapshot the ENTRY
-    /// DEBUG trap and `restore_default_signal (DEBUG_TRAP)` it, so the
+    /// DEBUG action and `restore_default_signal (DEBUG_TRAP)` it, so the
     /// sourced file's commands do not fire the trap that was live at entry
     /// (functrace off). The live trap table decides every fire inside the
     /// file — a trap the file INSTALLS fires normally (trap.c:750-756).
+    /// Membership, not action text: an entry IGNORE (`trap '' DEBUG`) is
+    /// skipped whole — TRAP_STRING is NULL for an ignored trap
+    /// (trap.h:57-59), so source.def:211's `if (debug_trap && ...)` never
+    /// arms the snapshot/remove/restore chain and the ignore stays trapped
+    /// through the file (`trap -p DEBUG` keeps showing `trap -- '' DEBUG`).
     /// Returns the entry action for `source_exit_debug_trap_restore`.
     pub(crate) fn source_entry_debug_trap_save(&mut self) -> Option<String> {
-        let entry = crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG");
-        if entry.is_some() {
-            crate::builtins::trap::remove_trap(&mut self.shell_state.env_vars, "DEBUG");
+        // get_trap_action's Some/None IS the SIG_TRAPPED analog: Some("")
+        // for a live ignore, None for untrapped or subshell-reset — the
+        // __RUBASH_TRAPS membership the CR review keys on.
+        let entry = crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG")?;
+        if entry.is_empty() {
+            return None;
         }
-        entry
+        crate::builtins::trap::remove_trap(&mut self.shell_state.env_vars, "DEBUG");
+        Some(entry)
     }
 
     /// GNU trap.c:737-763 (trap_if_untrapped via uw_maybe_set_debug_trap,
     /// popped by source.def:216's unwind-protect after source_file's
-    /// run_return_trap): the ENTRY trap comes back only when the file left
-    /// the DEBUG trap untrapped — an install (by the file or its RETURN
-    /// action) survives with SIG_TRAPPED semantics.
+    /// run_return_trap): the ENTRY action comes back only when DEBUG is
+    /// UNTRAPPED at exit — SIG_TRAPPED is set for a plain install AND for
+    /// an ignore (trap.c:900 marks ignored traps SIG_TRAPPED too), so a
+    /// `trap '' DEBUG` from the file (or its RETURN action) survives and
+    /// the entry action stays retired (rubash#797 CR R1/R3: membership,
+    /// not action text — get_trap_action's Some("") must read as trapped).
     pub(crate) fn source_exit_debug_trap_restore(&mut self, entry: Option<String>) {
         if let Some(action) = entry {
-            if crate::builtins::trap::active_trap_action_ref(&self.shell_state.env_vars, "DEBUG")
-                .is_none()
+            if crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG").is_none()
             {
                 crate::builtins::trap::set_trap(&mut self.shell_state.env_vars, "DEBUG", &action);
             }

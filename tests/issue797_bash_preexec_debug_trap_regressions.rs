@@ -23,7 +23,7 @@
 //!   `execute_variable_command` does `last_lastarg = save_lastarg()` before
 //!   the PC's parse_and_execute and :3022-3023 `bind_lastarg(last_lastarg)`
 //!   on every normal return (save_parser_state itself carries no lastarg —
-//!   parse.y:7221/:7223 cover only the exit value and PIPESTATUS). The
+//!   parse.y:7248/:7250 cover only the exit value and PIPESTATUS). The
 //!   engine left `$_` on the PC's OWN last command word, so the DEBUG trap
 //!   installed by bash-preexec handed `bp_install`/`bp_precmd_invoke` —
 //!   prompt-machinery internals — to `preexec "$_"` (wezterm's
@@ -46,8 +46,15 @@
 //! PROMPT_COMMAND, the `trap -p DEBUG` capture, `trap - DEBUG`, the
 //! re-trap with `"$_"`, precmd/precmd dispatch) — not the file itself.
 //!
+//! The source-scoping pins also cover the IGNORE edge the CR review caught
+//! on the first cut: `trap '' DEBUG` (IGNORE, trap.c:900 sets SIG_TRAPPED)
+//! is distinguished from `trap - DEBUG` by TRAP TABLE MEMBERSHIP
+//! (`__RUBASH_TRAPS`), never by action text — an entry ignore is not
+//! snapshotted (TRAP_STRING is NULL for it, trap.h:57-59) and a file's
+//! ignore blocks the entry action's return (trap_if_untrapped).
+//!
 //! GNU anchors (bash.git @b4608166, Bash-5.3 patch 15): parse.y:3011-3025
-//! execute_variable_command; eval.c:318-330; execute_cmd.c:4177-4192
+//! execute_variable_command; eval.c:318-330; execute_cmd.c:4177-4193
 //! save_lastarg/bind_lastarg (bind_lastarg(NULL) binds the null string).
 #![cfg(windows)]
 
@@ -243,7 +250,7 @@ fn pc_exit_jump_skips_underscore_restore() {
 }
 
 /// An unset pre-PC `$_` comes back unset-of-value as the null string
-/// (bind_lastarg(NULL) binds "", execute_cmd.c:4188-4190) — the PC path
+/// (bind_lastarg(NULL) binds "", execute_cmd.c:4192-4193) — the PC path
 /// must not leave the engine's `$_` binding in a half-cleared state.
 #[test]
 fn pc_with_unset_underscore_restores_null_binding() {
@@ -255,5 +262,108 @@ fn pc_with_unset_underscore_restores_null_binding() {
         session.stdout.contains("END="),
         "stdout: {:?}",
         session.stdout
+    );
+}
+
+// The ignore edge (CR review R1/R2/R3 on the first cut): GNU distinguishes
+// `trap '' DEBUG` (IGNORE — trapped, TRAP_STRING NULL, trap.c:900 still sets
+// SIG_TRAPPED) from `trap - DEBUG` (untrapped) by TRAP TABLE MEMBERSHIP, and
+// source.def:211's `TRAP_STRING(DEBUG_TRAP)` snapshot skips an ignored entry
+// trap whole (trap.h:57-59). The save/restore must key on membership
+// (get_trap_action's Some("") = live ignore), never on action text.
+
+/// Writes a script-mode fixture pair and runs the driver file, returning
+/// (exit code, stdout).
+fn run_script(
+    dir: &PathBuf,
+    driver: &str,
+    body: &str,
+    sourced: &str,
+    sourced_body: &str,
+) -> (Option<i32>, String) {
+    std::fs::write(dir.join(sourced), sourced_body).expect("write sourced fixture");
+    std::fs::write(dir.join(driver), body).expect("write driver");
+    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg(format!("./{driver}"))
+        .current_dir(dir)
+        .env_remove("PS1")
+        .env_remove("PROMPT_COMMAND")
+        .output()
+        .expect("run rubash");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+fn nonempty_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// R1: a real entry trap plus an in-file `trap '' DEBUG` — the IGNORE is
+/// SIG_TRAPPED (trap.c:900), so the entry action must NOT come back: the
+/// post-source `trap -p DEBUG` reads `trap -- '' DEBUG` and no ORIG fires.
+/// WSL GNU bash 5.3.0: `ORIG / in1 / in2 / after / trap -- '' DEBUG`.
+#[test]
+fn file_ignore_survives_source_entry_action_stays_retired() {
+    let dir = fixture_dir("ig-r1");
+    let (code, stdout) = run_script(
+        &dir,
+        "r1drv.sh",
+        "trap 'echo ORIG' DEBUG\nsource ./r1.sh\necho after\ntrap -p DEBUG\n",
+        "r1.sh",
+        "trap '' DEBUG\necho in1\necho in2\n",
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        nonempty_lines(&stdout),
+        vec!["ORIG", "in1", "in2", "after", "trap -- '' DEBUG"],
+        "the ignore must survive and the entry action must stay retired: {stdout:?}"
+    );
+}
+
+/// R2: an entry IGNORE is not snapshotted or removed at all (TRAP_STRING is
+/// NULL for it, trap.h:57-59) — `trap -p DEBUG` INSIDE the file still shows
+/// `trap -- '' DEBUG`. WSL GNU bash 5.3.0: identical, twice.
+#[test]
+fn entry_ignore_stays_visible_during_source() {
+    let dir = fixture_dir("ig-r2");
+    let (code, stdout) = run_script(
+        &dir,
+        "r2drv.sh",
+        "trap '' DEBUG\nsource ./r2.sh\necho after\ntrap -p DEBUG\n",
+        "r2.sh",
+        "trap -p DEBUG\necho in1\n",
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        nonempty_lines(&stdout),
+        vec!["trap -- '' DEBUG", "in1", "after", "trap -- '' DEBUG"],
+        "the entry ignore must stay live through the file: {stdout:?}"
+    );
+}
+
+/// R3: entry IGNORE untrapped by the file (`trap - DEBUG`) — nothing was
+/// snapshotted, so nothing comes back: no trap after the source. WSL GNU
+/// bash 5.3.0: `in1 / after` and NO `trap -p` line.
+#[test]
+fn entry_ignore_untrapped_by_file_leaves_no_trap() {
+    let dir = fixture_dir("ig-r3");
+    let (code, stdout) = run_script(
+        &dir,
+        "r3drv.sh",
+        "trap '' DEBUG\nsource ./r3.sh\necho after\ntrap -p DEBUG\n",
+        "r3.sh",
+        "trap - DEBUG\necho in1\n",
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        nonempty_lines(&stdout),
+        vec!["in1", "after"],
+        "a file-untrapped entry ignore must leave no trap: {stdout:?}"
     );
 }
