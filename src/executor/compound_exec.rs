@@ -363,12 +363,104 @@ impl Executor {
                 let _ = self.run_debug_trap(&inner_text)?;
             }
         }
+        let display_source = bash_command_source_text(&background_command.command);
+        // GNU execute_cmd.c:5884 (execute_disk_command) / :1761-1763
+        // (execute_in_subshell): the forked async subshell runs
+        // do_redirections(command->redirects, RX_ACTIVE) on its OWN
+        // descriptors and then dispose_redirects before the body executes,
+        // so `sleep 1 >/dev/null 2>&1 &` leaves no process holding the
+        // parent's stdout/stderr open and a caller reading the shell's pipes
+        // to EOF is released when the shell exits (niubash#122). The spawned
+        // `rubash -c` child stands in for that subshell: resolve the
+        // command's own redirections into its stdio here, and strip the
+        // consumed redirects from the serialized `-c` source so the child
+        // does not re-open them — `cmd >f 2>&1` must keep fd1/fd2 on the
+        // same open file description, which only the spawn-time stdio pair
+        // preserves.
+        let (stdio, consumed, captured_pipe_writer) =
+            self.resolve_background_stdio(&background_command.command);
+        // rubash#809: GNU executes a background SIMPLE command as fork+exec —
+        // execute_connection '&' (execute_cmd.c:5562+) forks, and the async
+        // child's execute_simple_command ends in shell_execve for an external,
+        // so no second shell process survives. The `rubash -c` wrapper respawn
+        // below pays one extra process spawn plus a full shell init for every
+        // `&` job (Windows cell: bgwait 750x `sleep &` measured ~2.2ms/job
+        // with the wrapper against ~0.05ms for a direct external spawn; the
+        // Android #809 2.47x gap has the same shape — wrapper respawn vs fork
+        // floor). When the background body is a bare external — no compound
+        // constructs, no assignments or redirects, no alias/function/builtin
+        // resolution, and not a script needing the shell fallback — spawn the
+        // external directly on the same async stdio (resolve_background_stdio
+        // rules apply unchanged). $! then names the external's pid (GNU's
+        // value), and the job table / wait / kill paths see the same
+        // registration shape they already handle for wrappers.
+        //
+        // The gate runs BEFORE any wrapper-only setup (exe resolution, env
+        // block, handle duplication): a direct spawn pays none of it.
+        let direct_plan = if !self.xtrace_enabled() && !captured_pipe_writer {
+            self.background_direct_external_command(&background_command.command)
+        } else {
+            None
+        };
+        if let Some((program, argv)) = direct_plan {
+            let mut process = std::process::Command::new(&program);
+            // argv[0] is the child's image name; the words after the
+            // command name are the real arguments.
+            process.args(&argv[1..]);
+            let [stdin_stdio, stdout_stdio, stderr_stdio] = stdio.map(|resolved| match resolved {
+                BackgroundStdio::Inherit => std::process::Stdio::inherit(),
+                BackgroundStdio::Null => std::process::Stdio::null(),
+                BackgroundStdio::File(file) => std::process::Stdio::from(file),
+            });
+            process
+                .stdin(stdin_stdio)
+                .stdout(stdout_stdio)
+                .stderr(stderr_stdio);
+            // Same environment application as every foreground external
+            // (exported shell vars; no assignments exist at this gate).
+            self.apply_external_environment(&background_command.command, &mut process);
+            // rubash#229/#737 unix arm: reset inherited signal dispositions
+            // in the child exactly like the foreground spawn path. The #737
+            // pdeathsig arm keys off __RUBASH_BACKGROUND_WRAPPER, which is
+            // never set here — a directly-exec'd async child survives shell
+            // exit, as GNU's does.
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+            }
+            match process.spawn() {
+                Ok(child) => {
+                    let pid = child.id();
+                    self.background_children
+                        .insert(pid, crate::fd::SpawnedChild::from(child));
+                    self.shell_state
+                        .job_table
+                        .register_process(pid, display_source.clone(), true);
+                    self.shell_state.job_table.set_job_control(
+                        pid,
+                        crate::builtins::set::shell_option_enabled(
+                            &self.shell_state.env_vars,
+                            "monitor",
+                        ),
+                    );
+                    self.shell_state.last_background_pid = Some(pid);
+                    // GNU expands the async simple command's words in the
+                    // exec'd child; no substitution status may leak into the
+                    // parent's bands (the next command must see the state it
+                    // had before).
+                    self.last_command_substitution_status.set(None);
+                    self.exit_code = 0;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
             .or_else(test_rubash_binary_from_current_exe)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| "rubash".into());
-        let display_source = bash_command_source_text(&background_command.command);
         // Environment block for the child: process env merged with the
         // shell's env_vars (same filter the old Command::env loop applied).
         let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
@@ -427,21 +519,6 @@ impl Executor {
         // survives).
         env_map.insert("__RUBASH_BACKGROUND_WRAPPER".to_string(), "1".to_string());
 
-        // GNU execute_cmd.c:5884 (execute_disk_command) / :1761-1763
-        // (execute_in_subshell): the forked async subshell runs
-        // do_redirections(command->redirects, RX_ACTIVE) on its OWN
-        // descriptors and then dispose_redirects before the body executes,
-        // so `sleep 1 >/dev/null 2>&1 &` leaves no process holding the
-        // parent's stdout/stderr open and a caller reading the shell's pipes
-        // to EOF is released when the shell exits (niubash#122). The spawned
-        // `rubash -c` child stands in for that subshell: resolve the
-        // command's own redirections into its stdio here, and strip the
-        // consumed redirects from the serialized `-c` source so the child
-        // does not re-open them — `cmd >f 2>&1` must keep fd1/fd2 on the
-        // same open file description, which only the spawn-time stdio pair
-        // preserves.
-        let (stdio, consumed, captured_pipe_writer) =
-            self.resolve_background_stdio(&background_command.command);
         let mut child_command = background_command.command.clone();
         strip_consumed_redirects(&mut child_command, &consumed);
         let source = self.background_command_source(&child_command);
@@ -609,6 +686,176 @@ impl Executor {
         self.shell_state.last_background_pid = Some(pid);
         self.exit_code = 0;
         Ok(())
+    }
+
+    /// rubash#809: resolve a background body to a directly-spawnable external
+    /// — `(program, argv)` — or None when the wrapper respawn must run.
+    /// The gate is deliberately narrow: every construct the `rubash -c`
+    /// wrapper exists to carry (compound semantics, assignment tempenv,
+    /// redirection application, substitution execution, fd>=3 forwarding,
+    /// restricted-shell rejection, alias/function/builtin dispatch, script
+    /// fallback, capture plumbing) falls back to the wrapper, whose behavior
+    /// is unchanged.
+    fn background_direct_external_command(
+        &mut self,
+        command: &CommandNode,
+    ) -> Option<(std::path::PathBuf, Vec<String>)> {
+        // A restricted shell refuses command names carrying `/' before any
+        // dispatch (execute_prepared_command -> restricted_command_error,
+        // pipeline_exec.rs:3564). The wrapper keeps that rejection exactly
+        // where it is today, so any `set -r` session never takes this path.
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
+            return None;
+        }
+        // Only a bare simple command: any compound carrier, connector, or
+        // nested execution form needs the wrapper's subshell semantics.
+        if command.pipe.is_some()
+            || command.pipeline_command.is_some()
+            || command.and_or_list.is_some()
+            || command.and_or.is_some()
+            || command.time_command.is_some()
+            || command.background_command.is_some()
+            || command.inverted_command.is_some()
+            || command.inverted
+            || command.subshell
+            || command.subshell_end
+            || command.subshell_command.is_some()
+            || command.for_command.is_some()
+            || command.arithmetic_command.is_some()
+            || command.if_command.is_some()
+            || command.loop_command.is_some()
+            || command.conditional_command.is_some()
+            || command.case_command.is_some()
+            || command.select_command.is_some()
+            || command.function_command.is_some()
+            || command.brace_group.is_some()
+            || command.coproc_command.is_some()
+        {
+            return None;
+        }
+        // No assignments (tempenv belongs to the child in GNU) and no
+        // redirections beyond the async fd 0-2 stdio rules this caller
+        // already resolved into handles.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+            || !command.assignment_raws.is_empty()
+            || !command.redirects.is_empty()
+            || command.redirect_in.is_some()
+            || command.redirect_out.is_some()
+            || command.append.is_some()
+            || command.redirect_err.is_some()
+            || command.redirect_err_append.is_some()
+            || command.heredoc.is_some()
+            || command.heredoc_body.is_some()
+            || command.heredoc_delimiter.is_some()
+            || !command.heredoc_redirects.is_empty()
+            || command.here_string.is_some()
+            || command.here_string_carrier.is_some()
+        {
+            return None;
+        }
+        // Process substitutions need the materialization plumbing the
+        // foreground external path owns; leave them to the wrapper.
+        if !command.process_substitutions.is_empty() {
+            return None;
+        }
+        // rubash#809 CR F2: GNU expands the async child's words INSIDE the
+        // forked child. Expanding substitution- or assignment-bearing words
+        // here in the parent would (a) double-fire side effects whenever the
+        // shape then falls back to the wrapper (the wrapper child re-expands
+        // the serialized source — `echo $(echo tick >> log) &` would append
+        // twice), (b) leak `${x:=v}` assignments into the parent shell, and
+        // (c) block the parent on the substitution's runtime. Such shapes
+        // keep the wrapper, whose child expands them exactly as today — the
+        // hot path (`sleep 0 &`, plain/parameter-expansion words) is
+        // unaffected. Raw-text scan: the structured parameter_expansion
+        // nodes are not populated by this parser, and `$((...))` rides the
+        // same `$(` marker as command substitution.
+        if command.word_metadata.iter().any(|metadata| {
+            metadata.raw.contains("$(")
+                || metadata.raw.contains('`')
+                || metadata.raw.contains(":=")
+                || parameter_expansion_assigns(&metadata.raw)
+        }) {
+            return None;
+        }
+        // rubash#180: a persistent `exec 3<file` descriptor must reach the
+        // child. The wrapper forwards live fd>=3 entries through the
+        // __RUBASH_FD_* env channel (spawn_external_process semantics); a
+        // native direct exec cannot, so any open fd>=3 keeps the wrapper.
+        if self
+            .fd_table
+            .entries
+            .iter()
+            .any(|(fd, entry)| *fd >= 3 && !entry.closed)
+        {
+            return None;
+        }
+        if command.words.is_empty() {
+            return None;
+        }
+        // rubash#809 CR F2-R2: the fatal parameter pre-scan lives on the
+        // dispatch path (command_execute.rs -> validate_command_parameter_
+        // expansions), NOT inside expand_command_words — without it the gate
+        // would swallow `set -u` unbound-variable and `${x:?msg}` /
+        // `${x?msg}` verdicts and hand degraded words to argv (sleep executed
+        // with an empty/message argument). Any fatal shape keeps the
+        // wrapper, whose child runs this same scan on its own dispatch and
+        // reports exactly as today. Safe to call here: the F2 arm above
+        // already routed every command-substitution-bearing word to the
+        // wrapper, so the scan's prefix-comsub side-effect replay can never
+        // fire in the parent.
+        if self.parameter_expansion_error(command).is_some() {
+            return None;
+        }
+        // A %jobspec leads execute_prepared_command's fg/bg dispatch, and an
+        // assignment-shaped first word is an assignment command — wrapper.
+        let first_raw = &command.words[0];
+        if first_raw.starts_with('%') {
+            return None;
+        }
+        if let Some((name, _)) = first_raw.split_once('=') {
+            if super::support_names::is_shell_name(name) {
+                return None;
+            }
+        }
+        // Expand with the same machinery the foreground dispatch uses; any
+        // expansion failure falls back to the wrapper, whose child re-parses
+        // the source and reports the error exactly as before.
+        let expanded = match self.expand_command_words(command) {
+            Ok(expanded) => expanded,
+            Err(_) => return None,
+        };
+        if self.shell_state.arithmetic_nounset_error.replace(false) {
+            self.shell_state.arithmetic_expansion_error.set(false);
+            return None;
+        }
+        if expanded.words.is_empty() {
+            return None;
+        }
+        let name = &expanded.words[0];
+        // Dispatch precedence (execute_prepared_command): jobspec, builtin,
+        // function and alias names all mean this is not a disk command.
+        if name.starts_with('%')
+            || super::builtin_names::is_shell_builtin_name(name)
+            || self.shell_state.functions.contains_key(name)
+            || (!self.shell_state.aliases.is_empty() && self.shell_state.aliases.contains_key(name))
+        {
+            return None;
+        }
+        // Same PATH resolution execute_external_inner uses; a name that does
+        // not resolve keeps today's child-side "command not found" behavior.
+        let Some(program) =
+            crate::executor::path::find_user_command(name, &self.shell_state.env_vars)
+        else {
+            return None;
+        };
+        // Script files need the shell fallback the wrapper's child provides.
+        if crate::executor::path::should_run_with_shell(&program) {
+            return None;
+        }
+        Some((program, expanded.words))
     }
 
     /// Mirror of GNU do_redirections (redir.c) restricted to fds 0-2 for the
@@ -2965,6 +3212,33 @@ fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
         inverted,
         posix_format,
     })
+}
+
+/// rubash#809 CR F2: does a raw word carry an assignment-typed braced
+/// parameter expansion — `${x=v}` / `${x:=v}` (also `${x=[w]}`)? These assign
+/// in the expanding shell, so they must expand in the wrapper child, never in
+/// the parent. `${x:-v}` / `${x-v}` / `${x:?v}` are reads and stay on the
+/// fast path.
+fn parameter_expansion_assigns(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut scan_from = 0usize;
+    while let Some(rel) = raw[scan_from..].find("${") {
+        let mut cursor = scan_from + rel + 2;
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        if cursor > name_start {
+            let rest = &raw[cursor..];
+            if rest.starts_with('=') || rest.starts_with(":=") {
+                return true;
+            }
+        }
+        scan_from = name_start.max(scan_from + 1);
+    }
+    false
 }
 
 fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
