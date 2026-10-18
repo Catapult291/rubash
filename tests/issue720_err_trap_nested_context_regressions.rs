@@ -195,6 +195,120 @@ fn return_plain_call_fires_with_own_status() {
 }
 
 // ---------------------------------------------------------------------------
+// CR round 2 — the region-close paths the first round missed: the and-or
+// list, brace-group, pipeline and main-dispatch catch-all arms all leave the
+// flat region without closing it (no parent-state restore, no :769 fire).
+// Each expectation is the literal WSL GNU bash 5.3.0(1) transcript.
+// ---------------------------------------------------------------------------
+
+/// `g() ( false && true ); g`: the region completes 1 through the exempt
+/// `&&` arm — GNU fires twice (region + call, region text, `false` itself is
+/// a non-last and-or operand and never fires, execute_cmd.c:2943 marks the
+/// lhs CMD_IGNORE_RETURN) — and the saved parent state must not leak (the
+/// first cut leaked `subshell_depth`, so `BASH_SUBSHELL` read 1 ever after).
+#[test]
+fn and_or_list_region_closes_and_fires() {
+    let source = concat!(
+        "set -E\n",
+        "trap 'echo ERR sub=$BASH_SUBSHELL lin=$LINENO cmd=$BASH_COMMAND' ERR\n",
+        "x=pre\n",
+        "g() ( false && true )\n",
+        "g\n",
+        "echo rc=$? x=${x-pre}",
+    );
+    let (out, code) = run(source);
+    assert_eq!(
+        out,
+        concat!(
+            "ERR sub=0 lin=4 cmd=( false && true )\n",
+            "ERR sub=0 lin=5 cmd=( false && true )\n",
+            "rc=1 x=pre\n"
+        )
+    );
+    assert_eq!(code, 0);
+}
+
+/// `f() (\n true | false\n)`: a pipeline body closes the region too — GNU
+/// fires for the failing last stage, the region (close-paren line), and the
+/// call.
+#[test]
+fn pipeline_body_region_closes_and_fires() {
+    let source = concat!(
+        "set -E\n",
+        "trap 'echo ERR sub=$BASH_SUBSHELL lin=$LINENO cmd=$BASH_COMMAND' ERR\n",
+        "f() (\n",
+        "  true | false\n",
+        ")\n",
+        "f\n",
+        "echo rc=$?",
+    );
+    let (out, code) = run(source);
+    assert_eq!(
+        out,
+        concat!(
+            "ERR sub=1 lin=4 cmd=false\n",
+            "ERR sub=0 lin=5 cmd=( true | false )\n",
+            "ERR sub=0 lin=6 cmd=( true | false )\n",
+            "rc=1\n"
+        )
+    );
+    assert_eq!(code, 0);
+}
+
+/// `f() ( x=v; return 4 ); f`: the `return` unwinds through the main
+/// dispatch catch-all — GNU ends the child with 4 (`return.def:57-76`), the
+/// parent adjudicates the completion twice (region + call, region text) and
+/// `x` stays CLEAN: the first cut leaked `x=v` across the subshell boundary.
+#[test]
+fn return_unwind_absorbed_at_region_boundary() {
+    let source = concat!(
+        "set -E\n",
+        "trap 'echo ERR sub=$BASH_SUBSHELL lin=$LINENO cmd=$BASH_COMMAND' ERR\n",
+        "f() ( x=v; return 4 )\n",
+        "f\n",
+        "echo rc=$? x=${x-pre}",
+    );
+    let (out, code) = run(source);
+    assert_eq!(
+        out,
+        concat!(
+            "ERR sub=0 lin=3 cmd=( x=v; return 4 )\n",
+            "ERR sub=0 lin=4 cmd=( x=v; return 4 )\n",
+            "rc=4 x=pre\n"
+        )
+    );
+    assert_eq!(code, 0);
+}
+
+/// `k() ( { false; } )`: a brace-group body closes the flat region as well
+/// (fourth path of the same class found in the CR round).
+#[test]
+fn brace_body_region_closes_and_fires() {
+    let (out, code) =
+        run("set -E; trap 'echo ERR sub=$BASH_SUBSHELL' ERR; k() ( { false; } ); k; echo rc=$?");
+    assert_eq!(out, "ERR sub=1\nERR sub=0\nERR sub=0\nrc=1\n");
+    assert_eq!(code, 0);
+}
+
+/// `m() ( true | exit 3 )` under lastpipe: inside the region the "current
+/// shell" is the region's forked stand-in, so the exit ends the child with 3
+/// and the parent observes a plain completion (two fires), not a top-level
+/// unwind.
+#[test]
+fn lastpipe_exit_in_region_absorbed() {
+    let source = concat!(
+        "set -E; shopt -s lastpipe 2>/dev/null\n",
+        "trap 'echo ERR sub=$BASH_SUBSHELL' ERR\n",
+        "m() ( true | exit 3 )\n",
+        "m\n",
+        "echo rc=$?",
+    );
+    let (out, code) = run(source);
+    assert_eq!(out, "ERR sub=0\nERR sub=0\nrc=3\n");
+    assert_eq!(code, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Form 3 — `cat <(false)` process-substitution copy path: NOT covered; the
 // divergence stays tracked in rubash#720 (read/procsub reaping area).
 // ---------------------------------------------------------------------------

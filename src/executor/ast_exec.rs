@@ -957,7 +957,23 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(error) => return Err(error),
+                    Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                        // GNU: `return N` inside a `( )` subshell ends the
+                        // child with status N (return.def:57-76
+                        // return_builtin — the child's own return_catch), the
+                        // parent observes a plain status-N completion and the
+                        // function continues after the region. Absorb at the
+                        // boundary (rubash#720 CR round 2).
+                        handle_exit_code!(code, command)
+                    }
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing a flat
+                        // region boundary must not leak the saved parent
+                        // state — close first (a no-op outside a region),
+                        // then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
                 if let Some(next_index) = self.skip_and_or_rhs(commands, index) {
                     index = next_index;
@@ -1017,7 +1033,23 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(error) => return Err(error),
+                    Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                        // GNU: `return N` inside a `( )` subshell ends the
+                        // child with status N (return.def:57-76
+                        // return_builtin — the child's own return_catch), the
+                        // parent observes a plain status-N completion and the
+                        // function continues after the region. Absorb at the
+                        // boundary (rubash#720 CR round 2).
+                        handle_exit_code!(code, command)
+                    }
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing a flat
+                        // region boundary must not leak the saved parent
+                        // state — close first (a no-op outside a region),
+                        // then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
                 if let Some(next_index) = self.skip_and_or_rhs(commands, index) {
                     index = next_index;
@@ -1062,7 +1094,23 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(error) => return Err(error),
+                    Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                        // GNU: `return N` inside a `( )` subshell ends the
+                        // child with status N (return.def:57-76
+                        // return_builtin — the child's own return_catch), the
+                        // parent observes a plain status-N completion and the
+                        // function continues after the region. Absorb at the
+                        // boundary (rubash#720 CR round 2).
+                        handle_exit_code!(code, command)
+                    }
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing a flat
+                        // region boundary must not leak the saved parent
+                        // state — close first (a no-op outside a region),
+                        // then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
                 index += 1;
                 close_subshell_region_if_ended!(command);
@@ -1112,7 +1160,23 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(error) => return Err(error),
+                    Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                        // GNU: `return N` inside a `( )` subshell ends the
+                        // child with status N (return.def:57-76
+                        // return_builtin — the child's own return_catch), the
+                        // parent observes a plain status-N completion and the
+                        // function continues after the region. Absorb at the
+                        // boundary (rubash#720 CR round 2).
+                        handle_exit_code!(code, command)
+                    }
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing a flat
+                        // region boundary must not leak the saved parent
+                        // state — close first (a no-op outside a region),
+                        // then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
                 if let Some(next_index) = self.skip_and_or_rhs(commands, index) {
                     index = next_index;
@@ -1178,15 +1242,28 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(ExecuteError::LastpipeExit(code)) => {
+                    Err(ExecuteError::LastpipeExit(code)) if subshell_state.is_some() => {
                         // Issue #74 (G2): `exit N` in a lastpipe stage runs in
                         // the current shell (shopt -s lastpipe), so it must
                         // exit the current shell — not just set the pipeline's
-                        // exit status.  Propagate to the top level.
+                        // exit status. Propagate to the top level. Inside a
+                        // flat `( )` region the "current shell" is the region's
+                        // forked stand-in: GNU's child dies with status N and
+                        // the parent observes a plain completion
+                        // (execute_in_subshell), so absorb at the boundary.
+                        handle_exit_code!(code, command)
+                    }
+                    Err(ExecuteError::LastpipeExit(code)) => {
                         self.exit_code = code;
                         return Err(ExecuteError::ExitCode(code));
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing the
+                        // region boundary must not leak the saved parent
+                        // state — close first, then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
                 if command.inverted {
                     self.exit_code = invert_exit_status(self.exit_code);
@@ -1211,6 +1288,7 @@ impl Executor {
                 } else {
                     index += 1;
                 }
+                close_subshell_region_if_ended!(command);
                 continue;
             }
 
@@ -1257,8 +1335,26 @@ impl Executor {
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
                     }
-                    Err(error) => return Err(error),
+                    Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                        // GNU: `return N` inside a `( )` subshell longjmps to
+                        // the child's own return_catch and the child EXITS N
+                        // (return.def:57-76 return_builtin; the parent sees a
+                        // plain status-N completion and the function continues
+                        // after the region — the node-form boundary documents
+                        // the same absorption). Absorb here so the unwind
+                        // neither crosses the boundary nor leaks the saved
+                        // parent state (rubash#720 CR round 2, form 3 probe).
+                        handle_exit_code!(code, command)
+                    }
+                    Err(error) => {
+                        // CR round 2 (rubash#720): an unwind crossing the
+                        // region boundary must not leak the saved parent
+                        // state — close first, then let the unwind continue.
+                        close_subshell_region_if_ended!(command);
+                        return Err(error);
+                    }
                 }
+                close_subshell_region_if_ended!(command);
                 index += 1;
                 continue;
             }
@@ -1271,6 +1367,7 @@ impl Executor {
                     } else {
                         index += 1;
                     }
+                    close_subshell_region_if_ended!(command);
                     continue;
                 }
                 Ok(false) => {}
@@ -1313,13 +1410,30 @@ impl Executor {
                 Err(ExecuteError::ExitCode(code)) => {
                     handle_exit_code!(code, command)
                 }
-                Err(error) => return Err(error),
+                Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                    // GNU: `return N` inside a `( )` subshell ends the child
+                    // with status N (return.def:57-76; the child's own
+                    // return_catch), the parent sees a plain completion and
+                    // the function continues after the region. Absorb at the
+                    // boundary — see the and_or_list twin above (rubash#720
+                    // CR round 2).
+                    handle_exit_code!(code, command)
+                }
+                Err(error) => {
+                    // CR round 2 (rubash#720): close the region before the
+                    // unwind crosses it — the saved parent state must not
+                    // leak (brace bodies close flat regions too:
+                    // `f() ( { false; } )`).
+                    close_subshell_region_if_ended!(command);
+                    return Err(error);
+                }
             }
 
             let simple_result = self.execute_simple_pipeline(commands, index);
             match simple_result {
                 Ok(Some(next_index)) => {
                     index = next_index;
+                    close_subshell_region_if_ended!(command);
                     continue;
                 }
                 Ok(None) => {}
@@ -1359,7 +1473,23 @@ impl Executor {
                     );
                     self.exit_code = 1;
                 }
-                Err(error) => return Err(error),
+                Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                    // GNU: `return N` inside a `( )` subshell ends the child
+                    // with status N (return.def:57-76 return_builtin — the
+                    // child's own return_catch), the parent observes a plain
+                    // status-N completion and the function continues after
+                    // the region. Absorb at the boundary (rubash#720 CR
+                    // round 2).
+                    handle_exit_code!(code, command)
+                }
+                Err(error) => {
+                    // CR round 2 (rubash#720): an unwind crossing a flat
+                    // region boundary must not leak the saved parent state —
+                    // close first (a no-op outside a region), then let the
+                    // unwind continue.
+                    close_subshell_region_if_ended!(command);
+                    return Err(error);
+                }
             }
 
             drop(_t_chain);
@@ -1520,7 +1650,23 @@ impl Executor {
                     }
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
+                    // GNU: `return N` inside a `( )` subshell ends the child
+                    // with status N (return.def:57-76 return_builtin — the
+                    // child's own return_catch), the parent observes a plain
+                    // status-N completion and the function continues after
+                    // the region. Absorb at the boundary (rubash#720 CR
+                    // round 2).
+                    handle_exit_code!(code, command)
+                }
+                Err(error) => {
+                    // CR round 2 (rubash#720): an unwind crossing a flat
+                    // region boundary must not leak the saved parent state —
+                    // close first (a no-op outside a region), then let the
+                    // unwind continue.
+                    close_subshell_region_if_ended!(command);
+                    return Err(error);
+                }
             }
             if command.inverted {
                 self.exit_code = invert_exit_status(self.exit_code);
