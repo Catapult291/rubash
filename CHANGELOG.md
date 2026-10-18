@@ -50,6 +50,10 @@
 - **fd 偏移测试经 PATH 解析外部 true**（#655 后续，PR #687）：硬编码 `/usr/bin/true` 在 Android（无 /usr/bin）上 127。测试时经 PATH 解析（绝对路径绕过 builtin 仍是外部 spawn），缺席则跳过。双测 Android 绿。纯测试改动。
 - **prompt 渲染不再破坏读者的 `$?`/PIPESTATUS**（#604）：交互驱动（niu 原生控制台通道，`expand_prompt_string_mut`）渲染 `PS1`/`PS2`/`PS0` 时，内嵌 `$(false)` 等命令替换的退出状态此前经赋值展开引擎的替换边界写入 `exit_code`，下一个命令的 `$?` 读到 1；GNU 的 prompt 渲染是读侧操作，从不动读者的状态（WSL GNU Bash 5.3.0 piped-`-i` 探针：`PS1='$(false)'` 渲染后 `echo $?` 仍打印渲染前的值）。修复：渲染通道快照并在收尾恢复 `$?` 与 PIPESTATUS——赋值 RHS 通道（`v=$(false)` → rc=1 的 POSIX 赋值退出规则）不受影响。附带 #604 的通道 parity 回归与相对性能上限测试（PS1 渲染路径 vs PROMPT_COMMAND 路径的中位耗时比值上限），并按 profile 数据澄清该 issue 的主刀：四主题 rr 成本为外部 spawn 数 × Windows spawn 地板（每次渲染 4-6 次 git spawn；裸 `std::process::Command` 对同一 git.exe 需 208.9ms，rubash 会话内 217.6ms），两条引擎通道执行同一替换体为 parity（同进程 dev 计 47/49/68ms，release 会话内逐次 git 209.7/217.6ms）。
 
+### 构建
+
+- **命令替换 pipeline-filter 死链删除**（#710）：`command_substitution_pipeline_filter` 的 8 条 filter 臂（sort/sed/tr/head/grep/wc/tail/uniq）连同其唯一调用链——`command_substitution_pipeline_output`、`timed_command_substitution_inner` 的 `|` 臂、`command_substitution_pipeline_first_stage`、孤儿助手 `split_pipeline_words`/`echo_raw_output`——自 rubash#117 平凡性 gate 之后不可达：gate 字节白名单拒绝 `|`，能抵达 filter 的替换体不可能含管线；且该链还只住在 `time` 前缀快捷方式内，进一步收窄。运行时复核：入口探针在 producer×filter 电池（含反引号、嵌套 comsub、alias 注入 `|`、`cat`/generic 首段、`time` 前缀形）上零命中；阳性对照（gate 临时放行 `|`）全部探针命中并复现休眠特征（`$(…|wc)` 默认单列 `1`，而活跃路径是三列）。`$( … | … )` 的可观测行为本就由真执行器管线（pipeline_exec）与外部二进制产出，删除零行为差；同步移除孤儿 doc-sync 测试与 `docs/builtins.md` 的 `substitution-fastpath-list` 机器块（审计 §2.5 加 resolution 注记）。新增 `tests/issue710_comsub_pipeline_reachability.rs` 钉住路由（wc 默认三列、echo 引导管线不吞、八 filter 走真执行器、time 前缀管线、末段状态语义），期望值与 WSL GNU 5.3.0 逐字节一致；全量失败集与基线双向一致。
+
 ## [1.4.0] - 2026-10-10
 
 GNU Bash 5.3.0 兼容性大幅推进。83 套件 true-baseline 总差异从 3427 行降至 2072 行（−40%），零差套件从 31 增至 32。

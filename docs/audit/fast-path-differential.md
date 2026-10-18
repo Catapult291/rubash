@@ -134,6 +134,23 @@ and `$( … | sort/tail/uniq)` comes from the external WinuxCmd binary (there is
 no pipeline arm for those). The dormant arms carry the same carrier defects as
 `wc`/`tr` (e.g. `-c` byte count) and must be fixed in tandem if ever revived.
 
+**Resolution (2026-10-13, issue #710):** the finding was re-verified at runtime
+— entry probes on `command_substitution_pipeline_filter`,
+`command_substitution_pipeline_output` and the `|` arm of
+`timed_command_substitution_inner` stayed silent across producer×filter
+batteries (incl. backtick, nested-comsub and alias-injected shapes), while a
+positive control admitting `|` in the triviality gate made all probes fire and
+reproduced the dormant one-column `wc` default — and the whole dormant chain
+was then **removed** rather than revived: the 8 filter arms,
+`command_substitution_pipeline_output`,
+`command_substitution_pipeline_first_stage`, the `|` arm of
+`timed_command_substitution_inner`, and their now-orphaned helpers
+(`split_pipeline_words`, `echo_raw_output`). `$( … | … )` substitutions route
+through the real executor's pipeline (§2.1) or the external binaries exactly as
+described above; a regression test pins that routing. The audit sections below
+keep the historical byte-level evidence for the pipeline arms (§2.1), which
+remain live.
+
 ## 3. Confirmed divergences
 
 `FAST`/`EXT`/`GNU` are the raw stdout bytes (`\xNN` = one byte) and exit status.
