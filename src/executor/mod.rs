@@ -728,6 +728,22 @@ pub struct Executor {
     /// source boundary and cleared at every pending-clearing boundary,
     /// same discipline as `evalerror_subscript_pending`.
     pub(crate) evalerror_failglob_pending: Cell<bool>,
+    /// rubash#705: marks a pending evalerror abort as the `exit` too-many-
+    /// arguments class (GNU builtins/common.c no_args, bash 5.3: prints the
+    /// diagnostic, `set_exit_status (EX_BADUSAGE)` = 2, then
+    /// `top_level_cleanup` + `jump_to_top_level (DISCARD)`). The status the
+    /// discard leaves behind is 2 — not the plain DISCARD 1 — and the
+    /// top_level_cleanup pops every parse_and_execute level, so the jump
+    /// lands at the OUTERMOST reader: script/stdin continue with the next
+    /// command ($?=2), while a `-c` string is abandoned entirely and
+    /// shell.c:1477 run_one_command's DISCARD catch exits 1. Unlike the
+    /// failglob/subscript classes this discard is NOT absorbed at the
+    /// eval/source boundaries (their string streams were popped); the
+    /// eval'd list just unwinds whole. Armed alongside `evalerror_pending`
+    /// at the exit interception site; consumed at the reader abandon point
+    /// and cleared at every pending-clearing boundary, same discipline as
+    /// `evalerror_subscript_pending`.
+    pub(crate) evalerror_exit_toomany_pending: Cell<bool>,
     /// rubash#637: the `evalerror_exec_depth` value at which the currently
     /// executing eval'd list runs (`None` outside `eval`). A nested abort
     /// unwinds silently everywhere EXCEPT the eval'd top list itself, where

@@ -410,6 +410,7 @@ impl Executor {
         let saved_nounset_force_eof = self.nounset_force_eof.get();
         let saved_evalerror_subscript = self.evalerror_subscript_pending.get();
         let saved_evalerror_failglob = self.evalerror_failglob_pending.get();
+        let saved_evalerror_exit_toomany = self.evalerror_exit_toomany_pending.get();
         let saved_evalerror_line = self.evalerror_line.get();
         let saved_reader_command_line = self.reader_command_line.get();
         let saved_parameter_assignment_failure = self.parameter_assignment_failure.get();
@@ -423,6 +424,7 @@ impl Executor {
         self.nounset_force_eof.set(false);
         self.evalerror_subscript_pending.set(false);
         self.evalerror_failglob_pending.set(false);
+        self.evalerror_exit_toomany_pending.set(false);
         self.evalerror_line.set(None);
         self.parameter_assignment_failure.set(false);
         // A parse error inside the child dies with it (GNU shell.c: the
@@ -701,6 +703,8 @@ impl Executor {
             .set(saved_evalerror_subscript);
         self.evalerror_failglob_pending
             .set(saved_evalerror_failglob);
+        self.evalerror_exit_toomany_pending
+            .set(saved_evalerror_exit_toomany);
         self.evalerror_line.set(saved_evalerror_line);
         self.reader_command_line.set(saved_reader_command_line);
         self.parameter_assignment_failure
