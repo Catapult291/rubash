@@ -3197,6 +3197,15 @@ impl Executor {
     }
 
     pub(in crate::executor) fn report_failglob(&mut self, pattern: &str) {
+        // The #809 background direct-spawn gate expands the async command's
+        // words in the PARENT as an eligibility probe; GNU expands the
+        // forked child's words inside the child, so the parent never sees a
+        // failglob verdict. A probe hit stays silent — the wrapper fallback
+        // re-expands in the child and reports exactly once (753.11: the
+        // doubled `no match` on the `&` line).
+        if self.expansion_probe_active.get() {
+            return;
+        }
         eprintln!("{}no match: {pattern}", self.diagnostic_prefix());
         self.exit_code = 1;
     }

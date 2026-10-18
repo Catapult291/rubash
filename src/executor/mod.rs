@@ -563,6 +563,15 @@ pub struct Executor {
     /// not against the map value (rubash perf12: the map-value gate
     /// produced stale alias/declare line numbers after an ambient restore).
     line_env_os_value: std::cell::RefCell<Option<String>>,
+    /// The background direct-spawn eligibility gate (#809) expands the async
+    /// command's words in the PARENT as a probe; GNU expands the forked
+    /// child's words inside the child, so the parent never observes a
+    /// failglob verdict. While this flag is set, `report_failglob` stays
+    /// silent — the wrapper fallback re-expands in the child and reports
+    /// exactly once, and the gate restores the expansion latches so the
+    /// parent-side discard never swallows the rest of the launch line
+    /// (`set -- /no/such/*.zzz & echo BG_after` lost its echo, 753.11).
+    expansion_probe_active: std::cell::Cell<bool>,
     /// GNU trap.c SIG_INPROGRESS: _run_trap_internal marks a trap
     /// in-progress before executing its action, and run_error_trap refuses
     /// to re-enter while it is set — an ERR trap action that itself fails
