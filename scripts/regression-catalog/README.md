@@ -93,3 +93,47 @@ runs this runner, and fails on `ALARM` — the runner already exits 1 for that.
 
 First recorded run: 27 cases, arm `b5793580`, `ok=27 alarms=0 newly-fixed=0`
 (posted on #746).
+
+## The #750-#810 wave (first batch of fixed-issue rows, rubash#746)
+
+Every fixed issue of the wave carries ONE catalogue line.  Where the fix face
+is behavioural it is a case above (flip verified on the arm named in the last
+run below); where the fix lives in harness/Rust-test territory it is a pointer
+to the pin, per the Scope rule.
+
+| issue | fix surface | catalogue line |
+|---|---|---|
+| #714 | `read -n/-N` count decoded units | `issue-714` (case, `must-match`) |
+| #723 | pipeline while-read consumer stall | `issue-723` (case, `must-match`) |
+| #726 | definition-level dup splice; `exec` group-order escape | `issue-726` (case, `must-match`) |
+| #733 | compound-assignment quote leak | `issue-733` (case, promoted 2026-10-19) |
+| #735 | PUA/marker collision | `issue-735` (case, kept `diverges`: `${x@Q}` byte face — follow-up #794/#796) |
+| #737 | kill reaches background children | `issue-737` (case, kept `diverges`: Killed-notification wording — follow-up #794) |
+| #743 | partially-quoted word field splitting | `issue-743` (case, promoted; rework follow-up #795) |
+| #753 | failglob abort scope | `issue-753` (case, promoted; also `tests/regression.rs` `issue_753`) |
+| #755 | scalar re-parsed as array by `${x[@]}` | `issue-755` (case, promoted) |
+| #756 | `history -w` with HISTFILE unset | `issue-756` (case, promoted; wording face moved to #551) |
+| #758 | malformed expansion swallowed | `issue-758` (case, promoted) |
+| #761 | unbounded producer + shell-side tail drain | `issue-761` + `issue-761b` (cases, promoted) |
+| #772 | non-UTF-8 `$(cat)` / `${x:off:len}` opacity | `loc-l1-substring` (promoted); `loc-l2`/`loc-l5` kept `diverges` (residual faces) |
+| #776 | `read -N` keeps embedded newline | `issue-776` (case; also `tests/regression.rs` `issue_776`) |
+| #780 | argument-less `-O`/`+O` shopt listing | pointer: `tests/regression.rs` `issue_780` (startup-flag face, not expressible in a case body) |
+| #788 | compound operand sets the array attribute | `issue-788` (case; also `tests/regression.rs` `issue_788`) |
+| #797 | sourced bash-preexec DEBUG-trap assembly | `issue-797` (case) |
+| #798 | `exit` inside source terminates | `issue-798` (case) |
+| #799 | command-name stem byte-exact | pointer: `tests/issue799_command_name_case_regressions.rs` (r/R cannot coexist on NTFS and WSL DrvFs is itself case-insensitive, so no differential case is expressible) |
+| #803 | nquote snapshot vs autocrlf | pointer: the snapshot runner's CRLF-normalizing copy predicate (`tests/regression.rs` `run_suite_snapshot`) — a harness face, not a behaviour |
+
+## Wiring with fast-path-differential.py (#706)
+
+`scripts/fast-path-differential.py` is the #706 harness skeleton; this
+catalogue is its generalization past fast paths.  The contract between them:
+
+* case ids trace to issues everywhere: the differential's `known=` notes name
+  `rubash#NNN`, and catalogue ids are `<case>` rows whose manifest line names
+  the issue — a failing name lands on the issue either way;
+* a fast-path known-divergence that starts passing must be PROMOTED out of the
+  differential (delete the `known` note) and, when the fix has an issue, given
+  a `must-match` row here — the two lists never both carry a fixed face;
+* families beyond the fast paths (parser, expansion, fd, jobs, harvest) live
+  ONLY here; the differential keeps no second copy of them.

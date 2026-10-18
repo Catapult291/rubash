@@ -17,6 +17,11 @@
 #     zecho / run-* wrappers resolve), TMPDIR per suite, stdin </dev/null,
 #     timeout -k 5 40
 #   * the ledger diff counts stdout only (stderr is captured separately)
+#   * helper-parity gate: both sides share ONE helper implementation
+#     (support/{recho,zecho}.c; the scripts/test-helpers/*.rs PE is its
+#     required-byte-exact port) and the harness refuses to start a ledger
+#     unless both carriers render identical bytes for identical argv
+#     (rubash#767)
 set -u
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -102,14 +107,22 @@ sync_suite() {
 # ---- helpers: recho/zecho must exist or every GNU output truncates ---------
 # (a fresh checkout has no binaries; a missing helper makes the GNU side
 #  abort with "command not found", poisoning the baseline silently)
-# The GNU side gets the ELF builds from support/*.c. The rubash side runs as
-# a Windows process and cannot exec ELF, so it gets REAL Windows helpers
-# compiled from scripts/test-helpers/*.rs — the executor no longer carries
-# test-only recho/zecho emulations (removed with upstream_scripts).
+# ONE implementation, TWO carriers (rubash#767): third_party/bash/support/
+# {recho,zecho}.c is THE implementation; the gcc ELF built from it is the
+# oracle-side carrier and scripts/test-helpers/{recho,zecho}.rs is its
+# required-byte-exact PE port for the rubash side (a Windows process cannot
+# exec the ELF). Staging two renderings of the same helper and letting their
+# outputs differ is how a harness-side difference gets counted against the
+# engine (9 of the 21-22 differing suites depend on these helpers); the
+# helper-parity preflight below refuses to start a ledger until both
+# carriers render identical bytes for identical argv. Both carriers are
+# rebuilt from source EVERY run so the gate can never pass on stale
+# binaries (the old only-if-missing staging kept whatever PE a previous
+# tree had built).
 ensure_test_helpers() {
   local h
   for h in recho zecho; do
-    if [ ! -x "$BASE/$h" ] && [ -f "$REPO/third_party/bash/support/$h.c" ]; then
+    if [ -f "$REPO/third_party/bash/support/$h.c" ] && command -v gcc >/dev/null 2>&1; then
       gcc -O1 -o "$BASE/$h" "$REPO/third_party/bash/support/$h.c" 2>/dev/null || true
     fi
   done
@@ -124,7 +137,7 @@ ensure_test_helpers() {
   fi
   if [ -n "$RUSTC_BUILD" ]; then
     for h in recho zecho; do
-      if [ ! -f "$BASE/$h.exe" ] && [ -f "$REPO/scripts/test-helpers/$h.rs" ]; then
+      if [ -f "$REPO/scripts/test-helpers/$h.rs" ]; then
         if [ "$RUSTC_BUILD" = rustc.exe ]; then
           "$RUSTC_BUILD" -O -o "$(wslpath -w "$BASE/$h.exe")" "$(wslpath -w "$REPO/scripts/test-helpers/$h.rs")" 2>/dev/null || true
         else
@@ -193,6 +206,84 @@ WINPATH_AS_WSL=$(/mnt/c/Windows/System32/cmd.exe /c 'echo %PATH%' 2>/dev/null \
   | sed -e 's|\\|/|g' -e 's|^\([A-Za-z]\):|/mnt/\L\1|' \
   | grep -v '^$' | paste -sd:)
 RUBSIDE_PATH="${RUBSIDE_PATH:-$BASE:$WINPATH_AS_WSL}"
+
+# ---- helper-parity preflight (rubash#767) -----------------------------------
+# Refuses to start a ledger until both helper carriers render IDENTICAL
+# bytes for identical argv. Each side's own shell builds the argv (printf
+# escapes -> command substitution), so the gate exercises the exact producer
+# path the suites use; outputs are od-dumped and diffed.
+#
+# Matrix tiers:
+#   gate (any divergence is FATAL, exit 9): every byte class the 83 suites
+#     put through recho/zecho -- ASCII, control ^X/^? mapping, DEL, raw
+#     0x80-0xFF as isolated escapes, empty argv, multi-arg spacing and
+#     argv indexing. Invalid-UTF-8 bytes travel the Windows command line
+#     as U+00nn (probed via encode_wide, 2026-10) and decode back per
+#     byte, so full parity is required and achievable here.
+#   report-only (never fatal): VALID multi-byte UTF-8 escape spellings.
+#     These hit the engine's byte-reencoding family, not the helper pair:
+#     rubash decodes printf '\xc3\xa9' into a single char and the wire
+#     carries U+00E9 where GNU keeps raw bytes C3 A9. Recorded so the
+#     ledger can attribute such diffs to the engine family (#540 class),
+#     never charged to the helpers.
+PARITY_LOG="${PARITY_LOG_OVERRIDE:-$REPO/target/issue-suites/results/helper-parity.log}"
+mkdir -p "$(dirname -- "$PARITY_LOG")"
+helper_parity() {
+  local h fmt g r fail=0 info=0
+  for h in recho zecho; do
+    [ -x "$BASE/$h" ]     || { echo "FATAL: oracle ELF $BASE/$h missing (gcc build failed?)" >&2; exit 9; }
+    [ -f "$BASE/$h.exe" ] || { echo "FATAL: arm PE $BASE/$h.exe missing (rustc build failed?)" >&2; exit 9; }
+  done
+  cat > "$BASE/.parity.sh" <<'EOS'
+h=$1
+shift
+"$h" "$(printf "$1")" "" tail-arg
+EOS
+  : > "$PARITY_LOG"
+  for fmt in \
+    plain \
+    'two args' \
+    '\n' \
+    'a\001b\177c' \
+    '\x01\x02\x1f' \
+    '\x7f' \
+    'x\x80y' \
+    '\xfe\xff' \
+    '\xc3' \
+    '\xe4\xb8' \
+    'caf\xc3\xa9' \
+    '\xe4\xb8\xad' \
+    'mix \x01\x02 end'
+  do
+    for h in recho zecho; do
+      g=$( cd "$BASE" && PATH="$BASE:/usr/bin:/bin" "$GNU_BASH" ./.parity.sh "$h" "$fmt" </dev/null 2>&1 | od -An -tx1 )
+      r=$( cd "$BASE" && env PATH="$RUBSIDE_PATH" WSLENV="$WSLENV:PATH/p" "$RUB" ./.parity.sh "$h.exe" "$fmt" </dev/null 2>&1 | od -An -tx1 )
+      if [ "$g" = "$r" ]; then
+        echo "OK   $h  printf '$fmt'" >> "$PARITY_LOG"
+      else
+        case "$fmt" in
+          *'\xc3\xa9'*|'\xe4\xb8\xad'|*'\xe4\xb8\xad'*)
+            echo "INFO $h  printf '$fmt' (engine byte-reencoding family, report-only)" >> "$PARITY_LOG"
+            info=$((info + 1))
+            ;;
+          *)
+            echo "FAIL $h  printf '$fmt'" >&2
+            echo "  oracle: $g" >&2
+            echo "  arm   : $r" >&2
+            fail=$((fail + 1))
+            ;;
+        esac
+      fi
+    done
+  done
+  if [ "$fail" -gt 0 ]; then
+    echo "FATAL: helper-parity gate failed ($fail case(s)); see $PARITY_LOG." >&2
+    echo "FATAL: a helper-pair difference must never be counted against the engine (rubash#767). Fix the port or the staging, then rerun." >&2
+    exit 9
+  fi
+  echo "helper-parity: gate green ($(grep -c '^OK' "$PARITY_LOG") ok, $info report-only) -> $PARITY_LOG"
+}
+helper_parity
 
 mkdir -p "$OUT"
 : > "$LOG"
