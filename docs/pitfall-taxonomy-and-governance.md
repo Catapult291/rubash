@@ -34,7 +34,7 @@ rubash 用带内哨兵（C0 字节 \x11–\x1f、PUA 码点 E000–E317、命名
 | S1 | **词层快速路径引号/转义失真** | ~242 提交（#116/#117、niubash#103…） | executor/mod.rs、assignment_expansion.rs | fast path 在文本层重实现词法语义，准入靠 contains() 黑名单（#117 已定性） |
 | S2 | **数组复合赋值/下标展开** | 223+ 提交，两次 merge 丢修复 | declare.rs、executor/mod.rs | 引号去除→转义解码→字段拆分的阶段顺序无唯一实现；declare/read/alias/直接赋值四入口各一份 |
 | S3 | 重定向/fd 模型 | ~206 提交（#118/#122） | command_prepare.rs | Windows 无真实 fd；内建输出通路 N 条各自打补丁 |
-| S4 | heredoc 收集 | ~101 提交（heredoc3/7/9/10 变体各自失败） | lexer/mod.rs | 独立扫描器而非 parser 状态机（GNU PST_EOFTOKEN 模型） |
+| S4 | heredoc 收集 | ~101 提交（heredoc3/7/9/10 变体各自失败） | lexer/mod.rs | 独立扫描器而非 parser 状态机（GNU PST_EOFTOKEN 模型）；**#703（2026-10-18）：同一规则两份实现**——lexer/heredoc_scan.rs 的 delimiter 词边界与展开期 comsub 收集器（embedded_mutations.rs collect_command_substitution_source_ex）各写一份且已漂移，收集器把 `cat <<EOF | cat` 读成 delimiter `EOF | cat` |
 | S5 | 命令替换 body 再解析 | ~129 提交 | command_substitution.rs | 文本切片+再解析替代 parse_and_execute 一体化 |
 | S6 | 子壳隔离 | 20+ 提交（#100 两修） | ast_exec.rs | 非 fork，靠手工快照/恢复清单，新增状态即新泄漏点 |
 | S7 | 作用域/varenv/nameref | 100+ 提交 | declare.rs、varenv | 与 variables.c frame/tempenv 不同构，正成批补语义 |
@@ -55,6 +55,11 @@ rubash 用带内哨兵（C0 字节 \x11–\x1f、PUA 码点 E000–E317、命名
 3. **平台债（S10/S11）是一次性的**，已在收敛，不再新增。
 4. **流程漏洞（M5/S13）用规则+CI 补**：merge 前聚焦回归、PASS 只认 WSL 5.3.0
    script-file 基线——规则已存在，需强制化。
+5. **同名规则多实现必然漂移（#703，2026-10-18）**：heredoc delimiter 词边界在
+   lexer 扫描器与展开期 comsub 收集器各有一份，修 lexer 不测收集器就会漏。
+   两条对策：改任何一份时 grep 另一份并跑同一形状；新增形状的回归必须同时
+   覆盖"词法期入口"（unquoted/无前缀）与"展开期入口"（带前缀/quoted word），
+   因为两者走的是不同代码路径——#703 的复现形状只有后者会红。
 
 ## 三、治理机制（新代码必须遵守）
 

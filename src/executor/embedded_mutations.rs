@@ -1813,12 +1813,6 @@ impl Executor {
         } else {
             source.trim()
         };
-        // GNU applies alias expansion while reading the substitution body
-        // (parse.y alias_expand_token + push_string): expand once at stream
-        // level for this body's own word scan; downstream real-parser paths
-        // receive the raw source and splice for themselves at their own
-        // parse boundary.
-        let words = split_shell_words(&self.comsub_body_alias_splice_extracted(source));
         // Store leading newlines for the heredoc path to adjust warning
         // line numbers: when `$(` is at end of line, the comsub body starts
         // on the next line, and the `cat` command line is
@@ -1834,6 +1828,29 @@ impl Executor {
                 return output;
             }
         }
+        // rubash#703 followup: the lexer marks a heredoc whose `)` closes on
+        // the delimiter line by splicing an IFS_GLUE byte before that `)`
+        // (lexer/mod.rs, make_cmd.c:602-611 shape). The typed path above
+        // already consumed that signal; it must not survive into the real
+        // parser, where the terminator line reads `EOF\x1c` and stops
+        // matching its delimiter — the heredoc then runs to end of body and
+        // the delimiter leaks into the substitution output
+        // (`x=$(cat <<EOF | cat` + `body` + `EOF)` printed `body` AND `EOF`).
+        // The marker is lexer-inserted bookkeeping, never body text (the
+        // typed path strips it the same way).
+        let cleaned;
+        let source: &str = if source.contains(crate::executor::markers::IFS_GLUE) {
+            cleaned = source.replace(crate::executor::markers::IFS_GLUE, "");
+            &cleaned
+        } else {
+            source
+        };
+        // GNU applies alias expansion while reading the substitution body
+        // (parse.y alias_expand_token + push_string): expand once at stream
+        // level for this body's own word scan; downstream real-parser paths
+        // receive the raw source and splice for themselves at their own
+        // parse boundary.
+        let words = split_shell_words(&self.comsub_body_alias_splice_extracted(source));
         let saved_positional_params = self.shell_state.positional_params.clone();
         // GNU subst.c:7143 command_substitute feeds the body to
         // parse_and_execute, so the real parser owns each word's quoting:
@@ -2586,7 +2603,21 @@ pub(in crate::executor) fn collect_command_substitution_source_ex(
             if lookahead.peek().copied() != Some('<') {
                 source.push(source_ch);
                 source.push(chars.next().expect("heredoc second less-than"));
-                let mut header = String::new();
+                // `<<-` is ONE operator word carrying the tab-strip dash
+                // (parse.y redirection). With a blank between `<<` and the
+                // word the dash is delimiter TEXT instead — GNU:
+                // `cat << -EOF` names `-EOF` (no strip), `cat <<- EOF`
+                // strips and names `EOF`.
+                let mut strip_tabs = false;
+                if chars.peek().copied() == Some('-') {
+                    strip_tabs = true;
+                    source.push(chars.next().expect("heredoc strip dash"));
+                }
+                // Blanks between the operator and the delimiter word are
+                // not delimiter text (`cat << EOF` names `EOF`).
+                while matches!(chars.peek(), Some(' ') | Some('\t')) {
+                    source.push(chars.next().expect("heredoc blank"));
+                }
                 // Delimiter text with quoting resolved the way the parser
                 // reports it (make_cmd.c heredoc delimiter): quote bytes are
                 // removed and a backslash contributes its escaped character.
@@ -2603,14 +2634,33 @@ pub(in crate::executor) fn collect_command_substitution_source_ex(
                         // parser tokenizes it as the substitution closer
                         // (PST_EOFTOKEN), not as delimiter text.
                         ')' if !header_single && !header_double => break,
+                        // rubash#703: the delimiter word ends at the first
+                        // unquoted blank or shell metacharacter, exactly
+                        // like read_token_word (parse.y:5688 shellbreak) and
+                        // the lexer's own heredoc header scan
+                        // (lexer/heredoc_scan.rs skip_heredoc_in_chars_core).
+                        // `cat <<EOF | cat` declares `EOF` and leaves
+                        // `| cat` on the header line; scanning the word past
+                        // the blank made the delimiter `EOF | cat`, so the
+                        // `EOF` terminator line never matched and the
+                        // collector swallowed the rest of the script
+                        // looking for it — `echo "X=$(cat <<EOF | cat` +
+                        // `body` + `EOF` + `)"` died with
+                        // `unexpected EOF while looking for matching )'`
+                        // while GNU prints X=body.
+                        _ if !header_single
+                            && !header_double
+                            && (header_ch.is_whitespace()
+                                || matches!(header_ch, ';' | '|' | '&' | '(' | '<' | '>')) =>
+                        {
+                            break;
+                        }
                         '\\' if !header_single => {
                             chars.next();
                             source.push(header_ch);
-                            header.push(header_ch);
                             if let Some(&escaped) = chars.peek() {
                                 chars.next();
                                 source.push(escaped);
-                                header.push(escaped);
                                 if escaped != '\n' {
                                     delimiter.push(escaped);
                                 }
@@ -2621,13 +2671,7 @@ pub(in crate::executor) fn collect_command_substitution_source_ex(
                     }
                     chars.next();
                     source.push(header_ch);
-                    if header_ch == '\n' {
-                        break;
-                    }
-                    header.push(header_ch);
                 }
-                let strip_tabs = header.trim_start().starts_with('-');
-                let delimiter = delimiter.trim().trim_start_matches('-').trim().to_string();
                 if !delimiter.is_empty() {
                     let mut body_line = String::new();
                     while let Some(body_ch) = chars.next() {

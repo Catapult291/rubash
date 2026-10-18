@@ -1032,7 +1032,10 @@ fn canary_bash_completion_bash_n_when_corpus_present() {
 // Revert check for this catalogue (2026-10-18): restoring all 25 touched `src/`
 // files to their pre-fix parents left the engine compiled but turned 18 of the
 // 20 cases red. The two that stayed green are exactly the cases marked
-// `[control]` / `[guard]` below, which is the expected shape.
+// `[control]` / `[guard]` below, which is the expected shape. The issue_703
+// batch (same day): reverting the comsub-collector fix turned 4 of its 5
+// cases red; the survivor is the 703.2 control (the shapes the issue report
+// named as already working).
 // ---------------------------------------------------------------------------
 
 /// Per-case scratch directory. The case id keeps concurrent cases of the same
@@ -1351,6 +1354,130 @@ mod issue_744 {
         assert_eq!(
             stdout, "[here]\n[here]\n[preherepost]\n[a b]\n",
             "here-string quote removal; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// rubash#703: a heredoc feeding a pipeline inside a double-quoted command
+/// substitution failed to parse.
+///
+/// `echo "X=$(cat <<EOF | cat` + `body` + `EOF` + `)"` died with
+/// `command substitution: line 4: unexpected EOF while looking for matching
+/// `)'` and printed nothing, while GNU prints `X=body`. The unquoted form,
+/// the quoted form without the `X=` prefix, and the quoted form without the
+/// pipeline all worked, which narrowed the trigger to the word-expansion
+/// comsub collector (`collect_command_substitution_source_ex`): its heredoc
+/// delimiter scan did not end the delimiter WORD at the first unquoted
+/// blank, so `cat <<EOF | cat` declared the delimiter `EOF | cat`, the `EOF`
+/// terminator line never matched, and the collector swallowed the rest of
+/// the script. GNU read_token_word ends the word at any unquoted shell
+/// metacharacter (parse.y:5688 shellbreak) — the same rule the lexer's own
+/// heredoc header scan already applies.
+mod issue_703 {
+    use super::*;
+
+    fn run_script(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("hd.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["hd.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 703.1 [ratchet] — the issue's exact repro. The delimiter word must end
+    /// at the blank before `|`, the `EOF` line must terminate the body, and
+    /// the `)` on the following line must close the substitution. Pre-fix the
+    /// collector read the delimiter as `EOF | cat`, never matched the
+    /// terminator, and reported the unclosed-`)` fatal with no output.
+    #[test]
+    fn case_1_quoted_comsub_heredoc_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.1",
+            "echo \"X=$(cat <<EOF | cat\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
+        assert!(
+            !stderr.contains("unexpected EOF"),
+            "unclosed-comsub fatal; stderr:\n{stderr}"
+        );
+    }
+
+    /// 703.2 [control] — the three shapes the issue report named as already
+    /// working must not regress: the unquoted assignment, the quoted
+    /// substitution without a word prefix, and the quoted substitution
+    /// without the pipeline. All three were green before the fix.
+    #[test]
+    fn case_2_working_shapes_stay_green() {
+        let (stdout, stderr, code) = run_script(
+            "703.2",
+            "x=$(cat <<EOF | cat\nbody\nEOF\n); echo \"X=$x\"\n\
+             echo \"$(cat <<EOF | cat\nbody\nEOF\n)\"\n\
+             echo \"X=$(cat <<EOF\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\nbody\nX=body\n", "stdout; stderr:\n{stderr}");
+    }
+
+    /// 703.3 [ratchet] — the make_cmd.c:602-611 pushback shape with a
+    /// pipeline: the `)` sits ON the delimiter line (`EOF)`), so the heredoc
+    /// is "delimited by end-of-file", GNU warns, and the substitution still
+    /// yields `body`. Two defects hid here: the pre-fix delimiter scan (same
+    /// fatal as 703.1), and — once that was fixed — the lexer's IFS_GLUE
+    /// `EOF)` marker reaching the real comsub parser, where the terminator
+    /// line read `EOF\x1c` and stopped matching, leaking the delimiter into
+    /// the output (`X=body` plus a stray `EOF`). Exact stdout pins both.
+    #[test]
+    fn case_3_eof_paren_pushback_with_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.3",
+            "echo \"X=$(cat <<EOF | cat\nbody\nEOF)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stray delimiter in output; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("delimited by end-of-file"),
+            "missing GNU here-document warning; stderr:\n{stderr}"
+        );
+    }
+
+    /// 703.4 [ratchet] — delimiter-word spellings that must still resolve
+    /// correctly once the word ends at the first unquoted blank: a blank
+    /// between `<<` and the word (`<< EOF`), the adjacent `<<-` tab-strip
+    /// dash, and a quoted delimiter carrying its own blank. Each carries a
+    /// pipeline after the word, so the pre-fix scan — which read the word to
+    /// end of line — declared `EOF | cat` (or `-EOF | cat`, `E O | cat`) and
+    /// died unclosed on all three.
+    #[test]
+    fn case_4_delimiter_spellings_with_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.4",
+            "echo \"X=$(cat << EOF | cat\nbody\nEOF\n)\"\n\
+             echo \"Y=$(cat <<-EOF | cat\n\tbody\n\tEOF\n)\"\n\
+             echo \"Z=$(cat <<\"E O\" | cat\nbody\nE O\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\nY=body\nZ=body\n", "stdout; stderr:\n{stderr}");
+    }
+
+    /// 703.5 [ratchet] — the same word-boundary rule with a `;` after the
+    /// delimiter: `cat <<EOF; cat` declares `EOF` and runs `cat` as the next
+    /// command. Pre-fix the delimiter read `EOF; cat` and the terminator
+    /// never matched, so the substitution died unclosed.
+    #[test]
+    fn case_5_semicolon_after_delimiter_word() {
+        let (stdout, stderr, code) = run_script(
+            "703.5",
+            "echo \"X=$(cat <<EOF; cat\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
+        assert!(
+            !stderr.contains("unexpected EOF"),
+            "unclosed-comsub fatal; stderr:\n{stderr}"
         );
     }
 }
