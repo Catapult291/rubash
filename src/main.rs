@@ -224,6 +224,58 @@ fn invocation_shell_name(argv0: &str) -> Option<String> {
 }
 
 fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i32 {
+    // rubash#815: `--profile` / `--profile-output <file>` are engine meta
+    // flags handled BEFORE the GNU option parser (the same shape as
+    // --identity and --internal-* at the run_main gate), so the GNU
+    // long-option contract stays untouched: LONG_OPTIONS keeps its exact
+    // 16-entry table bytes, and an unknown long option still reports
+    // "%s: invalid option" with rc 2. `--profile` does not consume the
+    // script operand directly — the first non-option word still runs as the
+    // script file through the normal launcher path; only LEADING option
+    // words are scanned, so `script.sh --profile-output f` keeps both words
+    // as the operand and $1 (GNU parses options until the first non-option
+    // argument). The session wraps the script-file driver only: `-c`, `-s`
+    // and interactive forms are unprofiled in M1 (owner ticket #815).
+    let mut profile_mode = false;
+    let mut profile_output: Option<String> = None;
+    let mut filtered_args: Vec<String> = Vec::with_capacity(args.len());
+    {
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            match arg {
+                "--profile" => {
+                    profile_mode = true;
+                    index += 1;
+                }
+                "--profile-output" => match args.get(index + 1) {
+                    Some(value) => {
+                        profile_output = Some(value.clone());
+                        index += 2;
+                    }
+                    None => {
+                        eprintln!("rubash: --profile-output: option requires an argument");
+                        return 2;
+                    }
+                },
+                "--" | "-" => {
+                    filtered_args.extend_from_slice(&args[index..]);
+                    break;
+                }
+                _ if arg.starts_with('-') => {
+                    filtered_args.push(arg.to_string());
+                    index += 1;
+                }
+                _ => {
+                    // First non-option word: the script operand. The rest is
+                    // the operand's positional parameters — verbatim.
+                    filtered_args.extend_from_slice(&args[index..]);
+                    break;
+                }
+            }
+        }
+    }
+    let args: &[String] = &filtered_args;
     // TODO(shell.c): GNU Bash has a full option parser and shell-name handling.
     // This narrow parser supports the `-c` and `-o posix -c` forms used by
     // upstream alias tests.
@@ -512,12 +564,23 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                     return run_pretty_print(executor, script);
                 }
                 apply_interactive_alias_default(executor, alias_expansion_override);
-                return run_script_file_with_init(
+                if profile_mode {
+                    // rubash#815: the profiler session wraps the script-file
+                    // driver. Reports go to --profile-output (or the process
+                    // temp directory) — never stdout/stderr, so profile mode
+                    // stays byte-identical with profiling off.
+                    rubash::executor::profiler::session_begin(profile_output.take());
+                }
+                let status = run_script_file_with_init(
                     executor,
                     script,
                     &args[index + 1..],
                     init_file.as_deref(),
                 );
+                if profile_mode {
+                    rubash::executor::profiler::session_end();
+                }
+                return status;
             }
         }
     }

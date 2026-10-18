@@ -287,6 +287,13 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#815 profiler: the external-spawn seam (GNU execute_cmd.c
+        // dispatches disk commands through execute_command_internal's
+        // simple-command tail; this is the fork face of the attribution
+        // three-way split). Drop guard covers every exit form; the off path
+        // is one relaxed AtomicBool load.
+        let _profiler_external =
+            super::profiler::enter_external(cmd.words.first().map(String::as_str).unwrap_or("?"));
         let (mut cmd, mut process_substitutions) =
             self.command_with_process_substitution_files(cmd)?;
         self.apply_default_external_stdin_file(&mut cmd, &mut process_substitutions)?;

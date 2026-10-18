@@ -273,6 +273,14 @@ impl Executor {
         let Some(word) = cmd.words.first() else {
             return Ok(());
         };
+        // rubash#815 profiler: the simple-command dispatch point (GNU
+        // execute_cmd.c:624 execute_command_internal). The frame is armed as
+        // TENTATIVE here — the real dispatcher classifies it: a function or
+        // external dispatch cancels the frame (the classifier is the
+        // dispatch that actually happened, no second admission list,
+        // rubash#117), and any other return confirms it as a builtin on
+        // drop. Off path: one relaxed AtomicBool load.
+        let _profiler_command = super::profiler::enter_prepared_command(word);
         // GNU execute_cmd.c:4750-4757: a simple command whose first word
         // starts with `%` is a job spec — dispatch to fg (bg when async)
         // before builtin/function/PATH lookup, with the `%` word itself as

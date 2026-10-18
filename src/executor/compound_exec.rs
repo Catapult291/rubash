@@ -1604,6 +1604,11 @@ impl Executor {
         let result = self.with_loop_fd_heredocs(cmd, |executor| {
             executor.with_ambient_line(subshell_line, |executor| {
                 executor.with_command_input_redirects(cmd, |executor| {
+                    // rubash#815 profiler: the flat-subshell frame (GNU
+                    // execute_cmd.c:1576 execute_in_subshell). The guard
+                    // spans the EXIT trap too — GNU runs it inside the
+                    // forked child.
+                    let _profiler_subshell = super::profiler::enter_subshell();
                     let body_result = executor.execute_ast_inner(body);
                     // GNU execute_cmd.c execute_in_subshell: expr.c
                     // evalerror's jump_to_top_level(DISCARD) reaches only the
