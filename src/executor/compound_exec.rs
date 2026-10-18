@@ -795,6 +795,20 @@ impl Executor {
         if command.words.is_empty() {
             return None;
         }
+        // rubash#809 CR F2-R2: the fatal parameter pre-scan lives on the
+        // dispatch path (command_execute.rs -> validate_command_parameter_
+        // expansions), NOT inside expand_command_words — without it the gate
+        // would swallow `set -u` unbound-variable and `${x:?msg}` /
+        // `${x?msg}` verdicts and hand degraded words to argv (sleep executed
+        // with an empty/message argument). Any fatal shape keeps the
+        // wrapper, whose child runs this same scan on its own dispatch and
+        // reports exactly as today. Safe to call here: the F2 arm above
+        // already routed every command-substitution-bearing word to the
+        // wrapper, so the scan's prefix-comsub side-effect replay can never
+        // fire in the parent.
+        if self.parameter_expansion_error(command).is_some() {
+            return None;
+        }
         // A %jobspec leads execute_prepared_command's fg/bg dispatch, and an
         // assignment-shaped first word is an assignment command — wrapper.
         let first_raw = &command.words[0];
