@@ -129,16 +129,18 @@ fn render_channel_respects_promptvars_gate() {
 
 /// The `\$` decode contract (parse.y:6586-6592): the dollar that came from
 /// `\$` survives the second pass literally, so `\$NAME` never expands NAME.
-/// Rubash on Windows runs with EUID 0, matching GNU-as-root's `#` render;
-/// the non-root `\$` backslash-quoting branch is pinned by the in-crate
-/// unit test `prompt_dollar_escape_uses_effective_uid`.
+/// Root renders `#` (rubash on Windows), non-root renders the
+/// backslash-quoted `$` (unix CI runners); both branches must keep the
+/// trailing name un-expanded. The exact per-branch byte contract is pinned
+/// by the in-crate unit test `prompt_dollar_escape_uses_effective_uid`.
 #[test]
 fn escaped_dollar_stays_literal_through_the_pass() {
     let mut exec = Executor::new();
     run(&mut exec, "USER=rootish");
 
-    // Root render: `#` and no expansion of the trailing name.
-    assert_eq!(prompt_transform(&mut exec, "\\$USER tail"), "#USER tail");
+    let root = exec.get_env("EUID") == Some("0");
+    let expected = if root { "#USER tail" } else { "$USER tail" };
+    assert_eq!(prompt_transform(&mut exec, "\\$USER tail"), expected);
 }
 
 /// A `"` inside the prompt value is DATA in the double-quoted pass word

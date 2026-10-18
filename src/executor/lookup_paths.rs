@@ -90,9 +90,18 @@ impl Executor {
     /// contract as `uname`/`arch` (docs/builtins.md §3) and GNU's own
     /// behavior for names it resolves off PATH (issue #759 item 4: GNU has
     /// no `sudo` builtin, `command -v sudo` finds /usr/bin/sudo).
+    #[cfg(windows)]
     pub(in crate::executor) fn routes_as_builtin(&self, name: &str) -> bool {
+        is_shell_builtin_name(name) || (name == "sudo" && self.elevation_handler.is_some())
+    }
+
+    /// Non-Windows routing: there is no host-capability `sudo` builtin off
+    /// Windows (the elevation machinery is `#[cfg(windows)]` throughout),
+    /// so a name routes as a builtin iff the pure table says so.
+    #[cfg(not(windows))]
+    pub(in crate::executor) fn routes_as_builtin(&self, name: &str) -> bool {
+        let _ = self;
         is_shell_builtin_name(name)
-            || (cfg!(windows) && name == "sudo" && self.elevation_handler.is_some())
     }
 
     pub(in crate::executor) fn command_paths(&self, name: &str, force_path: bool) -> Vec<String> {
