@@ -497,8 +497,12 @@ pub(in crate::executor) fn read_stdin_until(
         // the translation is what keeps `read -n1` + Enter at the delimiter
         // (zero chars) and a `read -t` line completing on the typed CR
         // instead of hanging for an LF that never comes. Pipe/file reads
-        // keep raw CRs (GNU reads them untranslated: input.c never touches
-        // a non-tty).
+        // keep raw CRs HERE (GNU reads them untranslated: input.c never
+        // touches a non-tty) — but only at this translation gate: on
+        // Windows `trim_read_input_literal`'s wave-2 pop still strips a
+        // record's trailing CR afterwards, so a CRLF pipe is NOT byte-GNU
+        // end to end (`printf 'x\r\n' | read x; ${#x}` = 5 vs GNU 6) — see
+        // the trim layer's NOTE below; pre-existing, cr-816 NIT-2.
         if onechar.is_some() && delimiter == '\n' {
             if matches!(unit, StdinUnit::Char('\r')) {
                 unit = StdinUnit::Char('\n');

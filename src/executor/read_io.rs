@@ -888,7 +888,11 @@ impl Executor {
             // shtty.c:115 tt_setonechar forces ICRNL for one-char tty reads —
             // see read_helpers::read_stdin_until. ConPTY delivers VK_RETURN
             // as a CR record in every mode; the translation keeps a deadline
-            // line read completing on the typed CR.
+            // line read completing on the typed CR. "Pipe/file reads keep
+            // raw CRs" holds only at this gate: on Windows
+            // `trim_read_input_literal`'s wave-2 pop still strips a record's
+            // trailing CR afterwards (CRLF pipes are not byte-GNU end to
+            // end) — see the trim layer's NOTE; cr-816 NIT-2.
             if onechar.is_some() && delimiter == '\n' {
                 if matches!(unit, StdinUnit::Char('\r')) {
                     unit = StdinUnit::Char('\n');
