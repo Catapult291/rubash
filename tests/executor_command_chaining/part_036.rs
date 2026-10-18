@@ -318,6 +318,65 @@ fn test_kill_current_jobspec_uses_last_background_job() {
     let _ = fs::remove_file(output_path);
 }
 
+/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): a jobspec kill's
+/// death is the kill builtin's own doing — GNU's non-interactive reader
+/// suppresses the completion notice (jobs.c notify_of_job_status
+/// DONT_REPORT_SIGTERM arm: nothing printed, the dead job is cleaned up),
+/// so `kill %1; jobs` lists nothing and no `[1]+ Exit 143` line fires at
+/// the wait. The signal status stays resolvable through the completed
+/// status (pinning that contract is the pid-operand test below).
+#[test]
+fn test_kill_jobspec_leaves_no_completion_notice() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-no-notice-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & kill %1; printf 'kill:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}; wait; echo \"after:$?\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "kill:0\nafter:0\n",
+        "no job-completion notice and no jobs listing for a jobspec kill"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+/// The kill builtin stashes the signal status before dropping the table
+/// entry, so the #737 contract survives the #796 notice fix: a pid-shaped
+/// wait after the kill still resolves the signal status (GNU 5.3.0:
+/// `kill $!; wait $!` reports 143).
+#[test]
+fn test_kill_pid_operand_then_wait_reports_signal_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-pid-wait-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & j=$!; kill $j; wait $j; printf 's:%s\\n' \"$?\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "s:143\n",
+        "wait after a pid kill still resolves the signal status"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
 #[test]
 fn test_kill_zero_checks_jobspec_without_removing_job() {
     let _cwd_guard = CwdGuard::take();
