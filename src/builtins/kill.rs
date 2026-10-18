@@ -1954,7 +1954,28 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 /// entry dispositions everywhere).
 #[cfg(unix)]
 pub fn child_pre_exec_reset() -> std::io::Result<()> {
-    kernel_signals::pre_exec_child_dispositions()
+    kernel_signals::pre_exec_child_dispositions()?;
+    // rubash#737: if the parent is a background-job wrapper
+    // (__RUBASH_BACKGROUND_WRAPPER), arrange for this child to die when the
+    // wrapper dies. Without this, `kill $!` kills the wrapper but leaves
+    // the actual work (grandchild) orphaned and running.
+    // Note: prctl(PR_SET_PDEATHSIG) is Linux-specific; on macOS and other
+    // Unix the wrapper relies on the parent tracking instead (rubash#737).
+    #[cfg(target_os = "linux")]
+    if std::env::var("__RUBASH_BACKGROUND_WRAPPER").as_deref() == Ok("1") {
+        // PR_SET_PDEATHSIG: send SIGKILL to this process when its parent dies.
+        const PR_SET_PDEATHSIG: i32 = 1;
+        let ret = unsafe { libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL as u64, 0, 0, 0) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Race: parent may have died between fork and prctl. If we're now
+        // orphaned (reparented to init), kill ourselves.
+        if unsafe { libc::getppid() } == 1 {
+            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
