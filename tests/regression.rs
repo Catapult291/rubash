@@ -461,7 +461,34 @@ fn run_suite_snapshot(suite: &str) {
                 || fname == "printenv"
                 || fname == "bash";
             if wanted && entry.path().is_file() {
-                let _ = std::fs::copy(entry.path(), dir.join(&fname));
+                // Normalize CRLF to LF while copying (rubash#803). The
+                // windows-latest CI image materializes the third_party/bash
+                // submodule with core.autocrlf=true, so every suite file
+                // lands CRLF there while a developer checkout (autocrlf
+                // unset) keeps the canonical LF bytes — and the suite's
+                // stdout diverges by whole faces (nquote4.sub's
+                // `alias foo=$'echo foo\n\nquux\n'` went silent on CI:
+                // 1226 runner bytes vs 1230 LF bytes vs 1230 under WSL
+                // GNU bash 5.3.0). The suite executes a unix corpus whose
+                // canonical blobs contain no CR at all (all 13 slices
+                // scanned), so the pair-wise conversion is exactly the
+                // autocrlf inverse and cannot touch semantic CR bytes;
+                // the recorded snapshot bytes stop depending on the
+                // checkout's line-ending config.
+                let bytes = std::fs::read(entry.path()).unwrap_or_default();
+                if bytes.is_empty() {
+                    let _ = std::fs::copy(entry.path(), dir.join(&fname));
+                } else {
+                    let mut lf = Vec::with_capacity(bytes.len());
+                    let mut it = bytes.iter().copied().peekable();
+                    while let Some(b) = it.next() {
+                        if b == b'\r' && it.peek() == Some(&b'\n') {
+                            continue; // CRLF pair: the CR is autocrlf noise
+                        }
+                        lf.push(b);
+                    }
+                    let _ = std::fs::write(dir.join(&fname), &lf);
+                }
                 copied += 1;
             }
         }
