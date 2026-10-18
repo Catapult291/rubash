@@ -33,10 +33,10 @@ pub(crate) const COMPATIBLE_SHELL_PATH_ENV: &str = "__RUBASH_COMPATIBLE_SHELL_PA
 struct CommandLookupCache {
     fingerprint: String,
     results: HashMap<String, Option<PathBuf>>,
-    /// Lowercased file-name listing per physical PATH directory. Replaces
-    /// the PATH x PATHEXT per-candidate stat grid with one read_dir per
-    /// directory (rubash#159).
-    listings: HashMap<PathBuf, Arc<HashSet<String>>>,
+    /// File-name listing per physical PATH directory. Replaces the PATH x
+    /// PATHEXT per-candidate stat grid with one read_dir per directory
+    /// (rubash#159); exact-case set + ASCII-lowercase fold map since #799.
+    listings: HashMap<PathBuf, Arc<DirListing>>,
     /// When each listing was read (the directory mtime). A listing whose
     /// directory mtime moved is dropped before a miss is concluded
     /// (rubash#392): `wpm` replaces command links by unlink+create, so a
@@ -354,7 +354,22 @@ fn cached_path_still_valid(path: &Path) -> bool {
     path.exists() && path.is_file()
 }
 
-/// Cached lowercased-name listing of one directory (rubash#159).
+/// One directory's file-name listing, exact case plus an ASCII-lowercase
+/// fold map (the type exists on all targets: the cache struct carries it
+/// unconditionally; only the Windows walk populates and consults it).
+#[cfg_attr(unix, allow(dead_code))]
+struct DirListing {
+    /// On-disk file names, byte-exact.
+    #[cfg_attr(unix, allow(dead_code))]
+    exact: HashSet<String>,
+    /// ASCII-lowercased name -> on-disk spelling. NTFS keeps at most one
+    /// name per lowercase key in a case-insensitive directory; the map only
+    /// serves the extension-case fallback, never the command stem.
+    #[cfg_attr(unix, allow(dead_code))]
+    fold: HashMap<String, String>,
+}
+
+/// Cached name listing of one directory (rubash#159, case policy rubash#799).
 ///
 /// GNU bash stats each PATH-element/name candidate directly
 /// (findcmd.c:623 find_user_command_in_path -> find_in_path_element ->
@@ -363,6 +378,26 @@ fn cached_path_still_valid(path: &Path) -> bool {
 /// directory, which costs milliseconds across a realistic PATH x PATHEXT
 /// grid. One read_dir per directory replaces the grid and is remembered
 /// for the life of the fingerprint.
+///
+/// Case contract (rubash#799). GNU findcmd.c joins the command NAME onto
+/// each PATH element and stats the result — findcmd.c:580-586 accepts the
+/// first regular executable file whose NAME matches byte-for-byte (on a
+/// case-sensitive fs `r` and `R` are different commands; WSL GNU bash 5.3
+/// probe: `command -v r` finds only the literally-spelled `r`, never a
+/// sibling `R`). The Windows stat layer folds case behind bash's back, so
+/// the listing walk must re-impose GNU's byte-exactness itself:
+///
+/// * `exact` answers the probe for the candidate's literal spelling. The
+///   command NAME (the stem) must match byte-for-byte: lowercase `r` never
+///   resolves to `R.exe` (the #799 harvest hang: a gitconfig alias `r = …`
+///   launched GNU R's interactive interpreter and ate the session).
+/// * `fold` admits one Windows-native deviation that has no GNU analogue at
+///   all — the appended EXTENSION compares ASCII-case-insensitively, so
+///   `R` still runs an on-disk `R.EXE` (extension case is a PATHEXT-form
+///   artifact, not part of the command name; msys bash form oracle
+///   5.2.37/5.3: bare `R` resolves `R.exe`/`R.bat`, extensionless file
+///   resolves verbatim). The stem check stays byte-exact inside the fold
+///   arm, and the RESOLVED spelling is always the on-disk one.
 ///
 /// The listing is a cache, not an oracle: rubash#392 validates it against
 /// the directory mtime before a miss is concluded (one stat per consulted
@@ -375,19 +410,25 @@ fn cached_path_still_valid(path: &Path) -> bool {
 /// the per-candidate stat walk would have found there: none. `cache` must
 /// already be verified against the current fingerprint by the caller.
 #[cfg(not(unix))]
-fn cached_dir_listing(cache: &mut CommandLookupCache, directory: &Path) -> Arc<HashSet<String>> {
+fn cached_dir_listing(cache: &mut CommandLookupCache, directory: &Path) -> Arc<DirListing> {
     if let Some(listing) = cache.listings.get(directory) {
         return Arc::clone(listing);
     }
-    let names = fs::read_dir(directory)
+    let mut listing = DirListing {
+        exact: HashSet::new(),
+        fold: HashMap::new(),
+    };
+    fs::read_dir(directory)
         .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
-                .collect::<HashSet<_>>()
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let lower = name.to_ascii_lowercase();
+                listing.fold.entry(lower).or_insert_with(|| name.clone());
+                listing.exact.insert(name);
+            }
         })
-        .unwrap_or_default();
-    let listing = Arc::new(names);
+        .ok();
+    let listing = Arc::new(listing);
     if cache.listings.len() >= 512 {
         cache.listings.clear();
         cache.listing_stamps.clear();
@@ -401,22 +442,24 @@ fn cached_dir_listing(cache: &mut CommandLookupCache, directory: &Path) -> Arc<H
     listing
 }
 
-/// One probe candidate for the listing-assisted PATH walk: the lowercased
-/// file name the directory listing is asked about, plus the spelled file
-/// name to join onto a directory when the listing claims it. Built ONCE per
-/// lookup, not per directory: GNU findcmd.c:623 find_user_command_in_path
-/// passes the same NAME to find_in_path_element for every directory, and
-/// the candidate set is a pure function of NAME and PATHEXT order. The
-/// candidate order (bare first for extension-carrying names, extensions
-/// first otherwise, bare last) and the `with_extension` spellings are
-/// byte-identical to the per-directory `executable_candidate_listed` this
-/// replaces — only the per-directory `dir.join(name)` /
-/// `with_extension` / `to_string_lossy().to_lowercase()` churn moved out
-/// of the loop (envfix3: a warm unique-name miss over a 69-entry PATH
-/// spent ~310 us re-deriving the same ~8 strings 69 times).
+/// One probe candidate for the listing-assisted PATH walk: the file name the
+/// directory listing is asked about (exact spelling for the byte-exact stem
+/// contract, rubash#799), its ASCII-lowercase form for the extension-case
+/// fallback, and the spelled file name to join onto a directory when the
+/// listing claims it. Built ONCE per lookup, not per directory: GNU
+/// findcmd.c:623 find_user_command_in_path passes the same NAME to
+/// find_in_path_element for every directory, and the candidate set is a pure
+/// function of NAME and PATHEXT order. The candidate order (bare first for
+/// extension-carrying names, extensions first otherwise, bare last) and the
+/// `with_extension` spellings are byte-identical to the per-directory
+/// `executable_candidate_listed` this replaces — only the per-directory
+/// `dir.join(name)` / `with_extension` / case-key churn moved out of the
+/// loop (envfix3: a warm unique-name miss over a 69-entry PATH spent ~310 us
+/// re-deriving the same ~8 strings 69 times).
 #[cfg(not(unix))]
 struct ListedCandidate {
     listing_key: String,
+    fold_key: String,
     file: PathBuf,
 }
 
@@ -429,8 +472,11 @@ fn listed_candidates(name: &str, extensions: &[String]) -> Vec<ListedCandidate> 
         // file_name() is None for `.`/`..`-shaped candidates; the stat walk
         // could never match those against a listing either.
         if let Some(file_name) = candidate.file_name() {
+            let listing_key = file_name.to_string_lossy().into_owned();
+            let fold_key = listing_key.to_ascii_lowercase();
             probes.push(ListedCandidate {
-                listing_key: file_name.to_string_lossy().to_lowercase(),
+                listing_key,
+                fold_key,
                 file: candidate.to_path_buf(),
             });
         }
@@ -486,15 +532,33 @@ fn find_in_path_via_listings(
         for dir in dirs.iter() {
             let listing = cached_dir_listing(&mut cache, dir);
             for candidate in &candidates {
-                // HashSet<String>::contains(&str): no lookup-key allocation.
-                if !listing.contains(candidate.listing_key.as_str()) {
+                // rubash#799: the command stem must match byte-for-byte —
+                // the exact set answers with the candidate's own spelling,
+                // so `r` never lifts `R.exe`. The fold arm below is the only
+                // case tolerance: the PATHEXT-style appended extension
+                // compares ASCII-case-insensitively (on-disk `R.EXE` still
+                // runs as `R`), and the resolved spelling stays the on-disk
+                // one. Extensionless candidates carry no extension for the
+                // OS to fold, so they never enter the fold arm — that arm
+                // must not become a whole-name fold or #799 comes back.
+                if listing.exact.contains(candidate.listing_key.as_str()) {
+                    // The listing only proves the NAME exists; confirm the stat
+                    // walk's exact semantics for directories and dangling symlinks.
+                    let path = dir.join(&candidate.file);
+                    if path.is_file() {
+                        return Some(path);
+                    }
                     continue;
                 }
-                // The listing only proves the NAME exists; confirm the stat
-                // walk's exact semantics for directories and dangling symlinks.
-                let path = dir.join(&candidate.file);
-                if path.is_file() {
-                    return Some(path);
+                if candidate.file.extension().is_some() {
+                    if let Some(disk) = listing.fold.get(candidate.fold_key.as_str()) {
+                        if listing_stem_exact_extension_ci(disk, &candidate.file) {
+                            let path = dir.join(disk);
+                            if path.is_file() {
+                                return Some(path);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -508,6 +572,28 @@ fn find_in_path_via_listings(
         break;
     }
     None
+}
+
+/// The fold arm's match predicate (rubash#799): the on-disk name `disk`
+/// matches the candidate when the STEM is byte-exact (the command name is
+/// case-sensitive, as on GNU's case-sensitive fs) and only the appended
+/// EXTENSION differs by ASCII case (`R` still runs an on-disk `R.EXE`).
+/// `candidate` must carry an extension — the caller gates that.
+#[cfg(not(unix))]
+fn listing_stem_exact_extension_ci(disk: &str, candidate: &Path) -> bool {
+    let Some(stem) = candidate.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some(ext) = candidate.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let Some(rest) = disk.strip_prefix(stem) else {
+        return false;
+    };
+    match rest.strip_prefix('.') {
+        Some(disk_ext) => disk_ext.eq_ignore_ascii_case(ext),
+        None => false,
+    }
 }
 
 /// Directory mtime — the cheap "did the entry set change" probe (rubash#392).
@@ -5271,8 +5357,9 @@ mod tests {
         // replaced (GNU findcmd.c:623 find_user_command_in_path: first
         // match wins in PATH order; executable_candidate order within a
         // directory: PATHEXT extensions before the bare extensionless
-        // file). Case-insensitive listing membership mirrors the
-        // case-insensitive Windows stat the old walk relied on.
+        // file). Case policy since rubash#799: the command stem matches
+        // byte-for-byte (GNU's findcmd walk is a literal join+stat — WSL
+        // 5.3 oracle), only the appended extension folds ASCII case.
         let dir_a = std::env::temp_dir().join("rubash-merged-scan-a");
         let dir_b = std::env::temp_dir().join("rubash-merged-scan-b");
         let _ = fs::remove_dir_all(&dir_a);
@@ -5281,7 +5368,7 @@ mod tests {
         fs::create_dir_all(&dir_b).unwrap();
         fs::write(dir_a.join("toolA.exe"), b"").unwrap();
         fs::write(dir_b.join("toolA.exe"), b"").unwrap(); // later PATH dir loses
-        fs::write(dir_b.join("TOOLB.exe"), b"").unwrap(); // case-insensitive hit
+        fs::write(dir_b.join("TOOLB.exe"), b"").unwrap(); // stem-exact hit only
         let wrapper = dir_b.join("code.cmd");
         let script = dir_b.join("code");
         fs::write(&wrapper, b"").unwrap();
@@ -5302,12 +5389,14 @@ mod tests {
             find_user_command("toolA", &env_vars),
             Some(dir_a.join("toolA.exe"))
         );
-        // The candidate path is built from the lookup name; the
-        // case-insensitive hit resolves to that spelling, exactly as the
-        // per-candidate stat walk returned it (with_extension candidate).
+        // rubash#799: lowercase `toolb` never lifts on-disk `TOOLB.exe`
+        // (the stem is the command name; byte-exact), while `TOOLB`
+        // resolves with the ON-DISK spelling through the ASCII-case fold
+        // of the appended extension.
+        assert_eq!(find_user_command("toolb", &env_vars), None);
         assert_eq!(
-            find_user_command("toolb", &env_vars),
-            Some(dir_b.join("toolb.exe"))
+            find_user_command("TOOLB", &env_vars),
+            Some(dir_b.join("TOOLB.exe"))
         );
         assert_eq!(find_user_command("code", &env_vars), Some(wrapper));
         // A miss in every listed directory stays a miss.

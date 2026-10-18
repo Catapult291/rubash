@@ -36,9 +36,9 @@ pub(in crate::executor) fn split_mapfile_input(
     if delim != 0
         && delim.is_ascii()
         && !is_assignment_carrier_byte(u32::from(delim))
-        && input.bytes().all(|b| {
-            !is_assignment_carrier_byte(u32::from(b)) && b != 0xEE
-        })
+        && input
+            .bytes()
+            .all(|b| !is_assignment_carrier_byte(u32::from(b)) && b != 0xEE)
     {
         let strip = trim_delimiter;
         let mut values = Vec::new();
