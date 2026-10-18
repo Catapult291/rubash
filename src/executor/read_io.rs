@@ -847,7 +847,17 @@ impl Executor {
         // a console in cooked line mode holds every keystroke until Enter —
         // while a plain newline-terminated read stays canonical and -s only
         // silences the echo (read.def:603-621).
-        let onechar = if char_limit.is_some() || delimiter != '\n' {
+        //
+        // rubash#806: a deadline on a CONSOLE also takes the one-char path —
+        // see read_helpers::read_stdin_until for the cooked-ahead analysis
+        // (the first cooked ReadFile(1) swallowed the whole typed line into
+        // conhost's pending read state, the raw-queue gate then timed out
+        // with a one-byte record and the rest of the line orphaned into the
+        // next reader).
+        let onechar = if char_limit.is_some()
+            || delimiter != '\n'
+            || (self.read_deadline.is_some() && crate::fd::is_console_handle(stdin_handle))
+        {
             crate::fd::enter_console_onechar_mode(stdin_handle)
         } else if silent {
             crate::fd::enter_console_noecho_mode(stdin_handle)
@@ -872,9 +882,18 @@ impl Executor {
                 }
                 decoder.queue_byte(buf[0]);
             }
-            let Some(unit) = decoder.next_unit() else {
+            let Some(mut unit) = decoder.next_unit() else {
                 continue;
             };
+            // shtty.c:115 tt_setonechar forces ICRNL for one-char tty reads —
+            // see read_helpers::read_stdin_until. ConPTY delivers VK_RETURN
+            // as a CR record in every mode; the translation keeps a deadline
+            // line read completing on the typed CR.
+            if onechar.is_some() && delimiter == '\n' {
+                if matches!(unit, StdinUnit::Char('\r')) {
+                    unit = StdinUnit::Char('\n');
+                }
+            }
             if manual_echo {
                 echo_stdin_unit(&onechar, &unit);
             }

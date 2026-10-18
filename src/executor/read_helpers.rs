@@ -411,7 +411,23 @@ pub(in crate::executor) fn read_stdin_until(
     // counts or a non-newline delimiter; a plain newline-terminated read
     // stays in canonical mode, and -s alone only silences the echo
     // (read.def:603-621 ttfd_noecho).
-    let onechar = if char_limit.is_some() || delimiter != '\n' {
+    //
+    // rubash#806: a deadline on a CONSOLE also takes the one-char path.
+    // The cooked line discipline and the raw input queue are two different
+    // buffers: the first cooked ReadFile(1) pulls the WHOLE typed line into
+    // conhost's pending read state (returning only its first byte), so the
+    // raw-queue readiness gate then sees an empty queue and burns the whole
+    // deadline (`read -t 3 a` + typed `hello` + Enter returned 142 with
+    // a=`h`, and the orphaned `ello\r` leaked into the NEXT read). One-char
+    // mode keeps every keystroke a raw record the gate can see, so the
+    // deadline cuts where GNU's select() would and the line stays atomic.
+    // GNU never buffers ahead here either: read.def:736 reads a -n/-d tty
+    // byte-wise through zread, and a deadline read gates per byte
+    // (read.def:659 check_read_timeout at the top of every iteration).
+    let onechar = if char_limit.is_some()
+        || delimiter != '\n'
+        || (deadline.is_some() && crate::fd::is_console_handle(stdin_handle))
+    {
         crate::fd::enter_console_onechar_mode(stdin_handle)
     } else if silent {
         crate::fd::enter_console_noecho_mode(stdin_handle)
@@ -471,10 +487,23 @@ pub(in crate::executor) fn read_stdin_until(
                 }
             }
         }
-        let Some(unit) = decoder.next_unit() else {
+        let Some(mut unit) = decoder.next_unit() else {
             continue;
         };
-        let is_cr = matches!(unit, StdinUnit::Char('\r'));
+        // shtty.c:115 tt_setonechar: `c_iflag |= ICRNL` — one-char tty reads
+        // get CR->NL on input (read.def:570-590 installs this for every -n,
+        // -N and -d tty read; the deadline console path above joins it).
+        // ConPTY delivers VK_RETURN as a CR record in every console mode, so
+        // the translation is what keeps `read -n1` + Enter at the delimiter
+        // (zero chars) and a `read -t` line completing on the typed CR
+        // instead of hanging for an LF that never comes. Pipe/file reads
+        // keep raw CRs (GNU reads them untranslated: input.c never touches
+        // a non-tty).
+        if onechar.is_some() && delimiter == '\n' {
+            if matches!(unit, StdinUnit::Char('\r')) {
+                unit = StdinUnit::Char('\n');
+            }
+        }
         if manual_echo {
             echo_unit(&unit);
         }
@@ -493,9 +522,6 @@ pub(in crate::executor) fn read_stdin_until(
         }
         if char_limit.is_some_and(|limit| units >= limit) {
             break;
-        }
-        if delimiter == '\n' && is_cr {
-            continue;
         }
     }
     if eof {
