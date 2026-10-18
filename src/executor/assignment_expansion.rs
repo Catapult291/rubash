@@ -520,17 +520,14 @@ impl Executor {
         // scalar store keeps the carrier. cow_replace keeps the marker-free
         // RHS (every plain `a=x` / `${a#p}` in a loop) at one scan and one
         // final allocation instead of two intermediate copies.
+        // The guard strip is E400-aware: user U+E401 data (E400 E401)
+        // must survive (rubash#735).
         let stripped = crate::executor::markers::cow_replace(
             &expanded,
             crate::executor::markers::IFS_GLUE_STR,
             "",
         );
-        let stripped = crate::executor::markers::cow_replace(
-            &stripped,
-            crate::executor::markers::ANSI_C_IFS_GUARD_STR,
-            "",
-        )
-        .into_owned();
+        let stripped = crate::executor::markers::strip_ansi_c_ifs_guard_cow(&stripped).into_owned();
         stripped
     }
 

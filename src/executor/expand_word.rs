@@ -273,7 +273,8 @@ impl Executor {
         // ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) here, or the
         // guard byte reaches the ambiguity gate and the open() call
         // (rubash#379: `> $'out tab1.txt'` must write that literal name).
-        let expanded = expanded.replace(crate::executor::markers::ANSI_C_IFS_GUARD, "");
+        // E400-aware: user U+E401 data (E400 E401) must survive (rubash#735).
+        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(&expanded);
         if suppress_glob {
             // GNU subst.c:12683-12688 (expand_words_no_vars else-branch): a
             // word that does not glob is still DEQUOTED before it becomes

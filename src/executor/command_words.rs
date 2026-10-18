@@ -492,10 +492,8 @@ impl Executor {
             // splitters' existing protection carrier -- so the field splitter
             // keeps the blank inside the current field (rubash#379: GNU
             // splits only expansion results, never source-word bytes).
-            &value.replace(
-                crate::executor::markers::ANSI_C_IFS_GUARD_STR,
-                crate::executor::markers::IFS_GLUE_STR,
-            ),
+            // E400-aware: user U+E401 (E400 E401) is data (rubash#735).
+            &crate::executor::markers::ansi_c_ifs_guard_to_ifs_glue(value),
             self.shell_state.env_vars.get("IFS").map(String::as_str),
         )
     }
