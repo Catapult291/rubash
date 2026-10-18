@@ -1394,10 +1394,8 @@ mod issue_703 {
     /// terminator, and reported the unclosed-`)` fatal with no output.
     #[test]
     fn case_1_quoted_comsub_heredoc_pipeline() {
-        let (stdout, stderr, code) = run_script(
-            "703.1",
-            "echo \"X=$(cat <<EOF | cat\nbody\nEOF\n)\"\n",
-        );
+        let (stdout, stderr, code) =
+            run_script("703.1", "echo \"X=$(cat <<EOF | cat\nbody\nEOF\n)\"\n");
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
         assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
         assert!(
@@ -1419,7 +1417,10 @@ mod issue_703 {
              echo \"X=$(cat <<EOF\nbody\nEOF\n)\"\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "X=body\nbody\nX=body\n", "stdout; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "X=body\nbody\nX=body\n",
+            "stdout; stderr:\n{stderr}"
+        );
     }
 
     /// 703.3 [ratchet] — the make_cmd.c:602-611 pushback shape with a
@@ -1432,12 +1433,13 @@ mod issue_703 {
     /// the output (`X=body` plus a stray `EOF`). Exact stdout pins both.
     #[test]
     fn case_3_eof_paren_pushback_with_pipeline() {
-        let (stdout, stderr, code) = run_script(
-            "703.3",
-            "echo \"X=$(cat <<EOF | cat\nbody\nEOF)\"\n",
-        );
+        let (stdout, stderr, code) =
+            run_script("703.3", "echo \"X=$(cat <<EOF | cat\nbody\nEOF)\"\n");
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "X=body\n", "stray delimiter in output; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "X=body\n",
+            "stray delimiter in output; stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains("delimited by end-of-file"),
             "missing GNU here-document warning; stderr:\n{stderr}"
@@ -1460,7 +1462,10 @@ mod issue_703 {
              echo \"Z=$(cat <<\"E O\" | cat\nbody\nE O\n)\"\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "X=body\nY=body\nZ=body\n", "stdout; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "X=body\nY=body\nZ=body\n",
+            "stdout; stderr:\n{stderr}"
+        );
     }
 
     /// 703.5 [ratchet] — the same word-boundary rule with a `;` after the
@@ -1469,10 +1474,8 @@ mod issue_703 {
     /// never matched, so the substitution died unclosed.
     #[test]
     fn case_5_semicolon_after_delimiter_word() {
-        let (stdout, stderr, code) = run_script(
-            "703.5",
-            "echo \"X=$(cat <<EOF; cat\nbody\nEOF\n)\"\n",
-        );
+        let (stdout, stderr, code) =
+            run_script("703.5", "echo \"X=$(cat <<EOF; cat\nbody\nEOF\n)\"\n");
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
         assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
         assert!(
@@ -1962,7 +1965,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "END\n", "list-position arm echoes must not run; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "list-position arm echoes must not run; stderr:\n{stderr}"
+        );
         assert_eq!(
             stderr,
             "fg.sh: line 2: no match: /no/such/*.zzz\n\
@@ -1993,7 +1999,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "END\n", "penetrating compound bodies; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "penetrating compound bodies; stderr:\n{stderr}"
+        );
         assert_eq!(
             stderr,
             "fg.sh: line 2: no match: /no/such/*.zzz\n\
@@ -2018,7 +2027,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "END\n", "for word-list abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "for word-list abort scope; stderr:\n{stderr}"
+        );
         assert_eq!(
             stderr,
             "fg.sh: line 2: no match: /no/such/*.zzz\n\
@@ -2041,7 +2053,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "END\n", "time must not contain the discard; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "time must not contain the discard; stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains("fg.sh: line 2: no match: /no/such/*.zzz"),
             "diagnostic missing; stderr:\n{stderr}"
@@ -2090,7 +2105,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
-        assert_eq!(stdout, "END\n", "redirect failglob abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "redirect failglob abort scope; stderr:\n{stderr}"
+        );
         assert_eq!(
             stderr,
             "fg.sh: line 2: no match: /no/such/*.zzz\n\
@@ -2292,7 +2310,10 @@ mod issue_753 {
             stdout, "TA_after\nin-brace2\nTA_brace_after\nEND\n",
             "temp-assignment containment must stay command-level; stderr:\n{stderr}"
         );
-        assert_eq!(stderr, "", "temp-assignment failglob is silent in GNU; stdout:\n{stdout}");
+        assert_eq!(
+            stderr, "",
+            "temp-assignment failglob is silent in GNU; stdout:\n{stdout}"
+        );
     }
 
     /// 753.14 [control] — `set -e` still exits at the first failglob with
@@ -2312,7 +2333,10 @@ mod issue_753 {
              echo END\n",
         );
         assert_eq!(code, Some(1), "errexit status; stderr:\n{stderr}");
-        assert_eq!(stdout, "", "errexit must exit before any echo; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "",
+            "errexit must exit before any echo; stderr:\n{stderr}"
+        );
         assert_eq!(
             stderr, "fg.sh: line 3: no match: /no/such/*.zzz\n",
             "diagnostics; stdout:\n{stdout}"
@@ -2380,8 +2404,7 @@ mod issue_753 {
             "select body must not contain the discard; stderr:\n{stderr}"
         );
         assert_eq!(
-            stderr,
-            "1) a\n2) b\n#? fg.sh: line 2: no match: /no/such/*.zzz\n",
+            stderr, "1) a\n2) b\n#? fg.sh: line 2: no match: /no/such/*.zzz\n",
             "menu plus diagnostic; stdout:\n{stdout}"
         );
     }

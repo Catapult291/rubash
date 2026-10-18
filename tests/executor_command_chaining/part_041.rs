@@ -89,7 +89,10 @@ fn test_exit_too_many_arguments_redirects_stderr() {
     // script/stdin face, so it just ends with $?=2.
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 2);
-    assert!(!Path::new(&status_path).exists(), "the discarded echo never ran");
+    assert!(
+        !Path::new(&status_path).exists(),
+        "the discarded echo never ran"
+    );
     assert!(fs::read_to_string(error_path)
         .unwrap()
         .contains("exit: too many arguments"));
