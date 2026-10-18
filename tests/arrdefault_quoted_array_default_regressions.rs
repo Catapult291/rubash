@@ -226,6 +226,34 @@ fn nested_quoted_guard_class() {
     );
 }
 
+/// rubash#795 differential (GNU 5.3.0 script-file probe, 2026-10-13): the
+/// split eligibility of an unquoted `${...}` span must key on the quote
+/// state at the `$` that introduces it. An escaped `\"` is data, never a
+/// quote toggle, so `\"${x}\"` classifies exactly like a bare `${x}` — the
+/// nested `"${a[@]+\"${a[@]}\"}"` guard keeps its per-element words (the
+/// literal quote characters glue to the first/last field) and a bare
+/// `\"${x}\"` word still splits its unquoted result. Whitespace-in-IFS and
+/// empty-IFS faces ride the same paths and stay byte-identical.
+#[test]
+fn escaped_quote_guard_class_splits_vs_gnu() {
+    assert_script(
+        concat!(
+            "a=(p q)\n",
+            "printf '<%s>' \"${a[@]+\\\"${a[@]}\\\"}\"; echo\n",
+            "for f in \"${a[@]+\\\"${a[@]}\\\"}\"; do echo \"[$f]\"; done\n",
+            "x='a b'\n",
+            "printf '<%s>' \\\"${x}\\\"; echo\n",
+            "IFS= printf '<%s>' \"${a[@]+\\\"${a[@]}\\\"}\"; echo\n",
+        ),
+        concat!(
+            "<\"p><q\">\n",
+            "[\"p]\n[q\"]\n",
+            "<\"a><b\">\n",
+            "<\"p><q\">\n",
+        ),
+    );
+}
+
 /// #147 regression guards: the `${arr[@]+"${arr[@]}"}` self-referential
 /// idiom family must stay green.
 #[test]

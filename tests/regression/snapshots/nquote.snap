@@ -78,7 +78,6 @@ $'\'abcd\''
 1
 argv[1] = <^?>
 \q
-foo
 argv[1] = <a^A)b>
 argv[1] = <a^Ab>
 argv[1] = <^A>

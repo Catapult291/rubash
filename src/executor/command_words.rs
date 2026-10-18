@@ -636,7 +636,24 @@ pub(in crate::executor) fn raw_word_has_unquoted_parameter_expansion_outside_quo
                     continue;
                 }
                 Some('{') => {
-                    // Skip to matching } (nested braces handled by depth).
+                    // A braced span IS a parameter expansion: when the `$`
+                    // introducing it sits outside any quote segment, the
+                    // word carries an unquoted expansion regardless of what
+                    // the body contains (quotes inside the body are the
+                    // expansion's own word syntax, not outer quoting).
+                    // Skipping the body wholesale hid the expansion from
+                    // this scan and cost `${assoc[@]@K}`, `${$+<newline>}`
+                    // and the nested `\"${a[@]}\"` guard fragment their
+                    // field split (rubash#795/#796): an escaped `\"` is
+                    // data, never a quote toggle, so `\"${x}\"` must
+                    // classify exactly like a bare `${x}`.
+                    if !in_single && !in_double {
+                        return true;
+                    }
+                    // Quoted at the introducer (`"${x}"`, `'${x}'`): the
+                    // span's RESULT never field-splits, so keep scanning
+                    // after the body. Skip to matching } (nested braces
+                    // handled by depth).
                     let mut depth = 1usize;
                     index += 2;
                     while index < chars.len() && depth > 0 {
