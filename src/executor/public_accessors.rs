@@ -1051,6 +1051,33 @@ impl Executor {
         );
     }
 
+    /// rubash#817: push a fresh read-unit generation for a nested read —
+    /// a `source`d file (builtins/source/execution.rs) or an `eval` string
+    /// (trap_exec.rs execute_eval_source). GNU gives each such unit its own
+    /// input stream (evalfile.c:253-257 push_stream; evalstring.c
+    /// parse_and_execute's pushed string), and the executor-level alias
+    /// same-read guard (arithmetic_aliases.rs alias_defined_on_current_line)
+    /// compares (generation, line) so a definition recorded inside the unit
+    /// can never collide with the sourcer's own later physical lines.
+    /// Returns the caller's generation for exit_read_unit; the ceiling never
+    /// decreases, so sibling units never share a value.
+    pub(crate) fn enter_read_unit(&mut self) -> usize {
+        let saved = self.shell_state.read_generation;
+        self.shell_state.read_generation_ceiling =
+            self.shell_state.read_generation_ceiling.wrapping_add(1);
+        self.shell_state.read_generation = self.shell_state.read_generation_ceiling;
+        saved
+    }
+
+    /// Restore the caller's read-unit generation saved by enter_read_unit.
+    /// GNU's run_unwind_frame pops the pushed stream — restoring
+    /// line_number — before source_file runs the RETURN trap
+    /// (evalfile.c:395), so the trap action and every later sourcer command
+    /// are read by the sourcer's own unit again.
+    pub(crate) fn exit_read_unit(&mut self, saved: usize) {
+        self.shell_state.read_generation = saved;
+    }
+
     pub(in crate::executor) fn set_current_line(&mut self, cmd: &CommandNode) {
         // GNU execute_cmd.c: only some command kinds stamp `line_number`
         // from their own `->line` (cm_simple :936, cm_subshell :696,

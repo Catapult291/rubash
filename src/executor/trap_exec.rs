@@ -478,7 +478,28 @@ impl Executor {
     /// Reparse and execute one eval-source string with the caller's line
     /// numbering (GNU variables.c:parse_and_execute SEVAL flags; eval-input
     /// line i sits at script line caller_line+i-1).
+    ///
+    /// rubash#817: the string is its own read unit — evalstring.c
+    /// parse_and_execute pushes it as fresh parser input — so alias
+    /// definitions inside record a fresh read-generation (enter_read_unit)
+    /// and an eval-body line that renumbers onto the caller's physical
+    /// line N must not collide with a use at the caller's line N (GNU
+    /// expands there: the definition was read in the eval string's stream,
+    /// earlier than the caller's token). The generation drops when the
+    /// string's execution returns, on every path.
     fn execute_eval_source(
+        &mut self,
+        source: &str,
+        caller_line: usize,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let saved_read_generation = self.enter_read_unit();
+        let result = self.execute_eval_source_inner(source, caller_line, cmd);
+        self.exit_read_unit(saved_read_generation);
+        result
+    }
+
+    fn execute_eval_source_inner(
         &mut self,
         source: &str,
         caller_line: usize,
