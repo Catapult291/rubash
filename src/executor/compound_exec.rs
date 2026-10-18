@@ -3197,9 +3197,20 @@ fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
 /// the parent. `${x:-v}` / `${x-v}` / `${x:?v}` are reads and stay on the
 /// fast path.
 fn parameter_expansion_assigns(raw: &str) -> bool {
+    // All indexing below is on the BYTE slice: every offset is a raw byte
+    // position (no char counting). UTF-8 continuation bytes are >= 0x80, so
+    // the two-byte "${" window can only match at a character boundary, and
+    // the identifier walk only advances over ASCII bytes — both keep
+    // `cursor` on a boundary by construction without slicing `raw`.
     let bytes = raw.as_bytes();
     let mut scan_from = 0usize;
-    while let Some(rel) = raw[scan_from..].find("${") {
+    while scan_from + 1 < bytes.len() {
+        let Some(rel) = bytes[scan_from..]
+            .windows(2)
+            .position(|window| window == b"${")
+        else {
+            break;
+        };
         let mut cursor = scan_from + rel + 2;
         let name_start = cursor;
         while cursor < bytes.len()
@@ -3207,11 +3218,16 @@ fn parameter_expansion_assigns(raw: &str) -> bool {
         {
             cursor += 1;
         }
-        if cursor > name_start {
-            let rest = &raw[cursor..];
-            if rest.starts_with('=') || rest.starts_with(":=") {
-                return true;
-            }
+        if cursor == name_start && cursor < bytes.len() && bytes[cursor] >= 0x80 {
+            // A multibyte character sits where the parameter name would be
+            // (`${中文=…}`): unicode names cannot be classified by the ASCII
+            // walk, so stay conservative and keep the wrapper.
+            return true;
+        }
+        if cursor > name_start
+            && (bytes[cursor..].starts_with(b"=") || bytes[cursor..].starts_with(b":="))
+        {
+            return true;
         }
         scan_from = name_start.max(scan_from + 1);
     }
