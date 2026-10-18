@@ -84,6 +84,16 @@ where
     }
 
     let arg = args[0];
+    // GNU builtins/pushd.def:318 popd_builtin()'s option walk treats an
+    // operand word that expanded to the empty string as the END of the
+    // argument list (`else if (*list->word->word) { invalid argument } else
+    // break;`, pushd.def:356-363) — `HOME=; popd ~` lands here with "" and
+    // performs the default top-of-stack pop instead of erroring (#754
+    // family: an empty tilde expansion is a real word, and each builtin
+    // judges it by its own operand rules).
+    if arg.is_empty() {
+        return Ok(Some(PopdOperand::Top { no_cd }));
+    }
     if !is_stack_index(arg) {
         // GNU popd.def: a ±-shaped non-number is get_numeric_arg's
         // `%s: invalid number`; anything else in the operand position is

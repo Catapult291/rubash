@@ -1105,7 +1105,22 @@ impl Executor {
             // so a glob pattern would be a literal path, not a match list.
             self.expand_word(word)
         } else {
-            self.home_value()
+            // GNU builtins/cd.def:316-322: the operand-less cd refuses only
+            // a MISSING HOME (`dirname == 0`); a set-but-EMPTY value flows
+            // on through make_absolute and lands on the cwd. Delegate that
+            // case to the real cd/pwd pair (None = no fast path) so the
+            // shortcut cannot drift from the builtin; only the missing case
+            // takes the fast verdict (cd.def:320-321). (#754 family: one
+            // HOME baseline per operation.)
+            match self.shell_state.env_vars.get("HOME") {
+                Some(home) if !home.is_empty() => home.clone(),
+                Some(_) => return None,
+                None => {
+                    eprintln!("{}cd: HOME not set", self.parser_diagnostic_prefix());
+                    self.last_command_substitution_status.set(Some(1));
+                    return Some(String::new());
+                }
+            }
         };
         let target_display = target.clone();
         let target = shell_path_to_windows(&target, &self.shell_state.env_vars);
