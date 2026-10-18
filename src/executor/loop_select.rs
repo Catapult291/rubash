@@ -49,6 +49,14 @@ impl Executor {
                         // the for command fails with status 1 and the next
                         // line runs; ExpansionFailure(1) rides the same
                         // top-level command-list-abandon machinery.
+                        // rubash#753: arm the reader-level abandon too — the
+                        // Err is swallowed by any compound that carries the
+                        // for (`{ for i in /no/such/*.zzz; do :; done; };
+                        // echo after` must not print `after`), and the class
+                        // flag lets the eval/source boundary contain a
+                        // discard raised inside their text.
+                        self.raise_evalerror_abort();
+                        self.evalerror_failglob_pending.set(true);
                         return Err(ExecuteError::ExpansionFailure(1));
                     }
                 }

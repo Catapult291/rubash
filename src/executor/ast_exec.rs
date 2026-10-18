@@ -67,6 +67,7 @@ impl Executor {
         self.evalerror_pending.set(false);
         self.nounset_force_eof.set(false);
         self.evalerror_subscript_pending.set(false);
+        self.evalerror_failglob_pending.set(false);
         self.evalerror_line.set(None);
         self.reader_command_line.set(None);
         // rubash#353: this run's unit (file / -c string) was upfront-lexed
@@ -175,6 +176,7 @@ impl Executor {
                     self.evalerror_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
+                    self.evalerror_failglob_pending.set(false);
                     self.evalerror_line.set(None);
                     if let Some(saved_state) = subshell_state.take() {
                         self.restore_flat_subshell(saved_state, subshell_cwd.take());
@@ -328,19 +330,20 @@ impl Executor {
                 // marker restore the saved parent state.
                 if subshell_state.is_some() {
                     if command.subshell_end {
-                        if let Some(saved_state) = subshell_state.take() {
-                            self.restore_flat_subshell(saved_state, subshell_cwd.take());
-                            if let Some(saved) = subshell_fd_table.take() {
-                                self.fd_table = saved;
-                            }
+                    if let Some(saved_state) = subshell_state.take() {
+                        self.restore_flat_subshell(saved_state, subshell_cwd.take());
+                        if let Some(saved) = subshell_fd_table.take() {
+                            self.fd_table = saved;
                         }
-                        self.evalerror_pending.set(false);
-                        self.nounset_force_eof.set(false);
-                        self.evalerror_subscript_pending.set(false);
-                        self.evalerror_line.set(None);
                     }
-                    index += 1;
-                    continue;
+                    self.evalerror_pending.set(false);
+                    self.nounset_force_eof.set(false);
+                    self.evalerror_subscript_pending.set(false);
+                    self.evalerror_failglob_pending.set(false);
+                    self.evalerror_line.set(None);
+                }
+                index += 1;
+                continue;
                 }
                 // The subshell-boundary error arm already tore the subshell
                 // down (subshell_state is None) but left this list's closing
@@ -352,6 +355,7 @@ impl Executor {
                     self.evalerror_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
+                    self.evalerror_failglob_pending.set(false);
                     self.evalerror_line.set(None);
                     index += 1;
                     continue;
@@ -417,6 +421,7 @@ impl Executor {
                 self.evalerror_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
+                self.evalerror_failglob_pending.set(false);
                 self.evalerror_line.set(None);
             }
             if self.evalerror_exec_depth.get() == 1 {
@@ -1412,6 +1417,7 @@ impl Executor {
                 self.evalerror_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
+                self.evalerror_failglob_pending.set(false);
                 self.evalerror_line.set(None);
                 if let Some(saved_state) = subshell_state.take() {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());

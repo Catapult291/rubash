@@ -775,6 +775,24 @@ impl Executor {
         self.evalerror_pending.set(true);
     }
 
+    /// rubash#753: absorb a pending failglob-class discard at a containment
+    /// boundary (the `eval` and `source` builtins — GNU evalstring.c:365,
+    /// 422-442 installs a local top_level catch for the text they run, so
+    /// the discard ends only that text and the CALLER's remaining commands
+    /// run). Drops the armed abandon and the class marker; the exit code is
+    /// left to the caller (the failglob site already set 1). Returns true
+    /// when a discard was absorbed, so a caller can tell "contained" from
+    /// "nothing pending".
+    pub(crate) fn absorb_failglob_discard(&mut self) -> bool {
+        if self.evalerror_failglob_pending.replace(false) {
+            self.evalerror_pending.set(false);
+            self.evalerror_line.set(None);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Report a failed subscript evaluation — unless the failure was already
     /// reported as nounset (rubash#639: the unbound-variable message prints
     /// once at the trap site inside `eval_indexed_subscript_expression`, so

@@ -1113,6 +1113,14 @@ impl Executor {
                     }
                     super::glob::PathnameExpansion::Fail(pattern) => {
                         self.report_failglob(&pattern);
+                        // rubash#753: a failglob element is GNU's
+                        // expand_words_no_vars DISCARD, not the
+                        // partial-bind break the bad-subscript class takes
+                        // — arm the abandon (and its class) so the declare
+                        // caller fails the whole operand instead of binding
+                        // the partial.
+                        self.raise_evalerror_abort();
+                        self.evalerror_failglob_pending.set(true);
                         return Err(format!("({})", elements.join(" ")));
                     }
                 }
@@ -1125,6 +1133,11 @@ impl Executor {
                         super::glob::PathnameExpansion::NoMatch => vec![field],
                         super::glob::PathnameExpansion::Fail(pattern) => {
                             self.report_failglob(&pattern);
+                            // rubash#753: same failglob-class arming as the
+                            // alternate-word arm above — the declare caller
+                            // must fail the operand, not bind the partial.
+                            self.raise_evalerror_abort();
+                            self.evalerror_failglob_pending.set(true);
                             return Err(format!("({})", elements.join(" ")));
                         }
                     };

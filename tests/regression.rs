@@ -1807,3 +1807,623 @@ mod issue_742 {
         assert_eq!(stdout, "[AB b]\n[AB b]\n", "stderr:\n{stderr}");
     }
 }
+
+/// rubash#753: after a failglob expansion error GNU abandons the rest of the
+/// current logical line; rubash only abandoned the failing command when that
+/// command was a compound, so one extra statement ran after the error.
+///
+/// The issue's repro is the brace group (`case2`): GNU never reaches the
+/// `echo` after the `;`, rubash ran it and reported `case2-rc=1`. The
+/// subshell (`case1`) and the simple command (`case3`) already matched,
+/// which pinned the divergence to the compound-command boundary swallowing
+/// the expansion failure instead of letting it unwind to the reader. This
+/// is control flow, distinct from #726's diagnostic-bypass defect.
+///
+/// GNU's rule, as pinned by the probe family behind these cases: the
+/// failglob failure abandons the remainder of the current logical line —
+/// the same discard the arithmetic/subscript evalerror path already
+/// implements (`evalerror_pending` + the reader loop-top check). The
+/// discard is CONTAINED by exactly these boundaries: `( )` subshells,
+/// pipeline stages, `$( )`, `&` background jobs, `eval`, and `source`; it
+/// PENETRATES brace groups, if/then bodies, if conditions,
+/// while/until/for/select bodies, case arms, function bodies, `!`, and
+/// `time`. A loop body's discard escapes through `done` to the enclosing
+/// logical line and aborts the loop; a `for` word-list failure is a plain
+/// line abort.
+///
+/// Fix: a new class flag `evalerror_failglob_pending` (mirroring
+/// `evalerror_subscript_pending`'s clear-at-every-boundary discipline) is
+/// armed at every failglob `Fail` site alongside `raise_evalerror_abort()`,
+/// so the reader-layer loop-top check discards the rest of the line. The
+/// eval/source boundaries absorb exactly this class (GNU evalstring.c
+/// catches the expansion error locally at the top level of eval/source),
+/// which is why the containing boundaries keep their old behavior.
+///
+/// Two pre-existing divergences found while probing, deliberately out of
+/// scope here (both reproduce on the pre-fix binary, so neither is a
+/// regression of this change; both are follow-up issue candidates):
+/// - `c=([k]=v [""]=x)` — a bad-subscript compound assignment binds
+///   partially and GNU CONTINUES the line (`sub-after rc=0`); rubash
+///   discards the rest of the line (subscript family).
+/// - `${arr[/no/such/*.zzz]}` — the subscript failglob diagnostic reads
+///   `arithmetic syntax error` where GNU reads `syntax error` (diagnostic
+///   wording family).
+mod issue_753 {
+    use super::*;
+
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// Same contract as `run`, with a stdin payload. The select shape needs
+    /// one input line for its body to execute at all: with
+    /// `Stdio::null()` the select EOFs before the first prompt and the body
+    /// never runs, which is exactly how the first select probe misread the
+    /// boundary (the body "discarding" the line was really the body never
+    /// executing).
+    fn run_with_stdin(case: &str, script: &str, input: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubash"));
+        cmd.args(["fg.sh"])
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", minimal_path())
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if cfg!(windows) {
+            for name in [
+                "SystemRoot",
+                "SystemDrive",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "OS",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Ok(value) = std::env::var(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn rubash");
+        std::io::Write::write_all(child.stdin.as_mut().expect("stdin pipe"), input.as_bytes())
+            .expect("write stdin");
+        drop(child.stdin.take());
+        let out = wait_bounded(&mut child, Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 753.1 [ratchet] — the issue's exact repro. case1 (subshell) and
+    /// case3 (simple command) were already GNU-correct and stay pinned
+    /// here; case2 (brace group) is the ratchet: pre-fix rubash printed
+    /// `case2-rc=1`, GNU abandons the rest of that logical line and never
+    /// reaches the `echo`. stderr pins all three diagnostics with their
+    /// line numbers, proving the failures fired rather than the echoes
+    /// silently vanishing.
+    #[test]
+    fn case_1_issue_repro_brace_group_same_line() {
+        let (stdout, stderr, code) = run(
+            "753.1",
+            "shopt -s failglob\n\
+             echo \"case1-start\"\n\
+             ( set -- /no/such/*.zzz; echo \"case1-inside\" ); echo \"case1-rc=$?\"\n\
+             echo \"case2-start\"\n\
+             { set -- /no/such/*.zzz; echo \"case2-inside\"; }; echo \"case2-rc=$?\"\n\
+             echo \"case3-start\"\n\
+             set -- /no/such/*.zzz; echo \"case3-rc=$?\"\n\
+             echo \"END\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "case1-start\ncase1-rc=1\ncase2-start\ncase3-start\nEND\n",
+            "case2-rc must not print; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n\
+             fg.sh: line 7: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.2 [ratchet] — a brace group in list position. Pre-fix rubash ran
+    /// `A_after_brace_semicolon` (after `;`), `C_or_arm` (the `||` arm —
+    /// the group "failed", so the arm was eligible), and `D_after_invert
+    /// rc=0` (`!` inverted the aborted group's status); GNU abandons the
+    /// line at each failure and prints only `END`. `B_and_arm` is pinned
+    /// too but is non-discriminating: the `&&` arm is skipped by status in
+    /// both shells, so its absence proves nothing about the discard — it
+    /// is here to keep the and/or pair covered as a family.
+    #[test]
+    fn case_2_brace_group_in_list_position() {
+        let (stdout, stderr, code) = run(
+            "753.2",
+            "shopt -s failglob\n\
+             { set -- /no/such/*.zzz; }; echo \"A_after_brace_semicolon\"\n\
+             { set -- /no/such/*.zzz; } && echo \"B_and_arm\"\n\
+             { set -- /no/such/*.zzz; } || echo \"C_or_arm\"\n\
+             ! { set -- /no/such/*.zzz; }; echo \"D_after_invert rc=$?\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "list-position arm echoes must not run; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.3 [ratchet] — the compound bodies that PENETRATE: an if/then
+    /// body and the if condition itself, a case arm, and a nested brace
+    /// group. Pre-fix rubash printed all five trailing echoes
+    /// (`E_after_fi_sameline`, `IFCOND_after`, `G_after_case_sameline`,
+    /// `L_nested_inner`, `M_after_nested`); GNU abandons each logical line
+    /// at the failure, so only `END` survives. The if-condition shape is
+    /// the one the probe family found last: the condition's failglob
+    /// aborts the whole `if ... fi` line, not just the condition command.
+    #[test]
+    fn case_3_if_body_if_condition_case_nested_brace() {
+        let (stdout, stderr, code) = run(
+            "753.3",
+            "shopt -s failglob\n\
+             if true; then set -- /no/such/*.zzz; fi; echo \"E_after_fi_sameline\"\n\
+             if set -- /no/such/*.zzz; then echo \"cond-T\"; fi; echo \"IFCOND_after\"\n\
+             case x in x) set -- /no/such/*.zzz;; esac; echo \"G_after_case_sameline\"\n\
+             { { set -- /no/such/*.zzz; }; echo \"L_nested_inner\"; }; echo \"M_after_nested\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "penetrating compound bodies; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.4 [ratchet] — the `for` word list. Bare (`FOR_after`) was
+    /// already GNU-correct pre-fix; the in-brace spelling
+    /// (`FOR_brace_after`) was not: pre-fix rubash ran the echo after the
+    /// brace group closed. GNU abandons the line in both spellings.
+    #[test]
+    fn case_4_for_word_list_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.4",
+            "shopt -s failglob\n\
+             for i in /no/such/*.zzz; do echo \"for-body\"; done; echo \"FOR_after\"\n\
+             { for i in /no/such/*.zzz; do echo \"for-body2\"; done; }; echo \"FOR_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "for word-list abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.5 [ratchet] — the `time` keyword. Pre-fix rubash printed
+    /// `I_after_time`; GNU abandons the rest of the line after the timed
+    /// group's failglob. stderr is only contains-checked: the `real`/
+    /// `user`/`sys` timing lines are machine-dependent bytes and belong to
+    /// no golden.
+    #[test]
+    fn case_5_time_keyword_penetrates() {
+        let (stdout, stderr, code) = run(
+            "753.5",
+            "shopt -s failglob\n\
+             time { set -- /no/such/*.zzz; }; echo \"I_after_time\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "time must not contain the discard; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("fg.sh: line 2: no match: /no/such/*.zzz"),
+            "diagnostic missing; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("real") && stderr.contains("user") && stderr.contains("sys"),
+            "time report missing; stderr:\n{stderr}"
+        );
+    }
+
+    /// 753.6 [ratchet] — a function definition, call, and trailing echo on
+    /// one logical line. Pre-fix rubash printed `after-func-sameline` (the
+    /// body's failglob only aborted the function call); GNU abandons the
+    /// line. The next-line spelling is covered by 753.15 and stays green.
+    #[test]
+    fn case_6_function_def_call_echo_same_line() {
+        let (stdout, stderr, code) = run(
+            "753.6",
+            "shopt -s failglob\n\
+             g() { set -- /no/such/*.zzz; echo \"func-inside\"; }; g; echo \"after-func-sameline\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "same-line echo after a failing function call must not run; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr, "fg.sh: line 2: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.7 [ratchet] — failglob in a redirection word. Bare
+    /// (`REDIR_after`) was already correct pre-fix; the brace-internal
+    /// spellings (`BR_after`, `BR_brace_after`) were not. GNU abandons the
+    /// line in all three spellings, so no redirect file is ever attempted.
+    #[test]
+    fn case_7_redirection_word_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.7",
+            "shopt -s failglob\n\
+             echo x > /no/such/*.zzz; echo \"REDIR_after\"\n\
+             { echo x > /no/such/*.zzz; }; echo \"BR_after\"\n\
+             { { echo x > /no/such/*.zzz; }; }; echo \"BR_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "redirect failglob abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.8 [ratchet] — failglob in a compound-assignment word. Bare
+    /// (`CA_after`) was already correct pre-fix; the brace, if-body,
+    /// case-arm, and same-line function spellings were not. GNU abandons
+    /// each logical line at the failure.
+    #[test]
+    fn case_8_compound_assignment_word_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.8",
+            "shopt -s failglob\n\
+             a=(/no/such/*.zzz); echo \"CA_after\"\n\
+             { a=(/no/such/*.zzz); echo \"in-brace\"; }; echo \"CA_brace_after\"\n\
+             if true; then a=(/no/such/*.zzz); fi; echo \"CA_if_after\"\n\
+             case x in x) a=(/no/such/*.zzz);; esac; echo \"CA_case_after\"\n\
+             f() { a=(/no/such/*.zzz); echo \"in-f\"; }; f; echo \"CA_func_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "compound-assignment failglob abort scope; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.9 [ratchet] — `declare` with an indexed compound operand. GNU
+    /// fails the whole operand, binds NOTHING (`declare -p b` reports
+    /// `declare: b: not found`), and abandons the line, so neither
+    /// `rc=`/`rc2=` echo runs. Pre-fix rubash bound `b=([0]="x")`, bound
+    /// `c=()`, and ran both echoes. This is the shape that made the
+    /// fix's declare path need a hard failure rather than the partial
+    /// binding the bad-subscript class uses.
+    #[test]
+    fn case_9_declare_indexed_operand_binds_nothing() {
+        let (stdout, stderr, code) = run(
+            "753.9",
+            "shopt -s failglob\n\
+             declare b=(x /no/such/*.zzz y); echo \"rc=$?\"\n\
+             declare -p b\n\
+             declare -a c=(/no/such/*.zzz); echo \"rc2=$?\"\n\
+             declare -p c\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "declare operand failure must bind nothing and abandon the line; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: declare: b: not found\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: declare: c: not found\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.10 [guard] — `declare -A` (associative) is EXEMPT from failglob
+    /// in the compound-operand path: GNU stores the literal key
+    /// `["/no/such/*.zzz"]=""` with rc 0 and no diagnostic. The fix must
+    /// not over-apply the discard to this shape; this case was green
+    /// pre-fix and pins the limit of the new arming.
+    #[test]
+    fn case_10_declare_associative_is_exempt() {
+        let (stdout, stderr, code) = run(
+            "753.10",
+            "shopt -s failglob\n\
+             declare -A d=(/no/such/*.zzz); echo \"rc3=$?\"\n\
+             declare -p d\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "rc3=0\ndeclare -A d=([\"/no/such/*.zzz\"]=\"\" )\nEND\n",
+            "assoc operand must store the literal key; stderr:\n{stderr}"
+        );
+        assert_eq!(stderr, "", "assoc path must stay silent; stdout:\n{stdout}");
+    }
+
+    /// 753.11 [control] — the CONTAINING boundaries, all green pre-fix and
+    /// pinned so the new discard cannot leak past them: `( )` subshell
+    /// (line continues, rc=1), pipeline stage (line continues, pipeline
+    /// rc=0 from `cat`), `&` background job (line continues, rc=0 from the
+    /// `&` itself), `eval` (the discard applies INSIDE the eval string —
+    /// `eval-inside` never prints — but the caller's line continues), a
+    /// bare `$( )` (substitution yields empty, line continues), and a
+    /// command-prefix assignment `v=$(...)` (line continues with v empty).
+    #[test]
+    fn case_11_containing_boundaries_stay_contained() {
+        let (stdout, stderr, code) = run(
+            "753.11",
+            "shopt -s failglob\n\
+             ( set -- /no/such/*.zzz ); echo \"SUB_after_subshell rc=$?\"\n\
+             set -- /no/such/*.zzz | cat; echo \"PIPE_after rc=$?\"\n\
+             set -- /no/such/*.zzz & echo \"BG_after rc=$?\"\n\
+             wait\n\
+             eval 'set -- /no/such/*.zzz; echo eval-inside'; echo \"EVAL_after\"\n\
+             eval 'set -- /no/such/*.zzz'; echo \"EVAL2_after\"\n\
+             echo \"$(set -- /no/such/*.zzz; echo sub-in)\"; echo \"COMSUB_after\"\n\
+             v=$(set -- /no/such/*.zzz); echo \"ASSIGN_after v=$v\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout,
+            "SUB_after_subshell rc=1\n\
+             PIPE_after rc=0\n\
+             BG_after rc=0\n\
+             EVAL_after\n\
+             EVAL2_after\n\
+             \n\
+             COMSUB_after\n\
+             ASSIGN_after v=\n\
+             END\n",
+            "containing boundaries; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n\
+             fg.sh: line 7: no match: /no/such/*.zzz\n\
+             fg.sh: line 8: no match: /no/such/*.zzz\n\
+             fg.sh: line 9: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.12 [control] — loop bodies PENETRATE: the failglob inside a
+    /// while/until/for body discards the rest of the body's logical line,
+    /// escapes through `done`, and aborts the loop (one diagnostic per
+    /// loop, not one per remaining iteration). The next-line echoes
+    /// (`W_next`, `U_next`, `F_next`) prove the discard stopped at the
+    /// line boundary. Green pre-fix; pinned so the reader-layer change
+    /// cannot swallow the following line.
+    #[test]
+    fn case_12_loop_bodies_penetrate_and_abort() {
+        let (stdout, stderr, code) = run(
+            "753.12",
+            "shopt -s failglob\n\
+             i=0; while [ $i -lt 3 ]; do i=$((i+1)); set -- /no/such/*.zzz; echo \"wbody-$i\"; done; echo \"W_same\"\n\
+             echo \"W_next\"\n\
+             i=0; until [ $i -ge 3 ]; do i=$((i+1)); set -- /no/such/*.zzz; echo \"ubody-$i\"; done; echo \"U_same\"\n\
+             echo \"U_next\"\n\
+             for i in 1 2; do set -- /no/such/*.zzz; echo \"fbody-$i\"; done; echo \"F_same\"\n\
+             echo \"F_next\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "W_next\nU_next\nF_next\nEND\n",
+            "loop-body discard must stop at the line boundary; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n",
+            "one diagnostic per aborted loop; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.13 [guard] — a temporary assignment prefix
+    /// (`x=/no/such/*.zzz true`) is COMMAND-level containment, not a line
+    /// abort: the command does not run, status is 1, GNU prints no
+    /// diagnostic at all, and the list continues — including inside a
+    /// brace group (`in-brace2` and `TA_brace_after` both print). The fix
+    /// must not upgrade this containment to a line discard; green pre-fix,
+    /// pinned as the guardrail.
+    #[test]
+    fn case_13_temporary_assignment_prefix_is_command_level() {
+        let (stdout, stderr, code) = run(
+            "753.13",
+            "shopt -s failglob\n\
+             x=/no/such/*.zzz true; echo \"TA_after\"\n\
+             { x=/no/such/*.zzz true; echo \"in-brace2\"; }; echo \"TA_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "TA_after\nin-brace2\nTA_brace_after\nEND\n",
+            "temp-assignment containment must stay command-level; stderr:\n{stderr}"
+        );
+        assert_eq!(stderr, "", "temp-assignment failglob is silent in GNU; stdout:\n{stdout}");
+    }
+
+    /// 753.14 [control] — `set -e` still exits at the first failglob with
+    /// status 1 and no further output. The errexit exit is decided at the
+    /// reader-layer post-command check before the new discard consumption
+    /// is reached, so this shape is unchanged by the fix; pinned so a
+    /// future reader-layer change cannot silently reorder the two.
+    #[test]
+    fn case_14_errexit_exits_before_discard() {
+        let (stdout, stderr, code) = run(
+            "753.14",
+            "set -e\n\
+             shopt -s failglob\n\
+             f() { set -- /no/such/*.zzz; echo in-f; }\n\
+             f\n\
+             echo \"F-next\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(1), "errexit status; stderr:\n{stderr}");
+        assert_eq!(stdout, "", "errexit must exit before any echo; stderr:\n{stderr}");
+        assert_eq!(
+            stderr, "fg.sh: line 3: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.15 [control] — the discard is a LINE boundary, not a file
+    /// boundary: every command on the following line still runs
+    /// (`after-nextline`, `after-if-nextline`, `after-while`,
+    /// `after-func-nextline`), and the same-line `echo` after each failing
+    /// compound does not. Green pre-fix for the next-line echoes; the
+    /// same-line absences were pinned by 753.1-753.8. Together the pair
+    /// proves the reader skipped exactly the remainder of one logical
+    /// line.
+    #[test]
+    fn case_15_next_line_commands_still_run() {
+        let (stdout, stderr, code) = run(
+            "753.15",
+            "shopt -s failglob\n\
+             { set -- /no/such/*.zzz; echo \"inside\"; }\n\
+             echo \"after-nextline\"\n\
+             if true; then set -- /no/such/*.zzz; echo \"then-inside\"; fi\n\
+             echo \"after-if-nextline\"\n\
+             while false; do set -- /no/such/*.zzz; done\n\
+             echo \"after-while\"\n\
+             h() { set -- /no/such/*.zzz; echo \"func-inside\"; }\n\
+             h\n\
+             echo \"after-func-nextline\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after-nextline\nafter-if-nextline\nafter-while\nafter-func-nextline\nEND\n",
+            "next-line commands must survive the discard; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 8: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.16 [control] — the select body PENETRATES like the other loop
+    /// bodies. Needs a stdin payload: with EOF-on-open stdin the select
+    /// menu EOFs before the first prompt and the body never executes,
+    /// which is how the first probe misread select as a containing
+    /// boundary. With one input line the menu prints (`1) a` / `2) b` /
+    /// `#? `), the body's failglob discards the rest of the line
+    /// (`select-body` and `SEL_same` never print), and the next line runs.
+    /// Green pre-fix; pinned with the other loop bodies.
+    #[test]
+    fn case_16_select_body_penetrates() {
+        let (stdout, stderr, code) = run_with_stdin(
+            "753.16",
+            "shopt -s failglob\n\
+             select v in a b; do set -- /no/such/*.zzz; echo \"select-body\"; break; done; echo \"SEL_same\"\n\
+             echo \"SEL_next\"\n",
+            "pick\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "SEL_next\n",
+            "select body must not contain the discard; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "1) a\n2) b\n#? fg.sh: line 2: no match: /no/such/*.zzz\n",
+            "menu plus diagnostic; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.17 [control] — `source` is a containing boundary at the FILE
+    /// seam: the failglob inside the sourced file discards the rest of
+    /// that file's logical line (`src-inside` never prints) but the next
+    /// line of the sourced file still runs (`src-after`), and the caller's
+    /// line — the very `source ...; echo caller-same` that triggered it —
+    /// continues (`caller-same`, `caller-next`). This is the GNU
+    /// evalstring.c top-level catch the fix mirrors by absorbing the
+    /// failglob class at the source boundary. Green pre-fix; pinned so the
+    /// reader-layer change cannot make source abort its caller's line.
+    #[test]
+    fn case_17_source_boundary_contains() {
+        let dir = case_scratch("753.17");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "shopt -s failglob\n\
+             source inner753.sh; echo \"caller-same\"\n\
+             echo \"caller-next\"\n\
+             echo END\n",
+        )
+        .expect("write script");
+        std::fs::write(
+            dir.join("inner753.sh"),
+            "shopt -s failglob\n\
+             set -- /no/such/*.zzz; echo \"src-inside\"\n\
+             echo \"src-after\"\n",
+        )
+        .expect("write inner script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "src-after\ncaller-same\ncaller-next\nEND\n",
+            "source must contain the discard at the file seam; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr, "inner753.sh: line 2: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+}

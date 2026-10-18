@@ -597,8 +597,33 @@ impl Executor {
             // matching GNU's forked-subshell re-jump.
             Err(ExecuteError::ExpansionFailure(code)) => {
                 self.exit_code = code;
+                // rubash#753: the escaped Err can only be a failglob /
+                // redirect-no-match discard raised where the eval'd list's
+                // own dispatch could not consume it (a function body called
+                // from the string keeps function_depth > 0, so its frame
+                // absorbed the Err instead). GNU's evalstring DISCARD arm
+                // contains it here — drop the class flag (and the abandon
+                // it armed) so the caller's reader loop does not also skip
+                // its same-line commands (`f() { eval 'set -- nope*'; };
+                // f; echo after` prints `after`). Other classes keep their
+                // established escaping behavior (rubash#637/#639).
+                self.absorb_failglob_discard();
                 Ok(())
             }
+            // GNU evalstring.c:365,422-442: a DISCARD-class word-expansion
+            // failure (failglob / redirect no-match, rubash#753) inside the
+            // eval'd string is caught at the eval boundary — eval returns
+            // the failure status and the CALLER's remaining commands run
+            // (`eval 'set -- /no/such/*.zzz'; echo K` prints K, verified
+            // GNU 5.3). The same-line skip inside the string already ran at
+            // the eval'd list level (`eval_list_depth` makes that list the
+            // discard boundary); this arm owns the trailing case — the
+            // failing command was the string's last, so the armed abandon
+            // survived the list — and must not leak into the caller's
+            // reader loop. The exit code is left alone: the failglob site
+            // already set 1, and a later line that ran fine yields eval rc
+            // 0, GNU's parse_and_execute loop semantics.
+            Ok(()) if self.absorb_failglob_discard() => Ok(()),
             Ok(()) if self.evalerror_subscript_pending.replace(false) => {
                 // GNU evalstring.c:365,422-442: DISCARD inside the eval'd
                 // string is caught at the eval boundary — eval returns

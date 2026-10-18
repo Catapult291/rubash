@@ -715,6 +715,19 @@ pub struct Executor {
     /// and cleared at every pending-clearing boundary, same discipline as
     /// `nounset_force_eof`.
     pub(crate) evalerror_subscript_pending: Cell<bool>,
+    /// rubash#753: marks a pending evalerror abort as the failglob /
+    /// redirect-no-match word-expansion class. The eval and source
+    /// boundaries absorb exactly this class (GNU evalstring.c:365,422-442
+    /// and evalfile.c's parse_and_execute both install a local top_level
+    /// catch: the discard ends only the eval'd string / sourced file and
+    /// the CALLER's remaining commands run — probe `eval 'set -- nope*';
+    /// echo K` prints K). Arithmetic and nounset subscript failures keep
+    /// escaping those boundaries (rubash#637/#639), so the class needs its
+    /// own marker beside `evalerror_subscript_pending`. Armed alongside
+    /// `evalerror_pending` at every failglob site; consumed at the eval /
+    /// source boundary and cleared at every pending-clearing boundary,
+    /// same discipline as `evalerror_subscript_pending`.
+    pub(crate) evalerror_failglob_pending: Cell<bool>,
     /// rubash#637: the `evalerror_exec_depth` value at which the currently
     /// executing eval'd list runs (`None` outside `eval`). A nested abort
     /// unwinds silently everywhere EXCEPT the eval'd top list itself, where

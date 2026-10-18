@@ -1252,6 +1252,20 @@ impl Executor {
                             // rubash#439: expansion error, not a failed
                             // command — no ERR trap.
                             self.command_expansion_failed.set(true);
+                            // rubash#753: the discard boundary is the
+                            // LOGICAL line wherever the word expanded — the
+                            // Err alone only reaches the reader when the
+                            // failing command sits directly at reader level.
+                            // A compound that swallows the Err (brace group
+                            // pipeline, and-or arm, `!`, `time`, if/then,
+                            // case, function frame) would otherwise resume
+                            // the line (`{ set -- /no/such/*.zzz; }; echo A`
+                            // printed A; GNU does not). Arm the reader-level
+                            // abandon so every such frame keeps the discard:
+                            // the loop-top check skips the commands sharing
+                            // the failing line and clears on the line change.
+                            self.raise_evalerror_abort();
+                            self.evalerror_failglob_pending.set(true);
                             return Err(ExecuteError::ExpansionFailure(1));
                         }
                     }
