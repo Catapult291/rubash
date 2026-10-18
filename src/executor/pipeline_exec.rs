@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use crate::executor::fd_table::FdEntry;
 
 fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (String, i32) {
@@ -2042,7 +2042,7 @@ impl Executor {
     /// Admission is a WHITELIST: the tail must be a literal builtin from
     /// `streaming_builtin_tail` and every prefix member a plain external, so a
     /// shape this path cannot faithfully stream keeps the existing executor.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn execute_external_prefix_streaming_tail(
         &mut self,
         commands: &[&CommandNode],
@@ -2155,12 +2155,18 @@ impl Executor {
         // handle); `pipeline_stdin_stream` tells the stage dispatcher to leave
         // FUNCTION_STDIN absent so `read` does not short-circuit to the
         // buffered mirror.
+        #[cfg(unix)]
+        use std::os::unix::io::IntoRawFd;
+        #[cfg(windows)]
         use std::os::windows::io::IntoRawHandle;
         let tail_reader = pipes[tail_index - 1]
             .0
             .take()
             .expect("tail reader already transferred");
+        #[cfg(windows)]
         let tail_handle = tail_reader.into_raw_handle() as crate::fd::HANDLE;
+        #[cfg(unix)]
+        let tail_handle = tail_reader.into_raw_fd() as crate::fd::HANDLE;
         let saved_fd0 = self.fd_table.entries.insert(
             0,
             FdEntry {
@@ -2219,10 +2225,9 @@ impl Executor {
         Ok(Some(()))
     }
 
-    /// Unix port: the OS-pipe streaming machinery is Windows-only for now (the
-    /// os_pipe spawn plumbing); on Unix the sequential stage loop keeps
-    /// handling mixed pipelines. rubash#761 follow-up.
-    #[cfg(not(windows))]
+    /// Non Windows/Unix port: the OS-pipe streaming machinery above covers
+    /// Windows and Unix; other platforms keep the sequential stage loop.
+    #[cfg(not(any(windows, unix)))]
     fn execute_external_prefix_streaming_tail(
         &mut self,
         _commands: &[&CommandNode],
@@ -2238,7 +2243,7 @@ impl Executor {
     /// same fd 0 — so `yes | while read; do break; done` stops the producer
     /// exactly when `break` ends the body. Redirects/tempenv/heredocs/procsubs
     /// on the tail force the existing executor.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn streaming_builtin_tail(&self, command: &CommandNode) -> bool {
         if !pipeline_streaming_plain_stage(command) {
             return false;
@@ -3957,7 +3962,7 @@ mod inline_tr_tests {
 /// with stdio alone — no shell-side redirect, tempenv, heredoc, process
 /// substitution, time prefix, inversion, or background/coproc modifier.
 /// Anything else keeps the shell-aware sequential machine.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn pipeline_streaming_plain_stage(command: &CommandNode) -> bool {
     command.time_command.is_none()
         && command.redirect_out.is_none()
@@ -3982,7 +3987,7 @@ fn pipeline_streaming_plain_stage(command: &CommandNode) -> bool {
 /// compound/subshel/brace shape, non-empty words). Prefix members are spawned
 /// as real external children, so only `pipeline_streaming_plain_stage` plus
 /// the external shape qualifies.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn pipeline_streaming_plain_external(command: &CommandNode) -> bool {
     !command.words.is_empty()
         && command.brace_group.is_none()
