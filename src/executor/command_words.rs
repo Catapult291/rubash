@@ -244,13 +244,12 @@ impl Executor {
             .words
             .get(index)
             .is_some_and(|word| word_is_unquoted_indirect_name_list(word));
-        let unquoted_embedded_parameter = !word_is_quoted
-            && cmd
-                .word_metadata
-                .get(index)
-                .map(|metadata| metadata.raw.as_str())
-                .or_else(|| cmd.words.get(index).map(String::as_str))
-                .is_some_and(raw_word_has_unquoted_parameter_expansion);
+        let unquoted_embedded_parameter = cmd
+            .word_metadata
+            .get(index)
+            .map(|metadata| metadata.raw.as_str())
+            .or_else(|| cmd.words.get(index).map(String::as_str))
+            .is_some_and(raw_word_has_unquoted_parameter_expansion_outside_quotes);
 
         (unquoted_variable && !unquoted_dynamic_parameter && field_split_would_change_word)
             || (unquoted_embedded_parameter && field_split_would_change_word)
@@ -595,12 +594,114 @@ pub(in crate::executor) fn raw_word_has_unquoted_parameter_expansion(raw: &str) 
     false
 }
 
+/// rubash#743: per-character quote state for field-split eligibility.
+/// Returns true only if the raw word contains a parameter expansion (`$name`,
+/// `${...}`, `$@`, etc.) OUTSIDE any `'...'`/`"..."` segment. GNU tracks
+/// quoting per character (parse.y read_token_word; subst.c:11639-11673
+/// CTLESC-protects quoted source chars), so a mixed word like `a$w"b"`
+/// field-splits the unquoted `$w` result while the quoted `"b"` stays
+/// joined. The word-level `raw_word_is_quoted` is too coarse: it suppresses
+/// splitting for the whole word when any quote appears.
+pub(in crate::executor) fn raw_word_has_unquoted_parameter_expansion_outside_quotes(
+    raw: &str,
+) -> bool {
+    if !raw.as_bytes().contains(&b'$') {
+        return false;
+    }
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index += 2;
+            continue;
+        }
+        // Skip $'...', $"...", ${...}, $(...) spans: quotes inside are word
+        // syntax of the expansion, not outer quoting (same rule as
+        // raw_word_is_quoted).
+        if ch == '$' {
+            match chars.get(index + 1) {
+                Some('\'') | Some('"') => {
+                    let quote = chars[index + 1];
+                    index += 2;
+                    while index < chars.len() && chars[index] != quote {
+                        if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    index += 1;
+                    continue;
+                }
+                Some('{') => {
+                    // Skip to matching } (nested braces handled by depth).
+                    let mut depth = 1usize;
+                    index += 2;
+                    while index < chars.len() && depth > 0 {
+                        if chars[index] == '{' {
+                            depth += 1;
+                        } else if chars[index] == '}' {
+                            depth -= 1;
+                        } else if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                Some('(') => {
+                    // $(...) — skip to matching ). Handled as a unit; the
+                    // command-substitution split path has its own check.
+                    let mut depth = 1usize;
+                    index += 2;
+                    while index < chars.len() && depth > 0 {
+                        if chars[index] == '(' {
+                            depth += 1;
+                        } else if chars[index] == ')' {
+                            depth -= 1;
+                        } else if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            // Unquoted $name / $@ / $1 etc. outside quotes: eligible.
+            if !in_single && !in_double {
+                match chars.get(index + 1).copied() {
+                    Some(ch)
+                        if is_shell_name_start(ch)
+                            || matches!(ch, '@' | '*' | '#' | '?' | '$' | '!' | '-' | '0') =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single {
+            in_double = !in_double;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Drop the ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) at a VALUE
 /// boundary: the guard is field-split transport (rubash#379), and a bound
 /// for-list value is final data -- the same contract argv materialization
 /// (command_prepare::materialize_expanded_command_word) applies.
+/// E400-aware: user U+E401 data (E400 E401) must survive (rubash#735).
 pub(in crate::executor) fn strip_for_word_guards(value: &str) -> String {
-    value.replace(crate::executor::markers::ANSI_C_IFS_GUARD, "")
+    crate::executor::markers::strip_ansi_c_ifs_guard(value)
 }
 
 /// Storage-side half of GNU dequote_string (subst.c:4807) for for-list

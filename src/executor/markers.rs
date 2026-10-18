@@ -868,7 +868,6 @@ pub(crate) fn strip_ansi_c_ifs_guard_cow(value: &str) -> std::borrow::Cow<'_, st
 pub(crate) fn ansi_c_ifs_guard_to_ifs_glue(value: &str) -> String {
     replace_ansi_c_ifs_guard(value, IFS_GLUE_STR)
 }
-///
 /// `str::replace` that borrows when the needle is absent.
 ///
 /// GNU's expansion passes restore markers IN PLACE over C strings — a value

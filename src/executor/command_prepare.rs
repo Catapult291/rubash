@@ -2106,16 +2106,14 @@ impl Executor {
         // CTLESC, so we mark literal non-whitespace IFS characters in the
         // word with \x1c before expansion. The sentinel passes through the
         // expansion walker unchanged and the field splitter consumes it.
-        // Only applied when IFS has non-whitespace characters and the word
-        // has unquoted expansions (parameter or command substitution).
-        let ifs_has_non_whitespace = self
-            .shell_state
-            .env_vars
-            .get("IFS")
-            .map(|ifs| ifs.chars().any(|ch| !matches!(ch, ' ' | '\t' | '\n')))
-            .unwrap_or(false);
-        let needs_ifs_marking = ifs_has_non_whitespace
-            && !word.starts_with(STORAGE_WORD_PREFIX)
+        // rubash#743: quote state is per-character (subst.c:11639-11673
+        // CTLESC-protects quoted source chars; subst.c:3119 list_string
+        // skips them). A mixed word like `"a b"$w` must split the unquoted
+        // `$w` result but not the quoted space, so quoted segments' IFS
+        // chars (including whitespace) are marked too. Applied when the
+        // word has unquoted expansions (parameter or command substitution);
+        // fully-quoted words skip splitting downstream regardless.
+        let needs_ifs_marking = !word.starts_with(STORAGE_WORD_PREFIX)
             && !word.starts_with(crate::executor::markers::QUOTED_WORD_PREFIX)
             && raw.is_some_and(|raw| {
                 raw_word_has_unquoted_parameter_expansion(raw)
@@ -2129,7 +2127,15 @@ impl Executor {
                 .get("IFS")
                 .map(String::as_str)
                 .unwrap_or("");
-            marked_word = mark_literal_ifs_chars(word, ifs);
+            // rubash#743: protect IFS chars inside quoted segments. The
+            // cooked word lost quote positions, so parse the raw word to
+            // find quoted IFS chars, then map them to cooked positions by
+            // simulating quote removal.
+            let mut marked = mark_literal_ifs_chars(word, ifs);
+            if let Some(raw) = raw {
+                marked = mark_quoted_ifs_from_raw(raw, &marked, ifs);
+            }
+            marked_word = marked;
             &marked_word
         } else {
             word
@@ -3803,7 +3809,9 @@ fn raw_has_quoted_empty_suffix(raw: &str) -> bool {
 ///
 /// Only non-whitespace IFS characters are marked: whitespace IFS characters
 /// (space, tab, newline) are already consumed as word boundaries by the
-/// lexer, so literal whitespace never reaches field splitting.
+/// lexer, so literal whitespace never reaches field splitting. Quoted-segment
+/// whitespace protection is handled separately by mark_quoted_ifs_from_raw
+/// (rubash#743), which uses the raw word's quote positions.
 fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
     let chars: Vec<char> = word.chars().collect();
     let mut output = String::with_capacity(word.len());
@@ -3812,6 +3820,28 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
         let ch = chars[index];
         if ch == '$' {
             if let Some(&next) = chars.get(index + 1) {
+                if next == '\'' || next == '"' {
+                    // $'...' / $"..." — copy through, skip the span. The
+                    // ANSI-C content is already lexer-decoded (with its own
+                    // IFS guards); the locale span's quotes are operators,
+                    // not outer quoting of the word.
+                    output.push(ch);
+                    output.push(next);
+                    index += 2;
+                    while index < chars.len() && chars[index] != next {
+                        if chars[index] == '\\' && index + 1 < chars.len() {
+                            output.push(chars[index]);
+                            index += 1;
+                        }
+                        output.push(chars[index]);
+                        index += 1;
+                    }
+                    if index < chars.len() {
+                        output.push(chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
                 if is_shell_name_start(next) {
                     // $name — copy through, skip the name characters
                     output.push(ch);
@@ -3963,7 +3993,10 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
             }
             continue;
         }
-        // Literal character — mark non-whitespace IFS chars with \x1c
+        // Literal character — mark non-whitespace IFS chars with \x1c.
+        // (Quoted-segment IFS protection is handled by
+        // mark_quoted_ifs_from_raw using the raw word; the cooked word here
+        // has no quote positions left to track.)
         if ifs.contains(ch) && !matches!(ch, ' ' | '\t' | '\n') {
             output.push(crate::executor::markers::IFS_GLUE);
         }
@@ -3973,15 +4006,196 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
     output
 }
 
+/// rubash#743: protect IFS chars that appear inside `'...'`/`"..."` segments
+/// of the raw word. The cooked word has already lost quote positions, so we
+/// re-parse the raw word, simulate quote removal, and verify the result
+/// matches the cooked word before applying \x1c marks. If the simulation
+/// diverges (complex lexer transformations), we bail out without marking
+/// rather than misaligning.
+///
+/// GNU subst.c:11639-11673 CTLESC-protects quoted source characters during
+/// expansion; the field splitter (subst.c:3119 list_string) skips them.
+/// This is the rubash port for the mixed-quote case: `"a b"$w` must protect
+/// the quoted space while the unquoted `$w` result still splits.
+fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> String {
+    // Strip existing \x1c marks to get the base cooked word for comparison.
+    let cooked: String = cooked_with_marks.replace(crate::executor::markers::IFS_GLUE, "");
+    let raw_chars: Vec<char> = raw.chars().collect();
+    let mut simulated = String::with_capacity(raw.len());
+    // Positions in `simulated` that were inside quotes and are IFS chars.
+    let mut quoted_ifs_positions = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < raw_chars.len() {
+        let ch = raw_chars[index];
+        if ch == '\\' {
+            // Escaped char: copy both, not a quote toggle.
+            simulated.push(ch);
+            if index + 1 < raw_chars.len() {
+                simulated.push(raw_chars[index + 1]);
+            }
+            index += 2;
+            continue;
+        }
+        if ch == '$' {
+            match raw_chars.get(index + 1) {
+                Some('\'') | Some('"') => {
+                    // $'...' / $"..." — copy span verbatim (lexer-decoded).
+                    let quote = raw_chars[index + 1];
+                    simulated.push(ch);
+                    simulated.push(quote);
+                    index += 2;
+                    while index < raw_chars.len() && raw_chars[index] != quote {
+                        if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
+                            simulated.push(raw_chars[index]);
+                            index += 1;
+                        }
+                        simulated.push(raw_chars[index]);
+                        index += 1;
+                    }
+                    if index < raw_chars.len() {
+                        simulated.push(raw_chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
+                Some('{') => {
+                    // ${...} — copy span verbatim (quotes inside are syntax).
+                    let mut depth = 1usize;
+                    simulated.push(ch);
+                    simulated.push('{');
+                    index += 2;
+                    while index < raw_chars.len() && depth > 0 {
+                        if raw_chars[index] == '{' {
+                            depth += 1;
+                        } else if raw_chars[index] == '}' {
+                            depth -= 1;
+                        } else if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
+                            simulated.push(raw_chars[index]);
+                            index += 1;
+                        }
+                        simulated.push(raw_chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
+                Some('(') => {
+                    // $(...) — copy span verbatim.
+                    let mut depth = 1usize;
+                    simulated.push(ch);
+                    simulated.push('(');
+                    index += 2;
+                    while index < raw_chars.len() && depth > 0 {
+                        if raw_chars[index] == '(' {
+                            depth += 1;
+                        } else if raw_chars[index] == ')' {
+                            depth -= 1;
+                        } else if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
+                            simulated.push(raw_chars[index]);
+                            index += 1;
+                        }
+                        simulated.push(raw_chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            // $name etc. — copy through. If a quote follows the name, the
+            // lexer inserts PARAM_NAME_END_MARKER (\u{13}); replicate it.
+            simulated.push(ch);
+            let mut name_end = index + 1;
+            while name_end < raw_chars.len()
+                && matches!(
+                    raw_chars[name_end],
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_'
+                )
+            {
+                name_end += 1;
+            }
+            if name_end > index + 1 && matches!(raw_chars.get(name_end), Some('\'') | Some('"')) {
+                while index + 1 < name_end {
+                    index += 1;
+                    simulated.push(raw_chars[index]);
+                }
+                simulated.push(crate::executor::markers::PARAM_NAME_END_MARKER);
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '`' {
+            // Backtick span — copy verbatim.
+            simulated.push(ch);
+            index += 1;
+            while index < raw_chars.len() && raw_chars[index] != '`' {
+                if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
+                    simulated.push(raw_chars[index]);
+                    index += 1;
+                }
+                simulated.push(raw_chars[index]);
+                index += 1;
+            }
+            if index < raw_chars.len() {
+                simulated.push(raw_chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            index += 1; // drop the quote
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            index += 1; // drop the quote
+            continue;
+        }
+        // Regular char: record if it's an IFS char inside quotes.
+        if (in_single || in_double) && ifs.contains(ch) {
+            quoted_ifs_positions.push(simulated.len());
+        }
+        simulated.push(ch);
+        index += 1;
+    }
+    // Only apply if our simulation matches the actual cooked word.
+    if simulated != cooked {
+        return cooked_with_marks.to_string();
+    }
+    // Apply \x1c marks at the recorded positions. The cooked_with_marks may
+    // already have marks from mark_literal_ifs_chars; we need to account for
+    // them when mapping positions.
+    let mut result = String::with_capacity(cooked_with_marks.len() + quoted_ifs_positions.len());
+    let mut cooked_pos = 0usize;
+    let mut mark_idx = 0usize;
+    let quoted_set: std::collections::HashSet<usize> = quoted_ifs_positions.into_iter().collect();
+    for ch in cooked_with_marks.chars() {
+        if ch == crate::executor::markers::IFS_GLUE {
+            result.push(ch);
+            // Next char is the protected one; don't advance cooked_pos yet.
+            continue;
+        }
+        if quoted_set.contains(&cooked_pos) {
+            result.push(crate::executor::markers::IFS_GLUE);
+        }
+        result.push(ch);
+        cooked_pos += 1;
+        mark_idx += 1;
+    }
+    let _ = mark_idx;
+    result
+}
+
 /// Strip \x1c IFS-protection markers from a string. Used for non-field-split
 /// return paths where the markers served their purpose (or were never
 /// needed) and must not leak into command arguments or assignment values.
 /// The ANSI-C_IFS_GUARD pairs (decoded `$'...'` blanks, rubash#379) drop
 /// their guard the same way, keeping the blank itself.
 fn strip_ifs_protection_markers(value: &str) -> String {
-    value
-        .replace(crate::executor::markers::IFS_GLUE, "")
-        .replace(crate::executor::markers::ANSI_C_IFS_GUARD, "")
+    crate::executor::markers::strip_ansi_c_ifs_guard(
+        &value.replace(crate::executor::markers::IFS_GLUE, ""),
+    )
 }
 
 fn field_split_escaped_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {
