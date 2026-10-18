@@ -796,6 +796,18 @@ const KEY_EVENT: WORD = 0x0001;
 /// report Ready forever and a `read -t` deadline never fires (niubash#280)
 /// — the following ReadFile then blocks indefinitely. A key-down record is
 /// exactly the event a cooked read consumes.
+///
+/// rubash#806: the readiness test must look at the whole peeked batch, not
+/// only the head record. The Enter that submitted the editing line leaves
+/// its key-RELEASE record queued (and ENABLE_WINDOW_INPUT windows add
+/// focus/resize records); with such a record at the head, a head-only peek
+/// stays un-Ready forever even while a consumable key-down sits right
+/// behind it — `read -t 2 -n1` then burned the whole deadline and returned
+/// 142 with the variable empty although GNU's select had fired on the same
+/// input within 0.2s (WSL GNU 5.3.0 oracle, 2026-10-13). Peek a batch and
+/// report Ready when ANY record in it is one the following ReadFile would
+/// deliver: a key-down with a character. Peek never consumes, so records
+/// stay in order for the readers.
 pub fn wait_readable(h: HANDLE, timeout: std::time::Duration) -> ReadWait {
     match unsafe { GetFileType(h) } {
         FILE_TYPE_CHAR => {
@@ -808,17 +820,28 @@ pub fn wait_readable(h: HANDLE, timeout: std::time::Duration) -> ReadWait {
                         read: *mut DWORD,
                     ) -> BOOL;
                 }
+                /// Batch depth of one readiness poll. A keystroke's
+                /// press/release pair plus the window/focus noise between
+                /// two readers is far below this; peek is non-consuming, so
+                /// a deeper queue only costs a re-peek next poll.
+                const PEEK_BATCH: DWORD = 16;
                 let deadline = std::time::Instant::now() + timeout;
                 loop {
-                    let mut record: InputRecord = unsafe { std::mem::zeroed() };
+                    let mut records: [InputRecord; PEEK_BATCH as usize] =
+                        unsafe { std::mem::zeroed() };
                     let mut read: DWORD = 0;
-                    let ok = unsafe { PeekConsoleInputW(h, &mut record, 1, &mut read) };
-                    if ok != 0
-                        && read > 0
-                        && record.event_type == KEY_EVENT
-                        && record.key.key_down != 0
-                    {
-                        return ReadWait::Ready;
+                    let ok = unsafe {
+                        PeekConsoleInputW(h, records.as_mut_ptr(), PEEK_BATCH, &mut read)
+                    };
+                    if ok != 0 && read > 0 {
+                        let consumable = records[..read as usize].iter().any(|record| {
+                            record.event_type == KEY_EVENT
+                                && record.key.key_down != 0
+                                && record.key.unicode_char != 0
+                        });
+                        if consumable {
+                            return ReadWait::Ready;
+                        }
                     }
                     if std::time::Instant::now() >= deadline {
                         return ReadWait::Timeout;
