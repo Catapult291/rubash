@@ -2884,6 +2884,17 @@ impl Executor {
         cmd: &CommandNode,
         auto_close: bool,
     ) -> Result<bool, ExecuteError> {
+        // RESTRICTED_SHELL (#804 F1/N2): the refusal must precede
+        // redir_varassign — GNU checks restricted before the varassign arm
+        // opens or creates the target — and it speaks at the FIRST
+        // restricted-write entry in the list (`> s1.txt {v}> s2.txt`
+        // refuses `s1.txt`, never materializing either; `2>/dev/null
+        // {v}> g.txt` refuses the /dev/null form itself, GNU 5.3), on
+        // every applier path (simple-command preflight and the
+        // exec-with-operand site alike).
+        if self.reject_restricted_write_redirect_entry(cmd)? {
+            return Ok(true);
+        }
         let mut redirect_failed = false;
         self.fd_var_external_undo.clear();
         for redirect in &cmd.redirects {

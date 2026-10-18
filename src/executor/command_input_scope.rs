@@ -52,6 +52,16 @@ impl Executor {
         // procsub.tests bug()) must therefore keep fd 3 open for the whole
         // compound command - condition and body alike - and restore the
         // previous descriptor state afterwards.
+        // RESTRICTED_SHELL (#804 N1): this binder reaches fd-var entries
+        // through execute_dynamic_fd_var_redirect DIRECTLY and opens the
+        // compound's output targets below, so the first restricted-write
+        // entry refuses here — before anything opens or binds — and the
+        // body never runs (status 1, GNU's in-child do_redirections
+        // refusal).
+        if self.reject_restricted_write_redirect_entry(cmd)? {
+            let default_result = T::default();
+            return Ok(default_result);
+        }
         let dynamic_names = cmd
             .redirects
             .iter()

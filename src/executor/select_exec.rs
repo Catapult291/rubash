@@ -11,6 +11,19 @@ impl Executor {
         cmd: &CommandNode,
         select_command: &SelectCommand,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804 N1): the select loop's redirects apply
+        // before the menu runs (do_redirections precedes the body, like
+        // every compound), so the refusal lands before
+        // with_command_input_redirects opens or binds anything — GNU
+        // prints no menu and leaves no file (`select x in a; do :; done >
+        // f` refuses `f`, rc 1).
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         if !is_shell_name(&select_command.variable) {
             // GNU execute_select_command (execute_cmd.c:3001-3010) runs
             // check_identifier BEFORE `line_number = select_command->line`

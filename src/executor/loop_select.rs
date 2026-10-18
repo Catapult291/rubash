@@ -266,6 +266,14 @@ impl Executor {
         for_command: &ForCommand,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804): refuse before any splice or creation.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         let mut redirect_cmd = cmd.clone();
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;

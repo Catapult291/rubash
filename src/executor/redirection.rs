@@ -98,37 +98,177 @@ impl Executor {
             )
     }
 
-    /// GNU do_redirections (redir.c:230-260) applies a command's
-    /// redirection list left to right and the FIRST failing entry aborts
-    /// the command (exit 1) with its diagnostic. This is rubash's
-    /// equivalent gate, run before execute_prepared_command: it rejects
-    /// (returns true) for the whole error class do_redirection_internal
-    /// can produce at APPLY time, so the command never runs — matching
-    /// GNU's "command not executed, $? = 1" contract for every command
-    /// type (builtin, external, function) alike:
-    ///
-    /// - AMBIGUOUS_REDIRECT (redir.c:911 / :784-843): a file-redirect word
-    ///   that expands to ZERO fields (`> $unset`) or MORE THAN ONE field
-    ///   (`> $v` with v="a b"). An EMPTY single field is NOT ambiguous —
-    ///   a quoted null (`> ""`, `> "$unsetv"`) anchors one empty field
-    ///   (execution_misc::raw_word_has_quoted_span), the open("")
-    ///   proceeds and fails ENOENT (`: No such file or directory`,
-    ///   redir.c:895-930 open + redirection_error default arm).
-    /// - dup/EBADF shapes (redir.c:1115 dup2, redir.c:149-176
-    ///   redirection_error): `<&N`/`>&N`/`>&N-` with fd N not open →
-    ///   `N: Bad file descriptor`; `>& ""`/`>& "$unset"` (all_digits("")
-    ///   vacuously true at general.c:233 but valid_number("") fails at
-    ///   general.c:243 → dest -1) → raw-word (redirector 0/1) or
-    ///   redirector-number EBADF text.
-    /// - move-fd with a bad source (redir.c:1137-1143 add_undo_redirect of
-    ///   the closed moved fd fails → sys_error line + `N: Bad file
-    ///   descriptor`).
-    /// - `<> word` (r_input_output, make_cmd.c:682 O_RDWR|O_CREAT): the
-    ///   open CREATES the missing file; only a real open error rejects.
-    ///
-    /// Diagnostics are order-routed (issue #250 semantics): only the
-    /// redirects BEFORE the failing entry have applied, so a preceding
-    /// `2>/dev/null` silences and a following one leaks.
+    /// RESTRICTED_SHELL scan for a COMPOUND command's own redirects (#804).
+    /// GNU applies a compound's redirects before its body runs
+    /// (execute_cmd.c:5606 for the builtin/function class,
+    /// do_redirection_internal for the group class), so a restricted shell
+    /// refuses before anything is created or spliced. Returns the full
+    /// diagnostic (prefix included) for the FIRST restricted write form in
+    /// parse order; the caller writes it, sets status 1 and skips the body.
+    /// The ordered `redirects` list is the authority; the stdio mirror
+    /// slots duplicate list entries and are deduped away. Message shapes
+    /// mirror redirection_error: a `{var}>` redirector names the VARIABLE
+    /// (redir.c:137-138), a command/process-substitution target reports
+    /// the LITERAL word (redir.c:186-190 re-expands with
+    /// W_NOCOMSUB|W_NOPROCSUB), everything else the expanded filename
+    /// (redir.c:210).
+    pub(in crate::executor) fn restricted_compound_redirect_error(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<Option<Vec<u8>>, ExecuteError> {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
+            return Ok(None);
+        }
+        let semantic_key = |redirect: &Redirect| {
+            format!(
+                "{:?}\x1f{}\x1f{:?}\x1f{}",
+                redirect.kind, redirect.operator, redirect.fd, redirect.target
+            )
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: Vec<&Redirect> = Vec::new();
+        for redirect in cmd.redirects.iter() {
+            if seen.insert(semantic_key(redirect)) {
+                candidates.push(redirect);
+            }
+        }
+        for redirect in [
+            cmd.redirect_out.as_ref(),
+            cmd.append.as_ref(),
+            cmd.redirect_err.as_ref(),
+            cmd.redirect_err_append.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen.insert(semantic_key(redirect)) {
+                candidates.push(redirect);
+            }
+        }
+        for redirect in candidates {
+            if !is_restricted_write_redirect(&redirect.kind)
+                && !is_raw_err_and_out_redirect(redirect)
+            {
+                continue;
+            }
+            // The per-entry order lives in one place: ambiguity resolves
+            // before the restricted refusal, with redirection_error's word
+            // rules (redir.c:911-919 + :137-138 + :186-190).
+            return Ok(Some(self.restricted_write_entry_diagnostic(redirect)?));
+        }
+        Ok(None)
+    }
+
+    /// GNU redir.c:911-919 for ONE restricted-write entry: ambiguity
+    /// resolves BEFORE the restricted refusal — redirection_expand yields
+    /// zero fields without an anchored quoted span, or more than one
+    /// field, and the entry reports `{raw}: ambiguous redirect` (a
+    /// varassign entry reports under the VARIABLE name, redir.c:137-138).
+    /// The expansion side effects GNU would have run stay run. Returns the
+    /// full diagnostic (prefix included) for the caller to route and to
+    /// skip the command with.
+    pub(in crate::executor) fn restricted_write_entry_diagnostic(
+        &mut self,
+        redirect: &Redirect,
+    ) -> Result<Vec<u8>, ExecuteError> {
+        let var_name = redirect.fd_var.as_deref().unwrap_or_default();
+        let target = self.expand_redirect_target(redirect);
+        let raw_word = redirect
+            .target_metadata
+            .raw
+            .strip_prefix('&')
+            .unwrap_or(&redirect.target_metadata.raw);
+        let expanded_word = target.strip_prefix('&').unwrap_or(&target);
+        let mut stderr = Vec::new();
+        // redir.c:911-914: the ambiguity class, worded like
+        // redirection_error — the RAW word for a plain entry, the variable
+        // for a varassign entry.
+        if expanded_word.is_empty() {
+            if self.redirect_operand_ambiguous(redirect, &redirect.target_metadata.raw, &target)
+                || !raw_word_has_quoted_span(raw_word)
+            {
+                writeln!(
+                    &mut stderr,
+                    "{}{}: ambiguous redirect",
+                    self.diagnostic_prefix(),
+                    if redirect.fd_var.is_some() {
+                        var_name
+                    } else {
+                        raw_word
+                    }
+                )?;
+                return Ok(stderr);
+            }
+            // One anchored quoted-empty field is NOT ambiguous: GNU's
+            // restricted check (redir.c:919) still fires before the
+            // open("") ENOENT, and the message names the (empty) filename.
+            write!(
+                &mut stderr,
+                "{}: restricted: cannot redirect output",
+                self.diagnostic_prefix()
+            )?;
+            return Ok(stderr);
+        }
+        if self.redirect_operand_ambiguous(redirect, &redirect.target_metadata.raw, &target) {
+            writeln!(
+                &mut stderr,
+                "{}{}: ambiguous redirect",
+                self.diagnostic_prefix(),
+                if redirect.fd_var.is_some() {
+                    var_name
+                } else {
+                    raw_word
+                }
+            )?;
+            return Ok(stderr);
+        }
+        // redir.c:210 with redirection_error's word rules: a varassign
+        // names the variable, a command/process-substitution target the
+        // LITERAL word (redir.c:186-190), everything else the expanded
+        // filename.
+        if redirect.fd_var.is_some() {
+            writeln!(
+                &mut stderr,
+                "{}{var_name}: restricted: cannot redirect output",
+                self.diagnostic_prefix()
+            )?;
+        } else {
+            let message_word: String =
+                if raw_word.contains("$(") || raw_word.contains("<(") || raw_word.contains(">(") {
+                    raw_word.to_owned()
+                } else {
+                    expanded_word.to_owned()
+                };
+            writeln!(
+                &mut stderr,
+                "{}{message_word}: restricted: cannot redirect output",
+                self.diagnostic_prefix()
+            )?;
+        }
+        Ok(stderr)
+    }
+
+    pub(in crate::executor) fn reject_restricted_write_redirect_entry(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<bool, ExecuteError> {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
+            return Ok(false);
+        }
+        let Some((index, redirect)) = cmd
+            .redirects
+            .iter()
+            .enumerate()
+            .find(|(_, redirect)| is_restricted_write_redirect(&redirect.kind))
+        else {
+            return Ok(false);
+        };
+        let stderr = self.restricted_write_entry_diagnostic(redirect)?;
+        self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
+        self.exit_code = 1;
+        Ok(true)
+    }
+
     pub(in crate::executor) fn reject_invalid_redirects(
         &mut self,
         cmd: &CommandNode,
@@ -245,8 +385,26 @@ impl Executor {
             // AMBIGUOUS_REDIRECT reported under the VARIABLE name
             // (redir.c:137-138: the REDIR_VARASSIGN && error<0 branch uses
             // the redirector word), and `{v}>&N` with N closed is the
-            // plain EBADF shape. File-open {var} forms need no gate check.
+            // plain EBADF shape. File-open {var} forms need no gate check —
+            // except the RESTRICTED_SHELL one: `{v}> f` is still
+            // r_output_direction for WRITE_REDIRECT (command.h:57 takes the
+            // direction, not the redirector spelling), so it is refused
+            // before the allocation like any other write form.
             if redirect.fd_var.is_some() && !is_dup_kind {
+                if is_restricted_write_redirect(&redirect.kind)
+                    && crate::builtins::set::shell_option_enabled(
+                        &self.shell_state.env_vars,
+                        "restricted",
+                    )
+                {
+                    // One per-entry order for every refusal site: ambiguity
+                    // (under the variable name, redir.c:137-138) resolves
+                    // before the restricted refusal (redir.c:911-919).
+                    let stderr = self.restricted_write_entry_diagnostic(redirect)?;
+                    self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
+                    self.exit_code = 1;
+                    return Ok(Some(RedirectRejection::Command));
+                }
                 continue;
             }
             let default_redirector = if redirect.kind == crate::parser::RedirectKind::DuplicateInput
@@ -427,6 +585,23 @@ impl Executor {
                         )
                         .map(|_| Some(RedirectRejection::Command));
                 }
+                // RESTRICTED_SHELL (redir.c:919-924): the translated
+                // r_err_and_out IS a WRITE_REDIRECT direction, so a
+                // restricted shell refuses it here with the expanded
+                // filename (redir.c:210) — `echo hi >& out.txt` used to slip
+                // through because the raw kind is still DuplicateOutput.
+                if crate::builtins::set::shell_option_enabled(
+                    &self.shell_state.env_vars,
+                    "restricted",
+                ) {
+                    return self
+                        .reject_redirect_at(
+                            cmd,
+                            index,
+                            &format!("{expanded_word}: restricted: cannot redirect output"),
+                        )
+                        .map(|_| Some(RedirectRejection::Command));
+                }
                 // r_err_and_out falls through to the file-open class with
                 // the stripped word as filename.
             }
@@ -453,6 +628,43 @@ impl Executor {
             if self.redirect_operand_ambiguous(redirect, &redirect.target_metadata.raw, &target) {
                 return self
                     .reject_redirect_at(cmd, index, &format!("{raw_word}: ambiguous redirect"))
+                    .map(|_| Some(RedirectRejection::Command));
+            }
+            // RESTRICTED_SHELL (vendored redir.c:919-924): after the
+            // redirectee expands and passes the ambiguity checks, a
+            // restricted shell refuses every WRITE_REDIRECT direction
+            // (command.h:57 — `>` `>>` `<>` `&>` `&>>` `>|`, on ANY target,
+            // slash-free ones and /dev/null included) with
+            // "<filename>: restricted: cannot redirect output"
+            // (redir.c:210) and skips the open — `<>` never creates, `>`
+            // never truncates. Read-only input is NOT in WRITE_REDIRECT and
+            // stays allowed (#804 gap 11/12: the old slash-in-target scan
+            // inverted both cells).
+            if is_restricted_write_redirect(&redirect.kind)
+                && crate::builtins::set::shell_option_enabled(
+                    &self.shell_state.env_vars,
+                    "restricted",
+                )
+            {
+                // redirection_error (redir.c:186-190) re-expands the word
+                // with W_NOCOMSUB|W_NOPROCSUB for the message: a
+                // command/process-substitution target reports the LITERAL
+                // `$(echo f)` text (GNU probe), a plain `$v` target reports
+                // the expansion.
+                let message_word = if raw_word.contains("$(")
+                    || raw_word.contains("<(")
+                    || raw_word.contains(">(")
+                {
+                    raw_word
+                } else {
+                    &*target
+                };
+                return self
+                    .reject_redirect_at(
+                        cmd,
+                        index,
+                        &format!("{message_word}: restricted: cannot redirect output"),
+                    )
                     .map(|_| Some(RedirectRejection::Command));
             }
             // `<> word` opens O_RDWR|O_CREAT (make_cmd.c:682) — creating
@@ -903,6 +1115,20 @@ impl Executor {
                 crate::parser::RedirectKind::Output
                 | crate::parser::RedirectKind::Append
                 | crate::parser::RedirectKind::ClobberOutput => {
+                    // RESTRICTED_SHELL (#804 round 3): this routing walk can
+                    // run BEFORE the ordered gate on pipeline stdio-wiring
+                    // probes; it must never speak for (or open) an entry the
+                    // restricted shell refuses — skip it silently and let
+                    // the ordered gate / materialization pre-check refuse
+                    // exactly once, with the entry's own ambiguity resolved
+                    // first (redir.c:911-919).
+                    if crate::builtins::set::shell_option_enabled(
+                        &self.shell_state.env_vars,
+                        "restricted",
+                    ) && is_restricted_write_redirect(&redirect.kind)
+                    {
+                        continue;
+                    }
                     let fd = redirect_fd_or_default(redirect, 1);
                     let target = self.expand_redirect_target(redirect);
                     // redir.c:298-333 redirection_expand: a zero-field

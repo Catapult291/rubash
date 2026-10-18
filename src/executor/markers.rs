@@ -26,6 +26,7 @@
 //! | Boundary | Entry point | Site |
 //! |---|---|---|
 //! | Output | `crate::locale::decode_to_visible_text` — the one sanctioned transport→visible decoder (echo paths additionally run `substitution_metadata::decode_raw_byte_markers` because echo input is already expansion-decoded text that can still carry raw-byte pairs) | `builtins/echo.rs`, `declare` printing, xtrace, `bad_substitution_display`, host `dump-strings` |
+//! | Host AST inspection | hosts decode AST words BETWEEN parse and execution on the interactive line-editor path (`decoded_words`: easter-egg routing, this-shell dispatch, positional params); those words legitimately carry the named-string COMPOUND_ASSIGNMENT_MARKER the parser pushed (parser/token_actions.rs), so the decoder whitelists it instead of asserting it away (#802) | host `decoded_words`, `decode_to_visible_text` |
 //! | Storage | values reaching `env_vars`/array stores are already data bytes — the encoder side is `substitution_metadata` (`bytes_to_assignment_shell_text`, `push_escaped_text_with_carriers`) which pair-encodes every `user_reachable` byte at entry so storage never confuses a user byte with a carrier | variable/array assignment paths |
 //! | Reparse | marker bytes are the lexer's own protocol: text re-fed through `eval`, alias bodies and command-substitution bodies re-lex with markers intact; user bytes inside reparsed text were pair-encoded at the original entry so they decode as data, never as carriers | `eval`, alias expansion, comsub reparse |
 //!

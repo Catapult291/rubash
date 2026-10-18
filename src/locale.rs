@@ -401,6 +401,9 @@ pub fn init_locale() {
 /// | `U+E400` + `c` | literal-char escape (markers::push_literal_char) | `c` |
 /// | `U+E301`..=`U+E308` | assignment DATA_* sentinels (quote/backtick/backslash data) | the data char |
 /// | `U+E309` | COMPOUND_EXPANSION_WS_TAG (field-splitting glue) | nothing |
+/// | `__RUBASH_CA1__` | COMPOUND_ASSIGNMENT_MARKER (named-string compound
+/// assignment tag; whitelisted carrier — the interactive line-editing
+/// boundary delivers it inside pre-execution AST words, #802) | nothing |
 /// | `U+E100`..=`U+E1FF` | conditional-pattern byte-chars | byte `(cp - E100)` as char |
 ///
 /// Ordering follows the storage-boundary contract documented in
@@ -444,6 +447,39 @@ pub fn decode_to_visible_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
+        // #802 entry-inventory whitelist: the named-string compound
+        // assignment carrier (`__RUBASH_CA1__`) is a legal resident of
+        // transport text on the interactive line-editing boundary. The
+        // parser pushes it into compound-assignment words
+        // (parser/token_actions.rs) and the assignment boundary consumes it
+        // before a value is stored (assignment_dispatch.rs /
+        // command_words.rs / execution_misc.rs strip it on every
+        // post-expansion display path), but hosts inspect AST words
+        // BETWEEN parse and execution — the interactive REPL decodes each
+        // command word for its easter-egg routing and this-shell dispatch
+        // (niubash shell.rs decoded_words). That text legitimately still
+        // carries the marker, so the decoder consumes it instead of
+        // rejecting it; every other named-string carrier (heredoc,
+        // comsub payload) never crosses this boundary and keeps its
+        // never-seen golden assertion below. Gated on the leading `_` so
+        // the probe costs nothing for marker-free words.
+        if ch == '_' {
+            let mut probe = chars.clone();
+            let mut matched = true;
+            for expected in COMPOUND_ASSIGNMENT_MARKER.chars().skip(1) {
+                match probe.next() {
+                    Some(next) if next == expected => {}
+                    _ => {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                chars = probe;
+                continue;
+            }
+        }
         match ch {
             CTLESC => {
                 if let Some(data) = chars.next() {
@@ -602,10 +638,11 @@ pub fn decode_to_visible_text(text: &str) -> String {
             !out.contains(COMSUB_PAYLOAD_PREFIX),
             "COMSUB_PAYLOAD_PREFIX leaked to output"
         );
-        debug_assert!(
-            !out.contains(COMPOUND_ASSIGNMENT_MARKER),
-            "COMPOUND_ASSIGNMENT_MARKER leaked to output"
-        );
+        // COMPOUND_ASSIGNMENT_MARKER is deliberately absent from the golden
+        // assertions: since #802 it is a whitelisted carrier of this decoder
+        // (see the entry-inventory note in the scan loop) — transport text
+        // on the host AST-inspection boundary carries it by contract, so it
+        // is consumed above instead of asserted away.
     }
     out
 }
