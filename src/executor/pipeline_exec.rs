@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use crate::executor::fd_table::FdEntry;
 
 fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (String, i32) {
@@ -48,14 +48,23 @@ where
     unsafe { Stdio::from_raw_handle(handle.into_raw_handle()) }
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn stdio_from_transferred_handle<T>(handle: T) -> Stdio
+where
+    T: std::os::unix::io::IntoRawFd,
+{
+    use std::os::unix::io::FromRawFd;
+    unsafe { Stdio::from_raw_fd(handle.into_raw_fd()) }
+}
+
+#[cfg(any(windows, unix))]
 fn internal_pipeline_program(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("<rubash-internal-{name}>"))
 }
 
 /// Drain one end of a child's pipe on a reader thread so the child can keep
 /// writing while the parent waits on other pipeline members (niubash#158).
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn spawn_pipe_drain<R>(mut reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: std::io::Read + Send + 'static,
@@ -67,7 +76,7 @@ where
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn join_pipe_drain(
     drain: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> Result<Vec<u8>, ExecuteError> {
@@ -80,7 +89,7 @@ fn join_pipe_drain(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn internal_pipeline_program_name(program: &std::path::Path) -> Option<&str> {
     let name = program.to_str()?.strip_prefix("<rubash-internal-")?;
     name.strip_suffix('>')
@@ -118,7 +127,7 @@ fn lingerer_sigpipe_status() -> std::process::ExitStatus {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn wait_for_windows_pipeline_member(
     process: &mut std::process::Child,
     downstream: Option<&mut std::process::Child>,
@@ -1219,7 +1228,7 @@ impl Executor {
     /// `pipeline_stdout_stream` instead of a parent capture. Builtins are
     /// excluded: their stderr redirects are applied by the driver's routing
     /// walk, which the concurrent shell-writer path bypasses.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn command_is_streamable_external_producer(
         &mut self,
         command: &CommandNode,
@@ -1256,7 +1265,7 @@ impl Executor {
     /// fallback). Only a literal first word is consulted so this admission
     /// probe never re-runs a command substitution its own stage expansion
     /// would — names carrying `$`/backticks/quotes take the sequential path.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn command_first_word_is_function(&self, command: &CommandNode) -> bool {
         let Some(word) = command.words.first() else {
             return false;
@@ -1363,7 +1372,7 @@ impl Executor {
     /// the (unbounded) producer. A non-trivial group — multiple commands,
     /// group redirects, a compound body — returns `None` and keeps the
     /// sequential path.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn unwrap_trivial_brace_group<'a>(&self, command: &'a CommandNode) -> Option<&'a CommandNode> {
         let group = command.brace_group.as_ref()?;
         let inert = command.words.is_empty()
@@ -1620,7 +1629,7 @@ impl Executor {
     /// the shell-aware sequential stage path instead: builtins, restricted
     /// refusals, redirects the OS-pipe plumbing cannot express, `|&`, or a
     /// program that would be refused by exec classification.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn concurrent_external_stage_spec(
         &mut self,
         command: &CommandNode,
@@ -2025,7 +2034,7 @@ impl Executor {
     /// Admission is a WHITELIST: the tail must be a literal builtin from
     /// `streaming_builtin_tail` and every prefix member a plain external, so a
     /// shape this path cannot faithfully stream keeps the existing executor.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn execute_external_prefix_streaming_tail(
         &mut self,
         commands: &[&CommandNode],
@@ -2138,12 +2147,18 @@ impl Executor {
         // handle); `pipeline_stdin_stream` tells the stage dispatcher to leave
         // FUNCTION_STDIN absent so `read` does not short-circuit to the
         // buffered mirror.
+        #[cfg(unix)]
+        use std::os::unix::io::IntoRawFd;
+        #[cfg(windows)]
         use std::os::windows::io::IntoRawHandle;
         let tail_reader = pipes[tail_index - 1]
             .0
             .take()
             .expect("tail reader already transferred");
+        #[cfg(windows)]
         let tail_handle = tail_reader.into_raw_handle() as crate::fd::HANDLE;
+        #[cfg(unix)]
+        let tail_handle = tail_reader.into_raw_fd() as crate::fd::HANDLE;
         let saved_fd0 = self.fd_table.entries.insert(
             0,
             FdEntry {
@@ -2202,10 +2217,9 @@ impl Executor {
         Ok(Some(()))
     }
 
-    /// Unix port: the OS-pipe streaming machinery is Windows-only for now (the
-    /// os_pipe spawn plumbing); on Unix the sequential stage loop keeps
-    /// handling mixed pipelines. rubash#761 follow-up.
-    #[cfg(not(windows))]
+    /// Non Windows/Unix port: the OS-pipe streaming machinery above covers
+    /// Windows and Unix; other platforms keep the sequential stage loop.
+    #[cfg(not(any(windows, unix)))]
     fn execute_external_prefix_streaming_tail(
         &mut self,
         _commands: &[&CommandNode],
@@ -2221,7 +2235,7 @@ impl Executor {
     /// same fd 0 — so `yes | while read; do break; done` stops the producer
     /// exactly when `break` ends the body. Redirects/tempenv/heredocs/procsubs
     /// on the tail force the existing executor.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn streaming_builtin_tail(&self, command: &CommandNode) -> bool {
         if !pipeline_streaming_plain_stage(command) {
             return false;
@@ -3940,7 +3954,7 @@ mod inline_tr_tests {
 /// with stdio alone — no shell-side redirect, tempenv, heredoc, process
 /// substitution, time prefix, inversion, or background/coproc modifier.
 /// Anything else keeps the shell-aware sequential machine.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn pipeline_streaming_plain_stage(command: &CommandNode) -> bool {
     command.time_command.is_none()
         && command.redirect_out.is_none()
@@ -3965,7 +3979,7 @@ fn pipeline_streaming_plain_stage(command: &CommandNode) -> bool {
 /// compound/subshel/brace shape, non-empty words). Prefix members are spawned
 /// as real external children, so only `pipeline_streaming_plain_stage` plus
 /// the external shape qualifies.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn pipeline_streaming_plain_external(command: &CommandNode) -> bool {
     !command.words.is_empty()
         && command.brace_group.is_none()
