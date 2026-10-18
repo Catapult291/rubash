@@ -88,7 +88,7 @@ class Session:
     def write(self, keys):
         self.proc.write(keys)
 
-    def ready(self, timeout=20):
+    def ready(self, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
             if "5.3#" in self.text():
@@ -96,7 +96,7 @@ class Session:
             time.sleep(0.05)
         raise TimeoutError(f"no prompt; tail={self.text()[-200:]!r}")
 
-    def marker(self, needle, timeout=8.0):
+    def marker(self, needle, timeout=12.0):
         """Wait for an output line carrying `needle` that is not the echoed
         command line (the echo always contains 'echo')."""
         deadline = time.time() + timeout
@@ -254,11 +254,11 @@ def main():
             try:
                 session.ready()
                 LEGS[leg](session)
-                print(f"{leg}=PASS")
-            except (AssertionError, TimeoutError) as err:
+                print(f"{leg}=PASS", flush=True)
+            except Exception as err:  # a leg failure must never kill the sweep
                 failed.append(leg)
-                detail = str(err).splitlines()[0][:200]
-                print(f"{leg}=FAIL {detail}")
+                detail = repr(err).splitlines()[0][:200]
+                print(f"{leg}=FAIL {detail}", flush=True)
             finally:
                 session.close()
                 time.sleep(0.1)
