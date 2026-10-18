@@ -469,9 +469,12 @@ fn run_suite_snapshot(suite: &str) {
                 // stdout diverges by whole faces (nquote4.sub's
                 // `alias foo=$'echo foo\n\nquux\n'` went silent on CI:
                 // 1226 runner bytes vs 1230 LF bytes vs 1230 under WSL
-                // GNU bash 5.3.0). The suite executes a unix corpus whose
-                // canonical blobs contain no CR at all (all 13 slices
-                // scanned), so the pair-wise conversion is exactly the
+                // GNU bash 5.3.0). The suite executes a unix corpus: the
+                // 144 tracked files matching this copy predicate (13
+                // slices) contain no CR in any canonical blob; on-disk
+                // copies of a built submodule can add untracked build
+                // artifacts such as `recho`, which are outside that corpus
+                // claim. The pair-wise conversion is therefore exactly the
                 // autocrlf inverse and cannot touch semantic CR bytes;
                 // the recorded snapshot bytes stop depending on the
                 // checkout's line-ending config.
