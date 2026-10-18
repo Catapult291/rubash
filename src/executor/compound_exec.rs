@@ -420,6 +420,12 @@ impl Executor {
             let line_offset = line.parse::<usize>().unwrap_or(1).saturating_sub(1);
             env_map.insert("__RUBASH_LINE_OFFSET".to_string(), line_offset.to_string());
         }
+        // rubash#737: mark this as a background-job wrapper. Children it
+        // spawns (via pre_exec) set PR_SET_PDEATHSIG so they die with the
+        // wrapper when it's killed — otherwise `kill $!` leaves orphaned
+        // grandchildren running (the wrapper is killed but the real work
+        // survives).
+        env_map.insert("__RUBASH_BACKGROUND_WRAPPER".to_string(), "1".to_string());
 
         // GNU execute_cmd.c:5884 (execute_disk_command) / :1761-1763
         // (execute_in_subshell): the forked async subshell runs

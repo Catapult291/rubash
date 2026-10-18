@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use crate::executor::fd_table::FdEntry;
 
 fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (String, i32) {
@@ -48,14 +48,23 @@ where
     unsafe { Stdio::from_raw_handle(handle.into_raw_handle()) }
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn stdio_from_transferred_handle<T>(handle: T) -> Stdio
+where
+    T: std::os::unix::io::IntoRawFd,
+{
+    use std::os::unix::io::FromRawFd;
+    unsafe { Stdio::from_raw_fd(handle.into_raw_fd()) }
+}
+
+#[cfg(any(windows, unix))]
 fn internal_pipeline_program(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("<rubash-internal-{name}>"))
 }
 
 /// Drain one end of a child's pipe on a reader thread so the child can keep
 /// writing while the parent waits on other pipeline members (niubash#158).
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn spawn_pipe_drain<R>(mut reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: std::io::Read + Send + 'static,
@@ -67,7 +76,7 @@ where
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn join_pipe_drain(
     drain: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> Result<Vec<u8>, ExecuteError> {
@@ -80,7 +89,7 @@ fn join_pipe_drain(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn internal_pipeline_program_name(program: &std::path::Path) -> Option<&str> {
     let name = program.to_str()?.strip_prefix("<rubash-internal-")?;
     name.strip_suffix('>')
@@ -118,7 +127,7 @@ fn lingerer_sigpipe_status() -> std::process::ExitStatus {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn wait_for_windows_pipeline_member(
     process: &mut std::process::Child,
     downstream: Option<&mut std::process::Child>,
@@ -1219,7 +1228,7 @@ impl Executor {
     /// `pipeline_stdout_stream` instead of a parent capture. Builtins are
     /// excluded: their stderr redirects are applied by the driver's routing
     /// walk, which the concurrent shell-writer path bypasses.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn command_is_streamable_external_producer(
         &mut self,
         command: &CommandNode,
@@ -1256,7 +1265,7 @@ impl Executor {
     /// fallback). Only a literal first word is consulted so this admission
     /// probe never re-runs a command substitution its own stage expansion
     /// would — names carrying `$`/backticks/quotes take the sequential path.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn command_first_word_is_function(&self, command: &CommandNode) -> bool {
         let Some(word) = command.words.first() else {
             return false;
@@ -1286,7 +1295,7 @@ impl Executor {
     /// `lingerer_sigpipe_status`). This is the shell-side twin of
     /// `execute_external_pipeline_concurrently`, which already covers the
     /// all-external `yes | head` case.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn execute_shell_writer_pipeline(
         &mut self,
         commands: &[&CommandNode],
@@ -1363,7 +1372,7 @@ impl Executor {
     /// the (unbounded) producer. A non-trivial group — multiple commands,
     /// group redirects, a compound body — returns `None` and keeps the
     /// sequential path.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn unwrap_trivial_brace_group<'a>(&self, command: &'a CommandNode) -> Option<&'a CommandNode> {
         let group = command.brace_group.as_ref()?;
         let inert = command.words.is_empty()
@@ -1403,13 +1412,16 @@ impl Executor {
     /// `consumers` holds the effective command node for each downstream stage:
     /// the stage itself, or the single external command inside a trivial
     /// brace group it was reduced from (`... | { head -1; }`).
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn run_shell_writer_pipeline(
         &mut self,
         commands: &[&CommandNode],
         consumers: &[&CommandNode],
         specs: Vec<(std::path::PathBuf, String, Vec<String>)>,
     ) -> Result<(), ExecuteError> {
+        #[cfg(unix)]
+        use std::os::unix::io::AsRawFd;
+        #[cfg(windows)]
         use std::os::windows::io::AsRawHandle;
 
         // node0 = producer; node1..nodeN = consumers. pipe[j] connects node j
@@ -1490,9 +1502,14 @@ impl Executor {
         // stage; it is dropped below so the consumers see EOF on a normal
         // (finite) producer.
         let mut producer_writer = pipes[0].1.take();
+        #[cfg(windows)]
         let stream_handle = producer_writer
             .as_ref()
             .map(|writer| writer.as_raw_handle() as crate::fd::HANDLE);
+        #[cfg(unix)]
+        let stream_handle = producer_writer
+            .as_ref()
+            .map(|writer| writer.as_raw_fd() as crate::fd::HANDLE);
         let (stage0_input, stage0_stdin_base) = self.initial_pipeline_input(commands[0]);
         let stage0_stdin_inherit = stage0_input.is_empty()
             && self.stdin_string_for_command(commands[0]).is_none()
@@ -1620,7 +1637,7 @@ impl Executor {
     /// the shell-aware sequential stage path instead: builtins, restricted
     /// refusals, redirects the OS-pipe plumbing cannot express, `|&`, or a
     /// program that would be refused by exec classification.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn concurrent_external_stage_spec(
         &mut self,
         command: &CommandNode,
@@ -2322,7 +2339,7 @@ impl Executor {
     /// (the os_pipe spawn plumbing the external concurrent paths use); on
     /// Unix the sequential stage loop keeps handling mixed pipelines.
     /// niubash#345 follow-up.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
     fn execute_shell_writer_pipeline(
         &mut self,
         _commands: &[&CommandNode],

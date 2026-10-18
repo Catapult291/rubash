@@ -117,14 +117,11 @@ impl Executor {
                 self.shell_state.job_table.mark_running(pid);
             } else if matches!(request.signal, 19 | 20) {
                 self.shell_state.job_table.mark_stopped(pid);
-            } else if operand.starts_with('%') {
-                self.shell_state
-                    .job_table
-                    .mark_completed(pid, 128 + request.signal);
-                self.close_coproc_endpoints(pid);
-                self.fd_table.close(pid);
-                self.shell_state.job_table.remove_job_by_pid(pid);
             }
+            // rubash#737: do NOT remove the job here. GNU keeps the job in
+            // the table after `kill %N` until it is reaped (via `wait` or
+            // the shell's SIGCHLD handler). Removing it immediately makes
+            // `wait %1` report "no such job" instead of the signal status.
             continue;
         }
 
