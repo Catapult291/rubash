@@ -1547,6 +1547,7 @@ impl Executor {
             return_trap_running: false,
             signal_trap_running: false,
             error_trap_running: false,
+            subshell_fork_collapse: std::cell::Cell::new(false),
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
             source_nest_depth: 0,

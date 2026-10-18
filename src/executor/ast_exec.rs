@@ -172,6 +172,11 @@ impl Executor {
         // open file description — reads in the subshell advance the shared
         // offset, matching fork().
         let mut subshell_fd_table: Option<crate::executor::fd_table::FdTable> = None;
+        // rubash#720 form 1: the enclosing fork-collapse value to restore
+        // when the flat region closes — Some only when the region opened
+        // with a single-subshell-command body (execute_cmd.c:1799-1806 +
+        // execute_cmd.c:662-663 erase this frame's :769 ERR wait).
+        let mut saved_fork_collapse: Option<bool> = None;
         // GNU execute_cmd.c: `exit` and an errexit trigger unwind the shell
         // via jump_to_top_level (exit.def:152 EXITBLTIN, execute_cmd.c:1174
         // ERREXIT) — they are never a plain command status. The jump stops
@@ -204,6 +209,15 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = saved_fork_collapse.take() {
+                            self.subshell_fork_collapse.set(saved);
+                        }
+                        // rubash#720 form 2: GNU adjudicates the user
+                        // subshell's completion ERR in the frame that waited
+                        // (execute_cmd.c:769-778 run_error_trap after
+                        // wait_for) — the forkless region closes here, so the
+                        // wait-side fire belongs at every close path.
+                        self.close_flat_region_err_adjudication(commands, index)?;
                     }
                 }
             };
@@ -230,6 +244,14 @@ impl Executor {
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }
+                    if let Some(saved) = saved_fork_collapse.take() {
+                        self.subshell_fork_collapse.set(saved);
+                    }
+                    // rubash#720 form 2: the wait-side ERR fire belongs after
+                    // the region restore and before the parent-side errexit
+                    // adjudication — GNU's :769 run_error_trap precedes the
+                    // :777 ERREXIT jump (execute_cmd.c:769-795).
+                    self.close_flat_region_err_adjudication(commands, index)?;
                 }
                 // The dead subshell's status is a failing command status in
                 // the parent: under `set -e` it exits the script unless the
@@ -356,6 +378,14 @@ impl Executor {
                             if let Some(saved) = subshell_fd_table.take() {
                                 self.fd_table = saved;
                             }
+                            if let Some(saved) = saved_fork_collapse.take() {
+                                self.subshell_fork_collapse.set(saved);
+                            }
+                            // rubash#720 form 2: the evalerror DISCARD aborts
+                            // the forked subshell with status 1 and the
+                            // parent's :769 wait-side ERR adjudication still
+                            // runs (rubash#439: the parent judges by status).
+                            self.close_flat_region_err_adjudication(commands, index)?;
                         }
                         self.evalerror_pending.set(false);
                         self.nounset_force_eof.set(false);
@@ -556,6 +586,12 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        // No ERR adjudication here: GNU -n executes nothing,
+                        // so no subshell completion status can exist to
+                        // adjudicate (run_error_trap gates on exec_result).
+                        if let Some(saved) = saved_fork_collapse.take() {
+                            self.subshell_fork_collapse.set(saved);
+                        }
                     }
                 }
                 index += 1;
@@ -569,6 +605,32 @@ impl Executor {
             // executes the whole list in the forked subshell
             // (execute_cmd.c:1576 execute_in_subshell).
             if command.subshell && subshell_state.is_none() {
+                // rubash#720 form 2: GNU's fork preamble (execute_cmd.c:703-710)
+                // fixes the_printed_command_except_trap to make_command_string
+                // of the subshell when a user subshell forks with the ERR trap
+                // armed — both parent-side fires (:769 for the region, :1000
+                // for the function call returning its status) then report that
+                // text as BASH_COMMAND. Stamp it BEFORE the wholesale clone so
+                // the boundary restore keeps it; the body's in-process
+                // mutations die with the restore the way the forked child's
+                // copy died with the child.
+                if crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR")
+                    .is_some()
+                {
+                    let close_index = (index..commands.len())
+                        .find(|candidate| commands[*candidate].subshell_end)
+                        .unwrap_or(index);
+                    let region_text =
+                        crate::executor::command_text::flat_subshell_region_source_text(
+                            &commands[index..=close_index],
+                        );
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_LAST_COMMAND".to_string(), region_text.clone());
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_CURRENT_COMMAND".to_string(), region_text);
+                }
                 subshell_state = Some(self.shell_state.clone_for_child_save());
                 subshell_fd_table = Some(self.fd_table.clone());
                 subshell_cwd = env::current_dir().ok();
@@ -576,6 +638,17 @@ impl Executor {
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
+                // rubash#720 form 1: a single-subshell-command region body is
+                // the body GNU's execute_in_subshell marks CMD_NO_FORK
+                // (execute_cmd.c:1799-1806) and runs in place via
+                // execute_cmd.c:662-663 — the region frame performs no wait
+                // and therefore no :769 ERR adjudication for it.
+                saved_fork_collapse = if command.subshell_end && command.subshell_command.is_some()
+                {
+                    Some(self.subshell_fork_collapse.replace(true))
+                } else {
+                    None
+                };
                 // Feed subshell group stdin redirect to all body commands;
                 // FUNCTION_STDIN lives in env_vars, so the wholesale state
                 // restore at the boundary reverts it.
@@ -1410,6 +1483,14 @@ impl Executor {
                         if let Some(saved) = subshell_fd_table.take() {
                             self.fd_table = saved;
                         }
+                        if let Some(saved) = saved_fork_collapse.take() {
+                            self.subshell_fork_collapse.set(saved);
+                        }
+                        // rubash#720 form 2: the expansion-failure abort dies
+                        // with the forked subshell (status `code`) and the
+                        // parent's :769 wait-side ERR adjudication judges the
+                        // status (rubash#439).
+                        self.close_flat_region_err_adjudication(commands, index)?;
                     }
                     // A malformed subshell can leave the command list with
                     // no closing marker.  In that case there is no boundary
@@ -1458,7 +1539,17 @@ impl Executor {
             // fire ERR a second time at the aggregate (GNU 5.3.0:
             // `trap 'echo E' ERR; if true; then false && true; fi; echo R`
             // prints only R).
-            if !command_status_produced_by_body(command) {
+            //
+            // A subshell command running under the rubash#720 fork-collapse
+            // is skipped too: GNU dispatched it in place inside the
+            // already-forked parent subshell (execute_cmd.c:1799-1806 marks
+            // the single-subshell-command body CMD_NO_FORK; execute_cmd.c:
+            // 662-663 skips make_child/wait_for), so this frame performs no
+            // :769 wait-side ERR adjudication for it — the failure is
+            // observed one frame up (`( (false) )` fires 2, not 3).
+            if !command_status_produced_by_body(command)
+                && !(command.subshell_command.is_some() && self.subshell_fork_collapse.get())
+            {
                 self.maybe_run_error_trap(command)?;
             }
 
@@ -1498,6 +1589,13 @@ impl Executor {
                     if let Some(saved) = subshell_fd_table.take() {
                         self.fd_table = saved;
                     }
+                    if let Some(saved) = saved_fork_collapse.take() {
+                        self.subshell_fork_collapse.set(saved);
+                    }
+                    // rubash#720 form 2: the normal-path region close — GNU's
+                    // parent waits for the forked subshell here and runs the
+                    // :769 ERR adjudication on the waited status.
+                    self.close_flat_region_err_adjudication(commands, index)?;
                 }
             }
 
@@ -1573,6 +1671,36 @@ impl Executor {
         }
         self.exit_code = invert_exit_status(self.exit_code);
         Ok(Some(end + 1))
+    }
+
+    /// rubash#720 form 2: the wait-side ERR adjudication for a closing flat
+    /// `f() ( list )` region. GNU runs it in the frame that waited for the
+    /// subshell fork — wait_for then run_error_trap keyed on the subshell
+    /// command itself (execute_cmd.c:756-778; the site checks user_subshell,
+    /// was_error_trap, ignore_return, invert and the status, with no
+    /// &&/|| exemption). The forkless region has no subshell node: the
+    /// opener command stands in for the gates (its invert/and_or context is
+    /// the region's own parse context), the text is the region's print_cmd
+    /// rendering, and the line is the opener's close-paren end_line
+    /// (execute_cmd.c:696). Callers run it after restore_flat_subshell, so
+    /// the trap table is the parent's — GNU's child died with its own.
+    fn close_flat_region_err_adjudication(
+        &mut self,
+        commands: &[CommandNode],
+        closer_index: usize,
+    ) -> Result<(), ExecuteError> {
+        let last = commands.len().saturating_sub(1);
+        let Some(open_index) = (0..=closer_index.min(last))
+            .rev()
+            .find(|i| commands[*i].subshell)
+        else {
+            return Ok(());
+        };
+        let opener = &commands[open_index];
+        let body = &commands[open_index..=closer_index.min(last)];
+        let text = crate::executor::command_text::flat_subshell_region_source_text(body);
+        let line = opener.end_line;
+        self.maybe_run_error_trap_for_flat_region(opener, text, line)
     }
 }
 

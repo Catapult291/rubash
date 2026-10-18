@@ -1859,6 +1859,21 @@ impl Executor {
             body_owned = Some(body_ast.commands);
         }
         let body: &[CommandNode] = body_owned.as_deref().unwrap_or(&subshell_command.body);
+        // rubash#720 form 1: GNU execute_cmd.c:1799-1806 (execute_in_subshell)
+        // marks a user subshell's WHOLE body CMD_NO_FORK when it is a single
+        // simple or subshell command; execute_cmd.c:662-663 runs a subshell
+        // body so marked IN PLACE inside the already-forked child — no
+        // second fork, no wait_for, and therefore no :769 run_error_trap in
+        // that frame. With `( (false) )` the middle frame never observes the
+        // status, so only the innermost `false` and the outermost waiter
+        // fire ERR (GNU 5.3.0: 2 fires, not 3). The flag scopes exactly the
+        // body execution of a single-subshell-command body.
+        let body_fork_collapsed = body.len() == 1 && body[0].subshell_command.is_some();
+        let saved_fork_collapse = if body_fork_collapsed {
+            Some(self.subshell_fork_collapse.replace(true))
+        } else {
+            None
+        };
         // GNU execute_cmd.c resolves subshell redirections in the parent
         // context before the body runs: expand and anchor relative file
         // targets now, or a `cd` in the body relocates them (niubash#118).
@@ -1938,6 +1953,9 @@ impl Executor {
         let status = match result {
             Ok(()) => body_status.unwrap_or(self.exit_code),
             Err(error) => {
+                if let Some(saved) = saved_fork_collapse {
+                    self.subshell_fork_collapse.set(saved);
+                }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
@@ -1947,6 +1965,9 @@ impl Executor {
         let status = match trap_result {
             Some(Ok(trap_status)) => trap_status,
             Some(Err(error)) => {
+                if let Some(saved) = saved_fork_collapse {
+                    self.subshell_fork_collapse.set(saved);
+                }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
@@ -1955,6 +1976,9 @@ impl Executor {
             None => status,
         };
 
+        if let Some(saved) = saved_fork_collapse {
+            self.subshell_fork_collapse.set(saved);
+        }
         self.restore_flat_subshell(saved_state, saved_cwd);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);

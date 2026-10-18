@@ -259,6 +259,22 @@ impl Executor {
         {
             self.maybe_run_error_trap(cmd)?;
             Err(ExecuteError::ExitCode(self.exit_code))
+        } else if matches!(result, Err(ExecuteError::Return(_)))
+            && (self.shell_state.function_depth > 0 || self.source_nest_depth > 0)
+        {
+            // rubash#720 form 4: a `return N` unwinding through dispatch is
+            // the builtin's own completion, not an errexit trigger at THIS
+            // gate. GNU's return.def:112-115 jumps only for an out-of-range
+            // count — an in-range return unwinds via execute_function's
+            // return_catch, the function boundary stamps
+            // last_command_exit_value = N, and the CALL's own gate then
+            // adjudicates. Firing here would attribute the loop condition's
+            // stale status (`until false` leaves exit_code = 1 from the
+            // failing test) to the return and lose N: GNU prints ERR:7 and
+            // exits 7 for `until false; do f; done` with `f(){ return 7; }`,
+            // not ERR:1 / exit 1. The unwind passes through to the function
+            // (or source) boundary untouched.
+            result
         } else if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
             self.maybe_run_error_trap(cmd)?;
             Err(ExecuteError::ExitCode(self.exit_code))
