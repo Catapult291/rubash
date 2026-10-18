@@ -142,20 +142,12 @@ impl Executor {
                 Ok(())
             }
             "set" => self.execute_set_command(&builtin_cmd),
-            "setopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(&builtin_cmd, true)?;
-                Ok(())
-            }
             "getopts" => {
                 self.exit_code = self.execute_getopts_command(&builtin_cmd)?;
                 Ok(())
             }
             "shopt" => {
                 self.exit_code = self.execute_shopt(&builtin_cmd)?;
-                Ok(())
-            }
-            "unsetopt" => {
-                self.exit_code = self.execute_zsh_option_builtin(&builtin_cmd, false)?;
                 Ok(())
             }
             "enable" => {
@@ -169,8 +161,13 @@ impl Executor {
             }
             "eval" => self.execute_eval(&builtin_cmd),
             "command" => self.execute_command_without_aliases(&builtin_cmd),
+            // GNU Bash has no `sudo` builtin (issue #759 item 4): the
+            // host-capability builtin only exists while an embedding host
+            // registered an elevation handler; otherwise `builtin sudo`
+            // falls through to the not-a-builtin error below, matching
+            // GNU's `builtin` on a non-builtin name.
             #[cfg(windows)]
-            "sudo" => {
+            "sudo" if self.elevation_handler.is_some() => {
                 self.exit_code = self.execute_sudo(&builtin_cmd)?;
                 Ok(())
             }

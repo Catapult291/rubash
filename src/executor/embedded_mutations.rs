@@ -955,7 +955,7 @@ impl Executor {
                                 output.push_str(&value);
                             }
                         } else {
-                            let name = collect_braced_parameter_name(&mut chars);
+                            let (name, _terminated) = collect_braced_parameter_body(&mut chars);
                             let value =
                                 self.expand_with_parameter_env(saved_parameter_state, |executor| {
                                     executor.expand_word_mut_with_context(
@@ -972,7 +972,7 @@ impl Executor {
                             }
                         }
                     } else {
-                        let name = collect_braced_parameter_name(&mut chars);
+                        let (name, _terminated) = collect_braced_parameter_body(&mut chars);
                         let value =
                             self.expand_with_parameter_env(saved_parameter_state, |executor| {
                                 // Propagate the outer quote context so a

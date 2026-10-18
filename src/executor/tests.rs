@@ -339,6 +339,16 @@ mod unit_tests {
             .shell_state
             .env_vars
             .insert("EUID".to_string(), "1000".to_string());
+        // parse.y:6586-6592: with the second expansion pass enabled
+        // (promptvars defaults on) a non-root `\$` is emitted backslash-
+        // quoted so that pass keeps the dollar literal; the full
+        // decode+expand result is the bare `$`.
+        assert_eq!(executor.decode_prompt_string("\\$"), "\\$");
+        assert_eq!(executor.expand_prompt_string("\\$"), "$");
+
+        // promptvars off removes the second pass (parse.y:6683), so the
+        // decode emits the bare character again.
+        crate::builtins::shopt::set_option(&mut executor.shell_state.env_vars, "promptvars", false);
         assert_eq!(executor.decode_prompt_string("\\$"), "$");
     }
 

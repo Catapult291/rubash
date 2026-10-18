@@ -399,7 +399,7 @@ impl Executor {
             match chars.peek().copied() {
                 Some('{') => {
                     chars.next();
-                    let name = collect_braced_parameter_name(&mut chars);
+                    let (name, _terminated) = collect_braced_parameter_body(&mut chars);
                     // Only a plain `${name}` is expanded for display; operators
                     // like `${x:-word}` stay literal (rare inside failing arith).
                     if is_shell_name(&name) {

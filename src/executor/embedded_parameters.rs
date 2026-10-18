@@ -81,8 +81,62 @@ impl Executor {
             return word.to_string();
         }
         EXPAND_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.expand_embedded_parameters_inner(word, false, false, true);
+        let result = self.expand_embedded_parameters_inner(word, false, false, true, false);
         EXPAND_DEPTH.with(|d| d.set(depth));
+        result
+    }
+
+    /// Prompt-string second pass (GNU parse.y:6689 expand_prompt_string
+    /// hands the decoded prompt to word expansion with Q_DOUBLE_QUOTES):
+    /// the whole word behaves as if inside double quotes — quote characters
+    /// in it are DATA, `\$`/`\``/`\"`/`\\` are escaped literals, and
+    /// parameter/command/arithmetic/backtick expansion still runs (issue
+    /// #757: bare special parameters must expand, `shopt -u promptvars`
+    /// must gate the pass itself).
+    ///
+    /// Containment (subst.c:4392-4418): expand_prompt_string runs the
+    /// expansion with `no_longjmp_on_fatal_error = 1` and RETURNS THE
+    /// PASSED STRING when the expansion verdicts — the diagnostic stands
+    /// (printed at the verdict site), the prompt value falls back to the
+    /// decoded input, and the enclosing command's status is untouched
+    /// (`PS1='a${1x}b'; p=${PS1@P}` keeps rc 0 with p literal; WSL GNU
+    /// 5.3.0 probes probe-f1/probe-f1b/probe-f1c).
+    pub(in crate::executor) fn expand_embedded_parameters_double_quoted(
+        &self,
+        word: &str,
+    ) -> String {
+        let depth = EXPAND_DEPTH.with(|d| d.get());
+        if depth >= MAX_EXPAND_DEPTH {
+            return word.to_string();
+        }
+        EXPAND_DEPTH.with(|d| d.set(depth + 1));
+        // Snapshot the expansion-verdict latches; a false→true transition
+        // inside the walk is the walk's own failure verdict.
+        let bad_sub_before = self.shell_state.parameter_bad_substitution.replace(false);
+        let arith_err_before = self.shell_state.arithmetic_expansion_error.replace(false);
+        let arith_fatal_before = self.shell_state.arithmetic_fatal_error.replace(false);
+        let arith_nonfatal_before = self.shell_state.arithmetic_nonfatal_error.replace(false);
+        let result = self.expand_embedded_parameters_inner(word, false, false, false, true);
+        let failed = self
+            .shell_state
+            .parameter_bad_substitution
+            .replace(bad_sub_before)
+            | self
+                .shell_state
+                .arithmetic_expansion_error
+                .replace(arith_err_before)
+            | self
+                .shell_state
+                .arithmetic_fatal_error
+                .replace(arith_fatal_before)
+            | self
+                .shell_state
+                .arithmetic_nonfatal_error
+                .replace(arith_nonfatal_before);
+        EXPAND_DEPTH.with(|d| d.set(depth));
+        if failed {
+            return word.to_string();
+        }
         result
     }
 
@@ -112,7 +166,8 @@ impl Executor {
             return word.to_string();
         }
         EXPAND_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.expand_embedded_parameters_inner(word, heredoc, protect_ifs, false);
+        let result =
+            self.expand_embedded_parameters_inner(word, heredoc, protect_ifs, false, false);
         EXPAND_DEPTH.with(|d| d.set(depth));
         result
     }
@@ -123,6 +178,7 @@ impl Executor {
         heredoc: bool,
         protect_ifs: bool,
         preserve_quotes: bool,
+        double_quoted: bool,
     ) -> String {
         // TODO(subst.c/subst.h): This is a narrow parameter-expansion subset.
         // GNU Bash handles quoting state, operators like ${name:-word},
@@ -225,6 +281,28 @@ impl Executor {
             // case falls through to the default push below. Heredoc text
             // treats quotes as data.
             if ch == '\\' && !heredoc {
+                if double_quoted {
+                    // Double-quoted word context (subst.c:12177 set_word_flags
+                    // Q_DOUBLE_QUOTES): the backslash stays meaningful only
+                    // before $ ` " \ and newline (dq-escape set); anything
+                    // else keeps both characters (`"\p"` -> `\p`).
+                    match chars.peek().copied() {
+                        Some(escaped @ ('$' | '`' | '"' | '\\')) => {
+                            chars.next();
+                            output.push(escaped);
+                        }
+                        Some('\n') => {
+                            chars.next();
+                        }
+                        Some(other) => {
+                            chars.next();
+                            output.push('\\');
+                            output.push(other);
+                        }
+                        None => output.push('\\'),
+                    }
+                    continue;
+                }
                 if preserve_quotes {
                     // Compound RHS: keep the escape pair verbatim so the
                     // storage tokenizer + unquote pass apply GNU's
@@ -261,8 +339,12 @@ impl Executor {
             // Quotes that survive to expansion belong to parameter-expansion
             // bodies (the lexer keeps `${...}` verbatim): GNU removes them
             // here, with single-quoted content staying literal. Heredoc text
-            // treats quotes as data.
-            if !heredoc && ch == '"' {
+            // treats quotes as data. In the double-quoted word context both
+            // quote characters are data (parse.y:6689 passes the decoded
+            // prompt with Q_DOUBLE_QUOTES; an embedded `"` never opens a
+            // span — subst.c only re-enters quote state on the CTLESC-marked
+            // spans the word scanner produced, and a prompt word has none).
+            if !heredoc && ch == '"' && !double_quoted {
                 in_double = !in_double;
                 if preserve_quotes {
                     output.push('"');
@@ -270,7 +352,7 @@ impl Executor {
                 continue;
             }
 
-            if !heredoc && ch == '\'' && !in_double {
+            if !heredoc && ch == '\'' && !in_double && !double_quoted {
                 if preserve_quotes {
                     // A single-quoted element is literal text in GNU's raw
                     // token stream; keep the quote characters so the
@@ -466,7 +548,73 @@ impl Executor {
                     let _site_guard = (!whole_braced).then(|| {
                         crate::executor::expand_braced_indices::SubSiteGuard::new(this_frag)
                     });
-                    let name = collect_braced_parameter_name(&mut chars);
+                    let (name, terminated) =
+                        crate::executor::command_subst_helpers::collect_braced_parameter_body(
+                            &mut chars,
+                        );
+                    if double_quoted {
+                        // Prompt-pass verdicts (GNU expand_prompt_string runs
+                        // under no_longjmp_on_fatal_error, subst.c:4407, and
+                        // falls back to the original string on any verdict,
+                        // subst.c:4413-4418) — raise them HERE so the pass
+                        // containment can act:
+                        //
+                        // - an unterminated `${body` is the bad-substitution
+                        //   default naming the whole word (GNU 5.3.0 probe:
+                        //   `PS1='a${bad'` prints `a${bad: bad
+                        //   substitution` and the value stays literal);
+                        // - the `?`/`:?` error operator REPORTS
+                        //   (subst.c:10403-10418) instead of substituting
+                        //   the message into the value — the value falls
+                        //   back with the enclosing command still at 0.
+                        if !terminated {
+                            self.write_diagnostic_fd2(
+                                format!(
+                                    "{}{}: bad substitution\n",
+                                    self.diagnostic_prefix(),
+                                    crate::executor::expand_word::bad_substitution_display(word)
+                                )
+                                .as_bytes(),
+                            );
+                            self.shell_state.parameter_bad_substitution.set(true);
+                            continue;
+                        }
+                        if let Some((error_name, message, require_non_empty)) =
+                            crate::executor::parameter_ops::parse_parameter_error_operator(
+                                &name,
+                                self.posix_mode_enabled(),
+                            )
+                        {
+                            let value = self.parameter_error_value(&error_name);
+                            let is_error = if require_non_empty {
+                                value.as_deref().map(str::is_empty).unwrap_or(true)
+                            } else {
+                                value.is_none()
+                            };
+                            if is_error {
+                                let message = if message.is_empty() {
+                                    if require_non_empty {
+                                        "parameter null or not set".to_string()
+                                    } else {
+                                        "parameter not set".to_string()
+                                    }
+                                } else {
+                                    self.expand_parameter_word(&message)
+                                };
+                                self.write_diagnostic_fd2(
+                                    format!(
+                                        "{}{}: {}\n",
+                                        self.diagnostic_prefix(),
+                                        error_name,
+                                        message
+                                    )
+                                    .as_bytes(),
+                                );
+                                self.shell_state.parameter_bad_substitution.set(true);
+                                continue;
+                            }
+                        }
+                    }
                     // A bad-substitution diagnostic inside this fragment must
                     // name the whole enclosing word (GNU subst.c:10278),
                     // not just the `${...}` span (rubash#758).

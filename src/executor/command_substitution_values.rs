@@ -898,7 +898,7 @@ impl Executor {
             .first()
             .map(String::as_str)
             .unwrap_or("");
-        if (is_shell_builtin_name(first_word)
+        if (self.routes_as_builtin(first_word)
             || crate::executor::command_dispatch_late::is_hidden_late_builtin(first_word))
             && !crate::builtins::enable::is_disabled(&self.shell_state.env_vars, first_word)
         {

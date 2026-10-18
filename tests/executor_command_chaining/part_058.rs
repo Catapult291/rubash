@@ -20,9 +20,11 @@ fn test_shift_invalid_counts_redirect_stderr() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
+    // rubash#759 item 3: the non-numeric operand is a usage error (2); the
+    // negative-count erange stays EXECUTION_FAILURE (1).
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        "nonnumeric:1:2:one\nnegative:1:2:one\n"
+        "nonnumeric:2:2:one\nnegative:1:2:one\n"
     );
     let error = fs::read_to_string(error_path).unwrap();
     assert!(error.contains("shift: x: numeric argument required"));
@@ -49,7 +51,9 @@ fn test_shift_too_many_arguments_fails_without_changing_positional_params() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "1 2 one\n");
+    // rubash#759 item 3: get_numeric_arg ends with no_args(), whose
+    // surplus-argument failure is EX_BADUSAGE (2), positions untouched.
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "2 2 one\n");
     assert!(fs::read_to_string(error_path)
         .unwrap()
         .contains("shift: too many arguments"));

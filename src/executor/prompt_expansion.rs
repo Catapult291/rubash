@@ -213,6 +213,22 @@ fn xtrace_single_quote(word: &str) -> String {
 }
 
 impl Executor {
+    /// GNU parse.y:6683 — the second, parameter/command-substitution pass
+    /// over a decoded prompt string runs when the `promptvars` shopt is on
+    /// (the default) OR posix mode is enabled; `shopt -u promptvars` alone
+    /// leaves `$`/backtick text in the prompt literal (issue #757).
+    pub(in crate::executor) fn prompt_expansion_enabled(&self) -> bool {
+        crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "promptvars")
+            || self.posix_mode_enabled()
+    }
+
+    /// parse.y:6588 gates the `\$` backslash-quoting on `current_user.euid
+    /// != 0`; prompt_dollar reads the same EUID cell, so the root branch
+    /// emits `#` unquoted exactly when this is false.
+    fn running_as_root(&self) -> bool {
+        self.shell_state.env_vars.get("EUID").map(String::as_str) == Some("0")
+    }
+
     pub(in crate::executor) fn indirect_pattern_removal(&self, name: &str) -> Option<String> {
         let (ref_expr, pattern, operation) = parse_indirect_pattern_removal(name)?;
         let ref_name = ref_expr
@@ -340,11 +356,23 @@ impl Executor {
                 Some('A') => output.push_str(&self.prompt_time("%H:%M")),
                 Some('d') => output.push_str(&self.prompt_time("%a %b %d")),
                 Some('D') => output.push_str(&self.decode_prompt_date_escape(&mut chars)),
-                Some('u') => output.push_str(&prompt_username(&self.shell_state.env_vars)),
-                Some('h') => output.push_str(&prompt_hostname(&self.shell_state.env_vars, false)),
-                Some('H') => output.push_str(&prompt_hostname(&self.shell_state.env_vars, true)),
-                Some('w') => output.push_str(&self.prompt_working_directory(false)),
-                Some('W') => output.push_str(&self.prompt_working_directory(true)),
+                Some('u') => output.push_str(
+                    &self.prompt_quote_for_expansion(&prompt_username(&self.shell_state.env_vars)),
+                ),
+                Some('h') => output.push_str(&self.prompt_quote_for_expansion(&prompt_hostname(
+                    &self.shell_state.env_vars,
+                    false,
+                ))),
+                Some('H') => output.push_str(&self.prompt_quote_for_expansion(&prompt_hostname(
+                    &self.shell_state.env_vars,
+                    true,
+                ))),
+                Some('w') => output.push_str(
+                    &self.prompt_quote_for_expansion(&self.prompt_working_directory(false)),
+                ),
+                Some('W') => output.push_str(
+                    &self.prompt_quote_for_expansion(&self.prompt_working_directory(true)),
+                ),
                 Some('l') => output.push_str(&prompt_terminal_basename(&self.shell_state.env_vars)),
                 Some('s') => output.push_str("bash"),
                 Some('v') => output.push_str(&prompt_short_version(&self.shell_state.env_vars)),
@@ -355,8 +383,20 @@ impl Executor {
                 // only a bare `!').
                 Some('!') => output.push_str(&self.prompt_history_number().to_string()),
                 Some('#') => output.push_str(&self.prompt_command_number().to_string()),
-                Some('$') => output.push(prompt_dollar(&self.shell_state.env_vars)),
                 Some('\\') => output.push('\\'),
+                Some('$') => {
+                    // GNU parse.y:6586-6592: with a second expansion pass
+                    // ahead (promptvars || posixly_correct) a non-root
+                    // backslashed dollar is emitted BACKSLASH-QUOTED so that
+                    // pass keeps it literal (dequote removes the backslash);
+                    // root renders the hash and the promptvars-off branch
+                    // renders the bare character with no pass to protect it
+                    // from.
+                    if self.prompt_expansion_enabled() && !self.running_as_root() {
+                        output.push('\\');
+                    }
+                    output.push(prompt_dollar(&self.shell_state.env_vars));
+                }
                 Some(marker @ ('[' | ']')) => {
                     // GNU parse.y:6609-6622: \[ and \] emit the readline
                     // prompt-ignore markers (RL_PROMPT_START/END_IGNORE) only
@@ -395,73 +435,6 @@ impl Executor {
         let decoded =
             crate::executor::substitution_metadata::decode_raw_byte_markers(output.as_bytes());
         String::from_utf8_lossy(&decoded).into_owned()
-    }
-
-    pub(in crate::executor) fn expand_prompt_parameters(&self, word: &str) -> String {
-        let mut output = String::new();
-        let mut chars = word.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch != '$' {
-                output.push(ch);
-                continue;
-            }
-
-            match chars.peek().copied() {
-                Some('{') => {
-                    chars.next();
-                    let mut name = String::new();
-                    for name_ch in chars.by_ref() {
-                        if name_ch == '}' {
-                            break;
-                        }
-                        name.push(name_ch);
-                    }
-                    output.push_str(&self.parameter_error_value(&name).unwrap_or_default());
-                }
-                Some('(') => {
-                    chars.next();
-                    let mut depth = 1;
-                    let mut source = String::new();
-                    while let Some(source_ch) = chars.next() {
-                        match source_ch {
-                            '(' => {
-                                depth += 1;
-                                source.push(source_ch);
-                            }
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                                source.push(source_ch);
-                            }
-                            _ => source.push(source_ch),
-                        }
-                    }
-                    output.push_str(&self.expand_command_substitution(&source));
-                }
-                Some(first) if is_shell_name_start(first) => {
-                    let mut name = String::new();
-                    while let Some(name_ch) = chars.peek().copied() {
-                        if !is_shell_name_char(name_ch) {
-                            break;
-                        }
-                        chars.next();
-                        name.push(name_ch);
-                    }
-                    output.push_str(&self.parameter_error_value(&name).unwrap_or_default());
-                }
-                Some(other) => {
-                    chars.next();
-                    output.push('$');
-                    output.push(other);
-                }
-                None => output.push('$'),
-            }
-        }
-
-        output
     }
 
     pub(in crate::executor) fn prompt_working_directory(&self, basename_only: bool) -> String {
@@ -549,12 +522,40 @@ impl Executor {
         let mut format = String::new();
         for ch in chars.by_ref() {
             if ch == '}' {
-                return self.prompt_time(&format);
+                // parse.y:6430-6436: the strftime text is backslash-quoted
+                // for double quotes when the expansion pass will run, so a
+                // `%`-format output containing `$`/backtick/quote bytes is
+                // not read as expansion syntax by that pass.
+                let rendered = self.prompt_time(&format);
+                return self.prompt_quote_for_expansion(&rendered);
             }
             format.push(ch);
         }
 
         format!("\\D{{{format}")
+    }
+
+    /// parse.y:6434/6452/6533/6549/6563 — the decode outputs that carry
+    /// filesystem/user/host text (`\w` `\u` `\h` `\D{}`) are run through
+    /// sh_backslash_quote_for_double_quotes (lib/sh/shquote.c:312) when the
+    /// second expansion pass is enabled, so their data cannot be misread as
+    /// expansion syntax by that pass; the pass's dequote removes the
+    /// backslashes again. With the pass off there is nothing to protect
+    /// (parse.y stores the plain text) and the output is unchanged. The
+    /// escaped set is slashify_in_quotes (syntax.h:26) minus newline, which
+    /// shquote.c:328 exempts.
+    fn prompt_quote_for_expansion(&self, text: &str) -> String {
+        if !self.prompt_expansion_enabled() || !text.matches(['\\', '`', '$', '"']).any(|_| true) {
+            return text.to_string();
+        }
+        let mut quoted = String::with_capacity(text.len() + 4);
+        for ch in text.chars() {
+            if matches!(ch, '\\' | '`' | '$' | '"') {
+                quoted.push('\\');
+            }
+            quoted.push(ch);
+        }
+        quoted
     }
 
     pub(in crate::executor) fn expand_assignment_tilde(&self, value: &str) -> String {

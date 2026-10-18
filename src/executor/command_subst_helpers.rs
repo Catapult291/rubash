@@ -4,6 +4,17 @@ use crate::executor::substitution_metadata::bytes_to_shell_text;
 pub(in crate::executor) fn collect_braced_parameter_name(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> String {
+    collect_braced_parameter_body(chars).0
+}
+
+/// Collects the `${`-body and reports whether the closing `}` was found.
+/// GNU subst.c parameter_brace_expand verdicts an unterminated `${body`
+/// (`PS1='a${bad'`) as `bad substitution` naming the whole word; the
+/// prompt pass needs the termination bit to raise that verdict (the
+/// ordinary word paths keep their historical silent behavior).
+pub(in crate::executor) fn collect_braced_parameter_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> (String, bool) {
     let mut name = String::new();
     let mut nested = 0usize;
     let mut single = false;
@@ -99,7 +110,7 @@ pub(in crate::executor) fn collect_braced_parameter_name(
         }
         if ch == '}' {
             if nested == 0 {
-                break;
+                return (name, true);
             }
             nested -= 1;
             name.push(ch);
@@ -107,7 +118,7 @@ pub(in crate::executor) fn collect_braced_parameter_name(
         }
         name.push(ch);
     }
-    name
+    (name, false)
 }
 
 pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> String {

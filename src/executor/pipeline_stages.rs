@@ -379,7 +379,7 @@ impl Executor {
         let Some(expanded_name) = expanded_first.first() else {
             return Ok(None);
         };
-        if !crate::executor::builtin_names::is_shell_builtin_name(expanded_name) {
+        if !self.routes_as_builtin(expanded_name) {
             return Ok(None);
         }
 

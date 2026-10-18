@@ -2480,3 +2480,197 @@ mod issue_753 {
         );
     }
 }
+
+/// rubash#759 item 3: `shift` with a bad operand is a USAGE error (2), not
+/// a plain failure. GNU builtins/shift.def routes a non-numeric operand
+/// through get_numeric_arg (builtins/common.c:501-505 sh_neednumarg,
+/// get_numeric_arg returns 0 and shift_builtin answers
+/// `return (EX_USAGE)`) and a surplus operand through no_args
+/// (`set_exit_status (EX_BADUSAGE)`); only the shift-count-erange path
+/// returns EXECUTION_FAILURE.
+/// GNU 5.3.0 differential (WSL stdin probes 2026-10-18):
+///   ( set -- 1 2; shift x )    -> 2   (was 1)
+///   ( set -- 1 2; shift 1 2 )  -> 2   (was 1)
+///   ( set -- 1 2; shift -1 )   -> 1
+///   set -- 1 2 3; shift 99     -> 1
+#[test]
+fn shift_bad_operand_status_matches_gnu() {
+    let dir = case_scratch("759.shift");
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    };
+
+    let statuses = run("( set -- 1 2; shift x ) 2>/dev/null; echo \"shiftx:$?\"\n\
+         ( set -- 1 2; shift 1 2 ) 2>/dev/null; echo \"shift12:$?\"\n\
+         ( set -- 1 2; shift -1 ) 2>/dev/null; echo \"shiftneg:$?\"\n\
+         set -- 1 2 3; shift 99 2>/dev/null; echo \"shiftbig:$?\"");
+    assert_eq!(
+        statuses, "shiftx:2\nshift12:2\nshiftneg:1\nshiftbig:1",
+        "shift statuses"
+    );
+
+    // The diagnostics themselves keep GNU's wording (only the status
+    // changed): `shift: x: numeric argument required` and
+    // `shift: too many arguments`.
+    let out = run_rubash_in(
+        &dir,
+        &["-c", "set -- 1 2; shift x; shift 1 2"],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("shift: x: numeric argument required"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("shift: too many arguments"), "{stderr}");
+}
+
+/// rubash#759 item 4: GNU bash has no `setopt`/`unsetopt` builtins — a
+/// script probing `command -v setopt` to detect zsh must get the GNU
+/// answer. After the removal `setopt x` is command-not-found (127),
+/// `builtin setopt x` is not-a-shell-builtin (1), and `enable -a` lists
+/// exactly GNU's 61 builtin names.
+/// GNU 5.3.0 differential (WSL stdin probe 2026-10-18):
+///   command -v setopt    -> rc 1, no output   (was "setopt", rc 0)
+///   command -v unsetopt  -> rc 1, no output   (was "unsetopt", rc 0)
+///   enable -a | wc -l    -> 61                (was 64 on Windows)
+#[test]
+fn zsh_option_builtins_are_gone() {
+    let dir = case_scratch("759.setopt");
+
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "command -v setopt; echo \"v:$?\"\ncommand -v unsetopt; echo \"v:$?\"\nenable -a",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("v:1"), "command -v setopt misses");
+    assert_eq!(lines.next(), Some("v:1"), "command -v unsetopt misses");
+    let listed = lines.filter(|line| !line.trim().is_empty()).count();
+    assert_eq!(
+        listed, 61,
+        "enable -a must list exactly GNU's 61 builtin names: {stdout}"
+    );
+
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "setopt hist_ignore_dups null_glob; echo \"plain:$?\"\n\
+             shopt -q nullglob; echo \"nullglob:$?\"\n\
+             builtin unsetopt null_glob; echo \"builtin:$?\"",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout.trim_end(),
+        "plain:127\nnullglob:1\nbuiltin:1",
+        "setopt/unsetopt are plain unknown commands; option state untouched"
+    );
+    assert!(stderr.contains("setopt: command not found"), "{stderr}");
+    assert!(
+        stderr.contains("builtin: unsetopt: not a shell builtin"),
+        "{stderr}"
+    );
+}
+
+/// rubash#759 item 4 (sudo): GNU bash has no `sudo` builtin — `command -v
+/// sudo` resolves it on PATH like any external (WSL: /usr/bin/sudo). rubash
+/// keeps the Windows host-capability builtin behind an embedding-host
+/// elevation handler (the docs/builtins.md §3 hidden-builtin contract), so
+/// with no handler the name must classify as external everywhere. On a
+/// Windows box without sudo.exe that is rc 1 with no output; the invariant
+/// under test is "never reports a builtin".
+/// GNU 5.3.0 differential (WSL stdin probe 2026-10-18):
+///   command -v sudo -> /usr/bin/sudo (external), rc 0
+///   type -t sudo    -> file, rc 0
+#[test]
+fn sudo_is_not_reported_as_a_builtin() {
+    let dir = case_scratch("759.sudo");
+    let out = run_rubash_in(
+        &dir,
+        &[
+            "-c",
+            "command -v sudo; echo \"v:$?\"\ntype -t sudo; echo \"t:$?\"",
+        ],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.lines().any(|line| line == "sudo"),
+        "`command -v sudo` must not report the bare builtin name: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sudo is a shell builtin"),
+        "`type sudo` must not report a builtin: {stdout}"
+    );
+}
+
+/// CR follow-up on rubash#757 (F1): the prompt-pass containment. GNU
+/// subst.c:4392-4418 expand_prompt_string runs the expansion with
+/// `no_longjmp_on_fatal_error = 1` and RETURNS THE PASSED STRING when the
+/// expansion verdicts: the diagnostic stands, the prompt value falls back
+/// to the decoded input, and the enclosing command's status is untouched.
+/// Before the containment a malformed `${...}` inside PS1 failed the whole
+/// assignment (rc 1, variable unset).
+/// GNU 5.3.0 differential (WSL stdin probes 2026-10-18, probe-f1/f1b/f1c):
+///   PS1='a${1x}b'; p=${PS1@P}  -> stderr `a${1x}b: bad substitution`,
+///                                 rc 0, p=`a${1x}b`, next line runs
+///   PS1='a$((1x))b'            -> arith diagnostic, rc 0, literal
+///   PS1='a${bad'               -> `a${bad: bad substitution`, rc 0, literal
+///   PS1='er:${nose?bad} t'     -> stderr `nose: bad`, rc 0, literal text
+///   PS1='a$((1/0))b'           -> division diagnostic, rc 0, literal
+#[test]
+fn prompt_expansion_failure_contained_like_gnu() {
+    let dir = case_scratch("757.containment");
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    };
+
+    // Bad substitution: diagnostic on stderr, value literal, rc 0, tail runs.
+    let (stdout, stderr, code) =
+        run("PS1='a${1x}b'\np=${PS1@P}\necho \"rc=$? p=[$p]\"\necho after");
+    assert_eq!(code, Some(0), "list rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "rc=0 p=[a${1x}b]\nafter",
+        "stdout; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a${1x}b: bad substitution"),
+        "diagnostic; stderr:\n{stderr}"
+    );
+
+    // Arithmetic verdict, unterminated brace, `?` operator: same contract.
+    let (stdout, stderr, code) = run("PS1='a$((1x))b'\np=${PS1@P}\necho \"arith:$? [$p]\"\n\
+         PS1='a${bad'\nq=${PS1@P}\necho \"unterm:$? [$q]\"\n\
+         unset p757_nose\nPS1='er:${p757_nose?bad} t'\nr=${PS1@P}\necho \"qmark:$? [$r]\"");
+    assert_eq!(code, Some(0), "list rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "arith:0 [a$((1x))b]\nunterm:0 [a${bad]\nqmark:0 [er:${p757_nose?bad} t]",
+        "stdout; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("value too great for base"), "{stderr}");
+    assert!(stderr.contains("a${bad: bad substitution"), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line.contains("p757_nose: bad")),
+        "`?` operator reports on stderr: {stderr}"
+    );
+
+    // A set variable under `?` still expands (no verdict).
+    let (stdout, _stderr, code) =
+        run("p757_x=set\nPS1='v${p757_x?nope}w'\np=${PS1@P}\necho \"xset:$? [$p]\"");
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "xset:0 [vsetw]");
+}

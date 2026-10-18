@@ -90,8 +90,6 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "shift",
     "shopt",
     "source",
-    #[cfg(windows)]
-    "sudo",
     "suspend",
     "test",
     "then",
@@ -239,11 +237,11 @@ where
 
     // help.def:183-187: no topic matched any pattern; the diagnostic names
     // the last pattern searched.  (`help bash' deliberately does nothing
-    // special, per the comment at help.def:129.)
+    // special, per the comment at help.def:129.) GNU has no `sudo` help
+    // topic either — rubash#759 item 4: with the sudo builtin hidden behind
+    // the embedding-host elevation handler, `help sudo` takes this same
+    // no-topics form instead of a hand-written page.
     if match_found == 0 {
-        if let Some(status) = try_windows_help_extension(&patterns, dflag, mflag, sflag, stdout)? {
-            return Ok(status);
-        }
         writeln!(
             stderr,
             "{}help: no help topics match `{last_pattern}'.  Try `help help' or `man -k {last_pattern}' or `info {last_pattern}'.",
@@ -253,41 +251,6 @@ where
     }
 
     Ok(EXECUTION_SUCCESS)
-}
-
-// rubash windows extension preserved from the previous implementation: the
-// windows-only `sudo` builtin keeps its hand-written help page for the exact
-// long-form invocation `help sudo`.  GNU has no such table entry.
-#[cfg(windows)]
-fn try_windows_help_extension<W>(
-    patterns: &[&str],
-    dflag: bool,
-    mflag: bool,
-    sflag: bool,
-    stdout: &mut W,
-) -> io::Result<Option<i32>>
-where
-    W: Write,
-{
-    if patterns == ["sudo"] && !dflag && !mflag && !sflag {
-        crate::builtins::sudo::print_help_with_io(stdout)?;
-        return Ok(Some(EXECUTION_SUCCESS));
-    }
-    Ok(None)
-}
-
-#[cfg(not(windows))]
-fn try_windows_help_extension<W>(
-    _patterns: &[&str],
-    _dflag: bool,
-    _mflag: bool,
-    _sflag: bool,
-    _stdout: &mut W,
-) -> io::Result<Option<i32>>
-where
-    W: Write,
-{
-    Ok(None)
 }
 
 fn find_topic(name: &str) -> Option<&'static HelpTopic> {
