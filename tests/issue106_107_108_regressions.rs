@@ -2,11 +2,19 @@
 //! b4cbcadc). Each test pins the GNU bash 5.3.0(1) baseline the reports
 //! quote.
 //!
-//! #106 — CRLF scripts: v1.1.1 (str::lines()) accepted CRLF; the GNU-fidelity
-//! rework of the line reader started keeping the trailing '\r' as word text,
-//! so `if`/`then`/`fi` in a CRLF file were executed as external commands.
-//! The lexer now treats '\r\n' as a line terminator (a lone '\r' not
-//! followed by '\n' is still ordinary word text).
+//! #106 — CRLF scripts: the v1.1.1 str::lines() reader accepted CRLF. The
+//! question of whether rubash should tolerate CRLF beyond GNU was settled
+//! on #731 (owner ruling 2026-10-18, correcting the issue's own premise):
+//! **a two-layer contract**. unix builds keep strict GNU parity (GNU bash
+//! 5.3.0 rejects a CRLF `if` with a syntax error, rc 2, and keeps the
+//! '\r' in heredoc bodies and trailing words — WSL 5.3.0 verified bytes
+//! in #731). windows builds keep the #140 product tolerance: the shipped
+//! oh-my-niu bundle is 100% CRLF, so the trailing '\r' of a CRLF line is
+//! stripped before lexing and from heredoc bodies, cfg!(windows)-gated —
+//! a deliberate Windows product decision (rubash#140, niubash#120), not
+//! a GNU-parity claim. A strict-parity opt-in on Windows is a future
+//! enhancement, never a default flip. A lone '\r' not followed by '\n'
+//! is still ordinary word text on both.
 //!
 //! #107 — `niu -c -l '<script>'` used to take the option right after `-c`
 //! as the command string; GNU reads commands from the FIRST NON-OPTION
@@ -40,11 +48,17 @@ fn write_crlf_script(rel_name: &str, body: &str) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// #106 — CRLF scripts must parse again
+// #106/#731 — CRLF scripts: a TWO-LAYER contract (owner ruling on #731,
+// 2026-10-18). windows = the #140 product tolerance (the CRLF compound
+// command parses; heredoc bodies come back clean of '\r'). unix = strict
+// GNU parity (WSL GNU 5.3.0 verified bytes: the CRLF `if` dies with
+// `syntax error: unexpected end of file from \`if' command on line 1`
+// (rc 2, empty stdout); the CRLF heredoc runs (the delimiter matches)
+// but every output line keeps its trailing '\r').
 // ---------------------------------------------------------------------------
 
 #[test]
-fn crlf_compound_commands_are_not_treated_as_external_commands() {
+fn crlf_compound_script_platform_contract() {
     let path = write_crlf_script(
         "issue106-compound.niu",
         "if true; then\n  echo compound-ok\nelse\n  echo compound-bad\nfi\n",
@@ -54,16 +68,30 @@ fn crlf_compound_commands_are_not_treated_as_external_commands() {
         &format!(". '{}'", path.to_string_lossy().replace('\\', "/")),
     ]);
     let _ = fs::remove_file(&path);
-    assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert_eq!(stdout, "compound-ok\n");
-    assert!(
-        !stderr.contains("command not found"),
-        "compound keywords leaked as commands: {stderr}"
-    );
+    if cfg!(windows) {
+        // #140 tolerance: the CRLF compound command parses and runs.
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout, "compound-ok\n");
+        assert!(
+            !stderr.contains("command not found"),
+            "compound keywords leaked as commands: {stderr}"
+        );
+    } else {
+        // GNU parity: the CRLF `if` is a syntax error, nothing executes.
+        assert_eq!(code, Some(2), "stdout: {stdout:?} stderr: {stderr}");
+        assert!(
+            stdout.is_empty(),
+            "the CRLF compound command must not execute: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("syntax error"),
+            "GNU rejects a CRLF `if` with a syntax error: {stderr}"
+        );
+    }
 }
 
 #[test]
-fn crlf_heredoc_delimiter_matches_and_body_is_clean() {
+fn crlf_heredoc_body_platform_contract() {
     let path = write_crlf_script(
         "issue106-heredoc.niu",
         "cat <<EOF\nhello\nEOF\necho heredoc-done\n",
@@ -73,8 +101,16 @@ fn crlf_heredoc_delimiter_matches_and_body_is_clean() {
         &format!(". '{}'", path.to_string_lossy().replace('\\', "/")),
     ]);
     let _ = fs::remove_file(&path);
-    assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert_eq!(stdout, "hello\nheredoc-done\n");
+    if cfg!(windows) {
+        // #140 tolerance: heredoc bodies come back clean of '\r'.
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout, "hello\nheredoc-done\n");
+    } else {
+        // GNU parity: the delimiter matches but every line keeps '\r'
+        // (WSL GNU 5.3.0: `hello\r\nheredoc-done\r\n`).
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout, "hello\r\nheredoc-done\r\n");
+    }
 }
 
 #[test]
