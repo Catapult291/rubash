@@ -437,12 +437,63 @@ fn normalize_snapshot(bytes: &[u8], scratch: &Path) -> Vec<u8> {
 }
 
 #[cfg(windows)]
+/// rubash#812: pin THIS_SH to a space-free copy of the engine for suite
+/// runs. The upstream assets expand ${THIS_SH} UNQUOTED
+/// (errors.tests:369 `${THIS_SH} ./errors10.sub`; errors10.sub:10-16 then
+/// re-invokes it for every `after exit:`/`after shift:` status line), and
+/// with no explicit value the engine auto-detects current_exe's FULL path
+/// (executor/init.rs). When the checkout lives under a path containing a
+/// space — any per-machine layout outside this repo — every
+/// sub-invocation word-splits (`.../no: No such file or directory`) and
+/// the errors slice's status lines COLLAPSE: a host-shape-dependent byte
+/// set that no snapshot normalizer can repair (the lines are absent, not
+/// misspelled; errors.snap:63-80 disappears whole). GNU never sees this
+/// because /usr/local/bin/bash has no space, and true-baseline.sh pins
+/// the GNU side contractually (`THIS_SH=$GNU_BASH`); pin the snapshot
+/// side the same way with a copy of this test's own engine named
+/// `bash.exe` under a space-free directory. The engine keeps an inherited
+/// THIS_SH exactly when its basename stem is sh/bash and the path exists
+/// (executor/init.rs `inherited_sh`), so the child resolves ${THIS_SH} to
+/// the pinned copy on every host; a bash-named wrapper is the blessed
+/// conventional-name configuration (same comment). Bytes on a space-free
+/// host are unchanged — the same engine runs either way — so this is not
+/// a re-record; a spaced-host run converges onto the committed bytes.
+fn space_free_this_sh(scratch: &Path) -> (PathBuf, Option<PathBuf>) {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
+    let mut candidates = vec![(scratch.join(".thissh"), None)];
+    if let Ok(sysroot) = std::env::var("SystemRoot") {
+        let sys_temp = Path::new(&sysroot)
+            .join("Temp")
+            .join(format!("rubash-812-thissh-{}", std::process::id()));
+        // The fallback must be cleaned up by the caller (it lives outside
+        // the per-suite scratch dir).
+        candidates.push((sys_temp.clone(), Some(sys_temp)));
+    }
+    for (cdir, cleanup) in candidates {
+        if cdir.to_string_lossy().contains(' ') {
+            continue;
+        }
+        if std::fs::create_dir_all(&cdir).is_ok() {
+            let shadow = cdir.join("bash.exe");
+            if std::fs::copy(&exe, &shadow).is_ok() {
+                return (shadow, cleanup);
+            }
+        }
+    }
+    panic!(
+        "rubash#812: no space-free directory available to pin THIS_SH; \
+         the snapshot lane cannot produce machine-independent bytes here"
+    );
+}
+
+#[cfg(windows)]
 fn run_suite_snapshot(suite: &str) {
     let root = manifest_dir();
     let src = root.join(UPSTREAM_TESTS);
     let dir = std::env::temp_dir().join(format!("rubash-snap-{suite}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create snapshot scratch dir");
+    let (this_sh, this_sh_cleanup) = space_free_this_sh(&dir);
 
     // Copy the suite and everything it may reference relative to cwd:
     // <suite>.tests plus every <suite>*.{sub,right} neighbor.
@@ -527,6 +578,11 @@ fn run_suite_snapshot(suite: &str) {
         .env_clear()
         .env("PATH", &path)
         .env("HOME", &dir)
+        // rubash#812: the pinned space-free THIS_SH (see
+        // space_free_this_sh) — the one deliberate variable, because the
+        // upstream assets invoke ${THIS_SH} unquoted and the auto-detected
+        // full exe path word-splits on any checkout layout with a space.
+        .env("THIS_SH", &this_sh)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -552,6 +608,9 @@ fn run_suite_snapshot(suite: &str) {
     let snap_path = root.join(SNAPSHOT_DIR).join(format!("{suite}.snap"));
     let normalized = normalize_snapshot(&out.stdout, &dir);
     let _ = std::fs::remove_dir_all(&dir);
+    if let Some(cleanup) = this_sh_cleanup {
+        let _ = std::fs::remove_dir_all(cleanup);
+    }
 
     if std::env::var("RUBASH_REGRESSION_RECORD").as_deref() == Ok("1") {
         std::fs::write(&snap_path, &normalized).expect("record snapshot");
