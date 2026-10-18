@@ -168,3 +168,33 @@ fn working_directory_dollar_stays_literal() {
         "trailing component intact: {rendered}"
     );
 }
+
+/// CR follow-up (F1): the subst.c:4392-4418 containment — a malformed
+/// `${...}` inside the prompt value REPORTS and falls back to the literal
+/// decoded string without failing the enclosing command (GNU probe:
+/// `PS1='a${1x}b'; p=${PS1@P}` keeps rc 0 with p literal).
+#[test]
+fn malformed_braced_parameter_contained_in_prompt_transform() {
+    let mut exec = Executor::new();
+
+    run(&mut exec, "PS1='a${1x}b'; p757_out=${PS1@P}");
+    assert_eq!(exec.last_exit_code(), 0, "assignment rc stays 0");
+    assert_eq!(
+        exec.get_env("p757_out"),
+        Some("a${1x}b"),
+        "value falls back to the literal decoded prompt"
+    );
+
+    // The `?` operator verdict reports instead of substituting the message
+    // (GNU probe: `PS1='er:${nose?bad} t'` -> stderr `nose: bad`, literal).
+    run(
+        &mut exec,
+        "unset p757_nose; PS1='er:${p757_nose?bad} t'; p757_out=${PS1@P}",
+    );
+    assert_eq!(exec.last_exit_code(), 0);
+    assert_eq!(
+        exec.get_env("p757_out"),
+        Some("er:${p757_nose?bad} t"),
+        "`?` verdict never substitutes the message into the value"
+    );
+}

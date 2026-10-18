@@ -71,10 +71,39 @@ impl Executor {
         // contract the `@P` transform channel gets from
         // expand_embedded_parameters_double_quoted.
         let rendered = if self.prompt_expansion_enabled() {
-            self.expand_embedded_parameters_mut_with_context(
+            // subst.c:4392-4418 containment: a verdict inside the prompt
+            // word keeps its diagnostic and falls back to the decoded
+            // string; the reader's status words are restored below either
+            // way (rubash#604 probes).
+            let bad_sub_before = self.shell_state.parameter_bad_substitution.replace(false);
+            let arith_err_before = self.shell_state.arithmetic_expansion_error.replace(false);
+            let arith_fatal_before = self.shell_state.arithmetic_fatal_error.replace(false);
+            let arith_nonfatal_before = self.shell_state.arithmetic_nonfatal_error.replace(false);
+            let expanded = self.expand_embedded_parameters_mut_with_context(
                 &decoded,
                 SubstitutionQuoteContext::DoubleQuoted,
-            )
+            );
+            let failed = self
+                .shell_state
+                .parameter_bad_substitution
+                .replace(bad_sub_before)
+                | self
+                    .shell_state
+                    .arithmetic_expansion_error
+                    .replace(arith_err_before)
+                | self
+                    .shell_state
+                    .arithmetic_fatal_error
+                    .replace(arith_fatal_before)
+                | self
+                    .shell_state
+                    .arithmetic_nonfatal_error
+                    .replace(arith_nonfatal_before);
+            if failed {
+                decoded
+            } else {
+                expanded
+            }
         } else {
             decoded
         };

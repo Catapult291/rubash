@@ -2612,3 +2612,65 @@ fn sudo_is_not_reported_as_a_builtin() {
         "`type sudo` must not report a builtin: {stdout}"
     );
 }
+
+/// CR follow-up on rubash#757 (F1): the prompt-pass containment. GNU
+/// subst.c:4392-4418 expand_prompt_string runs the expansion with
+/// `no_longjmp_on_fatal_error = 1` and RETURNS THE PASSED STRING when the
+/// expansion verdicts: the diagnostic stands, the prompt value falls back
+/// to the decoded input, and the enclosing command's status is untouched.
+/// Before the containment a malformed `${...}` inside PS1 failed the whole
+/// assignment (rc 1, variable unset).
+/// GNU 5.3.0 differential (WSL stdin probes 2026-10-18, probe-f1/f1b/f1c):
+///   PS1='a${1x}b'; p=${PS1@P}  -> stderr `a${1x}b: bad substitution`,
+///                                 rc 0, p=`a${1x}b`, next line runs
+///   PS1='a$((1x))b'            -> arith diagnostic, rc 0, literal
+///   PS1='a${bad'               -> `a${bad: bad substitution`, rc 0, literal
+///   PS1='er:${nose?bad} t'     -> stderr `nose: bad`, rc 0, literal text
+///   PS1='a$((1/0))b'           -> division diagnostic, rc 0, literal
+#[test]
+fn prompt_expansion_failure_contained_like_gnu() {
+    let dir = case_scratch("757.containment");
+    let run = |code: &str| {
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    };
+
+    // Bad substitution: diagnostic on stderr, value literal, rc 0, tail runs.
+    let (stdout, stderr, code) =
+        run("PS1='a${1x}b'\np=${PS1@P}\necho \"rc=$? p=[$p]\"\necho after");
+    assert_eq!(code, Some(0), "list rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "rc=0 p=[a${1x}b]\nafter",
+        "stdout; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a${1x}b: bad substitution"),
+        "diagnostic; stderr:\n{stderr}"
+    );
+
+    // Arithmetic verdict, unterminated brace, `?` operator: same contract.
+    let (stdout, stderr, code) = run("PS1='a$((1x))b'\np=${PS1@P}\necho \"arith:$? [$p]\"\n\
+         PS1='a${bad'\nq=${PS1@P}\necho \"unterm:$? [$q]\"\n\
+         unset p757_nose\nPS1='er:${p757_nose?bad} t'\nr=${PS1@P}\necho \"qmark:$? [$r]\"");
+    assert_eq!(code, Some(0), "list rc; stderr:\n{stderr}");
+    assert_eq!(
+        stdout, "arith:0 [a$((1x))b]\nunterm:0 [a${bad]\nqmark:0 [er:${p757_nose?bad} t]",
+        "stdout; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("value too great for base"), "{stderr}");
+    assert!(stderr.contains("a${bad: bad substitution"), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line.contains("p757_nose: bad")),
+        "`?` operator reports on stderr: {stderr}"
+    );
+
+    // A set variable under `?` still expands (no verdict).
+    let (stdout, _stderr, code) =
+        run("p757_x=set\nPS1='v${p757_x?nope}w'\np=${PS1@P}\necho \"xset:$? [$p]\"");
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "xset:0 [vsetw]");
+}

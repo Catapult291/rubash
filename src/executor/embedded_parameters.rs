@@ -93,6 +93,14 @@ impl Executor {
     /// parameter/command/arithmetic/backtick expansion still runs (issue
     /// #757: bare special parameters must expand, `shopt -u promptvars`
     /// must gate the pass itself).
+    ///
+    /// Containment (subst.c:4392-4418): expand_prompt_string runs the
+    /// expansion with `no_longjmp_on_fatal_error = 1` and RETURNS THE
+    /// PASSED STRING when the expansion verdicts — the diagnostic stands
+    /// (printed at the verdict site), the prompt value falls back to the
+    /// decoded input, and the enclosing command's status is untouched
+    /// (`PS1='a${1x}b'; p=${PS1@P}` keeps rc 0 with p literal; WSL GNU
+    /// 5.3.0 probes probe-f1/probe-f1b/probe-f1c).
     pub(in crate::executor) fn expand_embedded_parameters_double_quoted(
         &self,
         word: &str,
@@ -102,8 +110,33 @@ impl Executor {
             return word.to_string();
         }
         EXPAND_DEPTH.with(|d| d.set(depth + 1));
+        // Snapshot the expansion-verdict latches; a false→true transition
+        // inside the walk is the walk's own failure verdict.
+        let bad_sub_before = self.shell_state.parameter_bad_substitution.replace(false);
+        let arith_err_before = self.shell_state.arithmetic_expansion_error.replace(false);
+        let arith_fatal_before = self.shell_state.arithmetic_fatal_error.replace(false);
+        let arith_nonfatal_before = self.shell_state.arithmetic_nonfatal_error.replace(false);
         let result = self.expand_embedded_parameters_inner(word, false, false, false, true);
+        let failed = self
+            .shell_state
+            .parameter_bad_substitution
+            .replace(bad_sub_before)
+            | self
+                .shell_state
+                .arithmetic_expansion_error
+                .replace(arith_err_before)
+            | self
+                .shell_state
+                .arithmetic_fatal_error
+                .replace(arith_fatal_before)
+            | self
+                .shell_state
+                .arithmetic_nonfatal_error
+                .replace(arith_nonfatal_before);
         EXPAND_DEPTH.with(|d| d.set(depth));
+        if failed {
+            return word.to_string();
+        }
         result
     }
 
@@ -515,7 +548,73 @@ impl Executor {
                     let _site_guard = (!whole_braced).then(|| {
                         crate::executor::expand_braced_indices::SubSiteGuard::new(this_frag)
                     });
-                    let name = collect_braced_parameter_name(&mut chars);
+                    let (name, terminated) =
+                        crate::executor::command_subst_helpers::collect_braced_parameter_body(
+                            &mut chars,
+                        );
+                    if double_quoted {
+                        // Prompt-pass verdicts (GNU expand_prompt_string runs
+                        // under no_longjmp_on_fatal_error, subst.c:4407, and
+                        // falls back to the original string on any verdict,
+                        // subst.c:4413-4418) — raise them HERE so the pass
+                        // containment can act:
+                        //
+                        // - an unterminated `${body` is the bad-substitution
+                        //   default naming the whole word (GNU 5.3.0 probe:
+                        //   `PS1='a${bad'` prints `a${bad: bad
+                        //   substitution` and the value stays literal);
+                        // - the `?`/`:?` error operator REPORTS
+                        //   (subst.c:10403-10418) instead of substituting
+                        //   the message into the value — the value falls
+                        //   back with the enclosing command still at 0.
+                        if !terminated {
+                            self.write_diagnostic_fd2(
+                                format!(
+                                    "{}{}: bad substitution\n",
+                                    self.diagnostic_prefix(),
+                                    crate::executor::expand_word::bad_substitution_display(word)
+                                )
+                                .as_bytes(),
+                            );
+                            self.shell_state.parameter_bad_substitution.set(true);
+                            continue;
+                        }
+                        if let Some((error_name, message, require_non_empty)) =
+                            crate::executor::parameter_ops::parse_parameter_error_operator(
+                                &name,
+                                self.posix_mode_enabled(),
+                            )
+                        {
+                            let value = self.parameter_error_value(&error_name);
+                            let is_error = if require_non_empty {
+                                value.as_deref().map(str::is_empty).unwrap_or(true)
+                            } else {
+                                value.is_none()
+                            };
+                            if is_error {
+                                let message = if message.is_empty() {
+                                    if require_non_empty {
+                                        "parameter null or not set".to_string()
+                                    } else {
+                                        "parameter not set".to_string()
+                                    }
+                                } else {
+                                    self.expand_parameter_word(&message)
+                                };
+                                self.write_diagnostic_fd2(
+                                    format!(
+                                        "{}{}: {}\n",
+                                        self.diagnostic_prefix(),
+                                        error_name,
+                                        message
+                                    )
+                                    .as_bytes(),
+                                );
+                                self.shell_state.parameter_bad_substitution.set(true);
+                                continue;
+                            }
+                        }
+                    }
                     // A bad-substitution diagnostic inside this fragment must
                     // name the whole enclosing word (GNU subst.c:10278),
                     // not just the `${...}` span (rubash#758).
