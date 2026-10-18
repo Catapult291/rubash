@@ -233,7 +233,7 @@ impl Executor {
                         )?;
                         writeln!(
                             stderr,
-                            "export: usage: export [-fn] [name[=value] ...] or export -p"
+                            "export: usage: export [-fn] [name[=value] ...] or export -p [-f]"
                         )?;
                         return Ok(2);
                     }

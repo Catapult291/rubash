@@ -133,10 +133,22 @@ where
                     func_export = true;
                 }
                 other => {
-                    writeln!(stderr, "rubash: export: -{}: invalid option", other)?;
+                    // rubash#705 R7.4: GNU's get_name_for_error shape —
+                    // `<script>: line N:` in script mode, `bash: line N:`
+                    // under -c, bare `bash:` with neither. The old
+                    // hardcoded `rubash: export:` prefix was the
+                    // mixed-branding holdout on this path.
+                    let prefix = match (
+                        env_vars.get("__RUBASH_SCRIPT_NAME"),
+                        env_vars.get("__RUBASH_CURRENT_LINE"),
+                    ) {
+                        (Some(script), Some(line)) => format!("{script}: line {line}: "),
+                        _ => "bash: ".to_string(),
+                    };
+                    writeln!(stderr, "{prefix}export: -{other}: invalid option")?;
                     writeln!(
                         stderr,
-                        "export: usage: export [-fn] [name[=value] ...] or export -p"
+                        "export: usage: export [-fn] [name[=value] ...] or export -p [-f]"
                     )?;
                     return Ok(EX_USAGE);
                 }

@@ -48,20 +48,45 @@ where
         return Ok(ExitAction::Exit(EX_USAGE));
     }
 
-    let status = match parse_exit_status(args[0]) {
+    // GNU builtins/common.c get_exitstat (bash 5.3): ISOPTION(word, '-')
+    // matches "--" exactly and a leading `--` is skipped before the status
+    // word — `exit --` exits with $?, `exit -- 1` exits 1 (2026-10-18
+    // probes X4/X5). `exit -` is not skipped: valid_number("-") fails and
+    // it becomes the numeric argument error.
+    let rest = if args[0] == "--" {
+        &args[1..]
+    } else {
+        &args[..]
+    };
+
+    if rest.is_empty() {
+        return Ok(ExitAction::Exit(normalize_status(last_status)));
+    }
+
+    let status = match parse_exit_status(rest[0]) {
         Some(status) => status,
         None => {
+            // The executor's execute_exit_command_word intercepts this
+            // shape with the reader prolog (`bash: line N:` /
+            // `<script>: line N:`); this direct-call fallback keeps the
+            // canonical shell name for the rare non-reader callers and
+            // the unit tests below. The previous helper read
+            // __RUBASH_* from the PROCESS environment, which the engine
+            // only keeps in its internal env map — it always fell back,
+            // dropping the line segment (issue #705 R7.4).
             writeln!(
                 stderr,
-                "rubash: exit: {}: numeric argument required",
-                args[0]
+                "{}exit: {}: numeric argument required",
+                "bash: ", rest[0]
             )?;
             return Ok(ExitAction::Exit(EX_USAGE));
         }
     };
 
-    if args.len() > 1 {
-        writeln!(stderr, "rubash: exit: too many arguments")?;
+    if rest.len() > 1 {
+        // Same shape: the executor intercepts the too-many error with the
+        // reader prolog before this builtin path runs.
+        writeln!(stderr, "{}exit: too many arguments", "bash: ")?;
         return Ok(ExitAction::Continue(EXECUTION_FAILURE));
     }
 

@@ -19,7 +19,7 @@
 //! Every test is wrapped in a short deadline because the failure mode is a
 //! hang, not a wrong byte.
 
-#![cfg(windows)]
+#![cfg(any(windows, unix))]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -108,16 +108,28 @@ fn run_rubash_script(script: &str) -> RunOutcome {
 /// normalized to `/` (CreateProcess accepts them and the shell will not
 /// treat `\` as an escape).
 fn resolve_tool(name: &str) -> String {
+    #[cfg(windows)]
     let with_exe = format!("{name}.exe");
+    #[cfg(windows)]
+    let separator = ';';
+    #[cfg(unix)]
+    let separator = ':';
     for dir in std::env::var("PATH")
         .unwrap_or_default()
-        .split(';')
+        .split(separator)
         .filter(|entry| !entry.is_empty())
     {
-        for candidate in [format!("{dir}\\{with_exe}"), format!("{dir}\\{name}")] {
+        #[cfg(windows)]
+        let candidates = [format!("{dir}\\{with_exe}"), format!("{dir}\\{name}")];
+        #[cfg(unix)]
+        let candidates = [format!("{dir}/{name}")];
+        for candidate in candidates {
             let path = PathBuf::from(&candidate);
             if path.is_file() {
+                #[cfg(windows)]
                 return path.to_string_lossy().replace('\\', "/");
+                #[cfg(unix)]
+                return path.to_string_lossy().into_owned();
             }
         }
     }

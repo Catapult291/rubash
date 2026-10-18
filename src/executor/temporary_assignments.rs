@@ -71,6 +71,18 @@ impl Executor {
     /// to ExpansionFailure(1) — the same DISCARD contract.
     fn fail_compound_array_assignment(&mut self, base_name: &str, pattern: &str) -> bool {
         self.report_failglob(pattern);
+        // rubash#753: GNU's failglob discard abandons the rest of the
+        // failing command's LOGICAL line, not just this assignment —
+        // `{ a=(/no/such/*.zzz); echo in; }; echo after` prints neither
+        // `in` nor `after` (oracle probe). Returning false maps the
+        // failure to ExpansionFailure(1) at every caller, but that Err is
+        // swallowed by the compound that carries the assignment (brace
+        // pipeline, function frame, if body, case body), so arm the
+        // reader-level abandon alongside it — the eval/source boundaries
+        // absorb the class flag when the assignment ran inside an eval'd
+        // string or a sourced file.
+        self.raise_evalerror_abort();
+        self.evalerror_failglob_pending.set(true);
         if !self.shell_state.env_vars.contains_key(base_name)
             && !is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, base_name)
         {

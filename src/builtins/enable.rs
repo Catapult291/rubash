@@ -8,6 +8,8 @@ use std::io::{self, Write};
 
 const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
+/// GNU shell.h EX_BADUSAGE: usage errors exit 2.
+const EX_USAGE: i32 = 2;
 
 const DISABLED_BUILTINS: &str = "__RUBASH_DISABLED_BUILTINS";
 const ALL_BUILTINS: &[&str] = &[
@@ -127,16 +129,42 @@ where
                             break;
                         }
                         let Some(value) = args.get(index + 1) else {
-                            writeln!(stderr, "rubash: enable: -f: option requires an argument")?;
-                            return Ok(EXECUTION_FAILURE);
+                            writeln!(
+                                stderr,
+                                "{}enable: -f: option requires an argument",
+                                diagnostic_prefix(env_vars)
+                            )?;
+                            writeln!(
+                                stderr,
+                                "enable: usage: enable [-a] [-dnps] [-f filename] [name ...]"
+                            )?;
+                            // rubash#705 R7.4: GNU enable.def routes a
+                            // missing -f operand through internal_getopt's
+                            // `?` into the default arm — builtin_usage()
+                            // + `return (EX_USAGE)` (enable.def:163): the
+                            // usage failure is 2, not EXECUTION_FAILURE.
+                            // (GNU 5.3.0 probe: `enable -f` exits 2.)
+                            return Ok(EX_USAGE);
                         };
                         load_file = Some(value.clone());
                         index += 1;
                         break;
                     }
                     _ => {
-                        writeln!(stderr, "rubash: enable: -{option}: invalid option")?;
-                        return Ok(EXECUTION_FAILURE);
+                        writeln!(
+                            stderr,
+                            "{}enable: -{option}: invalid option",
+                            diagnostic_prefix(env_vars)
+                        )?;
+                        writeln!(
+                            stderr,
+                            "enable: usage: enable [-a] [-dnps] [-f filename] [name ...]"
+                        )?;
+                        // rubash#705 R7.4: the default getopt arm in
+                        // enable.def:161-163 returns EX_USAGE for an
+                        // invalid option. (GNU 5.3.0 probe: `enable -Q`
+                        // exits 2.)
+                        return Ok(EX_USAGE);
                     }
                 }
             }
@@ -299,5 +327,9 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
         return format!("{script}: line {line}: ");
     }
 
-    "rubash: ".to_string()
+    // rubash#705 R7.4: GNU's report_prolog falls back to the shell name
+    // ("bash:") when neither a script nor a line context exists. The old
+    // `rubash:` fallback was a second brand leaking into user-visible
+    // diagnostics.
+    "bash: ".to_string()
 }

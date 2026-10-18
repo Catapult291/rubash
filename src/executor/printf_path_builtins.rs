@@ -109,7 +109,12 @@ impl Executor {
         // marks the EXIT trap whose guard is open at every depth (see
         // run_exit_trap_for_status_with_output_redirects). Outside a trap
         // action it is the current $? (last_command_exit_value).
-        let last_status = if args.is_empty() {
+        // GNU builtins/common.c get_exitstat (bash 5.3): a leading `--` is
+        // skipped before the status word, so `exit --` is argument-less for
+        // this purpose — inside a trap action it exits with
+        // trap_saved_exit_value exactly like a bare `exit`.
+        let args_are_empty = args.is_empty() || (args.len() == 1 && args[0] == "--");
+        let last_status = if args_are_empty {
             let trap_context = self.trap_saved_exit_value.is_some()
                 && !self.debug_trap_running
                 && (self.trap_saved_exit_context == usize::MAX
@@ -410,23 +415,34 @@ impl Executor {
             // (rubash#699 R1.4). File/Stderr/other bindings go through the
             // same ordered machinery every other buffered builtin uses.
             if !stdout_default.is_empty() {
-                if matches!(
-                    self.fd_table.write_endpoint(1),
-                    Some(FdWriteEndpoint::Stdout)
-                ) {
-                    self.write_default_stdout(&stdout_default)?;
+                if self.route_builtin_buffered_output(cmd, &stdout_default, &[])? {
+                    // Routed through the command's ordered redirect state.
                 } else {
-                    let _ = self.route_builtin_buffered_output(cmd, &stdout_default, &[])?;
+                    // The walk declines only when the command carries no
+                    // output redirect (external_redirects'
+                    // write_external_captured_streams runs the same
+                    // fallback). write_default_stdout resolves the fd
+                    // table — Stdout, an `exec >file` File binding, a
+                    // `2>&1` fd-1 alias, or Closed — exactly where the
+                    // ordered walk would have put the bytes. The old
+                    // endpoint==Stdout shortcut covered only that one
+                    // shape and let an `exec >file` binding drop the
+                    // output on the floor.
+                    self.write_default_stdout(&stdout_default)?;
                 }
             }
             if !stderr_default.is_empty() {
-                if matches!(
-                    self.fd_table.write_endpoint(2),
-                    Some(FdWriteEndpoint::Stdout)
-                ) {
-                    self.write_default_stdout(&stderr_default)?;
+                if self.route_builtin_buffered_output(cmd, &[], &stderr_default)? {
+                    // Routed through the command's ordered redirect state.
                 } else {
-                    let _ = self.route_builtin_buffered_output(cmd, &[], &stderr_default)?;
+                    // Same contract as the stdout arm above. Without the
+                    // fallback an unredirected `cd a b` / `cd nosuch` lost
+                    // its diagnostic entirely: the walk declines (no
+                    // output redirect on the command), the old
+                    // `let _ =` swallowed the false return, and the bytes
+                    // never reached fd 2 (rubash#705 R7.4's branding probe
+                    // found `cd` printing nothing at all, rc 2).
+                    self.write_default_stderr(&stderr_default)?;
                 }
             }
             (status, stdout_buffer, stderr_buffer)

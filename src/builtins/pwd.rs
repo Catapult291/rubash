@@ -66,7 +66,19 @@ where
                 'L' => mode = Mode::Logical,
                 'P' => mode = Mode::Physical,
                 other => {
-                    writeln!(stderr, "rubash: pwd: -{}: invalid option", other)?;
+                    // rubash#705 R7.4: GNU's get_name_for_error shape —
+                    // `<script>: line N:` in script mode, `bash: line N:`
+                    // under -c, bare `bash:` with neither. The old
+                    // hardcoded `rubash: pwd:` prefix was the
+                    // mixed-branding holdout on this path.
+                    let prefix = match (
+                        env_vars.get("__RUBASH_SCRIPT_NAME"),
+                        env_vars.get("__RUBASH_CURRENT_LINE"),
+                    ) {
+                        (Some(script), Some(line)) => format!("{script}: line {line}: "),
+                        _ => "bash: ".to_string(),
+                    };
+                    writeln!(stderr, "{prefix}pwd: -{other}: invalid option")?;
                     writeln!(stderr, "pwd: usage: pwd [-LP]")?;
                     return Ok(EX_USAGE);
                 }

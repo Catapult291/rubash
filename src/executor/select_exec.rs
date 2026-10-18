@@ -117,6 +117,12 @@ impl Executor {
                         // failglob is a fatal word-expansion error (GNU):
                         // the select command fails with status 1 and the
                         // next line runs.
+                        // rubash#753: arm the reader-level abandon alongside
+                        // the Err (same contract as the for head) so a
+                        // compound carrying the select cannot resume the
+                        // failing line.
+                        self.raise_evalerror_abort();
+                        self.evalerror_failglob_pending.set(true);
                         return Err(ExecuteError::ExpansionFailure(1));
                     }
                 }

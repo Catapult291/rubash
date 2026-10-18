@@ -87,6 +87,14 @@ where
             "{}cd: too many arguments",
             diagnostic_prefix(env_vars)
         )?;
+        // GNU builtins/cd.def:329-330: the too-many-arguments refusal is
+        // `builtin_error` + `return (EX_USAGE)` — status 2. An earlier
+        // pass of this fix recorded EXECUTION_FAILURE (1) from a mis-read
+        // probe; the bash 5.3.0 source AND a direct probe of the
+        // 5.3.0(1)-release binary both give 2 (`bash -c 'cd a b'` exits
+        // 2, 2026-10-18). The diagnostic itself was being dropped by the
+        // executor's buffered-stdout flush (printf_path_builtins.rs),
+        // fixed there.
         return Ok(EX_USAGE);
     }
 

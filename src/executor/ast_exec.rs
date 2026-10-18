@@ -67,6 +67,8 @@ impl Executor {
         self.evalerror_pending.set(false);
         self.nounset_force_eof.set(false);
         self.evalerror_subscript_pending.set(false);
+        self.evalerror_failglob_pending.set(false);
+        self.evalerror_exit_toomany_pending.set(false);
         self.evalerror_line.set(None);
         self.reader_command_line.set(None);
         // rubash#353: this run's unit (file / -c string) was upfront-lexed
@@ -131,6 +133,25 @@ impl Executor {
             self.evalerror_pending.set(false);
             self.evalerror_line.set(None);
         }
+        // rubash#705: an exit too-many discard armed by this run's LAST
+        // command never reaches the in-loop abandon check — the loop is
+        // already over. Mirror the nounset tail conversion: at the true
+        // reader top under `-c`, no_args' top_level_cleanup unwound every
+        // parse_and_execute level and shell.c:1477 run_one_command's
+        // DISCARD catch ends the shell with status 1 (`bash -c 'exit 1 2'`
+        // exits 1 — probe W4). The evalerror_pending stays armed so a
+        // nested driver (a sourced file's run_source_impl, which returns
+        // the status to the source builtin) still abandons its caller's
+        // remaining commands through the in-loop check. In script mode the
+        // pending is simply stale now: the reader run is over, $? already
+        // holds 2 (probe W5: a script ending in `exit 1 2` exits 2), and
+        // the next execute_ast clears it at entry.
+        if self.evalerror_exec_depth.get() == 0 && self.evalerror_exit_toomany_pending.get() {
+            if self.shell_state.env_vars.contains_key("__RUBASH_IS_C") {
+                return Err(ExecuteError::ExitCode(1));
+            }
+            self.evalerror_exit_toomany_pending.set(false);
+        }
         result
     }
 
@@ -175,6 +196,8 @@ impl Executor {
                     self.evalerror_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
+                    self.evalerror_failglob_pending.set(false);
+                    self.evalerror_exit_toomany_pending.set(false);
                     self.evalerror_line.set(None);
                     if let Some(saved_state) = subshell_state.take() {
                         self.restore_flat_subshell(saved_state, subshell_cwd.take());
@@ -337,6 +360,8 @@ impl Executor {
                         self.evalerror_pending.set(false);
                         self.nounset_force_eof.set(false);
                         self.evalerror_subscript_pending.set(false);
+                        self.evalerror_failglob_pending.set(false);
+                        self.evalerror_exit_toomany_pending.set(false);
                         self.evalerror_line.set(None);
                     }
                     index += 1;
@@ -352,18 +377,27 @@ impl Executor {
                     self.evalerror_pending.set(false);
                     self.nounset_force_eof.set(false);
                     self.evalerror_subscript_pending.set(false);
+                    self.evalerror_failglob_pending.set(false);
+                    self.evalerror_exit_toomany_pending.set(false);
                     self.evalerror_line.set(None);
                     index += 1;
                     continue;
                 }
                 if self.evalerror_exec_depth.get() > 1
-                    && self.eval_list_depth.get() != Some(self.evalerror_exec_depth.get())
+                    && (self.eval_list_depth.get() != Some(self.evalerror_exec_depth.get())
+                        || self.evalerror_exit_toomany_pending.get())
                 {
                     // Nested function/loop/subshell bodies unwind silently on
                     // abort — except the eval'd top list itself (rubash#637):
                     // GNU's parse_and_execute loops per line inside eval, so
                     // falling through lets the normal line-skip logic run
-                    // later lines and eval return their status.
+                    // later lines and eval return their status. The exit
+                    // too-many class is the exception to that exception
+                    // (rubash#705): no_args' top_level_cleanup pops every
+                    // parse_and_execute level including the eval'd one, so
+                    // the WHOLE eval'd string is abandoned (`eval "exit 1 2
+                    // \necho IN"` never prints IN — probe V2) and the
+                    // pending discard keeps unwinding to the reader.
                     return Ok(());
                 }
                 if self.evalerror_line.get().is_none() {
@@ -383,6 +417,48 @@ impl Executor {
                         self.exit_code = self.expansion_fatal_status();
                     } else {
                         self.exit_code = 1;
+                    }
+                    // rubash#705: the exit too-many class leaves 2, not the
+                    // plain DISCARD 1 — no_args ran set_exit_status
+                    // (EX_BADUSAGE) before its jump, and the reader keeps a
+                    // non-zero value (eval.c:115-117 only rewrites a zero).
+                    // Consumed here: the eval'd list already unwound whole
+                    // (the nested check above), so no eval boundary owns
+                    // this class.
+                    // rubash#705: the exit too-many class leaves 2, not the
+                    // plain DISCARD 1 — no_args ran set_exit_status
+                    // (EX_BADUSAGE) before its jump, and the reader keeps a
+                    // non-zero value (eval.c:115-117 only rewrites a zero).
+                    // Consumed here: the eval'd list already unwound whole
+                    // (the nested check above), so no eval boundary owns
+                    // this class. The `-c` stop below rides THIS class
+                    // only — the other discard classes keep GNU's
+                    // line-contained shape under `-c` (probe G1:
+                    // `bash -c 'shopt -s failglob; set -- nope*\necho
+                    // after'` prints after).
+                    if self.evalerror_exit_toomany_pending.replace(false) {
+                        self.exit_code = 2;
+                        // rubash#705: under `-c` the discard never returns to
+                        // this reader — no_args' top_level_cleanup unwound
+                        // every parse_and_execute level and shell.c:1477
+                        // run_one_command's DISCARD catch ends the shell with
+                        // status 1, dropping every remaining command of the
+                        // -c string regardless of line (probe P2: `bash -c
+                        // 'exit 1 2\necho AFTER'` prints nothing more).
+                        // Contained inside a `( )` region — GNU's forked
+                        // subshell never sees the -c catch (probe P6). The
+                        // Err converts through script_driver's execute_ast
+                        // arm: exit_jump_pending stops any grouped read and
+                        // finish_shell runs the EXIT trap with $?=1 (probe
+                        // T1).
+                        if self.evalerror_exec_depth.get() == 1
+                            && subshell_state.is_none()
+                            && self.shell_state.env_vars.contains_key("__RUBASH_IS_C")
+                        {
+                            self.evalerror_pending.set(false);
+                            self.evalerror_line.set(None);
+                            return Err(ExecuteError::ExitCode(1));
+                        }
                     }
                     // The subscript class served its purpose once the abandon
                     // fires (rubash#637) — except anywhere inside an eval
@@ -417,6 +493,8 @@ impl Executor {
                 self.evalerror_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
+                self.evalerror_failglob_pending.set(false);
+                self.evalerror_exit_toomany_pending.set(false);
                 self.evalerror_line.set(None);
             }
             if self.evalerror_exec_depth.get() == 1 {
@@ -1412,6 +1490,8 @@ impl Executor {
                 self.evalerror_pending.set(false);
                 self.nounset_force_eof.set(false);
                 self.evalerror_subscript_pending.set(false);
+                self.evalerror_failglob_pending.set(false);
+                self.evalerror_exit_toomany_pending.set(false);
                 self.evalerror_line.set(None);
                 if let Some(saved_state) = subshell_state.take() {
                     self.restore_flat_subshell(saved_state, subshell_cwd.take());

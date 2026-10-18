@@ -1002,547 +1002,1428 @@ fn canary_bash_completion_bash_n_when_corpus_present() {
     );
 }
 
-/// niubash#362: `&` on a shell carrying a large function table
-/// must not die with "File name too long".
-///
-/// The async child is re-exec'd with the WHOLE function table serialized
-/// into its `-c` script (`compound_exec::background_command_source`). On
-/// Windows that string rides `CreateProcessW`'s lpCommandLine, capped at
-/// 32767 UTF-16 units, so a shell with a few thousand functions aborts the
-/// spawn with ERROR_FILENAME_EXCED_RANGE — surfaced as
-/// `niu: File name too long` — even for a trivial `echo hello &`. Unix has
-/// the analogous per-argument execve cap (MAX_ARG_STRLEN, 128 KiB). The
-/// spawn side now hands an over-budget script to the child through a temp
-/// file named by __RUBASH_CMD_FILE, and the entry point splices it back into
-/// the `-c` operand before parsing, so argv semantics are unchanged.
-///
-/// The generated script (~6000 functions, ~200 KB serialized) clears BOTH
-/// caps, so this fails pre-fix on Windows AND on Unix; the background child
-/// must still print its output and exit 0.
-#[test]
-fn background_command_with_large_function_table_runs() {
-    let _guard = HEAVY_TEST_LOCK.lock().unwrap();
-    let dir = std::env::temp_dir().join(format!("rubash-362-{}", std::process::id()));
+// ---------------------------------------------------------------------------
+// Issue case catalogue (rubash#746).
+//
+// Every fix below carries the id `<issue>.<n>`: the module is
+// `issue_<issue>` and the test is `case_<n>_...`, so a failing CI name points
+// straight at its issue (`issue_721::case_2_compound_loop_reports_enoent`).
+//
+// Why these live in `--test regression` instead of `tests/issueNNN_*.rs`:
+// the per-issue files are only reached by a full `cargo test`, and the only
+// target the Windows gate runs is `--test regression` (ci.yml, job
+// `regression`). A case outside that target cannot ratchet. The module name
+// keeps the issue reference that §3.4 of
+// docs/pitfall-taxonomy-and-governance.md requires, and the test name keeps
+// the #746 catalogue id.
+//
+// Case states (#746): a `ratchet` case is `must-match` and MUST turn red when
+// the fix is reverted — that is the §3.4 criterion. A `control` case asserts a
+// behaviour the fix must NOT change (a live fd still reads, `-n` still splits);
+// it passes on the pre-fix engine by construction, so it is never counted as
+// the issue's ratchet. A `guard` case pins a fix DIRECTION: it is green on the
+// original bug and on the final fix, and red on the wrong fix that was tried in
+// between. States are marked in each case's doc comment.
+//
+// GNU Bash 5.3.0 is the sole oracle, stdout and stderr are asserted separately
+// (a single `2>&1` capture interleaves differently and produced a false
+// positive in the #706 sweep).
+//
+// Revert check for this catalogue (2026-10-18): restoring all 25 touched `src/`
+// files to their pre-fix parents left the engine compiled but turned 18 of the
+// 20 cases red. The two that stayed green are exactly the cases marked
+// `[control]` / `[guard]` below, which is the expected shape. The issue_703
+// batch (same day): reverting the comsub-collector fix turned 4 of its 5
+// cases red; the survivor is the 703.2 control (the shapes the issue report
+// named as already working).
+// ---------------------------------------------------------------------------
+
+/// Per-case scratch directory. The case id keeps concurrent cases of the same
+/// issue from sharing one directory under the harness's default parallelism.
+fn case_scratch(case: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rubash-{case}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch");
+    dir
+}
 
-    let mut script = String::new();
-    for i in 0..6000 {
-        script.push_str(&format!("f{i}() {{ local v={i}; : \"$v\"; }}\n"));
+/// niubash#362: `&` on a shell carrying a large function table must not die
+/// with "File name too long".
+///
+/// The async child is re-exec'd with the WHOLE function table serialized into
+/// its `-c` script (`compound_exec::background_command_source`). On Windows
+/// that string rides `CreateProcessW`'s lpCommandLine, capped at 32767 UTF-16
+/// units, so a shell with a few thousand functions aborts the spawn with
+/// ERROR_FILENAME_EXCED_RANGE — surfaced as `niu: File name too long` — even
+/// for a trivial `echo hello &`. Unix has the analogous per-argument execve
+/// cap (MAX_ARG_STRLEN, 128 KiB). The spawn side now hands an over-budget
+/// script to the child through a temp file named by __RUBASH_CMD_FILE, and the
+/// entry point splices it back into the `-c` operand before parsing, so argv
+/// semantics are unchanged.
+mod issue_niubash_362 {
+    use super::*;
+
+    /// 362.1 — the generated script (~6000 functions, ~200 KB serialized)
+    /// clears BOTH caps, so this fails pre-fix on Windows AND on Unix; the
+    /// background child must still print its output and exit 0.
+    #[test]
+    fn case_1_background_command_with_large_function_table() {
+        let _guard = HEAVY_TEST_LOCK.lock().unwrap();
+        let dir = case_scratch("362.1");
+
+        let mut script = String::new();
+        for i in 0..6000 {
+            script.push_str(&format!("f{i}() {{ local v={i}; : \"$v\"; }}\n"));
+        }
+        script.push_str("echo hello &\nwait\necho large-fn-status:$?\n");
+        std::fs::write(dir.join("big.sh"), &script).expect("write script");
+
+        let out = run_rubash_in(&dir, &["big.sh"], Duration::from_secs(60));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.timed_out, "timed out; stderr:\n{stderr}");
+        assert_eq!(out.code, Some(0), "stderr:\n{stderr}");
+        assert!(
+            stdout.contains("hello"),
+            "background child output missing; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("large-fn-status:0"),
+            "wait status wrong; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("File name too long") && !stderr.contains("Argument list too long"),
+            "spawn hit an argv/command-line cap; stderr:\n{stderr}"
+        );
     }
-    script.push_str("echo hello &\nwait\necho large-fn-status:$?\n");
-    std::fs::write(dir.join("big.sh"), &script).expect("write script");
-
-    let out = run_rubash_in(&dir, &["big.sh"], Duration::from_secs(60));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.timed_out, "timed out; stderr:\n{stderr}");
-    assert_eq!(out.code, Some(0), "stderr:\n{stderr}");
-    assert!(
-        stdout.contains("hello"),
-        "background child output missing; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("large-fn-status:0"),
-        "wait status wrong; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("File name too long") && !stderr.contains("Argument list too long"),
-        "spawn hit an argv/command-line cap; stderr:\n{stderr}"
-    );
 }
 
 /// rubash#780: an argument-less `-O`/`+O` is the shopt LIST request, not a
 /// usage error — the sibling of the `-o`/`+o` case fixed in rubash#547.
-/// GNU 5.3.0 prints the shopt table (`name<TAB>state`, rc 0) for `-O` and
-/// the `shopt -u|-s name` recreate list for `+O`, then continues startup.
-/// Asserted against the engine's own builtin bytes so the check needs no
-/// GNU oracle: startup `-O` equals `shopt`, `+O` equals `shopt -p`.
-#[test]
-fn argument_less_capital_o_prints_the_shopt_listing() {
-    let dir = std::env::temp_dir().join(format!("rubash-780-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+mod issue_780 {
+    use super::*;
 
-    let dash = run_rubash_in(&dir, &["-O"], Duration::from_secs(30));
-    let builtin = run_rubash_in(&dir, &["-c", "shopt"], Duration::from_secs(30));
-    assert_eq!(
-        dash.code,
-        Some(0),
-        "`-O` rc, stderr:\n{}",
-        String::from_utf8_lossy(&dash.stderr)
-    );
-    assert!(!dash.stdout.is_empty(), "`-O` printed nothing");
-    assert_eq!(
-        dash.stdout, builtin.stdout,
-        "`-O` must be the `shopt` bytes"
-    );
+    /// 780.1 — GNU 5.3.0 prints the shopt table (`name<TAB>state`, rc 0) for
+    /// `-O` and the `shopt -u|-s name` recreate list for `+O`, then continues
+    /// startup. Asserted against the engine's own builtin bytes so the check
+    /// needs no GNU oracle: startup `-O` equals `shopt`, `+O` equals `shopt -p`.
+    #[test]
+    fn case_1_argument_less_capital_o_prints_shopt_listing() {
+        let dir = case_scratch("780.1");
 
-    let plus = run_rubash_in(&dir, &["+O"], Duration::from_secs(30));
-    let builtin_p = run_rubash_in(&dir, &["-c", "shopt -p"], Duration::from_secs(30));
-    assert_eq!(
-        plus.code,
-        Some(0),
-        "`+O` rc, stderr:\n{}",
-        String::from_utf8_lossy(&plus.stderr)
-    );
-    assert!(!plus.stdout.is_empty(), "`+O` printed nothing");
-    assert_eq!(
-        plus.stdout, builtin_p.stdout,
-        "`+O` must be the `shopt -p` bytes"
-    );
+        let dash = run_rubash_in(&dir, &["-O"], Duration::from_secs(30));
+        let builtin = run_rubash_in(&dir, &["-c", "shopt"], Duration::from_secs(30));
+        assert_eq!(
+            dash.code,
+            Some(0),
+            "`-O` rc, stderr:\n{}",
+            String::from_utf8_lossy(&dash.stderr)
+        );
+        assert!(!dash.stdout.is_empty(), "`-O` printed nothing");
+        assert_eq!(
+            dash.stdout, builtin.stdout,
+            "`-O` must be the `shopt` bytes"
+        );
+
+        let plus = run_rubash_in(&dir, &["+O"], Duration::from_secs(30));
+        let builtin_p = run_rubash_in(&dir, &["-c", "shopt -p"], Duration::from_secs(30));
+        assert_eq!(
+            plus.code,
+            Some(0),
+            "`+O` rc, stderr:\n{}",
+            String::from_utf8_lossy(&plus.stderr)
+        );
+        assert!(!plus.stdout.is_empty(), "`+O` printed nothing");
+        assert_eq!(
+            plus.stdout, builtin_p.stdout,
+            "`+O` must be the `shopt -p` bytes"
+        );
+    }
 }
 
 /// rubash#738: a heredoc delimiter carrying an escaped quote or backslash is
-/// DEQUOTED (GNU quote removal), not stripped of those characters. Before
-/// the fix `<<E\'OF` named `EOF`, the terminator `E'OF` never matched, and
-/// the heredoc ran to end-of-file — silently eating the rest of the script
-/// with `rc 0` and a warning on a stream scripts rarely read.
-///
-/// Expected bytes are GNU Bash 5.3.0's: the terminator matches, the body is
-/// exactly `hello`, and execution continues after the heredoc.
-#[test]
-fn heredoc_delimiter_with_escaped_quote_or_backslash_terminates() {
-    let dir = std::env::temp_dir().join(format!("rubash-738-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+/// DEQUOTED (GNU quote removal), not stripped of those characters.
+mod issue_738 {
+    use super::*;
 
-    // `<<E\'OF` … `E'OF` — an escaped single quote is literal delimiter text.
-    std::fs::write(
-        dir.join("esc_quote.sh"),
-        "cat <<E\\'OF\nhello\nE'OF\necho after-quote\n",
-    )
-    .expect("write esc_quote");
-    let out = run_rubash_in(&dir, &["esc_quote.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "esc_quote rc, stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "hello\nafter-quote\n",
-        "esc_quote stdout (the heredoc must end at E'OF):\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("delimited by end-of-file"),
-        "esc_quote still ran to EOF:\n{stderr}"
-    );
+    /// 738.1 — before the fix `<<E\'OF` named `EOF`, the terminator `E'OF`
+    /// never matched, and the heredoc ran to end-of-file — silently eating the
+    /// rest of the script with `rc 0` and a warning on a stream scripts rarely
+    /// read. Expected bytes are GNU Bash 5.3.0's: the terminator matches, the
+    /// body is exactly `hello`, and execution continues after the heredoc.
+    #[test]
+    fn case_1_escaped_quote_and_backslash_delimiters_terminate() {
+        let dir = case_scratch("738.1");
 
-    // `<<a\\b` … `a\b` — the escaped backslash is a literal delimiter byte.
-    std::fs::write(
-        dir.join("esc_backslash.sh"),
-        "cat <<a\\\\b\na\\b\necho after-backslash\n",
-    )
-    .expect("write esc_backslash");
-    let out = run_rubash_in(&dir, &["esc_backslash.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "esc_backslash rc, stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "after-backslash\n",
-        "esc_backslash stdout (the heredoc must end at a\\b):\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("delimited by end-of-file"),
-        "esc_backslash still ran to EOF:\n{stderr}"
-    );
-}
-/// niubash#404 (rubash side): GNU's exit echo is `interactive &&
-/// sourcelevel == 0` (builtins/exit.def:59-62). A reader-phase `exit` prints
-/// "exit" to stderr; an `exit` inside a sourced file does not — which is why
-/// `bash --rcfile rc -i -c 'echo AFTER'` with `exit 3` in the rc stays
-/// silent while `bash -i -c 'exit 3'` echoes.
-#[test]
-fn interactive_exit_echo_is_suppressed_inside_a_sourced_file() {
-    let dir = std::env::temp_dir().join(format!("rubash-404-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    std::fs::write(dir.join("rc.sh"), "echo RAN\nexit 3\n").expect("write rc");
-
-    let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rubash"))
-            .args(args)
-            .current_dir(&dir)
-            .env_clear()
-            .env("PATH", minimal_path())
-            .env("HOME", &dir)
-            .env("__RUBASH_INTERACTIVE", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("spawn rubash");
-        (
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-            out.status.code(),
+        // `<<E\'OF` … `E'OF` — an escaped single quote is literal delimiter text.
+        std::fs::write(
+            dir.join("esc_quote.sh"),
+            "cat <<E\\'OF\nhello\nE'OF\necho after-quote\n",
         )
-    };
+        .expect("write esc_quote");
+        let out = run_rubash_in(&dir, &["esc_quote.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.code, Some(0), "esc_quote rc, stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "hello\nafter-quote\n",
+            "esc_quote stdout (the heredoc must end at E'OF):\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("delimited by end-of-file"),
+            "esc_quote still ran to EOF:\n{stderr}"
+        );
 
-    // Reader-phase exit: the echo is required.
-    let (_, stderr, code) = run(&["--norc", "-c", "exit 3"]);
-    assert_eq!(code, Some(3), "stderr:\n{stderr}");
-    assert!(
-        stderr.lines().any(|line| line == "exit"),
-        "reader-phase `exit` must echo \"exit\" (GNU exit.def:59-62): {stderr:?}"
-    );
-
-    // Exit inside the sourced file: no echo.
-    let (stdout, stderr, code) = run(&["--norc", "-c", ". rc.sh"]);
-    assert_eq!(code, Some(3), "stderr:\n{stderr}");
-    assert_eq!(stdout.trim_end(), "RAN", "stdout:\n{stdout}");
-    assert!(
-        !stderr.lines().any(|line| line == "exit"),
-        "an `exit` inside a sourced file must stay silent: {stderr:?}"
-    );
+        // `<<a\\b` … `a\b` — the escaped backslash is a literal delimiter byte.
+        std::fs::write(
+            dir.join("esc_backslash.sh"),
+            "cat <<a\\\\b\na\\b\necho after-backslash\n",
+        )
+        .expect("write esc_backslash");
+        let out = run_rubash_in(&dir, &["esc_backslash.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.code, Some(0), "esc_backslash rc, stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after-backslash\n",
+            "esc_backslash stdout (the heredoc must end at a\\b):\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("delimited by end-of-file"),
+            "esc_backslash still ran to EOF:\n{stderr}"
+        );
+    }
 }
 
-/// rubash#788: a W_COMPASSIGN operand makes the variable an array even with
-/// no `-a`/`-A` flag, and that array bit survives an explicit `+a` in the
-/// same command.
-///
-/// GNU runs the compound assignment at expand_declaration_argument ->
-/// find_or_make_array_variable (arrayfunc.c:454-514), i.e. BEFORE the
-/// attribute pass, so `declare a=(x y)` yields `declare -a a` and
-/// `declare +a a=(x y)` hits "cannot destroy array variables in this way"
-/// with the attribute left in place.
-///
-/// Before the fix rubash wrote the indexed storage word but never set
-/// ARRAY_VARS, so the variable still READ as a scalar holding the raw
-/// storage text: `${a[0]}` returned `([0]="x" [1]="y")`, `${#a[@]}` was 1
-/// and `${a[1]}` was empty. That is the `golden_fnbody_strict_battery`
-/// failure (`array-y` expected, `array-` printed) that kept the Windows
-/// regression job red.
-#[test]
-fn compound_declaration_marks_the_variable_as_an_array() {
-    let dir = std::env::temp_dir().join(format!("rubash-788-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+/// niubash#404 (rubash side): GNU's exit echo is `interactive &&
+/// sourcelevel == 0` (builtins/exit.def:59-62).
+mod issue_niubash_404 {
+    use super::*;
 
-    let run = |code: &str| {
-        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+    /// 404.1 — a reader-phase `exit` prints "exit" to stderr; an `exit` inside
+    /// a sourced file does not, which is why `bash --rcfile rc -i -c 'echo
+    /// AFTER'` with `exit 3` in the rc stays silent while `bash -i -c 'exit 3'`
+    /// echoes.
+    #[test]
+    fn case_1_exit_echo_suppressed_inside_sourced_file() {
+        let dir = case_scratch("404.1");
+        std::fs::write(dir.join("rc.sh"), "echo RAN\nexit 3\n").expect("write rc");
+
+        let run = |args: &[&str]| {
+            let out = Command::new(env!("CARGO_BIN_EXE_rubash"))
+                .args(args)
+                .current_dir(&dir)
+                .env_clear()
+                .env("PATH", minimal_path())
+                .env("HOME", &dir)
+                .env("__RUBASH_INTERACTIVE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("spawn rubash");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                out.status.code(),
+            )
+        };
+
+        // Reader-phase exit: the echo is required.
+        let (_, stderr, code) = run(&["--norc", "-c", "exit 3"]);
+        assert_eq!(code, Some(3), "stderr:\n{stderr}");
+        assert!(
+            stderr.lines().any(|line| line == "exit"),
+            "reader-phase `exit` must echo \"exit\" (GNU exit.def:59-62): {stderr:?}"
+        );
+
+        // Exit inside the sourced file: no echo.
+        let (stdout, stderr, code) = run(&["--norc", "-c", ". rc.sh"]);
+        assert_eq!(code, Some(3), "stderr:\n{stderr}");
+        assert_eq!(stdout.trim_end(), "RAN", "stdout:\n{stdout}");
+        assert!(
+            !stderr.lines().any(|line| line == "exit"),
+            "an `exit` inside a sourced file must stay silent: {stderr:?}"
+        );
+    }
+}
+
+/// rubash#788: a W_COMPASSIGN operand makes the variable an array even with no
+/// `-a`/`-A` flag, and that array bit survives an explicit `+a` in the same
+/// command (GNU expand_declaration_argument -> find_or_make_array_variable,
+/// arrayfunc.c:454-514, runs BEFORE the attribute pass).
+mod issue_788 {
+    use super::*;
+
+    fn run(dir: &Path, code: &str) -> (String, String, Option<i32>) {
+        let out = run_rubash_in(dir, &["-c", code], Duration::from_secs(30));
         (
             String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
             out.code,
         )
-    };
-
-    // Expected bytes are GNU Bash 5.3.0's: `${a@a}` is the attribute word,
-    // then `${#a[@]}`, then element 1.
-    for (code, expected) in [
-        // No -a/-A: the compound list alone makes it an array.
-        ("declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"", "a|2|y"),
-        (
-            "declare a=(x); declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
-            "a|2|y",
-        ),
-        // A scalar promoted by a later compound append.
-        (
-            "declare a=x; declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
-            "a|2|y",
-        ),
-        // The attribute pass sees the array bit, refuses +a, keeps the array.
-        (
-            "declare +a a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
-            "a|2|y",
-        ),
-        // Function-scope declarations take the same path.
-        (
-            "f(){ local a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
-            "a|2|y",
-        ),
-        (
-            "f(){ declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
-            "a|2|y",
-        ),
-        // A quoted parenthesized STRING is not W_COMPASSIGN: still scalar.
-        ("declare a='(x y)'; echo \"${a@a}|${#a[@]}\"", "|1"),
-        // An associative target keeps -A and binds the list as key/value.
-        (
-            "declare -A a=([k]=v); echo \"${a@a}|${#a[@]}|${a[k]}\"",
-            "A|1|v",
-        ),
-    ] {
-        let (stdout, stderr, status) = run(code);
-        assert_eq!(stdout, expected, "`{code}` stdout; stderr:\n{stderr}");
-        assert_eq!(status, Some(0), "`{code}` rc; stderr:\n{stderr}");
     }
 
-    // The refusal is a real diagnostic, not a silent no-op.
-    let (_, stderr, status) = run("declare +a a=(x y)");
-    assert_eq!(status, Some(1), "`declare +a` must fail; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("cannot destroy array variables in this way"),
-        "`declare +a a=(x y)` diagnostic; stderr:\n{stderr}"
-    );
+    /// 788.1 — before the fix rubash wrote the indexed storage word but never
+    /// set ARRAY_VARS, so the variable still READ as a scalar holding the raw
+    /// storage text: `${a[0]}` returned `([0]="x" [1]="y")`, `${#a[@]}` was 1
+    /// and `${a[1]}` was empty. That is the `golden_fnbody_strict_battery`
+    /// failure (`array-y` expected, `array-` printed) that kept the Windows
+    /// regression job red. Expected bytes are GNU Bash 5.3.0's.
+    #[test]
+    fn case_1_compound_operand_sets_the_array_attribute() {
+        let dir = case_scratch("788.1");
+
+        for (code, expected) in [
+            // No -a/-A: the compound list alone makes it an array.
+            ("declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"", "a|2|y"),
+            (
+                "declare a=(x); declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+                "a|2|y",
+            ),
+            // A scalar promoted by a later compound append.
+            (
+                "declare a=x; declare a+=(y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+                "a|2|y",
+            ),
+            // The attribute pass sees the array bit, refuses +a, keeps the array.
+            (
+                "declare +a a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"",
+                "a|2|y",
+            ),
+            // Function-scope declarations take the same path.
+            (
+                "f(){ local a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
+                "a|2|y",
+            ),
+            (
+                "f(){ declare a=(x y); echo \"${a@a}|${#a[@]}|${a[1]}\"; }; f",
+                "a|2|y",
+            ),
+            // A quoted parenthesized STRING is not W_COMPASSIGN: still scalar.
+            ("declare a='(x y)'; echo \"${a@a}|${#a[@]}\"", "|1"),
+            // An associative target keeps -A and binds the list as key/value.
+            (
+                "declare -A a=([k]=v); echo \"${a@a}|${#a[@]}|${a[k]}\"",
+                "A|1|v",
+            ),
+        ] {
+            let (stdout, stderr, status) = run(&dir, code);
+            assert_eq!(stdout, expected, "`{code}` stdout; stderr:\n{stderr}");
+            assert_eq!(status, Some(0), "`{code}` rc; stderr:\n{stderr}");
+        }
+    }
+
+    /// 788.2 — the `+a` refusal is a real diagnostic, not a silent no-op.
+    #[test]
+    fn case_2_plus_a_is_refused_with_the_array_diagnostic() {
+        let dir = case_scratch("788.2");
+        let (_, stderr, status) = run(&dir, "declare +a a=(x y)");
+        assert_eq!(status, Some(1), "`declare +a` must fail; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("cannot destroy array variables in this way"),
+            "`declare +a a=(x y)` diagnostic; stderr:\n{stderr}"
+        );
+    }
 }
 
-/// rubash#744: a here-string inside a quoted whole-word `$(...)` must have
-/// its word quote-removed. The quoted-`$()` fast path in command_prepare
-/// handed the body straight to the specialized expander, which kept the
-/// quotes (`p "$(cat <<< 'here')"` printed `['here']`). The body now
-/// declines that shortcut when it carries `<<<`, so it reaches the AST path
-/// that already routes here-string substitutions through the real parser.
-#[test]
-fn here_string_inside_quoted_command_substitution_is_dequoted() {
-    let dir = std::env::temp_dir().join(format!("rubash-744-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+/// rubash#744: a here-string inside a quoted whole-word `$(...)` must have its
+/// word quote-removed.
+mod issue_744 {
+    use super::*;
 
-    let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
-                  p \"$(cat <<< 'here')\"\n\
-                  p $(cat <<< 'here')\n\
-                  p \"pre$(cat <<< 'here')post\"\n\
-                  p \"$(cat <<< \"a b\")\"\n";
-    std::fs::write(dir.join("here.sh"), script).expect("write script");
-    let out = run_rubash_in(&dir, &["here.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "[here]\n[here]\n[preherepost]\n[a b]\n",
-        "here-string quote removal; stderr:\n{stderr}"
-    );
+    /// 744.1 — the quoted-`$()` fast path in command_prepare handed the body
+    /// straight to the specialized expander, which kept the quotes
+    /// (`p "$(cat <<< 'here')"` printed `['here']`). The body now declines that
+    /// shortcut when it carries `<<<`, so it reaches the AST path that already
+    /// routes here-string substitutions through the real parser.
+    #[test]
+    fn case_1_here_string_in_quoted_comsub_is_dequoted() {
+        let dir = case_scratch("744.1");
+
+        let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                      p \"$(cat <<< 'here')\"\n\
+                      p $(cat <<< 'here')\n\
+                      p \"pre$(cat <<< 'here')post\"\n\
+                      p \"$(cat <<< \"a b\")\"\n";
+        std::fs::write(dir.join("here.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["here.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "[here]\n[here]\n[preherepost]\n[a b]\n",
+            "here-string quote removal; stderr:\n{stderr}"
+        );
+    }
 }
 
-/// rubash#745: inside a backtick body the backslash is consumed only before
-/// `$`, a backtick or another backslash; every other character keeps it
-/// (parse.y parse_matched_pair under P_BACKQUOTE). A backtick that sits inside
-/// a double-quoted word is a separate layer: lexer::quotes consumes `\"` there,
+/// rubash#703: a heredoc feeding a pipeline inside a double-quoted command
+/// substitution failed to parse.
+///
+/// `echo "X=$(cat <<EOF | cat` + `body` + `EOF` + `)"` died with
+/// `command substitution: line 4: unexpected EOF while looking for matching
+/// `)'` and printed nothing, while GNU prints `X=body`. The unquoted form,
+/// the quoted form without the `X=` prefix, and the quoted form without the
+/// pipeline all worked, which narrowed the trigger to the word-expansion
+/// comsub collector (`collect_command_substitution_source_ex`): its heredoc
+/// delimiter scan did not end the delimiter WORD at the first unquoted
+/// blank, so `cat <<EOF | cat` declared the delimiter `EOF | cat`, the `EOF`
+/// terminator line never matched, and the collector swallowed the rest of
+/// the script. GNU read_token_word ends the word at any unquoted shell
+/// metacharacter (parse.y:5688 shellbreak) — the same rule the lexer's own
+/// heredoc header scan already applies.
+mod issue_703 {
+    use super::*;
+
+    fn run_script(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("hd.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["hd.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 703.1 [ratchet] — the issue's exact repro. The delimiter word must end
+    /// at the blank before `|`, the `EOF` line must terminate the body, and
+    /// the `)` on the following line must close the substitution. Pre-fix the
+    /// collector read the delimiter as `EOF | cat`, never matched the
+    /// terminator, and reported the unclosed-`)` fatal with no output.
+    #[test]
+    fn case_1_quoted_comsub_heredoc_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.1",
+            "echo \"X=$(cat <<EOF | cat\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
+        assert!(
+            !stderr.contains("unexpected EOF"),
+            "unclosed-comsub fatal; stderr:\n{stderr}"
+        );
+    }
+
+    /// 703.2 [control] — the three shapes the issue report named as already
+    /// working must not regress: the unquoted assignment, the quoted
+    /// substitution without a word prefix, and the quoted substitution
+    /// without the pipeline. All three were green before the fix.
+    #[test]
+    fn case_2_working_shapes_stay_green() {
+        let (stdout, stderr, code) = run_script(
+            "703.2",
+            "x=$(cat <<EOF | cat\nbody\nEOF\n); echo \"X=$x\"\n\
+             echo \"$(cat <<EOF | cat\nbody\nEOF\n)\"\n\
+             echo \"X=$(cat <<EOF\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\nbody\nX=body\n", "stdout; stderr:\n{stderr}");
+    }
+
+    /// 703.3 [ratchet] — the make_cmd.c:602-611 pushback shape with a
+    /// pipeline: the `)` sits ON the delimiter line (`EOF)`), so the heredoc
+    /// is "delimited by end-of-file", GNU warns, and the substitution still
+    /// yields `body`. Two defects hid here: the pre-fix delimiter scan (same
+    /// fatal as 703.1), and — once that was fixed — the lexer's IFS_GLUE
+    /// `EOF)` marker reaching the real comsub parser, where the terminator
+    /// line read `EOF\x1c` and stopped matching, leaking the delimiter into
+    /// the output (`X=body` plus a stray `EOF`). Exact stdout pins both.
+    #[test]
+    fn case_3_eof_paren_pushback_with_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.3",
+            "echo \"X=$(cat <<EOF | cat\nbody\nEOF)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stray delimiter in output; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("delimited by end-of-file"),
+            "missing GNU here-document warning; stderr:\n{stderr}"
+        );
+    }
+
+    /// 703.4 [ratchet] — delimiter-word spellings that must still resolve
+    /// correctly once the word ends at the first unquoted blank: a blank
+    /// between `<<` and the word (`<< EOF`), the adjacent `<<-` tab-strip
+    /// dash, and a quoted delimiter carrying its own blank. Each carries a
+    /// pipeline after the word, so the pre-fix scan — which read the word to
+    /// end of line — declared `EOF | cat` (or `-EOF | cat`, `E O | cat`) and
+    /// died unclosed on all three.
+    #[test]
+    fn case_4_delimiter_spellings_with_pipeline() {
+        let (stdout, stderr, code) = run_script(
+            "703.4",
+            "echo \"X=$(cat << EOF | cat\nbody\nEOF\n)\"\n\
+             echo \"Y=$(cat <<-EOF | cat\n\tbody\n\tEOF\n)\"\n\
+             echo \"Z=$(cat <<\"E O\" | cat\nbody\nE O\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\nY=body\nZ=body\n", "stdout; stderr:\n{stderr}");
+    }
+
+    /// 703.5 [ratchet] — the same word-boundary rule with a `;` after the
+    /// delimiter: `cat <<EOF; cat` declares `EOF` and runs `cat` as the next
+    /// command. Pre-fix the delimiter read `EOF; cat` and the terminator
+    /// never matched, so the substitution died unclosed.
+    #[test]
+    fn case_5_semicolon_after_delimiter_word() {
+        let (stdout, stderr, code) = run_script(
+            "703.5",
+            "echo \"X=$(cat <<EOF; cat\nbody\nEOF\n)\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "X=body\n", "stdout; stderr:\n{stderr}");
+        assert!(
+            !stderr.contains("unexpected EOF"),
+            "unclosed-comsub fatal; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// rubash#745: two layers, not one.
+///
+/// Inside a backtick body the backslash is consumed only before `$`, a
+/// backtick or another backslash; every other character keeps it (parse.y
+/// parse_matched_pair under P_BACKQUOTE). A backtick that sits inside a
+/// double-quoted word is a separate layer: lexer::quotes consumes `\"` there,
 /// so the two upstream cases that look contradictory both hold —
 ///
 ///   recho `echo "(\")"`        keeps `\"`  (quote.tests:123)
 ///   recho "`echo \"x\"`"        sees a bare quote (exp.tests:146)
 ///   recho `echo 'a\' b`        keeps `\'`  (comsub.tests)
-///
-/// A body whose last character is a lone `\` keeps it too, which is why the
-/// decoder doubles a word-final odd run before the re-parse terminates the
-/// text with a newline.
-///
-/// The old decoder special-cased `\\"` while inside double quotes and emitted
-/// its quote marker directly, which made `"\\\\"` decode to `\"` instead of
-/// `\`, and dropped a trailing backslash completely.
-#[test]
-fn old_style_backtick_escape_rules_match_gnu() {
-    let dir = std::env::temp_dir().join(format!("rubash-745-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+mod issue_745 {
+    use super::*;
 
-    // Word-final `\\`, four backslashes inside double quotes, an escaped
-    // non-special, and both already-correct shapes as controls.
-    let script = "q() { printf '[%s]|%s\\n' \"$1\" \"${#1}\"; }\n\
-                  b=`printf '%s' \\\\`; q \"$b\"\n\
-                  c=`printf '%s' \"\\\\\\\\\"`; q \"$c\"\n\
-                  d=`printf '%s' \\a`; q \"$d\"\n\
-                  e=`echo a\\\\b`; q \"$e\"\n\
-                  f=`printf '%s' '\\\\'`; q \"$f\"\n\
-                  g=$(printf '%s' \\\\); q \"$g\"\n";
-    std::fs::write(dir.join("bt.sh"), script).expect("write script");
-    let out = run_rubash_in(&dir, &["bt.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "[\\]|1\n[\\]|1\n[a]|1\n[ab]|2\n[\\]|1\n[\\]|1\n",
-        "backtick escape rules; stderr:\n{stderr}"
-    );
+    fn run_script(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("bt.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["bt.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 745.1 — a word-final backslash run survives. GNU hands the body to
+    /// parse_and_execute with EOF immediately after it, so a lone trailing `\`
+    /// stays literal; the re-parse here terminates the text with a newline,
+    /// where `\` + newline is a line continuation. Also pins the four-backslash
+    /// double-quote shape the old decoder mangled (`"\\\\"` -> `\"` instead of
+    /// `\`).
+    #[test]
+    fn case_1_word_final_backslash_and_four_backslash_shape() {
+        let script = "q() { printf '[%s]|%s\\n' \"$1\" \"${#1}\"; }\n\
+                      b=`printf '%s' \\\\`; q \"$b\"\n\
+                      c=`printf '%s' \"\\\\\\\\\"`; q \"$c\"\n";
+        let (stdout, stderr, code) = run_script("745.1", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "[\\]|1\n[\\]|1\n", "stderr:\n{stderr}");
+    }
+
+    /// 745.2 `[guard]` — the escape set is `$`, backtick and `\`; every other
+    /// character keeps its backslash. This is the direction guard: the second
+    /// attempt at #745 read the rule as "strip the backslash before anything",
+    /// which turned `echo 'a\' b` inside backticks into `echo 'a' b` and broke
+    /// `comsub.tests`. The last line is the discriminator — green on the
+    /// original engine, red on that wrong fix, green here.
+    #[test]
+    fn case_2_escape_set_and_dquote_layer() {
+        let script = "q() { printf '[%s]|%s\\n' \"$1\" \"${#1}\"; }\n\
+                      p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                      d=`printf '%s' \\a`; q \"$d\"\n\
+                      e=`echo a\\\\b`; q \"$e\"\n\
+                      f=`printf '%s' '\\\\'`; q \"$f\"\n\
+                      g=$(printf '%s' \\\\); q \"$g\"\n\
+                      p `echo 'a\\' b`\n";
+        let (stdout, stderr, code) = run_script("745.2", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "[a]|1\n[ab]|2\n[\\]|1\n[\\]|1\n[a\\][b]\n",
+            "stderr:\n{stderr}"
+        );
+    }
 }
 
-/// rubash#776: `read -N` binds the record to the first name verbatim — no
-/// IFS splitting, no whitespace strip — and leaves the rest empty. Before
-/// the fix the record went through the ordinary split path, so `-N3` on
-/// `AB\nC` lost the newline and `-N5` on `AB CD` split into two fields.
-#[test]
-fn read_capital_n_binds_the_record_without_splitting() {
-    let dir = std::env::temp_dir().join(format!("rubash-776-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    std::fs::write(dir.join("in.txt"), "AB\nC").expect("write input");
+/// rubash#776: `read -N` binds the record to the first name verbatim — no IFS
+/// splitting, no whitespace strip — and leaves the rest empty.
+mod issue_776 {
+    use super::*;
 
-    // -N3 keeps the delimiter as data; -N5 keeps the space whole.
-    let script = "read -N3 c < in.txt; printf '<%s>|%s\\n' \"$c\" \"${#c}\"\n\
-                  read -N3 a b < in.txt; printf '[%s][%s]\\n' \"$a\" \"$b\"\n\
-                  printf 'AB CD' > in2.txt\n\
-                  read -N5 x y < in2.txt; printf '[%s][%s]\\n' \"$x\" \"$y\"\n\
-                  printf '  AB  ' > in3.txt\n\
-                  read -N6 s < in3.txt; printf '[%s]\\n' \"$s\"\n\
-                  read -n6 t < in3.txt; printf '[%s]\\n' \"$t\"\n";
-    std::fs::write(dir.join("n.sh"), script).expect("write script");
-    let out = run_rubash_in(&dir, &["n.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "<AB\n>|3\n[AB\n][]\n[AB CD][]\n[  AB  ]\n[AB]\n",
-        "read -N record binding; stderr:\n{stderr}"
-    );
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("in.txt"), "AB\nC").expect("write input");
+        std::fs::write(dir.join("n.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["n.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 776.1 — the delimiter the limit stopped on is data under `-N`: `-N3` on
+    /// `AB\nC` yields `AB\n`, and the second name stays empty instead of taking
+    /// a split field.
+    #[test]
+    fn case_1_capital_n_keeps_the_delimiter_and_skips_splitting() {
+        let script = "read -N3 c < in.txt; printf '<%s>|%s\\n' \"$c\" \"${#c}\"\n\
+                      read -N3 a b < in.txt; printf '[%s][%s]\\n' \"$a\" \"$b\"\n\
+                      printf 'AB CD' > in2.txt\n\
+                      read -N5 x y < in2.txt; printf '[%s][%s]\\n' \"$x\" \"$y\"\n";
+        let (stdout, stderr, code) = run("776.1", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "<AB\n>|3\n[AB\n][]\n[AB CD][]\n",
+            "stderr:\n{stderr}"
+        );
+    }
+
+    /// 776.2 — leading/trailing blanks are preserved, and `-n` keeps the
+    /// ordinary split/strip behaviour as the control.
+    #[test]
+    fn case_2_capital_n_keeps_whitespace_lowercase_n_still_strips() {
+        let script = "printf '  AB  ' > in3.txt\n\
+                      read -N6 s < in3.txt; printf '[%s]\\n' \"$s\"\n\
+                      read -n6 t < in3.txt; printf '[%s]\\n' \"$t\"\n";
+        let (stdout, stderr, code) = run("776.2", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "[  AB  ]\n[AB]\n", "stderr:\n{stderr}");
+    }
 }
 
 /// rubash#721: `< /dev/fd/N` (or `/proc/self/fd/N`) with N closed is an open
 /// failure, not an empty input. GNU opens the alias through the kernel and
 /// reports ENOENT, abandoning the command with status 1.
-///
-/// Two independent sites staged an empty mirror instead: the compound fd-0
-/// preflight treated every alias as available (`while read … done < /dev/fd/6`
-/// ran zero iterations and reported 0), and the read builtin's alias branch
-/// saw plain EOF (bare rc 1, no diagnostic). A live descriptor must still
-/// read normally — the check is "is N open", not "is the word an alias".
-#[test]
-fn closed_dev_fd_operand_reports_no_such_file() {
-    let dir = std::env::temp_dir().join(format!("rubash-721-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    std::fs::write(dir.join("live.txt"), "hi\n").expect("write input");
+mod issue_721 {
+    use super::*;
 
-    let run = |code: &str| {
+    fn run(case: &str, code: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("live.txt"), "hi\n").expect("write input");
         let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
         (
             String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
             out.code,
         )
-    };
+    }
 
-    // read builtin over a closed alias.
-    let (stdout, stderr, code) = run("exec 6<&-\nread -r z < /dev/fd/6\necho rc=$?");
-    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
-    assert_eq!(stdout, "rc=1", "read rc; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
-        "read must report the alias; stderr:\n{stderr}"
-    );
+    /// 721.1 — the read builtin's alias branch staged an empty mirror, which
+    /// read saw as plain EOF: bare rc 1 and no diagnostic.
+    #[test]
+    fn case_1_read_builtin_reports_closed_alias() {
+        let (stdout, stderr, code) = run("721.1", "exec 6<&-\nread -r z < /dev/fd/6\necho rc=$?");
+        assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=1", "read rc; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
+            "read must report the alias; stderr:\n{stderr}"
+        );
+    }
 
-    // Compound fd-0 input.
-    let (stdout, stderr, code) =
-        run("exec 6<&-\nwhile read -r l; do :; done < /dev/fd/6\necho rc=$?");
-    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
-    assert_eq!(stdout, "rc=1", "loop rc; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
-        "the loop must report the alias; stderr:\n{stderr}"
-    );
+    /// 721.2 — the compound fd-0 preflight treated every alias as available,
+    /// so `while read ... done < /dev/fd/6` ran zero iterations and reported 0.
+    #[test]
+    fn case_2_compound_loop_reports_closed_alias() {
+        let (stdout, stderr, code) = run(
+            "721.2",
+            "exec 6<&-\nwhile read -r l; do :; done < /dev/fd/6\necho rc=$?",
+        );
+        assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=1", "loop rc; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("/dev/fd/6") && stderr.contains("No such file or directory"),
+            "the loop must report the alias; stderr:\n{stderr}"
+        );
+    }
 
-    // /proc spelling takes the same path.
-    let (stdout, stderr, code) = run("exec 6<&-\nread -r z < /proc/self/fd/6\necho rc=$?");
-    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
-    assert_eq!(stdout, "rc=1", "proc rc; stderr:\n{stderr}");
+    /// 721.3 — the /proc spelling takes the same path.
+    #[test]
+    fn case_3_proc_self_fd_spelling_reports_closed_alias() {
+        let (stdout, stderr, code) = run(
+            "721.3",
+            "exec 6<&-\nread -r z < /proc/self/fd/6\necho rc=$?",
+        );
+        assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "rc=1", "proc rc; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("/proc/self/fd/6") && stderr.contains("No such file or directory"),
+            "the /proc operand must be reported; stderr:\n{stderr}"
+        );
+    }
 
-    // A live descriptor still serves its bytes.
-    let (stdout, stderr, code) =
-        run("exec 6< live.txt\nread -r z < /dev/fd/6\necho \"got=$z rc=$?\"");
-    assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
-    assert_eq!(stdout, "got=hi rc=0", "live fd; stderr:\n{stderr}");
+    /// 721.4 `[control]` — a live descriptor still serves its bytes: the check
+    /// is "is N open", not "is the word an alias". Green on the pre-fix engine
+    /// by design; it exists to catch an over-fix that rejects every alias.
+    #[test]
+    fn case_4_live_descriptor_still_reads() {
+        let (stdout, stderr, code) = run(
+            "721.4",
+            "exec 6< live.txt\nread -r z < /dev/fd/6\necho \"got=$z rc=$?\"",
+        );
+        assert_eq!(code, Some(0), "script rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "got=hi rc=0", "live fd; stderr:\n{stderr}");
+        assert!(stderr.is_empty(), "live fd must stay silent: {stderr:?}");
+    }
 }
 
 /// rubash#704 R6.2: `command -v`/`-V` use GNU's ANY-found rule
-/// (builtins/command.def increments any_found per resolved operand), so one
-/// miss among several operands still exits 0. `type` is the all-found
-/// builtin and is deliberately the opposite — the two shared an accumulator
-/// that made `command -v echo nosuch` return 1.
-#[test]
-fn command_describe_multi_operand_uses_any_found() {
-    let dir = std::env::temp_dir().join(format!("rubash-704-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+/// (builtins/command.def increments any_found per resolved operand).
+mod issue_704 {
+    use super::*;
 
-    let run = |code: &str| {
+    /// 704.2 — one miss among several operands still exits 0. `type` is the
+    /// all-found builtin and is deliberately the opposite — the two shared an
+    /// accumulator that made `command -v echo nosuch` return 1.
+    #[test]
+    fn case_2_command_v_multi_operand_is_any_found() {
+        let dir = case_scratch("704.2");
+
+        let code = "command -v echo nosuch_xyz >/dev/null; echo v:$?\n\
+                    command -v nosuch_xyz echo >/dev/null; echo v2:$?\n\
+                    command -V echo nosuch_xyz >/dev/null 2>&1; echo V:$?\n\
+                    command -v nosuch1 nosuch2 >/dev/null; echo miss:$?\n\
+                    type echo nosuch_xyz >/dev/null 2>&1; echo type:$?";
         let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
-        (
-            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-
-    let code = "command -v echo nosuch_xyz >/dev/null; echo v:$?\n\
-                command -v nosuch_xyz echo >/dev/null; echo v2:$?\n\
-                command -V echo nosuch_xyz >/dev/null 2>&1; echo V:$?\n\
-                command -v nosuch1 nosuch2 >/dev/null; echo miss:$?\n\
-                type echo nosuch_xyz >/dev/null 2>&1; echo type:$?";
-    let (stdout, stderr) = run(code);
-    assert_eq!(
-        stdout, "v:0\nv2:0\nV:0\nmiss:1\ntype:1",
-        "command describe status; stderr:\n{stderr}"
-    );
+        let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            stdout, "v:0\nv2:0\nV:0\nmiss:1\ntype:1",
+            "command describe status; stderr:\n{stderr}"
+        );
+    }
 }
 
-/// rubash#759: `dirs -l` is the LONG form (`$HOME` stays un-collapsed), not
-/// the one-per-line form. Only `-p` (and `-v`, which is already numbered)
-/// selects one entry per line. rubash treated `-l` as `-p`, so
-/// `dirs -l` printed three lines where GNU prints one.
-#[test]
-fn dirs_long_form_keeps_the_space_separator() {
-    let dir = std::env::temp_dir().join(format!("rubash-759-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("a")).expect("create a");
-    std::fs::create_dir_all(dir.join("b")).expect("create b");
+/// rubash#759: `dirs -l` is the LONG form (`$HOME` stays un-collapsed), not the
+/// one-per-line form. Only `-p` (and `-v`, already numbered) select one entry
+/// per line.
+mod issue_759 {
+    use super::*;
 
-    let run = |code: &str| {
-        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
-        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
-    };
+    /// 759.2 — rubash treated `-l` as `-p`, so `dirs -l` printed one line per
+    /// entry where GNU prints one line.
+    #[test]
+    fn case_2_dirs_long_form_keeps_the_space_separator() {
+        let dir = case_scratch("759.2");
+        std::fs::create_dir_all(dir.join("a")).expect("create a");
+        std::fs::create_dir_all(dir.join("b")).expect("create b");
 
-    let long = run("cd a\npushd ../b >/dev/null\ndirs -l");
-    assert_eq!(
-        long.lines().count(),
-        1,
-        "`dirs -l` must stay on one line: {long:?}"
-    );
-    assert!(
-        long.contains(' '),
-        "`dirs -l` separates with spaces: {long:?}"
-    );
+        let run = |code: &str| {
+            let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        };
 
-    let per_line = run("cd a\npushd ../b >/dev/null\ndirs -p");
-    assert_eq!(
-        per_line.lines().count(),
-        2,
-        "`dirs -p` is one entry per line: {per_line:?}"
-    );
+        let long = run("cd a\npushd ../b >/dev/null\ndirs -l");
+        assert_eq!(
+            long.lines().count(),
+            1,
+            "`dirs -l` must stay on one line: {long:?}"
+        );
+        assert!(
+            long.contains(' '),
+            "`dirs -l` separates with spaces: {long:?}"
+        );
 
-    let numbered = run("cd a\npushd ../b >/dev/null\ndirs -v");
-    assert_eq!(
-        numbered.lines().count(),
-        2,
-        "`dirs -v` is numbered, one per line: {numbered:?}"
-    );
-    let long_numbered = run("cd a\npushd ../b >/dev/null\ndirs -l -v");
-    assert_eq!(
-        long_numbered, numbered,
-        "`dirs -l -v` renders like `dirs -v`"
-    );
+        let per_line = run("cd a\npushd ../b >/dev/null\ndirs -p");
+        assert_eq!(
+            per_line.lines().count(),
+            2,
+            "`dirs -p` is one entry per line: {per_line:?}"
+        );
+
+        let numbered = run("cd a\npushd ../b >/dev/null\ndirs -v");
+        assert_eq!(
+            numbered.lines().count(),
+            2,
+            "`dirs -v` is numbered, one per line: {numbered:?}"
+        );
+        let long_numbered = run("cd a\npushd ../b >/dev/null\ndirs -l -v");
+        assert_eq!(
+            long_numbered, numbered,
+            "`dirs -l -v` renders like `dirs -v`"
+        );
+    }
 }
 
 /// rubash#742: three word-level quote-removal arms in lexer/quotes.rs.
-///
-/// 1–2. An unbraced `$name` ends at the next `$` or backslash; the old scan
-///      cleared `pending_name` without emitting PARAM_NAME_END_MARKER, so the
-///      cooked text glued the neighbours into one longer name and silently
-///      returned another variable's value (`$v\tb` with vtb=QQ printed QQ).
-/// 3.   An escaped blank must stay literal data. `\ ` was pushed bare, so the
-///      splitter saw an ordinary space and the word became two arguments.
-#[test]
-fn unbraced_name_and_escaped_blank_keep_their_boundaries() {
-    let dir = std::env::temp_dir().join(format!("rubash-742-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
+mod issue_742 {
+    use super::*;
 
-    // `\t` here is a literal backslash + t, not a tab.
-    let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
-                  v=AB; vtb=QQ\n\
-                  p $v\\tb\n\
-                  q=$v\\tb; p \"$q\"\n\
-                  p ${v}\\tb\n\
-                  w='a b'; wb=QQ\n\
-                  p a$w$'b'\n\
-                  p $w$'b'\n\
-                  p $v\\ b\n\
-                  p ${v}\\ b\n";
-    std::fs::write(dir.join("q.sh"), script).expect("write script");
-    let out = run_rubash_in(&dir, &["q.sh"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
-    assert_eq!(
-        stdout, "[ABtb]\n[ABtb]\n[ABtb]\n[aa][bb]\n[a][bb]\n[AB b]\n[AB b]\n",
-        "word boundaries; stderr:\n{stderr}"
-    );
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("q.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["q.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 742.1 — an unbraced `$name` ends at the next backslash. The old scan
+    /// cleared `pending_name` without emitting PARAM_NAME_END_MARKER, so the
+    /// neighbours glued into one longer name and another variable's value was
+    /// returned (`$v\tb` with vtb=QQ printed QQ). The braced form is the
+    /// control that pinned it to the unbraced scan.
+    #[test]
+    fn case_1_unbraced_name_ends_at_backslash() {
+        let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                      v=AB; vtb=QQ\n\
+                      p $v\\tb\n\
+                      q=$v\\tb; p \"$q\"\n\
+                      p ${v}\\tb\n";
+        let (stdout, stderr, code) = run("742.1", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "[ABtb]\n[ABtb]\n[ABtb]\n", "stderr:\n{stderr}");
+    }
+
+    /// 742.2 — an unbraced `$name` also ends at the next `$`, so a following
+    /// `$'...'` is a new expansion instead of more name bytes.
+    #[test]
+    fn case_2_unbraced_name_ends_at_dollar() {
+        let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                      w='a b'; wb=QQ\n\
+                      p a$w$'b'\n\
+                      p $w$'b'\n";
+        let (stdout, stderr, code) = run("742.2", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "[aa][bb]\n[a][bb]\n", "stderr:\n{stderr}");
+    }
+
+    /// 742.3 — an escaped blank is quoted data. The generic ASCII-escape arm
+    /// pushed the byte bare, so field splitting saw an ordinary space and one
+    /// argument became two.
+    #[test]
+    fn case_3_escaped_blank_stays_one_argument() {
+        let script = "p() { printf '[%s]' \"$@\"; printf '\\n'; }\n\
+                      v=AB\n\
+                      p $v\\ b\n\
+                      p ${v}\\ b\n";
+        let (stdout, stderr, code) = run("742.3", script);
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "[AB b]\n[AB b]\n", "stderr:\n{stderr}");
+    }
+}
+
+/// rubash#753: after a failglob expansion error GNU abandons the rest of the
+/// current logical line; rubash only abandoned the failing command when that
+/// command was a compound, so one extra statement ran after the error.
+///
+/// The issue's repro is the brace group (`case2`): GNU never reaches the
+/// `echo` after the `;`, rubash ran it and reported `case2-rc=1`. The
+/// subshell (`case1`) and the simple command (`case3`) already matched,
+/// which pinned the divergence to the compound-command boundary swallowing
+/// the expansion failure instead of letting it unwind to the reader. This
+/// is control flow, distinct from #726's diagnostic-bypass defect.
+///
+/// GNU's rule, as pinned by the probe family behind these cases: the
+/// failglob failure abandons the remainder of the current logical line —
+/// the same discard the arithmetic/subscript evalerror path already
+/// implements (`evalerror_pending` + the reader loop-top check). The
+/// discard is CONTAINED by exactly these boundaries: `( )` subshells,
+/// pipeline stages, `$( )`, `&` background jobs, `eval`, and `source`; it
+/// PENETRATES brace groups, if/then bodies, if conditions,
+/// while/until/for/select bodies, case arms, function bodies, `!`, and
+/// `time`. A loop body's discard escapes through `done` to the enclosing
+/// logical line and aborts the loop; a `for` word-list failure is a plain
+/// line abort.
+///
+/// Fix: a new class flag `evalerror_failglob_pending` (mirroring
+/// `evalerror_subscript_pending`'s clear-at-every-boundary discipline) is
+/// armed at every failglob `Fail` site alongside `raise_evalerror_abort()`,
+/// so the reader-layer loop-top check discards the rest of the line. The
+/// eval/source boundaries absorb exactly this class (GNU evalstring.c
+/// catches the expansion error locally at the top level of eval/source),
+/// which is why the containing boundaries keep their old behavior.
+///
+/// Two pre-existing divergences found while probing, deliberately out of
+/// scope here (both reproduce on the pre-fix binary, so neither is a
+/// regression of this change; both are follow-up issue candidates):
+/// - `c=([k]=v [""]=x)` — a bad-subscript compound assignment binds
+///   partially and GNU CONTINUES the line (`sub-after rc=0`); rubash
+///   discards the rest of the line (subscript family).
+/// - `${arr[/no/such/*.zzz]}` — the subscript failglob diagnostic reads
+///   `arithmetic syntax error` where GNU reads `syntax error` (diagnostic
+///   wording family).
+mod issue_753 {
+    use super::*;
+
+    fn run(case: &str, script: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// Same contract as `run`, with a stdin payload. The select shape needs
+    /// one input line for its body to execute at all: with
+    /// `Stdio::null()` the select EOFs before the first prompt and the body
+    /// never runs, which is exactly how the first select probe misread the
+    /// boundary (the body "discarding" the line was really the body never
+    /// executing).
+    fn run_with_stdin(case: &str, script: &str, input: &str) -> (String, String, Option<i32>) {
+        let dir = case_scratch(case);
+        std::fs::write(dir.join("fg.sh"), script).expect("write script");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubash"));
+        cmd.args(["fg.sh"])
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", minimal_path())
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if cfg!(windows) {
+            for name in [
+                "SystemRoot",
+                "SystemDrive",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "OS",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Ok(value) = std::env::var(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn rubash");
+        std::io::Write::write_all(child.stdin.as_mut().expect("stdin pipe"), input.as_bytes())
+            .expect("write stdin");
+        drop(child.stdin.take());
+        let out = wait_bounded(&mut child, Duration::from_secs(30));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.code,
+        )
+    }
+
+    /// 753.1 [ratchet] — the issue's exact repro. case1 (subshell) and
+    /// case3 (simple command) were already GNU-correct and stay pinned
+    /// here; case2 (brace group) is the ratchet: pre-fix rubash printed
+    /// `case2-rc=1`, GNU abandons the rest of that logical line and never
+    /// reaches the `echo`. stderr pins all three diagnostics with their
+    /// line numbers, proving the failures fired rather than the echoes
+    /// silently vanishing.
+    #[test]
+    fn case_1_issue_repro_brace_group_same_line() {
+        let (stdout, stderr, code) = run(
+            "753.1",
+            "shopt -s failglob\n\
+             echo \"case1-start\"\n\
+             ( set -- /no/such/*.zzz; echo \"case1-inside\" ); echo \"case1-rc=$?\"\n\
+             echo \"case2-start\"\n\
+             { set -- /no/such/*.zzz; echo \"case2-inside\"; }; echo \"case2-rc=$?\"\n\
+             echo \"case3-start\"\n\
+             set -- /no/such/*.zzz; echo \"case3-rc=$?\"\n\
+             echo \"END\"\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "case1-start\ncase1-rc=1\ncase2-start\ncase3-start\nEND\n",
+            "case2-rc must not print; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n\
+             fg.sh: line 7: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.2 [ratchet] — a brace group in list position. Pre-fix rubash ran
+    /// `A_after_brace_semicolon` (after `;`), `C_or_arm` (the `||` arm —
+    /// the group "failed", so the arm was eligible), and `D_after_invert
+    /// rc=0` (`!` inverted the aborted group's status); GNU abandons the
+    /// line at each failure and prints only `END`. `B_and_arm` is pinned
+    /// too but is non-discriminating: the `&&` arm is skipped by status in
+    /// both shells, so its absence proves nothing about the discard — it
+    /// is here to keep the and/or pair covered as a family.
+    #[test]
+    fn case_2_brace_group_in_list_position() {
+        let (stdout, stderr, code) = run(
+            "753.2",
+            "shopt -s failglob\n\
+             { set -- /no/such/*.zzz; }; echo \"A_after_brace_semicolon\"\n\
+             { set -- /no/such/*.zzz; } && echo \"B_and_arm\"\n\
+             { set -- /no/such/*.zzz; } || echo \"C_or_arm\"\n\
+             ! { set -- /no/such/*.zzz; }; echo \"D_after_invert rc=$?\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "list-position arm echoes must not run; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.3 [ratchet] — the compound bodies that PENETRATE: an if/then
+    /// body and the if condition itself, a case arm, and a nested brace
+    /// group. Pre-fix rubash printed all five trailing echoes
+    /// (`E_after_fi_sameline`, `IFCOND_after`, `G_after_case_sameline`,
+    /// `L_nested_inner`, `M_after_nested`); GNU abandons each logical line
+    /// at the failure, so only `END` survives. The if-condition shape is
+    /// the one the probe family found last: the condition's failglob
+    /// aborts the whole `if ... fi` line, not just the condition command.
+    #[test]
+    fn case_3_if_body_if_condition_case_nested_brace() {
+        let (stdout, stderr, code) = run(
+            "753.3",
+            "shopt -s failglob\n\
+             if true; then set -- /no/such/*.zzz; fi; echo \"E_after_fi_sameline\"\n\
+             if set -- /no/such/*.zzz; then echo \"cond-T\"; fi; echo \"IFCOND_after\"\n\
+             case x in x) set -- /no/such/*.zzz;; esac; echo \"G_after_case_sameline\"\n\
+             { { set -- /no/such/*.zzz; }; echo \"L_nested_inner\"; }; echo \"M_after_nested\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "penetrating compound bodies; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.4 [ratchet] — the `for` word list. Bare (`FOR_after`) was
+    /// already GNU-correct pre-fix; the in-brace spelling
+    /// (`FOR_brace_after`) was not: pre-fix rubash ran the echo after the
+    /// brace group closed. GNU abandons the line in both spellings.
+    #[test]
+    fn case_4_for_word_list_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.4",
+            "shopt -s failglob\n\
+             for i in /no/such/*.zzz; do echo \"for-body\"; done; echo \"FOR_after\"\n\
+             { for i in /no/such/*.zzz; do echo \"for-body2\"; done; }; echo \"FOR_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "for word-list abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.5 [ratchet] — the `time` keyword. Pre-fix rubash printed
+    /// `I_after_time`; GNU abandons the rest of the line after the timed
+    /// group's failglob. stderr is only contains-checked: the `real`/
+    /// `user`/`sys` timing lines are machine-dependent bytes and belong to
+    /// no golden.
+    #[test]
+    fn case_5_time_keyword_penetrates() {
+        let (stdout, stderr, code) = run(
+            "753.5",
+            "shopt -s failglob\n\
+             time { set -- /no/such/*.zzz; }; echo \"I_after_time\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "time must not contain the discard; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("fg.sh: line 2: no match: /no/such/*.zzz"),
+            "diagnostic missing; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("real") && stderr.contains("user") && stderr.contains("sys"),
+            "time report missing; stderr:\n{stderr}"
+        );
+    }
+
+    /// 753.6 [ratchet] — a function definition, call, and trailing echo on
+    /// one logical line. Pre-fix rubash printed `after-func-sameline` (the
+    /// body's failglob only aborted the function call); GNU abandons the
+    /// line. The next-line spelling is covered by 753.15 and stays green.
+    #[test]
+    fn case_6_function_def_call_echo_same_line() {
+        let (stdout, stderr, code) = run(
+            "753.6",
+            "shopt -s failglob\n\
+             g() { set -- /no/such/*.zzz; echo \"func-inside\"; }; g; echo \"after-func-sameline\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "same-line echo after a failing function call must not run; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr, "fg.sh: line 2: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.7 [ratchet] — failglob in a redirection word. Bare
+    /// (`REDIR_after`) was already correct pre-fix; the brace-internal
+    /// spellings (`BR_after`, `BR_brace_after`) were not. GNU abandons the
+    /// line in all three spellings, so no redirect file is ever attempted.
+    #[test]
+    fn case_7_redirection_word_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.7",
+            "shopt -s failglob\n\
+             echo x > /no/such/*.zzz; echo \"REDIR_after\"\n\
+             { echo x > /no/such/*.zzz; }; echo \"BR_after\"\n\
+             { { echo x > /no/such/*.zzz; }; }; echo \"BR_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(stdout, "END\n", "redirect failglob abort scope; stderr:\n{stderr}");
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.8 [ratchet] — failglob in a compound-assignment word. Bare
+    /// (`CA_after`) was already correct pre-fix; the brace, if-body,
+    /// case-arm, and same-line function spellings were not. GNU abandons
+    /// each logical line at the failure.
+    #[test]
+    fn case_8_compound_assignment_word_failglob() {
+        let (stdout, stderr, code) = run(
+            "753.8",
+            "shopt -s failglob\n\
+             a=(/no/such/*.zzz); echo \"CA_after\"\n\
+             { a=(/no/such/*.zzz); echo \"in-brace\"; }; echo \"CA_brace_after\"\n\
+             if true; then a=(/no/such/*.zzz); fi; echo \"CA_if_after\"\n\
+             case x in x) a=(/no/such/*.zzz);; esac; echo \"CA_case_after\"\n\
+             f() { a=(/no/such/*.zzz); echo \"in-f\"; }; f; echo \"CA_func_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "compound-assignment failglob abort scope; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.9 [ratchet] — `declare` with an indexed compound operand. GNU
+    /// fails the whole operand, binds NOTHING (`declare -p b` reports
+    /// `declare: b: not found`), and abandons the line, so neither
+    /// `rc=`/`rc2=` echo runs. Pre-fix rubash bound `b=([0]="x")`, bound
+    /// `c=()`, and ran both echoes. This is the shape that made the
+    /// fix's declare path need a hard failure rather than the partial
+    /// binding the bad-subscript class uses.
+    #[test]
+    fn case_9_declare_indexed_operand_binds_nothing() {
+        let (stdout, stderr, code) = run(
+            "753.9",
+            "shopt -s failglob\n\
+             declare b=(x /no/such/*.zzz y); echo \"rc=$?\"\n\
+             declare -p b\n\
+             declare -a c=(/no/such/*.zzz); echo \"rc2=$?\"\n\
+             declare -p c\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "END\n",
+            "declare operand failure must bind nothing and abandon the line; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: declare: b: not found\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 5: declare: c: not found\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.10 [guard] — `declare -A` (associative) is EXEMPT from failglob
+    /// in the compound-operand path: GNU stores the literal key
+    /// `["/no/such/*.zzz"]=""` with rc 0 and no diagnostic. The fix must
+    /// not over-apply the discard to this shape; this case was green
+    /// pre-fix and pins the limit of the new arming.
+    #[test]
+    fn case_10_declare_associative_is_exempt() {
+        let (stdout, stderr, code) = run(
+            "753.10",
+            "shopt -s failglob\n\
+             declare -A d=(/no/such/*.zzz); echo \"rc3=$?\"\n\
+             declare -p d\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "rc3=0\ndeclare -A d=([\"/no/such/*.zzz\"]=\"\" )\nEND\n",
+            "assoc operand must store the literal key; stderr:\n{stderr}"
+        );
+        assert_eq!(stderr, "", "assoc path must stay silent; stdout:\n{stdout}");
+    }
+
+    /// 753.11 [control] — the CONTAINING boundaries, all green pre-fix and
+    /// pinned so the new discard cannot leak past them: `( )` subshell
+    /// (line continues, rc=1), pipeline stage (line continues, pipeline
+    /// rc=0 from `cat`), `&` background job (line continues, rc=0 from the
+    /// `&` itself), `eval` (the discard applies INSIDE the eval string —
+    /// `eval-inside` never prints — but the caller's line continues), a
+    /// bare `$( )` (substitution yields empty, line continues), and a
+    /// command-prefix assignment `v=$(...)` (line continues with v empty).
+    #[test]
+    fn case_11_containing_boundaries_stay_contained() {
+        let (stdout, stderr, code) = run(
+            "753.11",
+            "shopt -s failglob\n\
+             ( set -- /no/such/*.zzz ); echo \"SUB_after_subshell rc=$?\"\n\
+             set -- /no/such/*.zzz | cat; echo \"PIPE_after rc=$?\"\n\
+             set -- /no/such/*.zzz & echo \"BG_after rc=$?\"\n\
+             wait\n\
+             eval 'set -- /no/such/*.zzz; echo eval-inside'; echo \"EVAL_after\"\n\
+             eval 'set -- /no/such/*.zzz'; echo \"EVAL2_after\"\n\
+             echo \"$(set -- /no/such/*.zzz; echo sub-in)\"; echo \"COMSUB_after\"\n\
+             v=$(set -- /no/such/*.zzz); echo \"ASSIGN_after v=$v\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout,
+            "SUB_after_subshell rc=1\n\
+             PIPE_after rc=0\n\
+             BG_after rc=0\n\
+             EVAL_after\n\
+             EVAL2_after\n\
+             \n\
+             COMSUB_after\n\
+             ASSIGN_after v=\n\
+             END\n",
+            "containing boundaries; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 3: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n\
+             fg.sh: line 7: no match: /no/such/*.zzz\n\
+             fg.sh: line 8: no match: /no/such/*.zzz\n\
+             fg.sh: line 9: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.12 [control] — loop bodies PENETRATE: the failglob inside a
+    /// while/until/for body discards the rest of the body's logical line,
+    /// escapes through `done`, and aborts the loop (one diagnostic per
+    /// loop, not one per remaining iteration). The next-line echoes
+    /// (`W_next`, `U_next`, `F_next`) prove the discard stopped at the
+    /// line boundary. Green pre-fix; pinned so the reader-layer change
+    /// cannot swallow the following line.
+    #[test]
+    fn case_12_loop_bodies_penetrate_and_abort() {
+        let (stdout, stderr, code) = run(
+            "753.12",
+            "shopt -s failglob\n\
+             i=0; while [ $i -lt 3 ]; do i=$((i+1)); set -- /no/such/*.zzz; echo \"wbody-$i\"; done; echo \"W_same\"\n\
+             echo \"W_next\"\n\
+             i=0; until [ $i -ge 3 ]; do i=$((i+1)); set -- /no/such/*.zzz; echo \"ubody-$i\"; done; echo \"U_same\"\n\
+             echo \"U_next\"\n\
+             for i in 1 2; do set -- /no/such/*.zzz; echo \"fbody-$i\"; done; echo \"F_same\"\n\
+             echo \"F_next\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "W_next\nU_next\nF_next\nEND\n",
+            "loop-body discard must stop at the line boundary; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 6: no match: /no/such/*.zzz\n",
+            "one diagnostic per aborted loop; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.13 [guard] — a temporary assignment prefix
+    /// (`x=/no/such/*.zzz true`) is COMMAND-level containment, not a line
+    /// abort: the command does not run, status is 1, GNU prints no
+    /// diagnostic at all, and the list continues — including inside a
+    /// brace group (`in-brace2` and `TA_brace_after` both print). The fix
+    /// must not upgrade this containment to a line discard; green pre-fix,
+    /// pinned as the guardrail.
+    #[test]
+    fn case_13_temporary_assignment_prefix_is_command_level() {
+        let (stdout, stderr, code) = run(
+            "753.13",
+            "shopt -s failglob\n\
+             x=/no/such/*.zzz true; echo \"TA_after\"\n\
+             { x=/no/such/*.zzz true; echo \"in-brace2\"; }; echo \"TA_brace_after\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "TA_after\nin-brace2\nTA_brace_after\nEND\n",
+            "temp-assignment containment must stay command-level; stderr:\n{stderr}"
+        );
+        assert_eq!(stderr, "", "temp-assignment failglob is silent in GNU; stdout:\n{stdout}");
+    }
+
+    /// 753.14 [control] — `set -e` still exits at the first failglob with
+    /// status 1 and no further output. The errexit exit is decided at the
+    /// reader-layer post-command check before the new discard consumption
+    /// is reached, so this shape is unchanged by the fix; pinned so a
+    /// future reader-layer change cannot silently reorder the two.
+    #[test]
+    fn case_14_errexit_exits_before_discard() {
+        let (stdout, stderr, code) = run(
+            "753.14",
+            "set -e\n\
+             shopt -s failglob\n\
+             f() { set -- /no/such/*.zzz; echo in-f; }\n\
+             f\n\
+             echo \"F-next\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(1), "errexit status; stderr:\n{stderr}");
+        assert_eq!(stdout, "", "errexit must exit before any echo; stderr:\n{stderr}");
+        assert_eq!(
+            stderr, "fg.sh: line 3: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.15 [control] — the discard is a LINE boundary, not a file
+    /// boundary: every command on the following line still runs
+    /// (`after-nextline`, `after-if-nextline`, `after-while`,
+    /// `after-func-nextline`), and the same-line `echo` after each failing
+    /// compound does not. Green pre-fix for the next-line echoes; the
+    /// same-line absences were pinned by 753.1-753.8. Together the pair
+    /// proves the reader skipped exactly the remainder of one logical
+    /// line.
+    #[test]
+    fn case_15_next_line_commands_still_run() {
+        let (stdout, stderr, code) = run(
+            "753.15",
+            "shopt -s failglob\n\
+             { set -- /no/such/*.zzz; echo \"inside\"; }\n\
+             echo \"after-nextline\"\n\
+             if true; then set -- /no/such/*.zzz; echo \"then-inside\"; fi\n\
+             echo \"after-if-nextline\"\n\
+             while false; do set -- /no/such/*.zzz; done\n\
+             echo \"after-while\"\n\
+             h() { set -- /no/such/*.zzz; echo \"func-inside\"; }\n\
+             h\n\
+             echo \"after-func-nextline\"\n\
+             echo END\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "after-nextline\nafter-if-nextline\nafter-while\nafter-func-nextline\nEND\n",
+            "next-line commands must survive the discard; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "fg.sh: line 2: no match: /no/such/*.zzz\n\
+             fg.sh: line 4: no match: /no/such/*.zzz\n\
+             fg.sh: line 8: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.16 [control] — the select body PENETRATES like the other loop
+    /// bodies. Needs a stdin payload: with EOF-on-open stdin the select
+    /// menu EOFs before the first prompt and the body never executes,
+    /// which is how the first probe misread select as a containing
+    /// boundary. With one input line the menu prints (`1) a` / `2) b` /
+    /// `#? `), the body's failglob discards the rest of the line
+    /// (`select-body` and `SEL_same` never print), and the next line runs.
+    /// Green pre-fix; pinned with the other loop bodies.
+    #[test]
+    fn case_16_select_body_penetrates() {
+        let (stdout, stderr, code) = run_with_stdin(
+            "753.16",
+            "shopt -s failglob\n\
+             select v in a b; do set -- /no/such/*.zzz; echo \"select-body\"; break; done; echo \"SEL_same\"\n\
+             echo \"SEL_next\"\n",
+            "pick\n",
+        );
+        assert_eq!(code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "SEL_next\n",
+            "select body must not contain the discard; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr,
+            "1) a\n2) b\n#? fg.sh: line 2: no match: /no/such/*.zzz\n",
+            "menu plus diagnostic; stdout:\n{stdout}"
+        );
+    }
+
+    /// 753.17 [control] — `source` is a containing boundary at the FILE
+    /// seam: the failglob inside the sourced file discards the rest of
+    /// that file's logical line (`src-inside` never prints) but the next
+    /// line of the sourced file still runs (`src-after`), and the caller's
+    /// line — the very `source ...; echo caller-same` that triggered it —
+    /// continues (`caller-same`, `caller-next`). This is the GNU
+    /// evalstring.c top-level catch the fix mirrors by absorbing the
+    /// failglob class at the source boundary. Green pre-fix; pinned so the
+    /// reader-layer change cannot make source abort its caller's line.
+    #[test]
+    fn case_17_source_boundary_contains() {
+        let dir = case_scratch("753.17");
+        std::fs::write(
+            dir.join("fg.sh"),
+            "shopt -s failglob\n\
+             source inner753.sh; echo \"caller-same\"\n\
+             echo \"caller-next\"\n\
+             echo END\n",
+        )
+        .expect("write script");
+        std::fs::write(
+            dir.join("inner753.sh"),
+            "shopt -s failglob\n\
+             set -- /no/such/*.zzz; echo \"src-inside\"\n\
+             echo \"src-after\"\n",
+        )
+        .expect("write inner script");
+        let out = run_rubash_in(&dir, &["fg.sh"], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.code, Some(0), "rc; stderr:\n{stderr}");
+        assert_eq!(
+            stdout, "src-after\ncaller-same\ncaller-next\nEND\n",
+            "source must contain the discard at the file seam; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr, "inner753.sh: line 2: no match: /no/such/*.zzz\n",
+            "diagnostics; stdout:\n{stdout}"
+        );
+    }
 }

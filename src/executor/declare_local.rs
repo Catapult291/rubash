@@ -701,8 +701,22 @@ impl Executor {
                     // processed before it and materializes the array — an
                     // empty partial list still binds `lhs=()`
                     // (declare.def:961-962 convert_var_to_array runs before
-                    // the assignment).
-                    Err(partial) => partial,
+                    // the assignment). That is the bad-subscript contract.
+                    // rubash#753: a failglob element is a different class —
+                    // GNU's expand_words_no_vars reports `no match' and
+                    // jumps DISCARD before any element binds, so the whole
+                    // operand fails: nothing binds and the rest of the
+                    // logical line is abandoned (`declare b=(/no/such/*.zzz);
+                    // echo after` never prints `after` and `declare -p b`
+                    // reports not found — verified GNU 5.3). Propagate the
+                    // hard failure; execute_declare's Err(()) arm returns 1
+                    // with the reader-level discard already armed.
+                    Err(partial) => {
+                        if self.evalerror_failglob_pending.get() {
+                            return Err(());
+                        }
+                        partial
+                    }
                 };
                 let marker = if marked { COMPOUND_ASSIGNMENT_MARKER } else { "" };
                 Ok(format!(

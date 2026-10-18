@@ -816,7 +816,13 @@ impl Executor {
 fn parameter_char_length(value: &str) -> usize {
     let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
         .expect("raw-byte sentinel is a valid char");
-    let bytes = if value.contains(sentinel) {
+    // decode_raw_byte_markers also restores the E400 literal-char escape
+    // (E400 + c -> c), so a value carrying user PUA data like
+    // `$'\uE301'` (stored as E400 E301) must take the decode path too —
+    // otherwise the escape introducer is miscounted as a character
+    // (rubash#735: `${#x}` was 2, not 1).
+    let literal_escape = crate::executor::markers::LITERAL_CHAR_ESCAPE;
+    let bytes = if value.contains(sentinel) || value.contains(literal_escape) {
         crate::executor::substitution_metadata::decode_raw_byte_markers(value.as_bytes())
     } else {
         value.as_bytes().to_vec()

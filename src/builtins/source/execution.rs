@@ -40,6 +40,19 @@ pub(super) fn execute_text_maybe_redirected(
 /// text is alias-expanded with the live table before parsing, and the
 /// STREAMED marker suspends executor-level re-expansion, matching
 /// run_history_group's contract.
+///
+/// rubash#753: a DISCARD-class word-expansion failure (failglob / redirect
+/// no-match) inside the sourced text ends only the sourced file — GNU's
+/// parse_and_execute installs the same local top_level catch as `eval`
+/// (evalstring.c:365,422-442), so the CALLER's remaining commands run
+/// (`source f; echo K` prints K when f's failing line was the last one).
+/// The group's own walk already skipped the failing line's tail inside the
+/// group (the group list runs one level below the reader, and the armed
+/// abandon makes it the discard boundary); `absorb_failglob_discard` after
+/// each group keeps the armed abandon from leaking into the caller's
+/// reader loop. The exit code is left alone: the failglob site set 1, and
+/// a later group that ran fine leaves its own status — GNU's per-line
+/// parse_and_execute loop semantics.
 fn run_source_groups(
     executor: &mut Executor,
     source: &str,
@@ -91,6 +104,7 @@ fn run_source_groups(
                     Some(pre_alias_text.as_str())
                 },
             );
+            executor.absorb_failglob_discard();
             match old_streamed {
                 Some(value) => executor
                     .shell_state
@@ -203,6 +217,7 @@ fn run_source_groups(
             .env_vars
             .insert("__RUBASH_ALIAS_STREAMED".to_string(), "1".to_string());
         let group_result = executor.execute_ast(&ast);
+        executor.absorb_failglob_discard();
         match old_streamed {
             Some(value) => executor
                 .shell_state

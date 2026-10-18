@@ -210,17 +210,68 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<Result<(), ExecuteError>, ExecuteError> {
-        if let Some(status) = cmd.words.get(1).filter(|status| *status != "--help") {
-            if status.parse::<i128>().is_err() {
+        // GNU builtins/common.c get_exitstat (bash 5.3) argument shape:
+        // ISOPTION(word, '-') matches "--" exactly, and a leading `--` is
+        // skipped before the status word — `exit --` exits with $?,
+        // `exit -- 1` exits 1, `exit -- 1 2` is the too-many error
+        // (2026-10-18 probes X4-X7). A raw first word of `--help` keeps
+        // the CHECK_HELPOPT help path (builtins/exit.def:59). `exit -` is
+        // NOT skipped: valid_number("-") fails, so it is the numeric
+        // argument error (probe X3).
+        let raw: Vec<&str> = cmd.words[1..].iter().map(String::as_str).collect();
+        // CHECK_HELPOPT (builtins/exit.def:59) inspects the RAW first word
+        // before anything else: `exit --help` prints the help text, and
+        // `exit -- --help` is the numeric error on `--help` (the `--` skip
+        // happens inside get_exitstat, after CHECK_HELPOPT).
+        if raw.first() != Some(&"--help") {
+            let arg_index = if raw.first() == Some(&"--") { 1 } else { 0 };
+            let rest = &raw[arg_index.min(raw.len())..];
+            // get_exitstat order: the FIRST status word's numeric validity is
+            // checked before no_args, so `exit abc def` reports the numeric
+            // error, not too-many-arguments. The numeric error path (below)
+            // keeps the 5.3 semantics: the command FAILS with status 2
+            // (EX_USAGE 258 -> builtin_status -> EX_BADUSAGE) and the shell
+            // CONTINUES — 5.2 exited here, but docs/architecture.md pins the
+            // 5.3.0 baseline (probe D: `-c 'exit abc; echo AFTER'` prints
+            // AFTER, $?=2).
+            if let Some(status) = rest.first() {
+                if status.parse::<i128>().is_err() {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        &mut stderr,
+                        "{}exit: {}: numeric argument required",
+                        self.diagnostic_prefix(),
+                        status
+                    )?;
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    self.exit_code = 2;
+                    return Ok(Ok(()));
+                }
+            }
+            // no_args (builtins/common.c, fatal == 0): the diagnostic carries
+            // the reader prolog (`bash: line N:` / `<script>: line N:` — the
+            // old builtin-level `std::env::var` helper never saw the engine's
+            // internal env, so the line segment was silently dropped, issue
+            // #705 R7.4), then `set_exit_status (EX_BADUSAGE)` puts 2 into $?,
+            // and `top_level_cleanup` + `jump_to_top_level (DISCARD)` abandon
+            // the rest of the current command list — nested eval/source string
+            // levels popped whole — before the reader continues with the next
+            // command ($?=2). Under `-c` the whole string is abandoned and
+            // shell.c:1477 run_one_command's DISCARD catch `return
+            // last_command_exit_value = 1` ends the shell (probes P1-P9,
+            // S1-S9, W1-W6: 2026-10-18 GNU 5.3.0). The discard rides the
+            // evalerror vehicle with the exit-too-many class marker.
+            if rest.len() > 1 {
                 let mut stderr = Vec::new();
                 writeln!(
                     &mut stderr,
-                    "{}exit: {}: numeric argument required",
-                    self.diagnostic_prefix(),
-                    status
+                    "{}exit: too many arguments",
+                    self.diagnostic_prefix()
                 )?;
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                 self.exit_code = 2;
+                self.raise_evalerror_abort();
+                self.evalerror_exit_toomany_pending.set(true);
                 return Ok(Ok(()));
             }
         }

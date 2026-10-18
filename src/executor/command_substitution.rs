@@ -1488,6 +1488,8 @@ impl Executor {
             evalerror_pending: Cell::new(false),
             nounset_force_eof: Cell::new(false),
             evalerror_subscript_pending: Cell::new(false),
+            evalerror_failglob_pending: Cell::new(false),
+            evalerror_exit_toomany_pending: Cell::new(false),
             eval_list_depth: Cell::new(None),
             evalerror_line: Cell::new(None),
             command_expansion_failed: Cell::new(false),

@@ -88,6 +88,19 @@ impl Executor {
     pub(in crate::executor) fn redirect_failglob_aborted(&mut self) -> bool {
         let aborted = self.shell_state.redirect_failglob_error.replace(false);
         self.shell_state.redirect_failglob_seen.set(false);
+        if aborted {
+            // rubash#753: GNU's redirect no-match is the same
+            // exp_jump_to_top_level(DISCARD) as the argument-word failglob
+            // — the whole logical line is abandoned (`{ echo x > nope*; };
+            // echo after` prints neither side; oracle probe). Every
+            // consumer of this gate is a failure observer (the Err sites
+            // abort the command list, the redirect_failed site skips the
+            // command), so arming here covers them all; the class flag
+            // lets the eval/source boundary contain the discard when the
+            // redirect sat inside their text.
+            self.raise_evalerror_abort();
+            self.evalerror_failglob_pending.set(true);
+        }
         aborted
     }
 
@@ -273,7 +286,8 @@ impl Executor {
         // ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) here, or the
         // guard byte reaches the ambiguity gate and the open() call
         // (rubash#379: `> $'out tab1.txt'` must write that literal name).
-        let expanded = expanded.replace(crate::executor::markers::ANSI_C_IFS_GUARD, "");
+        // E400-aware: user U+E401 data (E400 E401) must survive (rubash#735).
+        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(&expanded);
         if suppress_glob {
             // GNU subst.c:12683-12688 (expand_words_no_vars else-branch): a
             // word that does not glob is still DEQUOTED before it becomes
