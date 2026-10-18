@@ -69,12 +69,12 @@ after return: 2
 after history: 2
 after history: 2
 too many arguments
-after exit: 1
+after exit: 2
 after return: 2
 after shift: 1
 after break: 1
 after continue: 1
-after exit: 1
+after exit: 2
 after shift: 1
 after break: 1
 after continue: 1
