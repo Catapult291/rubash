@@ -56,6 +56,14 @@ fn run_main() -> i32 {
     // __RUBASH_CMD_FILE; splice it back into argv here, before anything reads
     // it and before the executor imports the process environment.
     rubash::invocation::materialize_command_file(&mut args);
+    // rubash#866: consume the background-wrapper spawn handshake (the
+    // --internal-bg-wrapper=<nonce> argv flag + the matching
+    // __RUBASH_BACKGROUND_WRAPPER env nonce) before any parser or the
+    // `--internal-*` dispatch below sees it; the env key is scrubbed
+    // unconditionally so a user-forged value can neither arm the wrapper
+    // role nor leak into children. Also runs for plain invocations, where
+    // it is just the scrub.
+    rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
     let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());
     if let Some(name) = args
         .get(1)

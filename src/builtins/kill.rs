@@ -1948,32 +1948,183 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
     kernel_signals::handler_installed(signal)
 }
 
+/// rubash#866: the reserved `__RUBASH_*` namespace key that used to carry
+/// the forgeable constant "1" into the wrapper's environment. It now carries
+/// an unguessable spawn-time nonce (see `new_background_wrapper_nonce`) and
+/// is only ever honored in combination with the matching argv flag
+/// (`BACKGROUND_WRAPPER_FLAG`) at handshake time; a user
+/// `export __RUBASH_BACKGROUND_WRAPPER=<anything>` arms nothing and is
+/// scrubbed from the process environment at startup.
+pub const BACKGROUND_WRAPPER_ENV_KEY: &str = "__RUBASH_BACKGROUND_WRAPPER";
+
+/// rubash#866: the internal argv flag carrying the handshake nonce. Like the
+/// other `--internal-*` faces it is consumed in main() before the GNU option
+/// parser ever sees it; the wrapper role arms only when the flag's nonce and
+/// the environment nonce agree (both constructed by the wrapper spawn site in
+/// compound_exec), so guessing or exporting the environment name alone is
+/// not enough.
+pub const BACKGROUND_WRAPPER_FLAG: &str = "--internal-bg-wrapper=";
+
+/// rubash#866: in-process wrapper role. Decided ONCE per process at startup
+/// by `consume_background_wrapper_handshake` (nonce handshake) and consulted
+/// by `child_pre_exec_reset` between fork and exec — never by reading the
+/// ambient environment, which a user script can forge. Atomic because the
+/// reader runs in the post-fork child (async-signal-safe: no locks, no
+/// allocation — the old `std::env::var` probe allocated).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static BACKGROUND_WRAPPER_ROLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// rubash#867: the parent pid an armed child must still see from getppid().
+/// Captured at handshake time (this process's own pid: the wrapper is the
+/// parent of every child it spawns) instead of comparing against the
+/// constant 1 — inside a PID namespace a healthy child of the namespace's
+/// PID 1 legitimately observes getppid() == 1 before any fork race, and the
+/// old constant comparison made it SIGKILL itself at spawn.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static BACKGROUND_WRAPPER_EXPECTED_PARENT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// rubash#866: per-process counter folded into the nonce so two wrappers
+/// spawned within the same clock tick never share a handshake value.
+static WRAPPER_NONCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// rubash#866: 128 bits of spawn-time handshake material as 32 hex chars.
+/// Entropy: wall-clock nanoseconds, pid, a process-local counter and an
+/// ASLR-derived stack address, run through SplitMix64. No dependency on a
+/// RNG crate; a user script cannot observe or predict the value another
+/// process drew at its spawn instant, which is the whole point — the
+/// forgeable constant "1" let `export __RUBASH_BACKGROUND_WRAPPER=1` impose
+/// PDEATHSIG semantics on children that never went through the wrapper
+/// spawn path.
+pub fn new_background_wrapper_nonce() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = WRAPPER_NONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let anchor = &counter as *const u64 as u64;
+    let mut z = nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ counter.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ anchor.rotate_left(17);
+    // SplitMix64 finalizer (Steele et al.), two draws for 128 bits.
+    let mut draw = |z: &mut u64| {
+        *z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut v = *z;
+        v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        v ^ (v >> 31)
+    };
+    let hi = draw(&mut z);
+    let lo = draw(&mut z);
+    format!("{hi:016x}{lo:016x}")
+}
+
+/// rubash#866: consume the background-wrapper spawn handshake — called from
+/// main() before any parser or executor touches argv (same consume-on-read
+/// face as NIU_INVOKED_AS and `--internal-yes|head|wc`). The wrapper role
+/// arms only when the argv flag nonce and the environment nonce AGREE (both
+/// were constructed by our own spawn site); afterwards the environment key
+/// is scrubbed unconditionally so a user-forged value can neither arm
+/// anything nor leak into grandchildren. On mismatch (hand forgery, stale
+/// spawn, tampering) the process simply runs without the wrapper role.
+pub fn consume_background_wrapper_handshake(args: &mut Vec<String>) {
+    let nonce = match args
+        .get(1)
+        .and_then(|arg| arg.strip_prefix(BACKGROUND_WRAPPER_FLAG))
+    {
+        Some(nonce) => nonce.to_owned(),
+        None => {
+            // No flag: a plain (user-invoked) rubash. Still scrub a forged
+            // ambient value — nothing may read it anymore.
+            std::env::remove_var(BACKGROUND_WRAPPER_ENV_KEY);
+            return;
+        }
+    };
+    args.remove(1);
+    if std::env::var(BACKGROUND_WRAPPER_ENV_KEY).as_deref() != Ok(nonce.as_str()) {
+        std::env::remove_var(BACKGROUND_WRAPPER_ENV_KEY);
+        return;
+    }
+    std::env::remove_var(BACKGROUND_WRAPPER_ENV_KEY);
+    #[cfg(unix)]
+    {
+        BACKGROUND_WRAPPER_ROLE.store(true, std::sync::atomic::Ordering::Release);
+        BACKGROUND_WRAPPER_EXPECTED_PARENT
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Test/inspection accessor for the in-process wrapper role.
+#[cfg(unix)]
+pub fn background_wrapper_role_armed() -> bool {
+    BACKGROUND_WRAPPER_ROLE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PR_SET_PDEATHSIG + race check against the EXPECTED parent pid. Runs
+/// between fork and exec: syscalls and atomic loads only, no allocation.
+#[cfg(target_os = "linux")]
+fn arm_pdeathsig(expected_parent: u32) -> std::io::Result<()> {
+    // PR_SET_PDEATHSIG: send SIGKILL to this process when its parent dies.
+    const PR_SET_PDEATHSIG: i32 = 1;
+    let ret = unsafe { libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL as u64, 0, 0, 0) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // rubash#867: race — the parent may have died between fork and prctl,
+    // in which case we were reparented (to init, a subreaper, or the
+    // namespace's PID 1). Self-kill only when the observed parent DIVERGES
+    // from the expected one; never against the constant 1, which a healthy
+    // child of a namespace-PID-1 parent matches before any race is possible.
+    if unsafe { libc::getppid() } != expected_parent as libc::pid_t {
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
+    Ok(())
+}
+
+/// Non-Linux unix: no PR_SET_PDEATHSIG; parent tracking covers the wrapper
+/// contract there (rubash#737).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn arm_pdeathsig(_expected_parent: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// pre_exec hook for spawned child processes (unix arm of rubash#229):
 /// restore GNU's child signal dispositions between fork and exec. A no-op
 /// when the backend was never installed (the process then still holds its
 /// entry dispositions everywhere).
+///
+/// rubash#737/#866: a process that consumed the background-wrapper handshake
+/// additionally arms PDEATHSIG for the children IT spawns, decided from the
+/// in-process role — the ambient environment is never consulted here (it is
+/// user-forgeable), and the race check compares against the wrapper's own
+/// pid instead of the constant 1 (rubash#867).
+///
+/// Behavior note (why this is an exact predicate swap): pre_exec runs in the
+/// forked child BEFORE execve, so the old `env::var` probe here read the
+/// FORKING PARENT's environ — the check was always a parent-state predicate,
+/// never a property of the child's own environment block. Swapping "parent
+/// env contains the marker" for "parent holds the in-process role" keeps
+/// every spawn's arming decision byte-identical in clean environments (the
+/// main shell never arms — so a wrapper itself survives its shell's exit, as
+/// GNU's background jobs do — and a wrapper arms every child it spawns),
+/// while a forged `export` arms nothing.
 #[cfg(unix)]
 pub fn child_pre_exec_reset() -> std::io::Result<()> {
     kernel_signals::pre_exec_child_dispositions()?;
-    // rubash#737: if the parent is a background-job wrapper
-    // (__RUBASH_BACKGROUND_WRAPPER), arrange for this child to die when the
-    // wrapper dies. Without this, `kill $!` kills the wrapper but leaves
-    // the actual work (grandchild) orphaned and running.
-    // Note: prctl(PR_SET_PDEATHSIG) is Linux-specific; on macOS and other
-    // Unix the wrapper relies on the parent tracking instead (rubash#737).
+    // rubash#737: if this process is a background-job wrapper, arrange for
+    // this child to die when the wrapper dies. Without this, `kill $!` kills
+    // the wrapper but leaves the actual work (grandchild) orphaned and
+    // running.
     #[cfg(target_os = "linux")]
-    if std::env::var("__RUBASH_BACKGROUND_WRAPPER").as_deref() == Ok("1") {
-        // PR_SET_PDEATHSIG: send SIGKILL to this process when its parent dies.
-        const PR_SET_PDEATHSIG: i32 = 1;
-        let ret = unsafe { libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL as u64, 0, 0, 0) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // Race: parent may have died between fork and prctl. If we're now
-        // orphaned (reparented to init), kill ourselves.
-        if unsafe { libc::getppid() } == 1 {
-            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
-        }
+    if BACKGROUND_WRAPPER_ROLE.load(std::sync::atomic::Ordering::Acquire) {
+        let expected =
+            BACKGROUND_WRAPPER_EXPECTED_PARENT.load(std::sync::atomic::Ordering::Acquire);
+        arm_pdeathsig(expected)?;
     }
     Ok(())
 }
@@ -2008,6 +2159,193 @@ mod kernel_signal_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("SIGUSR1 did not reach the pending-signal queue");
+    }
+}
+
+/// rubash#866/#867: the wrapper handshake is unforgeable — the role arms
+/// only when the argv nonce and the env nonce agree (both constructed by the
+/// wrapper spawn site), both channels are consumed afterwards, and a forged
+/// ambient value arms nothing and is scrubbed. These tests touch
+/// process-global state (the role statics + the env key); a Drop guard
+/// restores them so sibling tests in this binary are unaffected even on
+/// assertion failure.
+#[cfg(all(test, unix))]
+mod background_wrapper_handshake_tests {
+    use super::{
+        background_wrapper_role_armed, consume_background_wrapper_handshake,
+        new_background_wrapper_nonce, BACKGROUND_WRAPPER_ENV_KEY,
+        BACKGROUND_WRAPPER_EXPECTED_PARENT, BACKGROUND_WRAPPER_FLAG, BACKGROUND_WRAPPER_ROLE,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Serializes the env-key mutation across these tests (plain `cargo
+    /// test` runs them as threads of one process; nextest isolates them).
+    static HANDSHAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RoleGuard;
+    impl RoleGuard {
+        fn new() -> Self {
+            Self
+        }
+    }
+    impl Drop for RoleGuard {
+        fn drop(&mut self) {
+            BACKGROUND_WRAPPER_ROLE.store(false, Ordering::Release);
+            BACKGROUND_WRAPPER_EXPECTED_PARENT.store(0, Ordering::Release);
+            std::env::remove_var(BACKGROUND_WRAPPER_ENV_KEY);
+        }
+    }
+
+    fn args_with_flag(nonce: &str) -> Vec<String> {
+        vec![
+            "rubash".to_string(),
+            format!("{BACKGROUND_WRAPPER_FLAG}{nonce}"),
+            "-c".to_string(),
+            "true".to_string(),
+        ]
+    }
+
+    #[test]
+    fn forged_env_value_arms_nothing_and_is_scrubbed() {
+        let _lock = HANDSHAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RoleGuard::new();
+        // The #866 attack: plain `export __RUBASH_BACKGROUND_WRAPPER=1` in
+        // the environment of a rubash that never went through the wrapper
+        // spawn path.
+        std::env::set_var(BACKGROUND_WRAPPER_ENV_KEY, "1");
+        let mut args = vec!["rubash".to_string(), "-c".to_string(), "true".to_string()];
+        consume_background_wrapper_handshake(&mut args);
+        assert!(!background_wrapper_role_armed());
+        // The forged value must not survive to be inherited by children.
+        assert!(std::env::var(BACKGROUND_WRAPPER_ENV_KEY).is_err());
+        // argv untouched (no flag to strip).
+        assert_eq!(
+            args,
+            vec!["rubash".to_string(), "-c".to_string(), "true".to_string()]
+        );
+    }
+
+    #[test]
+    fn argv_flag_without_matching_env_nonce_arms_nothing() {
+        let _lock = HANDSHAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RoleGuard::new();
+        std::env::remove_var(BACKGROUND_WRAPPER_ENV_KEY);
+        let nonce = new_background_wrapper_nonce();
+        let mut args = args_with_flag(&nonce);
+        consume_background_wrapper_handshake(&mut args);
+        assert!(!background_wrapper_role_armed());
+        // The internal flag is still consumed: the GNU option parser must
+        // never see it.
+        assert_eq!(
+            args,
+            vec!["rubash".to_string(), "-c".to_string(), "true".to_string()]
+        );
+    }
+
+    #[test]
+    fn nonce_mismatch_between_channels_arms_nothing() {
+        let _lock = HANDSHAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RoleGuard::new();
+        std::env::set_var(BACKGROUND_WRAPPER_ENV_KEY, new_background_wrapper_nonce());
+        let forged = new_background_wrapper_nonce();
+        let mut args = args_with_flag(&forged);
+        consume_background_wrapper_handshake(&mut args);
+        assert!(!background_wrapper_role_armed());
+        assert!(std::env::var(BACKGROUND_WRAPPER_ENV_KEY).is_err());
+    }
+
+    #[test]
+    fn agreeing_channels_arm_role_capture_expected_parent_and_consume_both() {
+        let _lock = HANDSHAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RoleGuard::new();
+        let nonce = new_background_wrapper_nonce();
+        std::env::set_var(BACKGROUND_WRAPPER_ENV_KEY, &nonce);
+        let mut args = args_with_flag(&nonce);
+        consume_background_wrapper_handshake(&mut args);
+        assert!(background_wrapper_role_armed());
+        // rubash#867: the armed children compare getppid() against THIS
+        // process's pid, never the constant 1.
+        assert_eq!(
+            BACKGROUND_WRAPPER_EXPECTED_PARENT.load(Ordering::Acquire),
+            std::process::id()
+        );
+        assert!(std::env::var(BACKGROUND_WRAPPER_ENV_KEY).is_err());
+        assert_eq!(
+            args,
+            vec!["rubash".to_string(), "-c".to_string(), "true".to_string()]
+        );
+    }
+
+    #[test]
+    fn nonces_are_unique_and_well_formed() {
+        let a = new_background_wrapper_nonce();
+        let b = new_background_wrapper_nonce();
+        assert_ne!(a, b, "successive spawn-time nonces must differ");
+        assert_eq!(a.len(), 32);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+}
+
+/// rubash#867: the armed child's race check compares getppid() against the
+/// EXPECTED parent pid, never the constant 1. Driven here through the real
+/// role statics and the real pre_exec hook; the spawned processes are this
+/// test's own children. Mutates process-global state — the guard restores
+/// it, and the linux-only lib lane runs under nextest (process-per-test) in
+/// CI and --test-threads=1 locally, so no sibling test observes the window.
+#[cfg(all(test, target_os = "linux"))]
+mod pdeathsig_expected_parent_tests {
+    use super::{
+        child_pre_exec_reset, BACKGROUND_WRAPPER_EXPECTED_PARENT, BACKGROUND_WRAPPER_ROLE,
+    };
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::sync::atomic::Ordering;
+
+    struct RoleGuard;
+    impl Drop for RoleGuard {
+        fn drop(&mut self) {
+            BACKGROUND_WRAPPER_ROLE.store(false, Ordering::Release);
+            BACKGROUND_WRAPPER_EXPECTED_PARENT.store(0, Ordering::Release);
+        }
+    }
+
+    fn spawn_armed(expected_parent: u32) -> std::process::ExitStatus {
+        BACKGROUND_WRAPPER_ROLE.store(true, Ordering::Release);
+        BACKGROUND_WRAPPER_EXPECTED_PARENT.store(expected_parent, Ordering::Release);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo ARMED-ALIVE"]);
+        unsafe {
+            cmd.pre_exec(|| child_pre_exec_reset());
+        }
+        cmd.status().expect("spawn armed child")
+    }
+
+    #[test]
+    fn healthy_child_of_expected_parent_survives_arming() {
+        let _guard = RoleGuard;
+        let status = spawn_armed(std::process::id());
+        // A healthy child of a namespace-PID-1 parent lands here too: this
+        // assert is exactly the constant-1 comparison's false positive,
+        // which must never fire.
+        assert!(
+            status.success(),
+            "healthy armed child was killed: {status:?}"
+        );
+    }
+
+    #[test]
+    fn child_whose_parent_diverges_from_expected_self_kills() {
+        let _guard = RoleGuard;
+        // Deliberately wrong expectation: the observed ppid (this test's
+        // pid) diverges, so the race check must fire — proving the check
+        // reads the expected pid rather than `== 1` (on this host the old
+        // check's `getppid() == 1` was false for the same child).
+        let wrong = std::process::id().wrapping_add(0x4000_0000);
+        let status = spawn_armed(wrong);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "status: {status:?}");
     }
 }
 
