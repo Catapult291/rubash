@@ -3580,8 +3580,11 @@ impl Executor {
                 // transport text counts `printf 'a\014b' | wc -w` as 1 where
                 // GNU reports 2, and payload must never be fed to
                 // `decode_to_visible_text` (internal-text decoder: a payload
-                // control byte maps to CTLESC and trips its postcondition,
-                // locale.rs:545). The line-count arm needs no decode:
+                // control byte such as 0x11 is taken as the CTLESC carrier
+                // and consumes the following character, corrupting the byte
+                // stream — the output-side asserts that used to catch this
+                // were removed by #838, so the corruption is silent). The
+                // line-count arm needs no decode:
                 // 0x0A is not a carrier byte, so every `\n` is already real.
                 // Only the single-flag fast paths are emulated inline; every
                 // other invocation (-L, -m, --words, combined flags, file
@@ -3875,9 +3878,10 @@ pub(crate) fn command_is_compound_pipeline_stage(command: &CommandNode) -> bool 
 /// niubash#383: `wc -w` (and the flagless words field) must count words over
 /// the payload bytes the external wc would receive. It must NOT decode
 /// through `crate::locale::decode_to_visible_text`: that is an internal-text
-/// decoder, and a payload control byte (e.g. piped 0x11) decodes to CTLESC,
-/// tripping its `debug_assert!(!contains(CTLESC))` postcondition
-/// (locale.rs:545) and, without asserts, silently miscounting.
+/// decoder, and a payload control byte (e.g. piped 0x11) is decoded as the
+/// CTLESC carrier that consumes the following character — silently
+/// miscounting (its output-side asserts were removed by #838, so nothing
+/// trips any more).
 fn inline_wc_word_count(input: &str) -> usize {
     const ASCII_WHITESPACE: [u8; 6] = [b' ', b'\t', b'\n', 0x0B, 0x0C, b'\r'];
     crate::executor::substitution_metadata::shell_text_to_raw_bytes(input)

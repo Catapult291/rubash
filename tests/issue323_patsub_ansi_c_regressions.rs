@@ -5,9 +5,10 @@
 //! `apples\noranges\npears` as ONE line.
 //!
 //! GNU semantics (vendored third_party/bash): the replacement side of a
-//! pattern substitution is expanded as its own word — subst.c:4462
-//! expand_string_for_rhs (from parameter_brace_patsub) hands it through
-//! call_expand_word_internal, whose `$'` handling decodes with ansicstr
+//! pattern substitution is expanded as its own word — subst.c:3950
+//! expand_string_for_patsub (from parameter_brace_patsub:9433) hands it
+//! through expand_string_for_pat -> call_expand_word_internal, whose `$'`
+//! handling decodes with ansicstr
 //! (lib/sh/strtrans.c:51): `\a \b \e \E \f \n \r \t \v`, octal `\NNN`,
 //! `\xHH`, `\uNNNN`/`\UNNNNNNNN`, `\cX`, quote escapes; UNRECOGNIZED
 //! escapes keep the backslash (`$'\q'` → `\q`).
