@@ -152,5 +152,14 @@ the doubled emission and the dropped `2>file` capture are new. Filed as **#826**
 
     RUBASH_BIN=<path>/rubash.exe python scripts/audit/nested-context-probes.py
 
-Last full run (this branch, 2026-10-13): `cases=45 divergences=4` — the four are
-§3.1 and §3.2 (three probes of one mechanism). Every #720-related trap cell passes.
+Last full run (master `c9e14214`, 2026-10-20): `cases=45 divergences=0`
+engine-side — the §3.1 (#825, closed) and §3.2 (#826, closed) probes now pass,
+and every #720-related trap cell passes. The only residual byte diffs are three
+D1-brand path spellings (`/d/...` vs `/mnt/d/...` in the shell's own
+`$0: line N:` prefix on the redirect-failure probes); status, single emission
+and fd-table routing all match. Runner: `RUBASH_BIN=<exe>
+GNU_CMD='wsl /usr/local/bin/bash' python
+scripts/audit/nested-context-probes.py` from an empty scratch cwd (case
+artefacts land there); stdin is EOF by harness construction since the 2026-10-20
+rerun. On hosts whose `wsl.exe` prepends banner noise to guest stderr, strip
+that exact prefix outside the comparison — it is machine noise, not a leg.
