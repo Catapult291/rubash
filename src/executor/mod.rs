@@ -90,7 +90,7 @@ mod external_finish;
 mod external_inner;
 mod external_redirects;
 mod external_setup;
-mod fd_table;
+pub(crate) mod fd_table;
 mod function_calls;
 mod function_locals;
 mod getopts_enable;

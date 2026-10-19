@@ -962,9 +962,14 @@ impl Executor {
             fd -= 1;
         }
         if fd <= 3 {
-            // move_to_high_fd (general.c:681) is fcntl F_DUPFD-backed in
-            // GNU, so the fallback is bounded by the same RLIMIT_NOFILE
-            // soft limit as every other dynamic allocation (rubash#773).
+            // move_to_high_fd (general.c:681) is dup2-backed in GNU — it
+            // scans downward from maxfd-1 via fcntl F_GETFD and dup2()s
+            // into the first free slot — a different mechanism from the
+            // fcntl F_DUPFD that backs {var} allocation (redir.c:942).
+            // The limit-aware fallback below is bounded by the same
+            // RLIMIT_NOFILE soft limit as every other dynamic allocation
+            // (rubash#773); its low-first pick order is a pre-existing
+            // simplification of GNU's high-side scan.
             return self.allocate_dynamic_fd().unwrap_or(63);
         }
         self.fd_table.open_input(

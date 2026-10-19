@@ -338,15 +338,20 @@ mod plat {
 
     /// Emulated defaults (documented in the module platform-contract note).
     /// `n` mirrors the WSL GNU bash 5.3.0 oracle's own RLIMIT_NOFILE
-    /// (2026-10-19 probe: soft 10240 / hard 1048576) — the old stub's
-    /// soft-1024 opinion is what capped the fd table at 1014 `{fd}`
-    /// allocations with a bogus EINVAL (rubash#773). The fd allocator
-    /// (executor/fd_table.rs) takes this soft value as its ceiling.
+    /// (2026-10-19 probe) — the old stub's soft-1024 opinion is what capped
+    /// the fd table at 1014 `{fd}` allocations with a bogus EINVAL
+    /// (rubash#773). The pair is sourced from executor/fd_table.rs so the
+    /// reporting side and the allocator ceiling can never drift apart
+    /// (rubash#872): DEFAULT_OPEN_FILES_SOFT_LIMIT is what the fd
+    /// allocator clamps to, UNLIMITED_OPEN_FILES_CEILING is the hard cap.
     fn default_for(option: char) -> (u64, u64) {
         match option {
             'c' => (0, UNLIMITED), // Linux-typical: core dumps off by default
             'e' | 'r' => (0, 0),
-            'n' => (10_240, 1_048_576),
+            'n' => (
+                crate::executor::fd_table::FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT as u64,
+                crate::executor::fd_table::FdTable::UNLIMITED_OPEN_FILES_CEILING as u64,
+            ),
             'p' => (4096, 4096),
             'q' => (819_200, 819_200),
             's' => (8_388_608, UNLIMITED),

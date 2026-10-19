@@ -115,7 +115,6 @@ pub(crate) enum FdError {
 #[derive(Debug, Clone)]
 pub(crate) struct FdTable {
     pub(crate) entries: BTreeMap<u32, FdEntry>,
-    pub(crate) next_dynamic_fd: u32,
     /// builtins/read.def read_timeout: while `read -t N` runs, handle-backed
     /// reads wait at most until this deadline for input. `None` means an
     /// unbounded read. Only the blocking endpoints (File/CoprocStdout)
@@ -145,7 +144,6 @@ impl FdTable {
     pub(crate) fn new() -> Self {
         let mut table = Self {
             entries: BTreeMap::new(),
-            next_dynamic_fd: 10,
             read_deadline: None,
             read_timed_out: false,
             read_eof_no_delimiter: false,
@@ -240,7 +238,6 @@ impl FdTable {
         if candidate >= upper {
             return None;
         }
-        self.next_dynamic_fd = (candidate as u32).saturating_add(1).max(10);
         Some(candidate as u32)
     }
 
