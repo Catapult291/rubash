@@ -214,10 +214,10 @@ pub(crate) use crate::executor::markers::BYTE_CHAR_BASE;
 
 /// Flatten a pattern to byte-chars for byte-level matching. Pattern syntax
 /// chars (*, ?, \, [, ], CTLESC) are kept as-is; raw-byte markers become
-/// byte-chars; other chars become their UTF-8 byte-chars (each byte as
-/// U+E1xx). A CTLESC-quoted raw-byte marker pair (`CTLESC E000 [CTLESC]
-/// E0xx`, the quoted-span spelling of the pair) resolves to the single
-/// byte-char the pair carries.
+/// byte-chars; the literal-backslash marker becomes the backslash
+/// byte-char; all other chars stay verbatim. A CTLESC-quoted raw-byte
+/// marker pair (`CTLESC E000 [CTLESC] E0xx`, the quoted-span spelling of
+/// the pair) resolves to the single byte-char the pair carries.
 fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
@@ -250,6 +250,15 @@ fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
                 Some(byte_char) => output.push(byte_char),
                 None => output.push(ch),
             }
+        } else if ch == crate::executor::markers::PATTERN_LITERAL_BACKSLASH {
+            // A literal-backslash marker names `\` data — the matcher owns
+            // this invariant (case_pattern_atom_matches matches the marker
+            // against a literal backslash). Normalize to the backslash
+            // byte-char so it meets `\` on the word side. The generic C0
+            // arm below must not claim it: mapping the marker to byte 0x18
+            // matches nothing and turned `${red//\\[\\e/}` (exp.tests
+            // exp5.sub) into a silent no-op.
+            output.push(char::from_u32(BYTE_CHAR_BASE + 0x5C).expect("byte-char"));
         } else if (ch as u32) < 0x20 {
             // A literal C0 char (0x01..=0x1f) is a re-materialized byte
             // (substitution_result_visible_text / printf octal escapes):
@@ -500,6 +509,21 @@ mod tests {
     fn wildcard_matching_backtracks_after_a_partial_literal_match() {
         assert!(case_pattern_matches("*ab", "aab"));
         assert!(case_pattern_matches_nocase("*foo*", "PATH_FOO_VALUE"));
+    }
+
+    /// exp.tests exp5.sub pins `${red//\\[\\e/}` -> `[0;31m\]` and the
+    /// follow-up `${foo//[0;31m\\/}` -> `]`. Both patterns carry the
+    /// literal-backslash marker (\x18), which trips the byte-char gate, so
+    /// these exercise the flattened path end to end. The #729 rewrite
+    /// mapped the marker through the generic C0 arm to byte 0x18 (which
+    /// matches nothing) and both substitutions went silent; the marker
+    /// must normalize to the backslash byte.
+    #[test]
+    fn flattened_literal_backslash_marker_matches_backslash() {
+        assert!(case_pattern_matches("\u{18}[\u{18}e", "\\[\\e"));
+        assert!(!case_pattern_matches("\u{18}[\u{18}e", "\\[\\E"));
+        assert!(case_pattern_matches("[0;31m\u{18}", "[0;31m\\"));
+        assert!(!case_pattern_matches("[0;31m\u{18}", "[0;31m]"));
     }
 }
 
