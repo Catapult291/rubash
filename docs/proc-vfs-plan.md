@@ -3,7 +3,8 @@
 > 立项：2026-09-23。定位：userland 增值层，**不属 GNU 兼容契约**（GNU bash 在 Windows
 > 上同样没有 /proc），**不进 83 套件账本**。
 > 设计原则：复刻 `/dev` 虚拟路径体系的既有四层架构，不新造机制。
-> 任务板条目：TASKBOARD Q11。
+> 任务板条目：TASKBOARD Q11（docs/TASKBOARD.md 已移出版本树，可经
+> `git show 47440833^:docs/TASKBOARD.md` 取阅；参见 rubash#716）。
 
 ## 0. 目标场景（验收即这些命令工作）
 
