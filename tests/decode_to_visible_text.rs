@@ -90,3 +90,44 @@ fn compound_assignment_carrier_is_consumed_wherever_it_rides() {
         "a non-marker lookalike is untouched"
     );
 }
+
+/// #824: the other named-string markers pass through verbatim. They are
+/// plain typeable ASCII with no entry-side encoding, and their live
+/// producers are consumed at the execution boundaries (heredoc body
+/// execution, comsub payload decode) before anything is displayed — so on
+/// this boundary an occurrence is user data by contract. A debug build
+/// used to panic here on the "leaked to output" golden asserts.
+#[test]
+fn heredoc_and_comsub_marker_text_passes_through_verbatim() {
+    assert_eq!(
+        decode_to_visible_text("a__RUBASH_HD1__b"),
+        "a__RUBASH_HD1__b"
+    );
+    assert_eq!(
+        decode_to_visible_text("__RUBASH_CSB1_41;"),
+        "__RUBASH_CSB1_41;"
+    );
+}
+
+/// #824: a guard/assignment-sentinel codepoint in decode OUTPUT is
+/// E400-restored user data (the rubash#735 literal-char escape contract) —
+/// the scan consumes every bare guard with its protected char, so what
+/// survives is by construction data, never a live guard.
+#[test]
+fn guard_codepoints_survive_as_restored_user_data() {
+    assert_eq!(
+        decode_to_visible_text("\u{E400}\u{E314}Z"),
+        "\u{E314}Z",
+        "E400-escaped U+E314 is user data, restored verbatim"
+    );
+    assert_eq!(
+        decode_to_visible_text("a\u{E400}\u{E301}b"),
+        "a\u{E301}b",
+        "E400-escaped U+E301 is user data, restored verbatim"
+    );
+    assert_eq!(
+        decode_to_visible_text("\u{E314}Z"),
+        "Z",
+        "a bare guard pair is still consumed: guard + protected char -> char"
+    );
+}
