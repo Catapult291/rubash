@@ -2032,6 +2032,15 @@ pub fn new_background_wrapper_nonce() -> String {
 /// is scrubbed unconditionally so a user-forged value can neither arm
 /// anything nor leak into grandchildren. On mismatch (hand forgery, stale
 /// spawn, tampering) the process simply runs without the wrapper role.
+///
+/// Semantic boundary (rubash#881): a matching pair proves the two channels
+/// carry the same nonce — it does NOT prove the request originated at
+/// compound_exec's arming site. Any process that can set a child's
+/// environment and argv (the parent shell itself, or anything that
+/// observed the nonce) could construct the same agreement. The handshake
+/// exists to stop *ambient* forgery (`export` of a bare name), not to
+/// authenticate the caller; its consequence is bounded to the arming
+/// process's own tree (PDEATHSIG on that process's children).
 pub fn consume_background_wrapper_handshake(args: &mut Vec<String>) {
     let nonce = match args
         .get(1)
@@ -2113,6 +2122,15 @@ fn arm_pdeathsig(_expected_parent: u32) -> std::io::Result<()> {
 /// main shell never arms — so a wrapper itself survives its shell's exit, as
 /// GNU's background jobs do — and a wrapper arms every child it spawns),
 /// while a forged `export` arms nothing.
+///
+/// rubash#881 exec-cascade note: the role is in-process state, so it does
+/// NOT survive `exec`. A wrapper whose command is `exec rubash -c '...'`
+/// replaces its image with a fresh rubash that starts with
+/// BACKGROUND_WRAPPER_ROLE=false — children it then spawns are NOT armed.
+/// Under the old env-marker mechanism the forged/inherited variable could
+/// cross exec; the handshake's non-propagation is both the intended
+/// hardening and a closer match to GNU (a real background job's exec'd
+/// image is an ordinary process with no special child-kill contract).
 #[cfg(unix)]
 pub fn child_pre_exec_reset() -> std::io::Result<()> {
     kernel_signals::pre_exec_child_dispositions()?;

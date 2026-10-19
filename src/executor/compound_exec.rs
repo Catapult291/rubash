@@ -424,10 +424,13 @@ impl Executor {
             // (exported shell vars; no assignments exist at this gate).
             self.apply_external_environment(&background_command.command, &mut process);
             // rubash#229/#737 unix arm: reset inherited signal dispositions
-            // in the child exactly like the foreground spawn path. The #737
-            // pdeathsig arm keys off __RUBASH_BACKGROUND_WRAPPER, which is
-            // never set here — a directly-exec'd async child survives shell
-            // exit, as GNU's does.
+            // in the child exactly like the foreground spawn path.
+            // rubash#866: this direct spawn never performs the
+            // nonce handshake (no --internal-bg-wrapper argv flag, no env
+            // nonce), so the child's in-process BACKGROUND_WRAPPER_ROLE
+            // stays false and child_pre_exec_reset skips the PDEATHSIG arm
+            // — a directly-exec'd async child survives shell exit, as
+            // GNU's does.
             #[cfg(unix)]
             unsafe {
                 use std::os::unix::process::CommandExt;
