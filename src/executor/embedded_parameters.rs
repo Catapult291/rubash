@@ -101,6 +101,20 @@ impl Executor {
     /// decoded input, and the enclosing command's status is untouched
     /// (`PS1='a${1x}b'; p=${PS1@P}` keeps rc 0 with p literal; WSL GNU
     /// 5.3.0 probes probe-f1/probe-f1b/probe-f1c).
+    ///
+    /// Status transparency (parse.y:6684-6697): decode_prompt_string
+    /// snapshots last_command_exit_value and last_command_subst_status
+    /// around the promptvars pass (expand_prompt_string, parse.y:6689) and
+    /// restores both after it — the pass is a read-side render, and subst.c
+    /// string_transform 'P' routes through the same decode_prompt_string,
+    /// so `${var@P}` is covered by the same restore. The engine's
+    /// command-substitution boundary leaves each body's reaped status in
+    /// last_command_substitution_status (the cell the assignment/word
+    /// boundaries read to publish substitution exit rules); the prompt pass
+    /// therefore restores that cell to its pre-pass value so `PS1='x
+    /// $(false)y'; p=${PS1@P}` keeps the reader's `$?` (rubash#813: printed
+    /// 1 before the restore; WSL GNU 5.3.0 prints 0). Exit code and
+    /// PIPESTATUS are unreachable from this `&self` walk.
     pub(in crate::executor) fn expand_embedded_parameters_double_quoted(
         &self,
         word: &str,
@@ -116,7 +130,11 @@ impl Executor {
         let arith_err_before = self.shell_state.arithmetic_expansion_error.replace(false);
         let arith_fatal_before = self.shell_state.arithmetic_fatal_error.replace(false);
         let arith_nonfatal_before = self.shell_state.arithmetic_nonfatal_error.replace(false);
+        // The parse.y:6684-6697 status bracket (see the doc comment).
+        let comsub_status_before = self.last_command_substitution_status.replace(None);
         let result = self.expand_embedded_parameters_inner(word, false, false, false, true);
+        self.last_command_substitution_status
+            .set(comsub_status_before);
         let failed = self
             .shell_state
             .parameter_bad_substitution

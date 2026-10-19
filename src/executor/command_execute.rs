@@ -1071,8 +1071,10 @@ impl Executor {
             return false;
         }
         let expanded = self.expand_word(first);
-        crate::executor::builtin_names::is_shell_builtin_name(&expanded)
-            || self.routes_as_builtin(&expanded)
+        // routes_as_builtin already covers the pure builtin table on both
+        // platforms (lookup_paths.rs) — testing is_shell_builtin_name
+        // separately is a subsumed disjunct (#813 item 4).
+        self.routes_as_builtin(&expanded)
             || self.function_name_for_command_word(&expanded).is_some()
     }
 
