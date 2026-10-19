@@ -77,14 +77,15 @@ fn reader_mask_boundary_hits_stored_cell() {
 }
 
 /// An escape product directly after `$` is data, not a name start: the key
-/// is the literal `$tx` (GNU 24 74 78), even with `tx` set.
+/// is the literal `$tx` (GNU 24 74 78), even with `tx` set. The `tr -d ' \n'`
+/// eats od's newline, so the listing has no trailing newline (GNU face).
 #[test]
 fn escaped_char_stays_out_of_dollar_name() {
     let (stdout, stderr, _) = rubash(
         "tx=ZZ; declare -A S6; S6[$\\tx]=1\nprintf '%s' \"${!S6[@]}\" | od -An -tx1 | tr -d ' \\n'",
     );
     assert_eq!(stderr, "", "stderr not empty: {stderr}");
-    assert_eq!(stdout, "247478\n");
+    assert_eq!(stdout, "247478");
 }
 
 /// `((U8[$'']=1))`: GNU rejects the empty key with ONE `U8['']` diagnostic
@@ -124,12 +125,14 @@ fn arith_empty_token_write_invalid_identifier() {
 }
 
 /// Plain assignment `U7[$'']=1`: the diagnostic names the parse-cooked
-/// subscript `U7['']` and nothing is stored.
+/// subscript `U7['']`, nothing is stored, and GNU's `declare -p U7` goes
+/// silent afterwards (byte-verified WSL oracle: empty stdout, one stderr
+/// line, rc 1) — rubash matches that face.
 #[test]
 fn plain_empty_span_write_rejected() {
     let (stdout, stderr, _) = rubash("declare -A U7; U7[$'']=1; declare -p U7");
     assert_eq!(stderr, "bash: line 1: U7['']: bad array subscript\n");
-    assert_eq!(stdout, "declare -A U7\n");
+    assert_eq!(stdout, "");
 }
 
 /// `let "C9['']=1"`: same empty-key law under the EXP_EXPANDED entry.
@@ -219,12 +222,13 @@ fn nonempty_span_write_still_clean() {
 
 /// Non-regression (the #847 family): the unset deferred operand pass still
 /// quote-removes a quoted-source span (`$` literal, content verbatim), so
-/// the `$'...'-written cell SURVIVES.
+/// the `$'...'-written cell SURVIVES (WSL oracle: count stays 1). The raw
+/// `od -An -tx1` listing of the surviving key `x\ty` is ` 78 09 79\n`.
 #[test]
 fn unset_deferred_span_quote_removal_unchanged() {
     let (stdout, stderr, _) = rubash(
         "declare -A A1; ((A1[$'x\\ty']=1)); unset 'A1[$'\"'\"'x\\ty'\"'\"']'; printf '%s' \"${!A1[@]}\" | od -An -tx1",
     );
     assert_eq!(stderr, "", "stderr not empty: {stderr}");
-    assert_eq!(stdout, "24275c7479");
+    assert_eq!(stdout, " 78 09 79\n");
 }

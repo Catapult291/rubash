@@ -124,7 +124,8 @@ fn kvlist_sq_piece_key_unchanged() {
 }
 
 /// Non-regression (the bare-span kvlist spelling): the span DECODES in the
-/// bare shape (GNU key `prexpost`, 70 72 65 78 70 6f 73 74).
+/// bare shape (GNU key `prexpost`, 70 72 65 78 70 6f 73 74). The `tr -d ' \n'`
+/// eats od's newline, so the listing has no trailing newline (GNU face).
 #[test]
 fn kvlist_bare_span_key_decodes() {
     let (stdout, stderr, _) = rubash(
@@ -132,7 +133,7 @@ fn kvlist_bare_span_key_decodes() {
          printf '%s' \"${!K7[@]}\" | od -An -tx1 | tr -d ' \\n'",
     );
     assert_eq!(stderr, "", "stderr not empty: {stderr}");
-    assert_eq!(stdout, "70726578706f7374\n");
+    assert_eq!(stdout, "70726578706f7374");
 }
 
 /// Non-regression (#857): the plain assignment entry keeps storing and
