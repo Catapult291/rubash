@@ -6,11 +6,21 @@ use crate::executor::{
 };
 use std::collections::HashSet;
 
-/// Outcome of `parse_assoc_subscript`: the resolved key, or an invalid
-/// `name[...]` token (unterminated quote/missing `]`).
+/// Outcome of `parse_assoc_subscript`: the resolved key, an invalid
+/// `name[...]` token (unterminated quote/missing `]`), or a nonempty
+/// bracket text whose resolution is EMPTY (the rubash#860 empty-span
+/// family — `['']`, `[$'']`).
 pub(super) enum ParsedAssocSubscript {
     Key(String),
     Invalid,
+    /// The bracket text rode verbatim into `expand_subscript_string` and
+    /// resolved to nothing: GNU arrayfunc.c:1598-1606 (reads, INDEX_ERROR)
+    /// and :402-407 (binds, err_badarraysub) diagnose per context and the
+    /// bind stores nothing. `token` is the bracket text for the
+    /// `name[sub]` bind diagnostic.
+    EmptyKey {
+        token: String,
+    },
 }
 
 impl ConditionalArithParser<'_> {
@@ -46,11 +56,17 @@ impl ConditionalArithParser<'_> {
         if is_marked_var(self.env_vars, ASSOC_VARS, &resolved_name) {
             // Associative arrays use the key verbatim; no deferred evaluation.
 
-            match self.parse_assoc_subscript(&resolved_name)? {
+            match self.parse_assoc_subscript(&resolved_name, true)? {
                 ParsedAssocSubscript::Key(key) => {
                     return Some(ArithLValue::Assoc {
                         name: resolved_name,
                         key,
+                    });
+                }
+                ParsedAssocSubscript::EmptyKey { token } => {
+                    return Some(ArithLValue::AssocEmptyKey {
+                        bind_display: format!("{resolved_name}[{token}]"),
+                        name: resolved_name,
                     });
                 }
                 ParsedAssocSubscript::Invalid => {
@@ -154,11 +170,17 @@ impl ConditionalArithParser<'_> {
 
         let resolved_name = self.resolved_lvalue_name(name);
         if is_marked_var(self.env_vars, ASSOC_VARS, &resolved_name) {
-            match self.parse_assoc_subscript(&resolved_name)? {
+            match self.parse_assoc_subscript(&resolved_name, false)? {
                 ParsedAssocSubscript::Key(key) => {
                     return Some(ArithLValue::Assoc {
                         name: resolved_name,
                         key,
+                    });
+                }
+                ParsedAssocSubscript::EmptyKey { token } => {
+                    return Some(ArithLValue::AssocEmptyKey {
+                        bind_display: format!("{resolved_name}[{token}]"),
+                        name: resolved_name,
                     });
                 }
                 ParsedAssocSubscript::Invalid => {
@@ -237,7 +259,21 @@ impl ConditionalArithParser<'_> {
     /// `name[...]` token invalid — `AssocSubscript::Invalid` carries the
     /// lvalue text GNU prints in `bad array subscript` /
     /// `not a valid identifier` diagnostics.
-    pub(super) fn parse_assoc_subscript(&mut self, name: &str) -> Option<ParsedAssocSubscript> {
+    ///
+    /// `for_assignment` selects the bind-time law (`parse_lvalue_for_assignment`
+    /// vs `parse_lvalue`): an empty-bracket-text token writes as
+    /// `` `name[]': not a valid identifier `` (expr_bind_variable ->
+    /// sh_invalidid) while a NONEMPTY bracket text whose expansion resolves
+    /// empty (`['']`, `[$'']` — the rubash#860 empty-span family) takes
+    /// GNU's `*akey == 0` law instead: arrayfunc.c:402-407 diagnoses
+    /// `name[sub]: bad array subscript` at the bind and stores nothing;
+    /// the read path diagnoses the bare name once through INDEX_ERROR
+    /// (arrayfunc.c:1462-1470).
+    pub(super) fn parse_assoc_subscript(
+        &mut self,
+        name: &str,
+        for_assignment: bool,
+    ) -> Option<ParsedAssocSubscript> {
         let start = self.pos;
         let mut depth = 0usize;
         let mut single = false;
@@ -259,29 +295,53 @@ impl ConditionalArithParser<'_> {
                         // keeps IFS whitespace that surrounds or makes up the key
                         // (`k=$'\t'; A[$k]=2` keys on the tab, and `A[ $k ]` keys
                         // on ` x `), so it must not be trimmed away.
-                        let key = std::str::from_utf8(&self.input[start..self.pos])
+                        let raw = std::str::from_utf8(&self.input[start..self.pos])
                             .ok()?
                             .to_string();
                         self.pos += 1;
                         // A pre-expanded key (the Executor-side
                         // expand_subscript_string pass) is already the final
                         // string: use it verbatim and never expand it again.
-                        let key = match super::super::decode_arithmetic_assoc_key(&key) {
-                            Some(literal) => literal,
-                            None => self.expand_assoc_subscript_key(&key),
+                        // An empty encoded payload (marker only) is the
+                        // pre-pass's empty resolution — its bracket text is
+                        // genuinely empty (the pre-pass emits `[]` for the
+                        // empty-token class, so a surviving marker here is the
+                        // array_expand_once verbatim arm of an empty key).
+                        let decoded_raw = match super::super::decode_arithmetic_assoc_key(&raw) {
+                            Some(literal) => Some(literal),
+                            None => None,
+                        };
+                        let bracket_text = decoded_raw.as_deref().unwrap_or(&raw);
+                        let key = match &decoded_raw {
+                            Some(literal) => literal.clone(),
+                            None => self.expand_assoc_subscript_key(&raw),
                         };
                         if key.is_empty() {
-                            // GNU array_variable_part (arrayfunc.c): an
-                            // assoc subscript whose expand_subscript_string
-                            // result is empty is a bad subscript — diagnosed
-                            // once here and once in get_array_value, so the
-                            // read reports it twice (`A[$k]` with k unset ->
-                            // `A[]: bad array subscript` x2), then the
-                            // element reads as 0.
-                            self.diags
-                                .push(ArithEvalDiag::BadSubscript(format!("{name}[]")));
-                            self.diags
-                                .push(ArithEvalDiag::BadSubscript(format!("{name}[]")));
+                            if bracket_text.is_empty() {
+                                if for_assignment {
+                                    // GNU expr_bind_variable fails the `name[]`
+                                    // bind with sh_invalidid; the expression
+                                    // keeps evaluating.
+                                    return Some(ParsedAssocSubscript::Invalid);
+                                }
+                                // GNU array_variable_part (arrayfunc.c): an
+                                // assoc subscript whose expand_subscript_string
+                                // result is empty is a bad subscript — diagnosed
+                                // once here and once in get_array_value, so the
+                                // read reports it twice (`A[$k]` with k unset ->
+                                // `A[]: bad array subscript` x2), then the
+                                // element reads as 0.
+                                self.diags
+                                    .push(ArithEvalDiag::BadSubscript(format!("{name}[]")));
+                                self.diags
+                                    .push(ArithEvalDiag::BadSubscript(format!("{name}[]")));
+                                return Some(ParsedAssocSubscript::Key(String::new()));
+                            }
+                            // Nonempty bracket text resolving empty: the
+                            // `*akey == 0` law, not the `name[]` law.
+                            return Some(ParsedAssocSubscript::EmptyKey {
+                                token: bracket_text.to_string(),
+                            });
                         }
                         return Some(ParsedAssocSubscript::Key(key));
                     }
