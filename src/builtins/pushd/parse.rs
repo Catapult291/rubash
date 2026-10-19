@@ -4,6 +4,12 @@ use std::io::{self, Write};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PushdOperand {
     Swap,
+    /// `pushd -n` with no operand: GNU's option walk consumes `-n` and
+    /// leaves `list == 0`, reaching pushd.def:291 `return
+    /// EXECUTION_SUCCESS` — a silent no-op, NOT the bare-`pushd` swap
+    /// (that arm at :195-213 requires an unconsumed empty list and errors
+    /// "no other directory" when the stack is short). rubash#859.
+    NoOp,
     Index {
         index: usize,
         from_right: bool,
@@ -45,6 +51,13 @@ where
 {
     let (no_cd, args) = parse_stack_options(args);
     if args.is_empty() {
+        // `-n` consumed the whole list: GNU pushd.def:290-291 — the option
+        // walk ends with list == 0 AFTER flags were set, so the builtin
+        // returns EXECUTION_SUCCESS silently (no swap, no diagnostic). A
+        // bare `pushd` (no options at all) is the Swap arm instead.
+        if no_cd {
+            return Ok(Some(PushdOperand::NoOp));
+        }
         return Ok(Some(PushdOperand::Swap));
     }
 

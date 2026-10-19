@@ -155,6 +155,12 @@ where
             };
 
             match operand {
+                PushdOperand::NoOp => {
+                    // pushd.def:290-291: `pushd -n` (option consumed, no
+                    // operand) returns EXECUTION_SUCCESS silently — no
+                    // stack read, no swap, no diagnostic. rubash#859.
+                    return Ok(EXECUTION_SUCCESS);
+                }
                 PushdOperand::Swap => {
                     if stack.len() < 2 {
                         writeln!(stderr, "{diagnostic_prefix}pushd: no other directory")?;
