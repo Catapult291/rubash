@@ -404,6 +404,11 @@ pub fn init_locale() {
 /// | `__RUBASH_CA1__` | COMPOUND_ASSIGNMENT_MARKER (named-string compound
 /// assignment tag; whitelisted carrier — the interactive line-editing
 /// boundary delivers it inside pre-execution AST words, #802) | nothing |
+/// | `__RUBASH_HD1__`/`__RUBASH_CSB1_` | QUOTED_HEREDOC_MARKER /
+/// COMSUB_PAYLOAD_PREFIX (named-string heredoc/comsub tags) | passes
+/// through verbatim — plain typeable ASCII with no entry-side encoding;
+/// the live tags are consumed at their execution boundaries before
+/// anything is displayed, so an occurrence here is user data (#824) |
 /// | `U+E100`..=`U+E1FF` | conditional-pattern byte-chars | byte `(cp - E100)` as char |
 ///
 /// Ordering follows the storage-boundary contract documented in
@@ -420,15 +425,12 @@ pub fn init_locale() {
 pub fn decode_to_visible_text(text: &str) -> String {
     use crate::executor::conditional::pattern::BYTE_CHAR_BASE;
     use crate::executor::embedded_mutations::{COMPOUND_EXPANSION_WS_TAG, QUOTED_NULL_MARKER};
-    use crate::executor::markers::COMSUB_PAYLOAD_PREFIX;
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
     use crate::executor::types::COMPOUND_ASSIGNMENT_MARKER;
     use crate::executor::types::DEFERRED_COMPOUND_BODY;
-    use crate::lexer::{
-        ANSI_C_DQUOTE_MARKER, ANSI_C_QUOTE_MARKER, PARAM_NAME_END_MARKER, QUOTED_HEREDOC_MARKER,
-    };
+    use crate::lexer::{ANSI_C_DQUOTE_MARKER, ANSI_C_QUOTE_MARKER, PARAM_NAME_END_MARKER};
 
     const CTLESC: char = crate::executor::markers::CTLESC;
     // DATA_* sentinels owned by assignment_expansion.rs (declared as
@@ -460,8 +462,10 @@ pub fn decode_to_visible_text(text: &str) -> String {
         // (niubash shell.rs decoded_words). That text legitimately still
         // carries the marker, so the decoder consumes it instead of
         // rejecting it; every other named-string carrier (heredoc,
-        // comsub payload) never crosses this boundary and keeps its
-        // never-seen golden assertion below. Gated on the leading `_` so
+        // comsub payload) reaching this boundary is user-typed data by
+        // contract — the output-side leak assertions that used to live
+        // below were removed as unsound (#824: every asserted code point
+        // has a legal user-data path). Gated on the leading `_` so
         // the probe costs nothing for marker-free words.
         if ch == '_' {
             let mut probe = chars.clone();
@@ -549,101 +553,39 @@ pub fn decode_to_visible_text(text: &str) -> String {
             _ => out.push(ch),
         }
     }
-    // Golden assertion: guard markers must never leak to output in production contexts
-    // These are function-local PUA markers (U+E314-E317) with no
-    // external boundary; if they appear in output, the decode pass failed.
-    // Note: This assertion is skipped for debug/test contexts where raw marker
-    // strings may be passed directly to decode_to_visible_text.
-    if !cfg!(test) {
-        debug_assert!(
-            !out.contains(crate::executor::markers::PARAM_WORD_BACKSLASH_GUARD),
-            "PARAM_WORD_BACKSLASH_GUARD leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ESCAPED_IFS_GUARD),
-            "ESCAPED_IFS_GUARD leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::PROMPT_ESCAPE_GUARD),
-            "PROMPT_ESCAPE_GUARD leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::CASE_PATTERN_BACKSLASH_GUARD),
-            "CASE_PATTERN_BACKSLASH_GUARD leaked to output"
-        );
-        // Golden assertion: ASSIGN_DATA_* markers must never leak to output
-        // These are storage-boundary PUA markers (U+E301-E30C) with no
-        // external boundary; if they appear in output, the decode pass failed.
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_DATA_SQUOTE),
-            "ASSIGN_DATA_SQUOTE leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_DATA_DQUOTE),
-            "ASSIGN_DATA_DQUOTE leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_DATA_BACKTICK),
-            "ASSIGN_DATA_BACKTICK leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_ESCAPED_DQUOTE),
-            "ASSIGN_ESCAPED_DQUOTE leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_ESCAPED_SQUOTE),
-            "ASSIGN_ESCAPED_SQUOTE leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_ESCAPED_BACKSLASH),
-            "ASSIGN_ESCAPED_BACKSLASH leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_HOISTED_SQUOTE),
-            "ASSIGN_HOISTED_SQUOTE leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_HOISTED_BACKSLASH),
-            "ASSIGN_HOISTED_BACKSLASH leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG),
-            "COMPOUND_EXPANSION_WS_TAG leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_SQ_DOLLAR),
-            "ASSIGN_SQ_DOLLAR leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_SQ_BACKTICK),
-            "ASSIGN_SQ_BACKTICK leaked to output"
-        );
-        debug_assert!(
-            !out.contains(crate::executor::markers::ASSIGN_SQ_BACKSLASH),
-            "ASSIGN_SQ_BACKSLASH leaked to output"
-        );
-        // Golden assertion: CTLESC must never leak to output
-        // This is the most-traveled C0 carrier (0x11) used throughout the
-        // lexer/parser/executor pipeline to protect characters through
-        // intermediate passes. If it appears in output, the decode pass failed.
-        debug_assert!(!out.contains(CTLESC), "CTLESC leaked to output");
-        // Golden assertion: named string markers must never leak to output
-        // These are multi-char protocol prefixes used in transport text.
-        // If they appear in output, the decode pass failed.
-        debug_assert!(
-            !out.contains(QUOTED_HEREDOC_MARKER),
-            "QUOTED_HEREDOC_MARKER leaked to output"
-        );
-        debug_assert!(
-            !out.contains(COMSUB_PAYLOAD_PREFIX),
-            "COMSUB_PAYLOAD_PREFIX leaked to output"
-        );
-        // COMPOUND_ASSIGNMENT_MARKER is deliberately absent from the golden
-        // assertions: since #802 it is a whitelisted carrier of this decoder
-        // (see the entry-inventory note in the scan loop) — transport text
-        // on the host AST-inspection boundary carries it by contract, so it
-        // is consumed above instead of asserted away.
-    }
+    // #824 entry-inventory audit (the #729 carrier-consumer methodology
+    // applied to this decoder's OUTPUT side): a registered marker codepoint
+    // in `out` is not evidence of a decode failure, so there are no
+    // output-side "leaked" assertions here. Every family has a legitimate
+    // user-data path to the output:
+    //   - C0 carriers (0x11..=0x1f): the user's own bytes ride raw-byte
+    //     marker pairs at every entry (registry `user_reachable` contract)
+    //     and the E000+E0xx arm restores them as literal chars —
+    //     `x=$'\x11'; set -x; echo "$x"` traces byte 0x11, and GNU 5.3.0
+    //     prints it verbatim in the xtrace output too.
+    //   - PUA markers (the registry zone): user chars are E400
+    //     literal-char-escaped at entry (push_literal_char, rubash#735) and
+    //     the E400 arm restores them verbatim — `x=$'\uE314Z'; declare -p x`
+    //     must print U+E314 (GNU oracle: `declare -- x="\uE314Z"` raw). A
+    //     bare guard sentinel cannot survive the scan (the guard arm above
+    //     consumes each guard with its next char), so a guard codepoint in
+    //     `out` is restored user data, never a live guard.
+    //   - Named ASCII markers: `__RUBASH_HD1__` / `__RUBASH_CSB1_` are
+    //     simply typeable text with no entry-side encoding to tell them
+    //     apart; their live producers are consumed at their execution
+    //     boundaries (heredoc body execution, comsub payload decode) before
+    //     anything is stored or displayed, so an occurrence on this boundary
+    //     is user data by contract — GNU prints it verbatim, and so do the
+    //     scan's `_`-fallthrough arms. (`__RUBASH_CA1__` is the one reserved
+    //     exception: consumed by the probe above, the #802 stance.)
+    // Output-side debug_asserts over these codepoints could therefore only
+    // ever fire on well-formed user data — each had a two-to-three-line
+    // user-literal repro through `declare -p` or xtrace in a debug build
+    // (#824; e.g. `x=a__RUBASH_HD1__b; declare -p x`,
+    // `set -x; v=$'\uE314Z'; echo "$v"`). Leak detection stays where
+    // protocol and data can be told apart: in the scan arms above (a bare
+    // marker is always consumed or decoded in-pass) and at the integration
+    // boundary on marker-free inputs (tests/marker_leak_golden.rs).
     out
 }
 
