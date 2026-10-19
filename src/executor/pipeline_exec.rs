@@ -352,7 +352,25 @@ impl Executor {
             let mut body_owned;
             let body: &[CommandNode] = if brace_splice_needed {
                 body_owned = brace_group.body.clone();
-                self.apply_brace_group_redirects(redirect_command, &mut body_owned)?;
+                if let Err(error) =
+                    self.apply_brace_group_redirects(redirect_command, &mut body_owned)
+                {
+                    // The application site already reported the failed open
+                    // (GNU redir.c:135 redirection_error) with the parse-order
+                    // fd-2 bindings in force, and undid those bindings. What
+                    // remains is the single adjudication the main dispatch
+                    // owns for a compound's own failed redirection: status 1,
+                    // the ERR trap, errexit — and NO re-dispatch (the old
+                    // fall-through re-ran the same failing command through
+                    // the leaf path, printing the diagnostic twice, rubash#826
+                    // faces 1-2).
+                    return match error {
+                        ExecuteError::IoError(_) => self.finish_brace_redirect_failure(command),
+                        // A failglob abort was reported at the expansion;
+                        // keep the existing dispatch contract for it.
+                        other => Err(other),
+                    };
+                }
                 &body_owned
             } else {
                 &brace_group.body
@@ -433,6 +451,30 @@ impl Executor {
             crate::lexer::tokenize_comsub_body(inner, self.posix_mode_enabled(), start_line, false);
         let commands = crate::parser::parse(&tokens);
         self.execute_ast(&commands)?;
+        Ok(true)
+    }
+
+    /// Single adjudication for a brace group's own failed redirect open,
+    /// after the application site reported the diagnostic (rubash#826):
+    /// GNU execute_cmd.c:826-828 abandons the compound with status 1, fires
+    /// the ERR trap for the wrapper's own failure (redir12.sub: the trap
+    /// fires for a command killed by its redirection) and lets errexit act
+    /// on the fresh status — the same contract the main dispatch's IoError
+    /// arm applies to the loop/if wrappers. The command is NOT re-dispatched.
+    fn finish_brace_redirect_failure(
+        &mut self,
+        command: &CommandNode,
+    ) -> Result<bool, ExecuteError> {
+        self.exit_code = 1;
+        self.maybe_run_error_trap(command)?;
+        if self.errexit_enabled()
+            && self.errexit_is_active()
+            && self.suppress_errexit == 0
+            && !command.inverted
+            && command.and_or().is_none()
+        {
+            return Err(ExecuteError::ExitCode(1));
+        }
         Ok(true)
     }
 
