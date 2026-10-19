@@ -303,11 +303,23 @@ impl Executor {
             if key.is_empty() {
                 // An associative key is data, so nothing can fill in an empty
                 // one: GNU rejects `A[]`, `A[""]` and `A[$unset]` with the
-                // subscript as written (assoc.c assign_array_element).
-                eprintln!(
-                    "{}{lhs_as_written}: bad array subscript",
-                    self.diagnostic_prefix()
-                );
+                // subscript as written (assoc.c assign_array_element). The
+                // written subscript carries `$'...'` spans the way the SOURCE
+                // spelled them; GNU's word was cooked at parse time
+                // (read_token_word ansiexpand + sh_single_quote requote), so
+                // `A[$'']=1` reports `A['']: bad array subscript`
+                // (rubash#860 empty-span row).
+                let lhs = if raw_subscript.is_some_and(|raw| raw.contains("$'")) {
+                    format!(
+                        "{name}[{}]",
+                        super::arithmetic::requote_arith_span_token_text(
+                            raw_subscript.unwrap_or_default()
+                        )
+                    )
+                } else {
+                    lhs_as_written
+                };
+                eprintln!("{}{lhs}: bad array subscript", self.diagnostic_prefix());
                 self.exit_code = 1;
                 return true;
             }

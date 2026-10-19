@@ -1126,7 +1126,38 @@ impl Executor {
                             .replace(crate::executor::markers::DATA_SQUOTE, "'")
                             .replace(crate::executor::markers::DATA_DQUOTE, "\"")
                     } else {
-                        self.expand_assoc_subscript_once(raw, ansi_mode)
+                        let key = self.expand_assoc_subscript_once(raw, ansi_mode);
+                        if key.is_empty() {
+                            // rubash#860 empty-span family: the resolution is
+                            // empty, and GNU's law branches on the TOKEN text
+                            // (the bracket content after the body-level
+                            // expansion kept single quotes and stripped double
+                            // quotes). Route the parser into the right class
+                            // instead of encoding an empty key: an empty
+                            // token text takes the `name[]` law (bind:
+                            // `` `name[]': not a valid identifier ``; read:
+                            // `name[]` x2), a nonempty one (`['']`,
+                            // `[$'']`) takes the `*akey == 0` law (bind:
+                            // `name['']: bad array subscript`, no store;
+                            // read: bare `name` once).
+                            if self.arith_assoc_subscript_token_text(raw).is_empty() {
+                                output.push_str(name);
+                                output.push_str("[]");
+                            } else {
+                                // The parse-cooked token text (`$''` -> `''`,
+                                // `''''''` preserved verbatim — the sq rides
+                                // the arith token as syntax) feeds the
+                                // parser's empty-resolution law so the
+                                // diagnostics print GNU's word.
+                                output.push_str(name);
+                                output.push('[');
+                                output.push_str(&requote_arith_span_token_text(raw));
+                                output.push(']');
+                            }
+                            index = end;
+                            continue;
+                        }
+                        key
                     };
                     output.push_str(name);
                     output.push('[');
@@ -1274,6 +1305,27 @@ impl Executor {
         crate::executor::markers::decode_word_position_carriers(&expanded)
     }
 
+    /// The bracket text GNU's arith token carries for this subscript — the
+    /// body-level expansion with single quotes PRESERVED as syntax and
+    /// double quotes stripped (verified GNU 5.3.0, rubash#860: `((C['']=1))`
+    /// tokens `C['']` while `((C3[""]=1))` tokens `C3[]`). `$'...'` spans
+    /// are decoded and re-quoted at that phase (`$''` tokens `['']`), and
+    /// `$name`/arithmetic expansions run once (`[$u]` with u empty tokens
+    /// `[]`). Only the empty/nonempty VERDICT feeds the empty-key class
+    /// split, so the protected-sq rendering never reaches output.
+    fn arith_assoc_subscript_token_text(&self, raw: &str) -> String {
+        let requoted = requote_arith_span_token_text(raw);
+        if !requoted.contains('$') && !requoted.contains('"') {
+            // No expansion sites: the quotes are the token text verbatim
+            // (`''` stays `''` — nonempty — while the walker would strip it).
+            return requoted;
+        }
+        // expand_arithmetic_special_parameters protects `'` as data for the
+        // walker (its own doc: single quotes are literal data for expr.c)
+        // and the walker strips paired `"` — exactly the body-level law.
+        self.expand_arithmetic_special_parameters(&requoted)
+    }
+
     pub(super) fn expand_arithmetic_special_parameters(&self, expression: &str) -> String {
         // In arithmetic contexts, special parameters expand to numeric values:
         // $- -> 0 (shell flags not meaningful in arithmetic), $# -> param count
@@ -1328,6 +1380,77 @@ impl Executor {
         self.expand_embedded_parameters(&protected)
             .replace(DATA_DOLLAR_STR, "$")
     }
+}
+
+/// The parse-cooked form of an arith subscript's `$'...'` spans: each closed
+/// span is decoded and sh_single_quote'd (`$''` -> `''`), everything else —
+/// including the span-less majority — rides verbatim. Mirrors the scan of
+/// [`crate::executor::subscript_expansion::transform_arith_ansi_c_spans`]
+/// (dual quote state, backslash pairs literal, unterminated spans verbatim);
+/// this is the rendering GNU's read_token_word/ansiexpand gives the word at
+/// parse time, which is what its diagnostics print (rubash#860 row
+/// `D[$'']=1` -> `D['']: bad array subscript`).
+pub(in crate::executor) fn requote_arith_span_token_text(text: &str) -> String {
+    if !text.contains("$'") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
+                output.push_str(
+                    &crate::executor::subscript_expansion::diagnostic_single_quote(&decoded),
+                );
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
 }
 
 pub(super) fn eval_arith_value(value: &str) -> i128 {

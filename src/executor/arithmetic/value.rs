@@ -53,6 +53,14 @@ impl ConditionalArithParser<'_> {
                     .push(ArithEvalDiag::BadSubscript(display.clone()));
                 Some(0)
             }
+            ArithLValue::AssocEmptyKey { name, .. } => {
+                // `C['']` read: the akey failed `*akey == 0` inside
+                // array_value_internal — GNU INDEX_ERROR diagnoses the bare
+                // NAME once (arrayfunc.c:1462-1470 err_badarraysub(var->name))
+                // and the element reads as 0.
+                self.diags.push(ArithEvalDiag::BadSubscript(name.clone()));
+                Some(0)
+            }
             ArithLValue::Assoc { name, key } => {
                 let value = self
                     .env_vars
@@ -521,6 +529,10 @@ impl ConditionalArithParser<'_> {
             // `a[]` has no writable name — GNU's bind fails later with
             // `not a valid identifier`; there is no readonly check.
             ArithLValue::InvalidElement { .. } => return true,
+            // GNU rejects the empty akey at arrayfunc.c:402-407 BEFORE the
+            // readonly check inside bind_assoc_variable, so the empty-key
+            // bind is never a readonly failure.
+            ArithLValue::AssocEmptyKey { .. } => return true,
         };
         if is_marked_var(self.env_vars, READONLY_VARS, name) {
             self.env_vars
@@ -544,6 +556,14 @@ impl ConditionalArithParser<'_> {
                 // expression value is unaffected).
                 self.diags
                     .push(ArithEvalDiag::InvalidIdentifier(display.clone()));
+            }
+            ArithLValue::AssocEmptyKey { bind_display, .. } => {
+                // `C['']` on the bind side: GNU assign_array_element_internal
+                // fails the empty akey with err_badarraysub —
+                // `C['']: bad array subscript` (arrayfunc.c:402-407) — and
+                // binds nothing.
+                self.diags
+                    .push(ArithEvalDiag::BadSubscript(bind_display.clone()));
             }
             ArithLValue::Assoc { name, key } => self.set_assoc_element(name, key, value),
         }
@@ -691,6 +711,14 @@ impl ConditionalArithParser<'_> {
     }
 
     pub(super) fn set_assoc_element(&mut self, name: &str, key: &str, value: i128) {
+        if key.is_empty() {
+            // GNU arrayfunc.c:402-407 assign_array_element_internal: an empty
+            // akey fails err_badarraysub and returns NULL before
+            // bind_assoc_variable — nothing is stored. (The `(( C['']=1 ))`
+            // family reaches its own diagnostic through ArithLValue::
+            // AssocEmptyKey; this guard covers any other caller spelling.)
+            return;
+        }
         let mut entries = self
             .env_vars
             .get(name)

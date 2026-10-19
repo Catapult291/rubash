@@ -831,12 +831,22 @@ impl Executor {
                                 self.expand_subscript_string(sub)
                             };
                             if key.is_empty() {
-                                // GNU err_badarraysub prints the element
-                                // word as rebuilt by
-                                // expand_compound_array_assignment.
-                                self.report_bad_array_subscript(&compound_element_diagnostic_word(
-                                    inner, index, sub_end, &key, true,
-                                ));
+                                // GNU err_badarraysub (arrayfunc.c:765-767
+                                // assign_compound_array_list) prints the
+                                // ELEMENT WORD as the parsed list carries it:
+                                // the raw `[sub]=value` text with `$'...'`
+                                // spans parse-cooked — `[$'']=1` reports
+                                // `['']=1`, while the quotes and value ride
+                                // verbatim (`[""]=1`, `[$u]=1`, `[]=1`). The
+                                // declare operand path keeps the rebuilt
+                                // `[key]='value'` form (its
+                                // expand_compound_array_assignment rebuild is
+                                // a different producer; pinned as parity).
+                                self.report_bad_array_subscript(
+                                    &crate::executor::arithmetic::requote_arith_span_token_text(
+                                        compound_element_word(inner, index),
+                                    ),
+                                );
                                 return Err(format!("({out})"));
                             }
                             out.push('[');
@@ -1736,7 +1746,7 @@ fn compound_element_diagnostic_word(
 
 /// lib/sh/shquote.c sh_single_quote: wrap in single quotes, rendering each
 /// embedded quote as `'\''`.
-fn diagnostic_single_quote(s: &str) -> String {
+pub(in crate::executor) fn diagnostic_single_quote(s: &str) -> String {
     let mut quoted = String::with_capacity(s.len() + 2);
     quoted.push('\'');
     for ch in s.chars() {
@@ -1787,7 +1797,18 @@ fn dequote_compound_subscript(sub: &str) -> String {
     // it can carry the \x1c/E309 expansion-whitespace data tags; the resolved
     // key is cooked text only — strip the tags the same way
     // expand_subscript_string does for its freshly-expanded result.
-    out.replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
+    //
+    // A kept `$'...'` spelling (the #847 dual-state law) rides the lexer's
+    // E010/E011 data-quote markers in that cooked text; the key is plain
+    // bytes (subst.c dequote_list drops the CTLESC protection), so restore
+    // them here. Without this the kvlist strict path stored
+    // `pre$<E010>x<E010>post` for `K=( ["pre$'x'post']=v )` while every
+    // reader resolved the plain spelling — the cell was unreachable by
+    // direct read (rubash#861: write parity, read miss, count=2 after a
+    // clean-spelling overwrite).
+    out.replace(crate::executor::markers::ANSI_C_QUOTE_MARKER, "'")
+        .replace(crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\"")
+        .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
         .replace(crate::executor::markers::IFS_GLUE, "")
 }
 
@@ -1916,7 +1937,22 @@ fn mask_subscript_escapes(raw: &str) -> String {
                 out.push('\\');
                 out.push(next);
             }
-            _ => out.push(next),
+            _ => {
+                // An escape product is QUOTED DATA for the walker's `$name`
+                // scan: GNU's expand_word_internal scans left to right, so in
+                // `$x\ty` the name extraction at `$` stops at the backslash
+                // (subst.c:10934 param_expand's legal_variable_char loop) and
+                // the escaped `t` arrives after it — key `ty`. Masking the
+                // escape away first would glue the product INTO the name
+                // (`$xty` — the empty-key pseudo-diagnostic of rubash#860),
+                // so a name-character product rides the quote-boundary
+                // marker the lexer emits for the same job (#742); the
+                // embedded walker's tail strips it.
+                if next == '_' || next.is_ascii_alphanumeric() {
+                    out.push(crate::lexer::PARAM_NAME_END_MARKER);
+                }
+                out.push(next);
+            }
         }
     }
     out
