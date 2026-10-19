@@ -3059,9 +3059,15 @@ impl Executor {
             String::new()
         };
         let Some(fd) = self.allocate_dynamic_fd() else {
+            // GNU exhausts {var} heredocs through the same REDIR_VARASSIGN
+            // fcntl F_DUPFD path (probe: ulimit -Sn 6 then exec {v}<<E
+            // prints "redirection error: cannot duplicate fd: ..." too), so
+            // carry the identical errno-aware payload; GNU's own line-2
+            // target word for heredocs is the internal doc pointer, the
+            // variable name is the honest stand-in.
             return Err(ExecuteError::IoError(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("{name}: cannot allocate fd"),
+                self.fd_dup_error_payload(name),
             )));
         };
         self.fd_table
@@ -3514,24 +3520,59 @@ impl Executor {
         self.close_persistent_input_fd(target_fd);
     }
 
-    fn open_files_limit(&self) -> Option<u32> {
-        let value = self.shell_state.env_vars.get("__RUBASH_ULIMIT_N")?;
-        if value == "unlimited" {
+    /// The RLIMIT_NOFILE *soft* limit the {var} allocator must stay below
+    /// (GNU redir.c:940 fcntl F_DUPFD semantics), or None for unlimited.
+    ///
+    /// The Windows emulation stores the pair as `"<soft>:<hard>"` decimal
+    /// under `__RUBASH_ULIMIT_N` (builtins/ulimit.rs plat::set; u64::MAX
+    /// means unlimited) and forwards it to spawned children, so parse the
+    /// soft side. An absent key is NOT unlimited: it is the default soft
+    /// limit (10240 — the WSL GNU 5.3.0 oracle's RLIMIT_NOFILE soft, which
+    /// is also what the emulation reports before any `ulimit` call).
+    /// rubash#773: the old parser ran `parse::<u32>()` over the whole
+    /// `"soft:hard"` cell, so it failed on every stored value and the
+    /// allocator silently fell back to its 1024 hard cap.
+    pub(in crate::executor) fn open_files_limit(&self) -> Option<u32> {
+        const UNLIMITED: u64 = u64::MAX;
+        let raw = self.shell_state.env_vars.get("__RUBASH_ULIMIT_N");
+        let Some(value) = raw else {
+            return Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT);
+        };
+        let soft = value.split(':').next().unwrap_or(value);
+        if soft == "unlimited" {
             return None;
         }
-        value.parse::<u32>().ok()
+        match soft.parse::<u64>() {
+            Ok(UNLIMITED) => None,
+            Ok(soft) => Some(u32::try_from(soft).unwrap_or(u32::MAX)),
+            Err(_) => Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT),
+        }
     }
 
-    fn allocate_dynamic_fd(&mut self) -> Option<u32> {
+    pub(in crate::executor) fn allocate_dynamic_fd(&mut self) -> Option<u32> {
         let limit = self.open_files_limit();
         self.fd_table.allocate_dynamic_with_limit(limit)
     }
 
+    /// GNU redir.c:940-946 (REDIR_VARASSIGN): a failed
+    /// `fcntl(fd, F_DUPFD, SHELL_FD_BASE)` reports
+    /// `sys_error("redirection error: cannot duplicate fd")` carrying the
+    /// F_DUPFD errno. Which errno that is depends on where the limit bit
+    /// the request (WSL GNU 5.3.0 probes, 2026-10-19): EMFILE — "Too many
+    /// open files" — when the table is saturated below the soft limit
+    /// (default 10240: exhaustion lands at ~10229 allocations); EINVAL —
+    /// "Invalid argument" — when the base 10 itself sits at/above the soft
+    /// limit (`ulimit -Sn 6`). rubash#773: report the same split instead of
+    /// the hardcoded EINVAL text, which sent EMFILE scripts debugging the
+    /// wrong layer.
     fn fd_dup_error_payload(&self, target: &str) -> String {
+        let errno = match self.open_files_limit() {
+            Some(limit) if limit <= 10 => "Invalid argument",
+            _ => "Too many open files",
+        };
         format!(
-            "redirection error: cannot duplicate fd: Invalid argument\n{}{}: Invalid argument",
-            self.diagnostic_prefix(),
-            target
+            "redirection error: cannot duplicate fd: {errno}\n{}{target}: {errno}",
+            self.diagnostic_prefix()
         )
     }
 

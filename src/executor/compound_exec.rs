@@ -308,7 +308,11 @@ impl Executor {
         if free {
             want
         } else {
-            self.fd_table.allocate_dynamic()
+            // GNU's fallback for a busy high fd is move_to_high_fd
+            // (general.c:681), another fcntl F_DUPFD consumer — bounded by
+            // the same RLIMIT_NOFILE soft limit as {var} allocation
+            // (rubash#773), so route through the limit-aware allocator.
+            self.allocate_dynamic_fd().unwrap_or(want)
         }
     }
 
