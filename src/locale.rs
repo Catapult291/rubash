@@ -462,8 +462,10 @@ pub fn decode_to_visible_text(text: &str) -> String {
         // (niubash shell.rs decoded_words). That text legitimately still
         // carries the marker, so the decoder consumes it instead of
         // rejecting it; every other named-string carrier (heredoc,
-        // comsub payload) never crosses this boundary and keeps its
-        // never-seen golden assertion below. Gated on the leading `_` so
+        // comsub payload) reaching this boundary is user-typed data by
+        // contract — the output-side leak assertions that used to live
+        // below were removed as unsound (#824: every asserted code point
+        // has a legal user-data path). Gated on the leading `_` so
         // the probe costs nothing for marker-free words.
         if ch == '_' {
             let mut probe = chars.clone();
