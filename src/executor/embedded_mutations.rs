@@ -2164,6 +2164,12 @@ impl Executor {
 
         self.restore_flat_subshell(saved_state, saved_dir);
         self.fd_table = saved_fd_table;
+        // rubash#846: the substitution body ran in a fork-equivalent child
+        // frame (GNU subst.c:7143 command_substitute has no :1831-style
+        // invert step), so an inner compound's own redirect failure arrives
+        // here as plain status — never flipped. Discard the mark; the
+        // parent judges the enclosing command by status only.
+        self.compound_redirect_failed.set(false);
         // rubash#485: GNU subst.c command_substitute reaps the substitution
         // child in the parent and its exit status becomes the shell's
         // last_command_exit_value BEFORE the enclosing command runs, so a

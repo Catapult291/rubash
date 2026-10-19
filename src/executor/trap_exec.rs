@@ -496,6 +496,11 @@ impl Executor {
         let saved_read_generation = self.enter_read_unit();
         let result = self.execute_eval_source_inner(source, caller_line, cmd);
         self.exit_read_unit(saved_read_generation);
+        // rubash#846: eval runs its string as a fresh frame (GNU evalstring
+        // parse_and_execute) — an inner compound's own redirect failure
+        // arrives here as plain status, never flipped. Discard the mark;
+        // the caller judges by status only.
+        self.compound_redirect_failed.set(false);
         result
     }
 

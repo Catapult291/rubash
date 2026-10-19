@@ -296,7 +296,17 @@ impl Executor {
             self.exit_code = 1;
             return Ok(());
         }
-        self.apply_no_output_builtin_redirects(cmd)?;
+        // rubash#846 (GNU execute_cmd.c:854-883): the `[[ ]]` command's
+        // OWN redirect failure — mark it for the `!` flip sites. This is
+        // the live path for `[[ ]]` with redirects (the late.rs `"[["`
+        // word arm is a fallback); without the mark here,
+        // `! [[ -n x ]] > /bad` flips to 0 instead of staying 1.
+        if let Err(error) = self.apply_no_output_builtin_redirects(cmd) {
+            if matches!(error, ExecuteError::IoError(_)) {
+                self.note_compound_redirect_failure();
+            }
+            return Err(error);
+        }
         // GNU execute_cmd.c execute_cond_command -> redir.c
         // do_redirections/undo_redirections: the command's output
         // redirections bind the real descriptors for the duration of the

@@ -934,6 +934,22 @@ pub struct Executor {
     /// last executed top-level command carried `!`; the drivers consult it
     /// before breaking (set-e1.sub `! true` under `set -o posix`).
     pub(crate) last_command_inverted: Cell<bool>,
+    /// GNU execute_cmd.c:854-883: a compound command's OWN redirect failure
+    /// abandons it with status 1 and returns BEFORE the :1204 invert step,
+    /// so `! { :; } > bad` stays 1 (no flip) while `! true > bad` (simple
+    /// command, flipped at :1204) is 0. Set at each compound's own
+    /// do_redirections-failure adjudication (IoError from the apply stage
+    /// only — never ExpansionFailure, never a body write error); simple
+    /// commands never set it. The `!` flip sites (compound_exec
+    /// execute_inverted_ast_command, ast_exec command dispatch) suppress
+    /// the flip while it is set and leave it set: nested `! ! C` wrappers
+    /// suppress in turn, and the innermost fork/call boundary that owns a
+    /// flip of its own (subshell-region single-inverted-body at
+    /// execute_cmd.c:1831, pipeline wait-side at :763) consumes it.
+    /// Comsub / function / eval boundaries consume it without flipping
+    /// (command_substitute has no :1831-equivalent); the flat-command loop
+    /// clears it between top-level commands as a backstop. rubash#846.
+    pub(crate) compound_redirect_failed: Cell<bool>,
     /// The group's execute_ast ended by unwinding (`exit`, errexit, POSIX
     /// special-builtin failure, fatal expansion — GNU's
     /// jump_to_top_level(EXITPROG/ERREXIT/FORCE_EOF)). run_source converts

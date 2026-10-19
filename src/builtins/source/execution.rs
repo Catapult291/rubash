@@ -20,16 +20,23 @@ pub(super) fn execute_text_maybe_redirected(
     redirect_cmd: Option<&CommandNode>,
     source_name: Option<&str>,
 ) -> Result<(), ExecuteError> {
-    if let Some(redirect_cmd) = redirect_cmd {
+    let result = if let Some(redirect_cmd) = redirect_cmd {
         // GNU execute_cmd.c applies the command's redirections once for the
         // whole sourced text (redir.c do_redirection_internal). The outer
         // scope opens/anchors the targets; each executed group then carries
         // the inherited per-leaf redirects like the script driver.
-        return executor.with_compound_output_redirects(redirect_cmd, |executor| {
+        executor.with_compound_output_redirects(redirect_cmd, |executor| {
             execute_source_with_args(executor, source, args, source_name, Some(redirect_cmd))
-        });
-    }
-    execute_source_with_args(executor, source, args, source_name, None)
+        })
+    } else {
+        execute_source_with_args(executor, source, args, source_name, None)
+    };
+    // rubash#846: sourced text runs as a fresh frame (GNU evalfile
+    // parse_and_execute) — an inner compound's own redirect failure
+    // arrives here as plain status, never flipped. Discard the mark; the
+    // caller judges by status only.
+    executor.compound_redirect_failed.set(false);
+    result
 }
 
 /// GNU builtins/evalfile.c source_file -> evalstring.c parse_and_execute:
