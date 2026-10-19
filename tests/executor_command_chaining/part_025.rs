@@ -172,7 +172,12 @@ fn test_popd_appends_stderr() {
     assert_eq!(executor.last_exit_code(), 1);
     let error = fs::read_to_string(error_path).unwrap();
     assert!(error.starts_with("before\n"));
-    assert!(error.contains("popd: +9: directory stack index out of range"));
+    // rubash#830: with the display down to the cwd entry the offset is 0, so
+    // GNU's pushd_error (pushd.def:540-546) names "directory stack empty"
+    // regardless of the operand — `popd +9` on a spent stack (WSL GNU bash
+    // 5.3.0: "popd: directory stack empty", rc 1); the out-of-range wording
+    // is reserved for a non-zero offset.
+    assert!(error.contains("popd: directory stack empty"));
     let _ = fs::remove_file(error_path);
 }
 
