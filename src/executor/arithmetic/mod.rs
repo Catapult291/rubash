@@ -451,8 +451,19 @@ impl Executor {
         let expression = if preexpansion_is_identity {
             std::borrow::Cow::Borrowed(expression)
         } else {
-            let with_assoc_keys =
-                self.expand_arithmetic_assoc_subscripts(expression, assoc_noexpand);
+            let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+                expression,
+                assoc_noexpand,
+                // GNU expr.c:340,368: the `let` operand arrives EXP_EXPANDED
+                // (already word-expanded), so `$'...'` is data there, while
+                // the `(( ))` body reaches expand_subscript_string raw and
+                // its ANSI-C arm decodes (issue rubash#828).
+                if expand {
+                    crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode
+                } else {
+                    crate::executor::subscript_expansion::ArithAnsiSpanMode::LetOperand
+                },
+            );
             let expanded = if expand {
                 self.expand_arithmetic_expression_mut(&with_assoc_keys)
             } else {
@@ -712,8 +723,14 @@ impl Executor {
         // GNU arrayfunc.c:1376 evalexp(t, eflag): eflag=0 for compat>51 —
         // the nested assoc subscript scan stays flag-0 even under
         // array_expand_once (AV_NOEXPAND applied to the OUTER subscript's
-        // expand_arith_string, not this inner evaluation).
-        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(&reexpanded, false);
+        // expand_arith_string, not this inner evaluation). The nested scan
+        // is a reader-side expand_subscript_string pass, so its `$'...'`
+        // spans decode (issue rubash#828).
+        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+            &reexpanded,
+            false,
+            crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode,
+        );
 
         let expression = normalize_arithmetic_quotes(&with_assoc_keys);
         // GNU expr.c:1190-1216 expr_streval: an unset (or invisible)
@@ -895,7 +912,13 @@ impl Executor {
             }
             return None;
         }
-        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(expression, false);
+        // `$(( ))` is a reader entry: GNU's expand_subscript_string decodes
+        // the raw `$'...'` spelling (issue rubash#828).
+        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+            expression,
+            false,
+            crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode,
+        );
         let expanded = self.expand_arithmetic_expression_mut(&with_assoc_keys);
         let expression = normalize_arithmetic_quotes(&expanded);
         *self.arithmetic_last_eval_input.borrow_mut() = expression.to_string();
@@ -1019,6 +1042,7 @@ impl Executor {
         &mut self,
         expression: &str,
         noexpand: bool,
+        ansi_mode: crate::executor::subscript_expansion::ArithAnsiSpanMode,
     ) -> String {
         let bytes = expression.as_bytes();
         let mut output = String::with_capacity(expression.len());
@@ -1096,13 +1120,13 @@ impl Executor {
                         // only the lexer's data-quote/dollar markers come
                         // back to their characters (eval_indexed_subscript_
                         // expression's ExpandedOnce branch does the same).
-                        raw.replace('', "$")
-                            .replace('', "`")
-                            .replace('', "\\")
-                            .replace('', "'")
-                            .replace('', "\"")
+                        raw.replace(crate::executor::markers::DATA_DOLLAR, "$")
+                            .replace(crate::executor::markers::DATA_BACKTICK, "`")
+                            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+                            .replace(crate::executor::markers::DATA_SQUOTE, "'")
+                            .replace(crate::executor::markers::DATA_DQUOTE, "\"")
                     } else {
-                        self.expand_assoc_subscript_once(raw)
+                        self.expand_assoc_subscript_once(raw, ansi_mode)
                     };
                     output.push_str(name);
                     output.push('[');
@@ -1201,14 +1225,31 @@ impl Executor {
     /// single-quoted span, which is why `A['$v']` keys on `$v` — and anything
     /// else goes through the ordinary word expansion, which stops at one round.
     ///
-    /// NOTE: the arithmetic evaluator is handed the `(( ))` body AFTER the
-    /// lexer's own escape pass, so its subscript text is not the source
-    /// spelling; re-running the assignment path's quote-removal pass here
-    /// would drop one backslash too many (`A[a\\b]` read `a\b` instead of
-    /// `ab`). The assignment path owns the faithful
-    /// `expand_subscript_string`; this path keeps its own one-round word
-    /// expansion until the `(( ))` body reaches the evaluator unescaped.
-    fn expand_assoc_subscript_once(&mut self, raw: &str) -> String {
+    /// `ansi_mode` owns the literal `$'...'` spans (issue rubash#828): the
+    /// `((...))`-family entries decode them ANSI-C style with backslash
+    /// protection, while `let` — whose operand GNU considers already
+    /// word-expanded — drops the quotes verbatim without decoding. Bare
+    /// (non-`$'`) spellings are NOT re-processed here: the arithmetic
+    /// evaluator is handed the `(( ))` body AFTER the lexer's own escape
+    /// pass, so its subscript text is not the source spelling; re-running
+    /// the assignment path's quote-removal pass here would drop one
+    /// backslash too many (`A[a\\b]` read `a\b` instead of `ab`). The
+    /// assignment path owns the faithful `expand_subscript_string`; this
+    /// path keeps its own one-round word expansion until the `(( ))` body
+    /// reaches the evaluator unescaped.
+    fn expand_assoc_subscript_once(
+        &mut self,
+        raw: &str,
+        ansi_mode: crate::executor::subscript_expansion::ArithAnsiSpanMode,
+    ) -> String {
+        let raw_owned;
+        let raw = if raw.contains("$'") {
+            raw_owned =
+                crate::executor::subscript_expansion::transform_arith_ansi_c_spans(raw, ansi_mode);
+            raw_owned.as_str()
+        } else {
+            raw
+        };
         if let Some(literal) =
             crate::executor::subscript_expansion::wholly_single_quoted_literal(raw)
         {
