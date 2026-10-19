@@ -355,3 +355,210 @@ fn signed_integer_formats_honor_sign_flags_and_zero_padding() {
         "<+42>< 42><  +42><-0042><+0042>"
     );
 }
+
+/// rubash#704 R6.1 — printf numeric validation. GNU getintmax/getuintmax/
+/// getdouble (printf.def:1427/1450/1472) hand the operand to
+/// strtoimax/strtoumax/strtod, which skip only LEADING white space; the
+/// accumulated prefix value is still printed while chk_converror
+/// (printf.def:1388-1395) rejects whatever bytes remain and flips
+/// conversion_error (exit 1).
+mod numeric_validation_704 {
+    use super::*;
+
+    #[test]
+    fn trailing_whitespace_is_not_part_of_the_number() {
+        let (status, stdout, stderr, _) =
+            run(&["%d|%i|%u|%x|%X|%o", "5 ", "5 ", "5 ", "5 ", "5 ", "5 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5|5|5|5|5|5");
+        assert_eq!(stderr.matches("printf: 5 : invalid number").count(), 6);
+
+        let (status, stdout, stderr, _) = run(&["%d", "5\t"]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5");
+        assert!(stderr.contains("printf: 5\t: invalid number"));
+    }
+
+    #[test]
+    fn float_conversions_keep_the_accumulated_prefix_value() {
+        // getdouble -> strtod: `5 ` accumulates 5.0; the trailing space is a
+        // chk_converror suffix. The pre-fix engine dropped the value to 0.
+        let (status, stdout, stderr, _) = run(&["%f|%e|%g|%a", "5 ", "5 ", "5 ", "5 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        // The %a rendering keeps the engine's own mantissa style (a separate
+        // pre-existing divergence from glibc's "0xap-1"); what this facet
+        // owns is that the VALUE survives: it must not collapse to 0x0p+0.
+        assert_eq!(stdout, "5.000000|5.000000e+00|5|0x1.4p+2");
+        assert_eq!(stderr.matches("printf: 5 : invalid number").count(), 4);
+
+        let (status, stdout, stderr, _) = run(&["%f", "5.5 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5.500000");
+        assert!(stderr.contains("printf: 5.5 : invalid number"));
+    }
+
+    #[test]
+    fn leading_whitespace_still_converts_silently() {
+        let (status, stdout, stderr, _) = run(&["%d|%f", " 5", " 5"]);
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(stdout, "5|5.000000");
+        assert!(stderr.is_empty());
+
+        // Both-side padding: the leading half is skipped, the trailing half
+        // is the suffix the diagnostic names verbatim.
+        let (status, stdout, stderr, _) = run(&["%d", "  5  "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5");
+        assert!(stderr.contains("printf:   5  : invalid number"));
+    }
+
+    #[test]
+    fn suffix_wins_over_erange_in_the_diagnostic_choice() {
+        // chk_converror checks `*ep != '\0'` BEFORE errno == ERANGE.
+        let (status, stdout, stderr, _) = run(&["%d", "99999999999999999999x"]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "9223372036854775807");
+        assert!(stderr.contains("99999999999999999999x: invalid number"));
+        assert!(!stderr.contains("Numerical result out of range"));
+    }
+
+    #[test]
+    fn signed_suffixes_keep_their_converted_value() {
+        let (status, stdout, stderr, _) = run(&["%d|%d|%u|%d", "+5 ", "-5 ", "-1 ", "-010 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5|-5|18446744073709551615|-8");
+        assert!(stderr.contains("printf: +5 : invalid number"));
+        assert!(stderr.contains("printf: -5 : invalid number"));
+        assert!(stderr.contains("printf: -1 : invalid number"));
+        assert!(stderr.contains("printf: -010 : invalid number"));
+    }
+
+    #[test]
+    fn invalid_number_classification_follows_sh_invalidnum() {
+        // builtins/common.c:214-225 sh_invalidnum(): leading `0` + digit is
+        // an octal complaint, leading `0x` (lowercase x only) a hex
+        // complaint, everything else a plain number — including `0Xzz`
+        // (strtoumax consumed only the `0`) and `0 `.
+        let (status, stdout, stderr, _) =
+            run(&["%d|%d|%d|%d|%d", "055 ", "01z", "0Xzz", "0x10 ", "0 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "45|1|0|16|0");
+        assert!(stderr.contains("printf: 055 : invalid octal number"));
+        assert!(stderr.contains("01z: invalid octal number"));
+        assert!(stderr.contains("0Xzz: invalid number"));
+        assert!(stderr.contains("printf: 0x10 : invalid hex number"));
+        assert!(stderr.contains("printf: 0 : invalid number"));
+    }
+
+    #[test]
+    fn base_zero_binary_literals_convert_like_glibc() {
+        // glibc 2.38+ strto* accepts the C23 0b/0B prefix in base 0.
+        let (status, stdout, stderr, _) = run(&["%d|%d", "0b101", "0B101"]);
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(stdout, "5|5");
+        assert!(stderr.is_empty());
+
+        // A non-binary digit after 0b is a suffix on the octal `0`.
+        let (status, stdout, stderr, _) = run(&["%d", "0b2"]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "0");
+        assert!(stderr.contains("0b2: invalid number"));
+    }
+
+    #[test]
+    fn whitespace_only_operand_reports_the_whole_operand() {
+        let (status, stdout, stderr, _) = run(&["%d|%d", " ", "  "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "0|0");
+        assert!(stderr.contains("printf:  : invalid number"));
+        assert!(stderr.contains("printf:   : invalid number"));
+    }
+
+    #[test]
+    fn lone_quote_is_a_nul_character_constant_without_error() {
+        // printf.def:1519-1544 asciicode(): arg[1] of a quoted operand, with
+        // no chk_converror — a lone quote reads the NUL at arg[1] (0).
+        let (status, stdout, stderr, _) = run(&["%d|%d|%d", "'a", "'a ", "'"]);
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(stdout, "97|97|0");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn float_subject_sequences_parse_the_longest_valid_prefix() {
+        let (status, stdout, stderr, _) =
+            run(&["%f|%f|%f|%f|%f|%f", "5x", "5. ", "5e", "1e3 ", ".5 ", "ff"]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(
+            stdout,
+            "5.000000|5.000000|5.000000|1000.000000|0.500000|0.000000"
+        );
+        assert!(stderr.contains("5x: invalid number"));
+        assert!(stderr.contains("printf: 5. : invalid number"));
+        assert!(stderr.contains("5e: invalid number"));
+        assert!(stderr.contains("printf: 1e3 : invalid number"));
+        assert!(stderr.contains("printf: .5 : invalid number"));
+        assert!(stderr.contains("ff: invalid number"));
+    }
+
+    #[test]
+    fn hexadecimal_float_subjects_convert() {
+        let (status, stdout, stderr, _) = run(&["%f|%f|%f|%f", "0x1", "0x1p3", "0x.8p1", "0xg"]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "1.000000|8.000000|1.000000|0.000000");
+        assert!(stderr.contains("printf: 0xg: invalid hex number"));
+    }
+
+    #[test]
+    fn nonfinite_operands_spell_like_glibc() {
+        // glibc spells per conversion case: %f/%e/%g -> inf/nan, %F/%E ->
+        // INF/NAN; the sign bit renders as a literal minus; `%+f` keeps the
+        // plus.
+        let (status, stdout, stderr, _) = run(&[
+            "%f|%f|%F|%F|%e|%+f|%f",
+            "inf",
+            "nan",
+            "inf",
+            "nan ",
+            "nan",
+            "inf",
+            "-nan",
+        ]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "inf|nan|INF|NAN|nan|+inf|-nan");
+        assert!(stderr.contains("printf: nan : invalid number"));
+    }
+
+    #[test]
+    fn nan_parenthesised_sequence_is_part_of_the_subject() {
+        let (status, stdout, stderr, _) = run(&["%f|%f", "nan(123)", "infinity"]);
+        assert_eq!(status, EXECUTION_SUCCESS);
+        assert_eq!(stdout, "nan|inf");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn width_and_continuation_still_apply_to_suffixed_operands() {
+        let (status, stdout, stderr, _) = run(&["%5d|\n", "5 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "    5|\n");
+        assert!(stderr.contains("printf: 5 : invalid number"));
+
+        // POSIX: processing continues after a conversion error — every
+        // operand gets its own diagnostic.
+        let (status, stdout, stderr, _) = run(&["%d:%d\n", "5 ", "6 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert_eq!(stdout, "5:6\n");
+        assert!(stderr.contains("printf: 5 : invalid number"));
+        assert!(stderr.contains("printf: 6 : invalid number"));
+    }
+
+    #[test]
+    fn v_assignment_still_lands_with_a_conversion_error() {
+        let (status, stdout, stderr, env_vars) = run(&["-v", "V", "%d\n", "5 "]);
+        assert_eq!(status, EXECUTION_FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("printf: 5 : invalid number"));
+        assert_eq!(env_vars.get("V"), Some(&"5\n".to_string()));
+    }
+}

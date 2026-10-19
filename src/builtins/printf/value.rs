@@ -86,7 +86,7 @@ pub(super) fn format_value(
         'f' | 'F' => {
             let parsed = parse_f64(value);
             invalid_number = parsed.invalid;
-            format_float(parsed.value, spec, 'f')
+            format_float(parsed.value, spec, spec.specifier)
         }
         'e' => {
             let parsed = parse_f64(value);

@@ -48,6 +48,17 @@ impl Executor {
             return Ok(false);
         };
         let saved_path = self.use_standard_path_for_lookup(use_standard_path);
+        // builtins/command.def:95-96 command_builtin(): `if (list == 0)
+        // return (EXECUTION_SUCCESS);` -- the no-operand early return comes
+        // BEFORE the describe loop, so `command -v`/`-V` with no names
+        // succeeds with no output (GNU probe rc=0) even though the
+        // any_found accumulator below would otherwise report failure.
+        let names = &args[first_name..];
+        if names.is_empty() {
+            self.restore_lookup_path(saved_path);
+            self.exit_code = 0;
+            return Ok(true);
+        }
         // rubash#704 R6.2: `command -v`/`-V` use GNU's ANY-found rule
         // (builtins/command.def: `if (describe_command (...) == 0)
         // any_found++` -> EXECUTION_SUCCESS when one operand resolved).
@@ -56,7 +67,7 @@ impl Executor {
         // shared "any miss sets status 1" made `command -v echo nosuch`
         // return 1 while GNU returns 0.
         let mut any_found = false;
-        for name in &args[first_name..] {
+        for name in names {
             if !use_standard_path && !name.contains('/') && !name.contains('\\') {
                 crate::builtins::hash::bump_hashed_path_hit(&mut self.shell_state.env_vars, name);
             }
