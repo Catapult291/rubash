@@ -1849,6 +1849,63 @@ mod issue_704 {
             "command describe status; stderr:\n{stderr}"
         );
     }
+
+    /// 704.2b — builtins/command.def:95-96 `if (list == 0) return
+    /// (EXECUTION_SUCCESS);`: the no-operand early return comes BEFORE the
+    /// describe loop, so `command -v`/`-V` with no names succeeds with no
+    /// output instead of falling through to the any_found accumulator's
+    /// failure. Same rule inside a substitution (the status rides
+    /// last_command_substitution_status).
+    #[test]
+    fn case_2b_command_v_without_operands_succeeds() {
+        let dir = case_scratch("704.2b");
+
+        let code = "command -v; echo direct:$?\n\
+                    command -V; echo verbose:$?\n\
+                    v=$(command -v); echo \"comsub:[${v}] rc:$?\"\n\
+                    v=$(command -V); echo \"comsubV:[${v}] rc:$?\"";
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            stdout, "direct:0\nverbose:0\ncomsub:[] rc:0\ncomsubV:[] rc:0",
+            "no-operand describe status; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "no-operand forms print nothing on stderr; got:\n{stderr}"
+        );
+    }
+
+    /// 704.2c — the substitution entry point shares the any-found rule, and
+    /// the `-V` per-operand "not found" diagnostic still reaches stderr
+    /// while the found operand's description is captured (WSL GNU bash
+    /// 5.3.0 probe: `v=$(command -V echo nosuch_xyz)` -> stdout captures
+    /// "echo is a shell builtin", stderr gets
+    /// "command: nosuch_xyz: not found", rc 0).
+    #[test]
+    fn case_2c_command_v_in_substitution_uses_any_found() {
+        let dir = case_scratch("704.2c");
+
+        let code = "v=$(command -v echo nosuch_xyz); echo \"any:[$v] rc:$?\"\n\
+                    v=$(command -v nosuch_one nosuch_two); echo \"miss:[$v] rc:$?\"\n\
+                    v=$(command -V echo nosuch_xyz); echo \"verbose:[$v] rc:$?\"";
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            stdout, "any:[echo] rc:0\nmiss:[] rc:1\nverbose:[echo is a shell builtin] rc:0",
+            "substituted describe status; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("command: nosuch_xyz: not found"),
+            "-V not-found diagnostic must reach stderr; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("nosuch_one: not found"),
+            "-v (reusable) stays silent about misses; stderr:\n{stderr}"
+        );
+    }
 }
 
 /// rubash#759: `dirs -l` is the LONG form (`$HOME` stays un-collapsed), not the
