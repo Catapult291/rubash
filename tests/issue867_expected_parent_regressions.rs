@@ -23,6 +23,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
