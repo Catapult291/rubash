@@ -1262,7 +1262,16 @@ impl Executor {
         // emits it verbatim instead of consuming it as an sq opener —
         // without this the key stored `80s` (assoc9.sub `let "++a[$b]"`).
         let raw = crate::executor::subscript_expansion::mark_expanded_once_data_squotes(raw);
-        self.expand_word_mut_with_context(&raw, SubstitutionQuoteContext::Unquoted)
+        let expanded = self.expand_word_mut_with_context(&raw, SubstitutionQuoteContext::Unquoted);
+        // The expansion owns the final key text, so the data carriers the
+        // pre-pass marked (`\x17` for the expanded-once `'` above, the
+        // span/dollar carriers of a kept `$'...'` spelling) dequote here —
+        // markers.rs:380 decode_word_position_carriers, GNU subst.c:4807
+        // dequote_string. Without it a dquoted span kept raw by the
+        // rubash#847 dual-state law stored a literal \x17 mid-key
+        // (`((G["pre$'x'post"]=1))` keyed `pre$\x17x'post` and the
+        // variable-spelling read missed the cell).
+        crate::executor::markers::decode_word_position_carriers(&expanded)
     }
 
     pub(super) fn expand_arithmetic_special_parameters(&self, expression: &str) -> String {
