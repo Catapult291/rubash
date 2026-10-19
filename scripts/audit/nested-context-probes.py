@@ -71,7 +71,12 @@ cases = [
  ("bg-var-isolation",       "x=1; x=2 & wait; echo $x"),
 ]
 def _run(argv):
-    p = subprocess.run(argv, capture_output=True)
+    # stdin is EOF, never inherited: a case that dups fd 0 (fd9-in-subshell)
+    # must see EOF deterministically instead of blocking on whatever pipe
+    # the runner was launched with (rubash#713 rerun 2026-10-20 hung here
+    # under a held-open inherited stdin). Both legs share the same DEVNULL,
+    # so the differential comparison is unaffected.
+    p = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL)
     return (
         p.stdout.decode(errors="replace"),
         p.stderr.decode(errors="replace"),
