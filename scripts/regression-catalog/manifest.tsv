@@ -6,7 +6,7 @@ issue-714	714	must-match	read -n/-N count decoded units — fixed by PR #775
 issue-723	723	must-match	pipeline while-read consumer stall — fixed by PR #793
 issue-726	726	must-match	definition-level dup splice + exec group-order escape — fixed by PR #783
 issue-733	733	must-match	compound-assignment quote leak — fixed by PR #792
-issue-734	734	diverges	assoc subscript via ANSI-C quoting — still open
+issue-734	734	must-match	assoc subscript via ANSI-C quoting — fixed (catalog PROMOTE 2026-10-19: matches GNU already on pristine b79e678a; row was stale, see tests/issue734)
 issue-735	735	diverges	PUA collision fixed by PR #791 but ${x@Q}-shape length/bytes still diverge (follow-up #794/#796)
 issue-737	737	diverges	kill reaches background children (stdout) — job Killed-notification wording still diverges (follow-up #794)
 issue-738	738	must-match	heredoc delimiter dequote — fixed, pinned also in tests/regression.rs
@@ -33,4 +33,5 @@ loc-l5-read-cr	772	diverges	read -r still strips a trailing CR (#769-class byte-
 lim-f5-fd-cap	773	diverges	fd table caps at 1014 with 'cannot duplicate fd: Invalid argument'
 lim-f6-nul	773	diverges	read counts NUL bytes (8 vs 6); comsub does not warn
 lim-f7-closed-fd0	773	diverges	closed fd 0 then re-redirect -> Bad file descriptor
-issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (CR Nit 2 unset-operand row stays a pinned divergence, see tests/issue828)
+issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (the CR Nit 2 unset-operand row landed as parity in #847, see tests/issue828)
+issue-847	847	must-match	#822 span scanner dquote state (E3b: dq-wrapped $'...' spelling stays raw on assign/read/arith) + unset deferred operand quote-removes $'...' (u1/u2/u3 keep the cell; bare/variable rows still delete) - fixed

@@ -1364,11 +1364,21 @@ pub(super) fn scan_compound_subscript(
 /// the span at parse time with CTLESC protection (see
 /// [`Executor::expand_assignment_subscript_string`]), while the `${...}`
 /// reader's runtime decode is unprotected and its backslashes drop.
+///
+/// The scan carries the same dual quote state as
+/// [`transform_arith_ansi_c_spans`] (rubash#839): a span only OPENS outside
+/// both quotes, and `'`/`"` toggle their own state only outside the other
+/// quote. Inside `"pre$'x'post"` the spelling is DATA — GNU's
+/// expand_word_internal does not recognize ANSI-C quoting inside double
+/// quotes, so the whole spelling reaches the key verbatim (probe 2026-10-19:
+/// `M["pre$'x'post"]=w` stores `pre$'x'post`, byte-for-byte) — and decoding
+/// it there stored the merged `prexpost` (rubash#847 E3b face).
 fn decode_ansi_c_spans(text: &str, preserve_backslashes: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut output = String::with_capacity(text.len());
     let mut index = 0usize;
     let mut in_single = false;
+    let mut in_double = false;
     while index < chars.len() {
         let ch = chars[index];
         if ch == '\\' && !in_single && index + 1 < chars.len() {
@@ -1379,13 +1389,19 @@ fn decode_ansi_c_spans(text: &str, preserve_backslashes: bool) -> String {
             index += 2;
             continue;
         }
-        if ch == '\'' {
+        if ch == '\'' && !in_double {
             in_single = !in_single;
             output.push(ch);
             index += 1;
             continue;
         }
-        if !in_single && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
             // `$'...'`: the close quote is the first unescaped `'`.
             let mut inner_end = index + 2;
             let mut inner = String::new();
@@ -1541,6 +1557,87 @@ fn mark_arith_span_data(text: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// GNU unset's deferred operand pass (rubash#847, the u-family): a
+/// `name[sub]` operand whose subscript carries a QUOTED-source `$'...'`
+/// spelling — `unset 'A[$'"'"'x\ty'"'"']'`, `unset "A[$'x\ty']"` — reaches
+/// `unbind_array_element` as plain post-quote-removal text, and GNU's
+/// second expand_subscript_string pass there does NOT re-recognize the
+/// span as ANSI-C. It quote-removes it instead: the quotes drop, the span
+/// dollar stays literal and the content rides verbatim, so `$'x\ty'`
+/// resolves to the key `$x\ty` (probe 2026-10-19: with a literal `$x` cell
+/// present, `unset "C[\$'x']"` deletes THAT cell) and no ordinary
+/// `$'...'`-written cell matches — the cell survives. Decoding the span
+/// instead resolved the stored clean key and deleted the cell (the
+/// divergence #839 pinned as CR Nit 2).
+///
+/// The scan mirrors [`transform_arith_ansi_c_spans`]'s dual quote state:
+/// `$'` opens a span only outside both quotes, `'`/`"` toggle outside the
+/// other quote, a span closes at its first unescaped `'`, an unterminated
+/// span stays verbatim. `$k`-style expansions in the operand are untouched
+/// — they keep expanding on the deferred pass (probe: `unset 'P3[$k]'`
+/// with k=Q deletes the `Q` cell) — and every syntax character inside a
+/// span rides [`mark_arith_span_data`]'s carrier so the embedded-parameter
+/// walker expands none of it.
+pub(in crate::executor) fn quote_remove_ansi_c_spans(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                // The span dollar stays literal data and the quotes drop;
+                // the content rides verbatim (no ANSI-C decode here).
+                output.push(LITERAL_DOLLAR);
+                output.push_str(&mark_arith_span_data(&inner));
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
 }
 
 fn decode_deferred_compound_body(inner: &str) -> String {

@@ -19,10 +19,9 @@
 //!    parity — rubash used to keep the quotes too (`$'x\ty'`).
 //! 3. `unset 'A[$'"'"'x\ty'"'"']'` — the CR-Nit-2 data point: the operand
 //!    spelling that decodes to the stored key. GNU's unset does not
-//!    ANSI-C-decode the operand and KEEPS the cell; rubash decodes it and
-//!    DELETES. Pre-existing on both sides of this fix and parked with the
-//!    unset-operand follow-up ticket — pinned below as the documented
-//!    divergence, not changed here.
+//!    ANSI-C-decode the operand and KEEPS the cell; rubash used to decode
+//!    it and DELETE. Landed by the parked unset-operand follow-up
+//!    (rubash#847, `quote_remove_ansi_c_spans`), pinned below as parity.
 //!
 //! Fix: `expand_assoc_subscript_once` rewrites the literal `$'...'` spans
 //! per entry (`ArithAnsiSpanMode::Decode` for the `((...))`/`$((...))`
@@ -187,19 +186,20 @@ fn unset_via_variable_removes_arith_cell() {
     assert_eq!(stdout, "declare -A U=()\n");
 }
 
-/// CR Nit 2 data point, pinned as the documented DIVERGENCE: the unset
-/// operand spelling that decodes to the stored key. GNU 5.3.0 does not
-/// ANSI-C-decode the operand and KEEPS the cell (`declare -A V=([$'x\ty']="1" )`,
-/// probe 2026-10-13); rubash decodes it and deletes. Pre-existing on both
-/// sides of this fix — the fix deliberately does not touch unset operand
-/// semantics; the behavior lives with the parked unset-operand follow-up.
-/// If this test flips, that follow-up landed (or unset regressed).
+/// CR Nit 2 data point, now GNU PARITY (rubash#847): the unset operand
+/// spelling carrying a quoted-source `$'...'` span. GNU 5.3.0 does not
+/// ANSI-C-decode the operand — its deferred pass quote-removes it (quotes
+/// drop, the span dollar stays literal, content verbatim) — so the
+/// `$'...'`-written cell KEEPS (`declare -A V=([$'x\ty']="1" )`, probes
+/// 2026-10-13/2026-10-19). rubash decoded the span, resolved the stored
+/// clean key and deleted the cell; `quote_remove_ansi_c_spans` mirrors
+/// GNU's deferred-pass law.
 #[test]
-fn unset_ansi_c_operand_spelling_divergence_pinned() {
+fn unset_ansi_c_operand_spelling_matches_gnu() {
     let (stdout, stderr, _) =
         rubash("declare -A V; ((V[$'x\\ty']=1)); unset 'V[$'\"'\"'x\\ty'\"'\"']'; declare -p V");
     assert_clean(&stderr);
-    assert_eq!(stdout, "declare -A V=()\n");
+    assert_eq!(stdout, "declare -A V=([$'x\\ty']=\"1\" )\n");
 }
 
 /// The `let` double-quoted form stores GNU's scrambled key: `$` literal,
@@ -370,4 +370,178 @@ fn let_entry_quote_state_shapes_unchanged() {
     );
     assert_clean(&stderr);
     assert_eq!(stdout, "70726524277827706f7374\n2761242762276327\n");
+}
+
+// =====================================================================
+// rubash#847 — the two remaining faces of the span-state family.
+//
+// GNU bash 5.3.0 baselines (WSL, UTF-8 locale, byte-verified probes
+// 2026-10-19; the full differential lives on the PR):
+//
+// 1. E3b — the #822 assignment/reader ANSI-C span scanner tracked only
+//    single-quote state, so a span INSIDE double quotes was decoded
+//    anyway: `M["pre$'x'post"]=w` stored the merged `prexpost`. GNU's
+//    expand_word_internal never recognizes ANSI-C quoting inside dquotes
+//    — the whole spelling is data and the key stays `pre$'x'post`
+//    (`70726524277827706f7374`), on the assignment entry, the `((...))`
+//    entry and the `${...}` reader alike.
+// 2. u-family — unset's deferred operand pass quote-removes a
+//    quoted-source `$'...'` spelling instead of decoding it
+//    (`quote_remove_ansi_c_spans`): u1/u2/u3 below keep the cell.
+//
+// Both fixes mirror the #839 dual-state law: `$'` opens a span only
+// outside both quotes, `'`/`"` toggle only outside the other quote.
+
+/// E3b on the assignment entry: the dq-wrapped span stays raw data
+/// (GNU: `pre$'x'post`, `70726524277827706f7374`).
+#[test]
+fn e3b_assignment_dq_span_kept_raw() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A M; M[\"pre$'x'post\"]=w
+         printf '%s' \"${!M[@]}\" | od -A n -t x1 | tr -d ' \\n'; printf '\\n'",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "70726524277827706f7374\n");
+}
+
+/// E3b on the reader: the same spelling self-reads the `((...))`-written
+/// cell (GNU: `gr=1`).
+#[test]
+fn e3b_reader_self_read_hits() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A G; ((G[\"pre$'x'post\"]=1)); printf 'gr=%s\\n' \"${G[\"pre$'x'post\"]}\"",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "gr=1\n");
+}
+
+/// E3b on the arithmetic write: the stored key is the clean spelling, so a
+/// variable holding the same bytes reads it back (GNU: `[1]`).
+#[test]
+fn e3b_arith_write_variable_read_hits() {
+    let (stdout, stderr, _) = rubash(
+        "k=\"pre$'x'post\"; declare -A G; ((G[\"pre$'x'post\"]=1)); printf '[%s]\\n' \"${G[$k]}\"",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "[1]\n");
+}
+
+/// Dquote escape rules still apply to the kept spelling's surroundings:
+/// the dq `\\t` stays a literal backslash pair, no ANSI-C decode fires
+/// (GNU: `abcd$'e\\tf'gh`, `616263642427655c7466276768`).
+#[test]
+fn e3b_dq_adjacent_text_span_kept_raw() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A W5; W5[ab\"cd$'e\\tf'\"gh]=1
+         printf '%s' \"${!W5[@]}\" | od -A n -t x1 | tr -d ' \\n'; printf '\\n'",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "616263642427655c7466276768\n");
+}
+
+/// The dq `\\\\` collapse happens at dquote level, not in the span: the
+/// kept spelling shows one backslash (GNU: `x$'a\\b'y`, `782427615c622779`).
+#[test]
+fn e3b_dq_escaped_backslash_span_kept_raw() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A W6; W6[\"x$'a\\\\b'y\"]=1
+         printf '%s' \"${!W6[@]}\" | od -A n -t x1 | tr -d ' \\n'; printf '\\n'",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "782427615c622779\n");
+}
+
+/// E3 non-regression: a bare `$x` INSIDE the dquotes still expands (GNU:
+/// `pre'post`, `70726527706f7374`).
+#[test]
+fn e3_bare_expansion_non_regression() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A E3; ((E3[\"pre$x'post\"]=1))
+         printf '%s' \"${!E3[@]}\" | od -A n -t x1 | tr -d ' \\n'; printf '\\n'",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "70726527706f7374\n");
+}
+
+/// E1 non-regression: the sq-piece spelling keys on `a$bc` (GNU:
+/// `61246263`).
+#[test]
+fn e1_sq_pieces_non_regression() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A E1; E1['a$'b'c']=1
+         printf '%s' \"${!E1[@]}\" | od -A n -t x1 | tr -d ' \\n'; printf '\\n'",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "61246263\n");
+}
+
+/// u1 — the CR Nit 2 spelling (sq-embedded operand): the cell survives
+/// (GNU: `declare -A A1=([$'x\\ty']=\"1\" )`).
+#[test]
+fn unset_u1_sq_embedded_keeps_cell() {
+    let (stdout, stderr, _) = rubash(
+        "declare -A A1; ((A1[$'x\\ty']=1)); unset 'A1[$'\"'\"'x\\ty'\"'\"']'; declare -p A1",
+    );
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A A1=([$'x\\ty']=\"1\" )\n");
+}
+
+/// u2 — the plain double-quoted operand: same keep (GNU parity).
+#[test]
+fn unset_u2_double_quoted_keeps_cell() {
+    let (stdout, stderr, _) =
+        rubash("declare -A A2; ((A2[$'x\\ty']=1)); unset \"A2[$'x\\ty']\"; declare -p A2");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A A2=([$'x\\ty']=\"1\" )\n");
+}
+
+/// u3 — the dq-escaped-dollar operand: same keep (GNU parity).
+#[test]
+fn unset_u3_dq_escaped_dollar_keeps_cell() {
+    let (stdout, stderr, _) =
+        rubash("declare -A A3; ((A3[$'x\\ty']=1)); unset \"A3[\\$'x\\ty']\"; declare -p A3");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A A3=([$'x\\ty']=\"1\" )\n");
+}
+
+/// The resolved key is `$x\ty` — literal span dollar plus the quote-removed
+/// content — so a LITERAL `$x` cell is the one that gets hit (GNU gnu9
+/// probe: `unset "C[\$'x']"` deletes the `$x` cell and keeps `x`).
+#[test]
+fn unset_resolves_to_literal_dollar_prefix_key() {
+    let (stdout, stderr, _) =
+        rubash("declare -A C; C[x]=a; C[\\$x]=i; unset \"C[\\$'x']\"; declare -p C");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A C=([x]=\"a\" )\n");
+}
+
+/// Bare (unquoted) ANSI-C spelling non-regression: it decoded at word
+/// expansion long before unset, so the cell is still removed (GNU: `()`).
+#[test]
+fn unset_bare_spelling_still_deletes() {
+    let (stdout, stderr, _) =
+        rubash("declare -A G1; ((G1[$'x\\ty']=1)); unset G1[$'x\\ty']; declare -p G1");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A G1=()\n");
+}
+
+/// Variable-spelling operand non-regression: `$k` still expands on the
+/// deferred pass and removes the cell (GNU: `()`).
+#[test]
+fn unset_variable_spelling_still_deletes() {
+    let (stdout, stderr, _) =
+        rubash("k=$'x\\ty'; declare -A A5; ((A5[$'x\\ty']=1)); unset \"A5[$k]\"; declare -p A5");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A A5=()\n");
+}
+
+/// A `$k` with NO span in the operand still expands even from a
+/// single-quoted source (GNU probe: `unset 'P3[$k]'` with k=Q deletes the
+/// `Q` cell) — the transform touches only `$'...'` spellings.
+#[test]
+fn unset_param_expansion_without_span_still_runs() {
+    let (stdout, stderr, _) =
+        rubash("k=Q; declare -A P3; P3[Q]=cell; unset 'P3[$k]'; declare -p P3");
+    assert_clean(&stderr);
+    assert_eq!(stdout, "declare -A P3=()\n");
 }
