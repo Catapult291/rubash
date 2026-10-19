@@ -8,6 +8,10 @@ pub(super) enum PushdOperand {
         index: usize,
         from_right: bool,
         no_cd: bool,
+        /// The raw ±N word. GNU hands the word itself to pushd_error
+        /// (pushd.def:242 walks it inline), so the range diagnostic echoes
+        /// the offending operand verbatim — never a trailing option word.
+        word: String,
     },
     Dir {
         dir: String,
@@ -15,7 +19,7 @@ pub(super) enum PushdOperand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PopdOperand {
     Top {
         no_cd: bool,
@@ -24,6 +28,10 @@ pub(super) enum PopdOperand {
         index: usize,
         from_right: bool,
         no_cd: bool,
+        /// The raw ±N word: popd's walk records it as which_word
+        /// (pushd.def:374-377) and hands it to pushd_error at :382/:414,
+        /// so `popd +5 -n` reports "+5", not the option that follows it.
+        word: String,
     },
 }
 
@@ -57,6 +65,7 @@ where
             index: arg[1..].parse::<usize>().unwrap_or(usize::MAX),
             from_right: arg.starts_with('-'),
             no_cd,
+            word: arg.to_string(),
         }));
     }
 
@@ -112,6 +121,7 @@ where
         index,
         from_right: arg.starts_with('-'),
         no_cd,
+        word: arg.to_string(),
     }))
 }
 

@@ -71,24 +71,6 @@ pub(super) fn resolved_index(value: usize, from_right: bool, len: usize) -> Opti
     }
 }
 
-pub(super) fn set_pwd_from_stack(
-    env_vars: &mut HashMap<String, String>,
-    stack: &[String],
-    update_oldpwd: bool,
-) {
-    let Some(pwd) = stack.first().cloned() else {
-        return;
-    };
-    if update_oldpwd {
-        let old = env_vars
-            .get("PWD")
-            .cloned()
-            .unwrap_or_else(|| "/".to_string());
-        env_vars.insert("OLDPWD".to_string(), old);
-    }
-    env_vars.insert("PWD".to_string(), pwd);
-}
-
 pub(super) fn logical_dir_exists(dir: &str, env_vars: &HashMap<String, String>) -> bool {
     // The shell keeps POSIX-looking paths in PWD even on Windows.  Resolve
     // those paths before checking them, while allowing relative operands such

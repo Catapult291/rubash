@@ -97,7 +97,12 @@ fn test_pushd_redirects_stderr() {
     assert_eq!(executor.last_exit_code(), 0);
     assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
     let error = fs::read_to_string(error_path).unwrap();
-    assert!(error.contains("pushd: +9: directory stack index out of range"));
+    // #848: pushd_error (pushd.def:540-546) says "directory stack empty"
+    // while the offset is 0 — WSL GNU bash 5.3.0(1), 2026-10-19:
+    // `pushd +9` fresh prints "bash: line 1: pushd: directory stack empty",
+    // rc 1. The "+9: directory stack index out of range" wording is the
+    // offset >= 1 branch, pinned in issue844_848 with a two-entry stack.
+    assert!(error.contains("pushd: directory stack empty"));
     let _ = fs::remove_file(error_path);
     let _ = fs::remove_file(status_path);
 }
