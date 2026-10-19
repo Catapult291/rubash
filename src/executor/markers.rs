@@ -33,6 +33,7 @@
 //! | Display xtrace rendering (#824 audit) | expanded words feed the same Output decoder (`prompt_expansion.rs` xtrace arms) | same whitelist: `set -x; v=$'\uE314Z'; echo "$v"` traces the U+E314 char, and literal `__RUBASH_*` text traces verbatim — both byte-identical to GNU bash 5.3.0 |
 //! | Host AST inspection | hosts decode AST words BETWEEN parse and execution on the interactive line-editor path (`decoded_words`: easter-egg routing, this-shell dispatch, positional params); those words legitimately carry the named-string COMPOUND_ASSIGNMENT_MARKER the parser pushed (parser/token_actions.rs), so the decoder whitelists it instead of asserting it away (#802) | host `decoded_words`, `decode_to_visible_text` |
 //! | Storage | values reaching `env_vars`/array stores are already data bytes — the encoder side is `substitution_metadata` (`bytes_to_assignment_shell_text`, `push_escaped_text_with_carriers`) which pair-encodes every `user_reachable` byte at entry so storage never confuses a user byte with a carrier | variable/array assignment paths |
+//! | Patsub replacement (rubash#843) | replacement-side literal chars are E400-escaped IN FLIGHT by the scan pass (`expand_braced_replacement.rs` `push_replacement_literal` / ANSI-C body collection), and `finish_patsub_replacement` copies E400/E000 pairs verbatim before resolving the PATSUB markers — a bare E310..=E313 in the marked text is pipeline protocol, an escaped pair is user data (`${v/b/$'\uE312x'}` emits U+E312, GNU-verified) | `${var/pat/rep}` replacement text |
 //! | Reparse | marker bytes are the lexer's own protocol: text re-fed through `eval`, alias bodies and command-substitution bodies re-lex with markers intact; user bytes inside reparsed text were pair-encoded at the original entry so they decode as data, never as carriers | `eval`, alias expansion, comsub reparse |
 //!
 //! Golden rule (amended by the #824 audit): on marker-FREE input no
@@ -183,6 +184,13 @@ pub(crate) const ARRAYREF_FLAG: char = '\u{E318}';
 // the markers now live in the registry PUA block. Internal to
 // expand_braced_replacement.rs: produced by the marking passes, consumed by
 // finish_patsub_replacement before text leaves the substitution.
+//
+// rubash#843: the codepoints are user-reachable — `$'\uE312'` is real
+// replacement data for GNU — so the patsub scan pass E400-escapes every
+// literal registry-zone char in flight (push_replacement_literal) and
+// finish_patsub_replacement copies escape/raw-byte pairs verbatim before
+// resolving the markers. `user_reachable` is honored in-flight rather than
+// at a global entry boundary: the pipeline is the re-encoding producer.
 // ==========================================================================
 
 /// Start of a quoted replacement region.
@@ -573,25 +581,25 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
         name: "PATSUB_QUOTED_VALUE_START",
         code: PATSUB_QUOTED_VALUE_START as u32,
         boundaries: &[],
-        user_reachable: false,
+        user_reachable: true,
     },
     MarkerInfo {
         name: "PATSUB_QUOTED_VALUE_END",
         code: PATSUB_QUOTED_VALUE_END as u32,
         boundaries: &[],
-        user_reachable: false,
+        user_reachable: true,
     },
     MarkerInfo {
         name: "PATSUB_QUOTED_AMP",
         code: PATSUB_QUOTED_AMP as u32,
         boundaries: &[],
-        user_reachable: false,
+        user_reachable: true,
     },
     MarkerInfo {
         name: "PATSUB_QUOTED_BACKSLASH",
         code: PATSUB_QUOTED_BACKSLASH as u32,
         boundaries: &[],
-        user_reachable: false,
+        user_reachable: true,
     },
     MarkerInfo {
         name: "RAW_BYTE_MARKER_ESCAPE",
