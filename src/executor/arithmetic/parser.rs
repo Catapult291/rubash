@@ -256,6 +256,19 @@ pub(super) enum ArithLValue {
         name: String,
         key: String,
     },
+    /// An associative lvalue whose bracket text is NONEMPTY but whose
+    /// `expand_subscript_string` resolution is EMPTY (`(( C[''] = 1 ))`,
+    /// `(( C[$''] += 1 ))` — the rubash#860 empty-span family). GNU
+    /// evaluates it as a normal assoc reference whose akey fails the
+    /// `*akey == 0` check: the READ diagnoses the bare NAME once
+    /// (arrayfunc.c:1462-1470 INDEX_ERROR -> err_badarraysub(var->name)),
+    /// the BIND diagnoses the full `name[sub]` token once and stores
+    /// nothing (arrayfunc.c:402-407), and the expression value is 0.
+    AssocEmptyKey {
+        name: String,
+        /// The `name[sub]` token text for the bind-time diagnostic.
+        bind_display: String,
+    },
     /// `name[]` with an empty subscript — GNU tokenizes it as STR `name[]`
     /// but every use fails non-fatally: reads report `bad array subscript`
     /// and binds report `` `name[]': not a valid identifier `` while the

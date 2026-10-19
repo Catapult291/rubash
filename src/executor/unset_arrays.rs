@@ -716,10 +716,15 @@ impl Executor {
                 return Some(1);
             }
             let mut entries = assoc_entries(&current);
+            let before = entries.len();
             entries.retain(|(entry_key, _)| *entry_key != key);
-            self.shell_state
-                .env_vars
-                .insert(array_name.to_string(), format_assoc_storage(entries));
+            if entries.len() != before
+                || !is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, array_name)
+            {
+                self.shell_state
+                    .env_vars
+                    .insert(array_name.to_string(), format_assoc_storage(entries));
+            }
             return Some(0);
         }
 
