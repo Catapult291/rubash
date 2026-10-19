@@ -86,7 +86,9 @@ as zero after audit; earlier slice: 2026-09-25 on 71c933eb)
 
   PASS:            83/83 suites  ██████████████████████████████  100%
   ────────────────────────────────────────────────────────────────
-  Byte-identical:  82 suites (0 diff)
+  Byte-identical:  82 suites byte-identical (0 diff) — env-audited
+                   measure as defined in the header line above, not
+                   raw stdout byte-equality
   nameref:         1 line (`declare -r RO_PID` visible after coproc) —
                    proven GNU 5.3.0's own coproc reap-timing race: GNU
                    vs itself flips 59/60↔1/60 on the harness filesystem,
