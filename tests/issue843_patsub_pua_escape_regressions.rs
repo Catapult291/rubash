@@ -6,8 +6,8 @@
 //! dropped.
 //!
 //! GNU semantics (vendored third_party/bash): the replacement side of a
-//! pattern substitution is expanded as its own word — subst.c:4462
-//! expand_string_for_rhs -> parameter_brace_patsub:9424-9444 — and its
+//! pattern substitution is expanded as its own word — subst.c:3950
+//! expand_string_for_patsub, called at parameter_brace_patsub:9433 — and its
 //! characters are plain data. `&`/`\&` reference forms and the `//` global
 //! form keep working around the glyph; strcreplace (stringlib.c:180, flags
 //! 2 via pat_subst:9252) only treats a literal `&`/`\&`/`\\` specially, so

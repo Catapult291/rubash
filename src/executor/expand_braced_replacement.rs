@@ -550,7 +550,7 @@ fn push_double_quoted_replacement_char(marked: &mut String, chars: &[char], inde
 /// hand-rolled table here previously knew only \xHH, \' and \, so the
 /// common C escapes stayed two-character literal text — `${s//,/$'\n'}` /
 /// `$'\t'` stored backslash+n instead of a newline (rubash#323; GNU
-/// subst.c:4462 expand_string_for_rhs hands the replacement through
+/// subst.c:3950 expand_string_for_patsub hands the replacement through
 /// expand_word_internal, whose $' handling calls ansicstr on the whole
 /// table).
 fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usize) -> usize {
