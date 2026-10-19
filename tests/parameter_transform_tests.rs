@@ -290,6 +290,36 @@ fn test_parameter_transform_prints_key_value_pairs() {
     let _ = fs::remove_file(output_path);
 }
 
+/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): the `@K`
+/// transform emits a trailing separator after the last pair. The UNQUOTED
+/// word field-splits its expansion result, so the trailing IFS whitespace
+/// produces no field and `echo assoc:${assoc[@]@K}` stores no trailing
+/// space; the QUOTED face keeps it (GNU: `echo "x:${assoc[@]@K}"` prints a
+/// trailing space). Pair order is GNU hash order (assoc.c:346), pinned by
+/// test_parameter_transform_prints_key_value_pairs.
+#[test]
+fn test_parameter_transform_at_k_trailing_separator_splits_away_unquoted() {
+    let output_path = "target/rubash-param-transform-atk-trailing-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "declare -A assoc; assoc[one]=alpha; assoc[two]=beta; echo assoc:${{assoc[@]@K}} > {output_path}; echo \"q:${{assoc[@]@K}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "assoc:two \"beta\" one \"alpha\"\nq:two \"beta\" one \"alpha\" \n",
+        "unquoted @K word drops the trailing separator; quoted face keeps it"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
 #[test]
 fn test_parameter_transform_changes_case() {
     let output_path = "target/rubash-param-transform-case-output.txt";

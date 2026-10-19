@@ -4050,10 +4050,30 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
     while index < raw_chars.len() {
         let ch = raw_chars[index];
         if ch == '\\' {
-            // Escaped char: copy both, not a quote toggle.
-            simulated.push(ch);
-            if index + 1 < raw_chars.len() {
-                simulated.push(raw_chars[index + 1]);
+            // Escaped char: copy both, not a quote toggle — except an
+            // escaped quote OUTSIDE any quote span, which the lexer cooks
+            // to its data-quote marker (`\'` -> DATA_SQUOTE, `\"` ->
+            // DATA_DQUOTE; probe 2026-10-13: raw `\'x\'" "` cooks to
+            // `\x17x\x17 `). The simulation must reproduce the cooked text
+            // or the closing comparison bails and the quoted-segment IFS
+            // protection is lost (rubash#795 followup: `\'${x//"'"/...}}\'
+            // " "` lost its quoted trailing space once the braced span made
+            // the word split-eligible again). Inside a quote span a
+            // backslash is span data and stays a pair.
+            if !in_single
+                && !in_double
+                && matches!(raw_chars.get(index + 1), Some('\'') | Some('"'))
+            {
+                simulated.push(if raw_chars[index + 1] == '\'' {
+                    crate::executor::markers::DATA_SQUOTE
+                } else {
+                    crate::executor::markers::DATA_DQUOTE
+                });
+            } else {
+                simulated.push(ch);
+                if index + 1 < raw_chars.len() {
+                    simulated.push(raw_chars[index + 1]);
+                }
             }
             index += 2;
             continue;
