@@ -91,16 +91,37 @@ impl Executor {
         };
 
         let mut stdout = Vec::new();
-        let mut status = 0;
-        for name in &words[1 + first_name..] {
+        // rubash#704 R6.2: same GNU any-found rule as the direct path
+        // (builtins/command.def:111-121): one resolved operand suffices for
+        // status 0, and the command.def:95-96 no-operand early return makes
+        // `$(command -v)` succeed with empty output.
+        let mut any_found = false;
+        let names = &words[1 + first_name..];
+        if names.is_empty() {
+            self.last_command_substitution_status.set(Some(0));
+            return Some(String::new());
+        }
+        for name in names {
             let name = self.expand_word(name);
             match self.describe_name_with_io(&name, mode, use_standard_path, false, &mut stdout) {
-                Ok(true) => {}
-                Ok(false) => status = 1,
-                Err(_) => status = 1,
+                Ok(true) => any_found = true,
+                // command.def:115-117: the per-operand "not found" diagnostic
+                // belongs to -V only, and GNU routes it to the shell's stderr
+                // even from inside a substitution (oracle probe:
+                // `$(command -V echo nosuch)` captures the description while
+                // `command: nosuch: not found` reaches stderr). eprintln! is
+                // this file's established carrier for expansion-time stderr
+                // (the `cat` shortcut above the describe call).
+                Ok(false) => {
+                    if mode == TypeDescribeMode::Verbose {
+                        eprintln!("{}command: {name}: not found", self.diagnostic_prefix());
+                    }
+                }
+                Err(_) => {}
             }
         }
-        self.last_command_substitution_status.set(Some(status));
+        self.last_command_substitution_status
+            .set(Some(if any_found { 0 } else { 1 }));
         Some(
             crate::executor::substitution_metadata::bytes_to_shell_text(&stdout)
                 .trim_capture_terminator()
