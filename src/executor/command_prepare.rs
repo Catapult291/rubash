@@ -3914,7 +3914,18 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
                         }
                     } else {
                         // $(...) — copy through, skip until matching )
-                        let end = skip_raw_command_substitution(&chars, index + 1);
+                        // rubash#875: the same beyond-the-buffer sentinel the
+                        // braced branch clamps above — an unclosed $( whose
+                        // quoted span ends in a trailing backslash (the word
+                        // is $("a\ ) makes skip_raw_command_substitution
+                        // return len+1 through skip_raw_quote's `index += 2`,
+                        // and an unclamped copy loop then indexes chars[len]
+                        // and panics the whole shell (release-journey P7
+                        // panic, command_prepare.rs:3919, run 39233051251).
+                        // Clamp to the buffer: an unclosed body is copied
+                        // verbatim, which is exactly what the word contains
+                        // at this stage.
+                        let end = skip_raw_command_substitution(&chars, index + 1).min(chars.len());
                         while index < end {
                             output.push(chars[index]);
                             index += 1;
@@ -3942,9 +3953,14 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
         }
         if ch == '`' {
             // Backtick — copy through, skip the body
+            // rubash#875: same sentinel clamp as the $() branch above — a
+            // trailing backslash inside an unclosed backtick span (the word
+            // is `a\ ) sends skip_raw_backtick past the buffer (the
+            // `index += 2` escape hop), and the copy loop below would index
+            // chars[len] and panic the shell.
             output.push(ch);
             index += 1;
-            let end = skip_raw_backtick(&chars, index);
+            let end = skip_raw_backtick(&chars, index).min(chars.len());
             while index < end {
                 output.push(chars[index]);
                 index += 1;
@@ -4397,6 +4413,7 @@ fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
 #[cfg(test)]
 mod command_word_materialization_tests {
     use super::materialize_expanded_command_word;
+    use super::mark_literal_ifs_chars;
 
     #[test]
     fn materializes_legacy_payload_at_single_boundary() {
@@ -4521,5 +4538,35 @@ mod command_word_materialization_tests {
             return None;
         }
         ast.commands.into_iter().next()
+    }
+
+    // rubash#875: the raw-skip helpers return beyond-the-buffer sentinels for
+    // unclosed spans whose trailing escape hop (`index += 2`) lands one past
+    // the end. The `$()` and backtick copy loops in mark_literal_ifs_chars
+    // must clamp to the buffer (the braced branch has clamped since the #743
+    // followup); before the clamp each of these words panicked the shell at
+    // chars[len] (release-journey P7 panic, run 39233051251: a theme script
+    // sets IFS, and an unquoted `$(...` expansion word reaches the marker).
+    #[test]
+    fn unclosed_command_substitution_with_quoted_trailing_backslash_does_not_panic() {
+        // The word is $("a\ : the double quote opens a quoted span whose
+        // trailing backslash sends skip_raw_quote to len+1; the copy loop
+        // must stop at the buffer edge instead of indexing chars[len].
+        let _ = mark_literal_ifs_chars(r#"$("a\"#, " \t\n");
+    }
+
+    #[test]
+    fn unclosed_backtick_with_trailing_backslash_does_not_panic() {
+        // The word is `a\ : the escape hop inside the unclosed backtick span
+        // lands one past the buffer; the copy loop must stop at the edge.
+        let _ = mark_literal_ifs_chars(r#"`a\"#, " \t\n");
+    }
+
+    #[test]
+    fn clamped_marker_keeps_ordinary_words_intact() {
+        // The clamp only bounds the copy loop; ordinary words must come out
+        // byte-identical, closed substitution bodies included.
+        assert_eq!(mark_literal_ifs_chars("plain", " "), "plain");
+        assert_eq!(mark_literal_ifs_chars("$(echo a b)", " "), "$(echo a b)");
     }
 }
