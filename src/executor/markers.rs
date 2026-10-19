@@ -15,8 +15,11 @@
 //! - Business code must `use crate::executor::markers::*` (or name the
 //!   const) — never write a raw `'\x1f'` / `'\u{E302}'` literal.
 //! - A new marker = a new const + encode/decode pair + a boundary entry in
-//!   `MARKERS`, plus a golden assertion that the sentinel never appears in
-//!   stdout / `declare -p` / xtrace output.
+//!   `MARKERS`, plus a `tests/marker_leak_golden.rs` case asserting the
+//!   sentinel never appears in stdout / `declare -p` / xtrace output on
+//!   marker-free input (the #824 audit moved leak detection out of the
+//!   shared decoder's output — there the codepoints are indistinguishable
+//!   from restored user data).
 //! - `user_reachable == true` markers can equal a byte the user can type or
 //!   pipe in; the entry point producing transport text MUST re-encode that
 //!   byte (raw-byte marker pair), or the marker silently corrupts data.
@@ -26,12 +29,20 @@
 //! | Boundary | Entry point | Site |
 //! |---|---|---|
 //! | Output | `crate::locale::decode_to_visible_text` — the one sanctioned transport→visible decoder (echo paths additionally run `substitution_metadata::decode_raw_byte_markers` because echo input is already expansion-decoded text that can still carry raw-byte pairs) | `builtins/echo.rs`, `declare` printing, xtrace, `bad_substitution_display`, host `dump-strings` |
+//! | Display value rendering (#824 audit) | stored values feed the Output decoder on the `declare -p` path (`builtins/declare/storage.rs` `display_text` / `quote_array_element_value`) | user-literal `__RUBASH_HD1__`/`__RUBASH_CSB1_` ASCII, `$'\uE3xx'` registry-zone chars (E400-escaped at entry, #735) and raw C0 bytes (raw-byte pairs) all decode to themselves there — whitelist: the decoder carries no output-side leak asserts; a registry codepoint in decoded output is restored user data by contract |
+//! | Display xtrace rendering (#824 audit) | expanded words feed the same Output decoder (`prompt_expansion.rs` xtrace arms) | same whitelist: `set -x; v=$'\uE314Z'; echo "$v"` traces the U+E314 char, and literal `__RUBASH_*` text traces verbatim — both byte-identical to GNU bash 5.3.0 |
 //! | Host AST inspection | hosts decode AST words BETWEEN parse and execution on the interactive line-editor path (`decoded_words`: easter-egg routing, this-shell dispatch, positional params); those words legitimately carry the named-string COMPOUND_ASSIGNMENT_MARKER the parser pushed (parser/token_actions.rs), so the decoder whitelists it instead of asserting it away (#802) | host `decoded_words`, `decode_to_visible_text` |
 //! | Storage | values reaching `env_vars`/array stores are already data bytes — the encoder side is `substitution_metadata` (`bytes_to_assignment_shell_text`, `push_escaped_text_with_carriers`) which pair-encodes every `user_reachable` byte at entry so storage never confuses a user byte with a carrier | variable/array assignment paths |
 //! | Reparse | marker bytes are the lexer's own protocol: text re-fed through `eval`, alias bodies and command-substitution bodies re-lex with markers intact; user bytes inside reparsed text were pair-encoded at the original entry so they decode as data, never as carriers | `eval`, alias expansion, comsub reparse |
 //!
-//! Golden rule: no `MARKERS` codepoint may appear in stdout, `declare -p`,
-//! or xtrace output — asserted by the leak tests in `locale.rs`/`markers.rs`.
+//! Golden rule (amended by the #824 audit): on marker-FREE input no
+//! `MARKERS` codepoint may appear in stdout, `declare -p`, or xtrace output
+//! — asserted by `tests/marker_leak_golden.rs` at the integration boundary.
+//! Input that legitimately carries registry codepoints (user-literal
+//! named-marker ASCII, `$'\uE3xx'` data, raw C0 bytes) decodes to those
+//! codepoints verbatim: the shared decoder's output carries no "leaked
+//! marker" assertions — on that boundary they could only fire on
+//! well-formed user data, which is exactly the #824 panic family.
 
 /// Decode boundary at which a carrier is restored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
