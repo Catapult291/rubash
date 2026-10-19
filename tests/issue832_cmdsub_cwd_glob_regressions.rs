@@ -8,9 +8,9 @@
 //! CWD-dependent judgment is pathname expansion of the unquoted
 //! comsub-bearing word, which GNU itself performs and which therefore MUST
 //! stay CWD-sensitive:
-//! - subst.c:12601 glob_expand_word_list — "If the word isn't an assignment
-//!   and contains an unquoted pattern matching character, then glob it",
-//!   decided by unquoted_glob_pattern_p (pathexp.c:66);
+//! - subst.c:12626 in glob_expand_word_list — "If the word isn't an
+//!   assignment and contains an unquoted pattern matching character, then
+//!   glob it", decided by unquoted_glob_pattern_p (pathexp.c:66);
 //! - subst.c:6643 comsub_shouldquote — for an UNQUOTED enclosing word the
 //!   command-substitution output is inserted without CTLESC, so the `'`
 //!   characters produced by `echo "'s'"` are data, never quoting
