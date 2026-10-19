@@ -1423,6 +1423,126 @@ fn decode_ansi_c_spans(text: &str, preserve_backslashes: bool) -> String {
     output
 }
 
+/// How an arithmetic entry's associative subscript treats literal `$'...'`
+/// spans (issue rubash#828 — the fourth write-entry family, alongside the
+/// two entries [`Executor::expand_assignment_subscript_string`] serves).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum ArithAnsiSpanMode {
+    /// `((...))` / `$((...))` / nested-subscript readers: the raw spelling
+    /// reaches GNU's runtime `expand_subscript_string`, whose
+    /// `expand_word_internal` arm ANSI-C-decodes the span with the product
+    /// quoted (CTLESC), so the decoded bytes ride as data and decoded
+    /// backslashes survive (`((D[$'a\\b']=2))` stores `61 5c 62`, GNU bash
+    /// 5.3.0 probe, 2026-10-13).
+    Decode,
+    /// `let`: the operand was word-expanded once (let.def passes
+    /// EXP_EXPANDED) and GNU's expand_arith_string does NOT re-recognize
+    /// `$'` as ANSI-C there: the `$` stays literal data, the span quotes
+    /// drop as shell quotes and the raw spelling rides verbatim
+    /// (`let "B[$'x\ty']=1"` stores `24 78 5c 74 79` = `$x\ty` — GNU's own
+    /// scrambled-key quirk, pinned as parity, probed 2026-10-13).
+    LetOperand,
+}
+
+/// Rewrite the literal `$'...'` spans of an arithmetic associative
+/// subscript into data-carrier form — no live `$`, quote or backslash
+/// survives inside a span product, so the embedded-parameter walker
+/// expands only the text outside the spans. Scanning mirrors
+/// [`decode_ansi_c_spans`] and extends it with dquote state (arithmetic
+/// subscript text carries live `"..."` segments, which the #822
+/// lexer-cooked assignment words never do): backslash pairs are literal
+/// syntax, quotes toggle their own state outside the other quote, a
+/// `$'...'` span only OPENS outside both quotes (rubash#839 CR — inside
+/// `"pre$'x'post"` the spelling is data, and in `'a$'b'c'` the `$'` at
+/// the single-quote close boundary is that span's data dollar followed by
+/// its closer), a span closes at its first unescaped `'`, and an
+/// unterminated span stays verbatim.
+pub(in crate::executor) fn transform_arith_ansi_c_spans(
+    text: &str,
+    mode: ArithAnsiSpanMode,
+) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                match mode {
+                    ArithAnsiSpanMode::Decode => {
+                        let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
+                        output.push_str(&mark_arith_span_data(&decoded));
+                    }
+                    ArithAnsiSpanMode::LetOperand => {
+                        output.push(LITERAL_DOLLAR);
+                        output.push_str(&mark_arith_span_data(&inner));
+                    }
+                }
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+/// CTLESC port for an arithmetic span product: every character the
+/// embedded-parameter walker would re-read as syntax rides its data
+/// carrier, so the bytes land in the resolved key verbatim (the walker's
+/// tail restore decodes them; see embedded_mutations.rs).
+fn mark_arith_span_data(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\\' => LITERAL_BACKSLASH,
+            '$' => LITERAL_DOLLAR,
+            '`' => LITERAL_BACKTICK,
+            '\'' => LITERAL_SINGLE_QUOTE,
+            '"' => LITERAL_DOUBLE_QUOTE,
+            other => other,
+        })
+        .collect()
+}
+
 fn decode_deferred_compound_body(inner: &str) -> String {
     inner
         .chars()

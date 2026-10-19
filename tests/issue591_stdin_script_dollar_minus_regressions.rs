@@ -41,7 +41,7 @@ fn run_stdin(args: &[&str], stdin: &[u8]) -> (String, String, Option<i32>) {
 /// `printf 'echo [$-]' | niu -s` -> `[hBs]` (GNU 5.3.0 oracle byte-for-byte).
 #[test]
 fn explicit_s_flag_shows_s_in_dollar_minus() {
-    let (stdout, stderr, rc) = run_stdin(&["-s"], b"echo [$-]");
+    let (stdout, stderr, rc) = run_stdin(&["-s"], b"echo \"[$-]\"");
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
     assert_eq!(stdout, "[hBs]\n", "stderr: {stderr:?}");
 }
@@ -51,7 +51,7 @@ fn explicit_s_flag_shows_s_in_dollar_minus() {
 /// 'echo [$-]' | bash` -> `[hBs]`).
 #[test]
 fn no_operand_piped_stdin_shows_s_in_dollar_minus() {
-    let (stdout, stderr, rc) = run_stdin(&[], b"echo [$-]\n");
+    let (stdout, stderr, rc) = run_stdin(&[], b"echo \"[$-]\"\n");
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
     assert_eq!(stdout, "[hBs]\n", "stderr: {stderr:?}");
 }
@@ -59,7 +59,7 @@ fn no_operand_piped_stdin_shows_s_in_dollar_minus() {
 /// `-c` keeps GNU's shape without `s`: `[hBc]` (want_pending_command only).
 #[test]
 fn command_string_has_no_s_in_dollar_minus() {
-    let (stdout, stderr, rc) = run_stdin(&["-c", "echo [$-]"], b"");
+    let (stdout, stderr, rc) = run_stdin(&["-c", "echo \"[$-]\""], b"");
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
     assert_eq!(stdout, "[hBc]\n", "stderr: {stderr:?}");
 }
@@ -69,7 +69,7 @@ fn command_string_has_no_s_in_dollar_minus() {
 #[test]
 fn script_file_has_no_s_or_c_in_dollar_minus() {
     let script = std::env::temp_dir().join("issue591_script.sh");
-    std::fs::write(&script, "echo [$-]\n").expect("write script");
+    std::fs::write(&script, "echo \"[$-]\"\n").expect("write script");
     let (stdout, stderr, rc) = run_stdin(&[&script.to_string_lossy()], b"");
     let _ = std::fs::remove_file(&script);
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
@@ -86,7 +86,7 @@ fn s_flag_stays_process_local() {
     let (stdout, stderr, rc) = run_stdin(
         &["-s"],
         format!(
-            "\"{}\" -c 'echo [$-]'\n",
+            "\"{}\" -c 'echo \"[$-]\"'\n",
             env!("CARGO_BIN_EXE_rubash").replace('\\', "/")
         )
         .as_bytes(),

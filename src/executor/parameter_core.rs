@@ -804,7 +804,12 @@ impl Executor {
         // Same expand_array_subscript protection as the &self variant:
         // encode `name[sub]` assoc subscripts before the $-passes, so
         // expansion products inside the subscript stay verbatim keys.
-        let expression = self.expand_arithmetic_assoc_subscripts(&expression, false);
+        // Reader entry: `$'...'` spans decode (issue rubash#828).
+        let expression = self.expand_arithmetic_assoc_subscripts(
+            &expression,
+            false,
+            crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode,
+        );
         let expression = self.expand_arithmetic_special_parameters(&expression);
         let expression = self.expand_embedded_parameters_mut(&expression);
         let evaluated = self.eval_arithmetic_expansion_value(&expression);

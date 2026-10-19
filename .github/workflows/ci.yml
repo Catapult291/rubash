@@ -48,6 +48,16 @@ jobs:
       - name: Run Rust library tests
         run: cargo nextest run --lib --profile ci
 
+      # #824 mechanism: the marker-leak golden suite is the only gate that
+      # feeds user-literal marker text (typed `__RUBASH_*` ASCII, $'\uE3xx'
+      # PUA data, raw C0 bytes) to the decode boundaries — the in-binary
+      # debug_assert family this suite pins is armed only in dev-profile
+      # builds of the spawned shell, and no other CI lane ran these targets
+      # (the #824 panics therefore never met a gate). Hermetic, fast, hard
+      # gate (unlike the continue-on-error cli_tests lane below).
+      - name: Run marker leak golden tests
+        run: cargo nextest run --test marker_leak_golden --test issue824_marker_decode_boundary_regressions --profile ci
+
       - name: Run compatibility CLI tests
         continue-on-error: true
         run: cargo nextest run --test cli_tests --profile ci

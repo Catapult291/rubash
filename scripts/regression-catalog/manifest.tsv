@@ -33,3 +33,4 @@ loc-l5-read-cr	772	diverges	read -r still strips a trailing CR (#769-class byte-
 lim-f5-fd-cap	773	diverges	fd table caps at 1014 with 'cannot duplicate fd: Invalid argument'
 lim-f6-nul	773	diverges	read counts NUL bytes (8 vs 6); comsub does not warn
 lim-f7-closed-fd0	773	diverges	closed fd 0 then re-redirect -> Bad file descriptor
+issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (CR Nit 2 unset-operand row stays a pinned divergence, see tests/issue828)
