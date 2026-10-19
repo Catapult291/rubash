@@ -127,7 +127,7 @@ fn contains_glob_or_extglob(word: &str) -> bool {
 ///
 /// Admission mirrors GNU exactly (rubash#832 family): the only pattern test
 /// is `unquoted_glob_pattern_p` below, the port of pathexp.c:66 — the same
-/// predicate subst.c:12601 glob_expand_word_list consults ("If the word
+/// predicate glob_expand_word_list consults (subst.c:12626: "If the word
 /// isn't an assignment and contains an unquoted pattern matching character,
 /// then glob it"). Quote and brace characters are NOT on that list: once a
 /// `'` `"` `{` `}` reaches this function it is expansion OUTPUT data

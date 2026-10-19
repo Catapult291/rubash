@@ -3914,7 +3914,18 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
                         }
                     } else {
                         // $(...) — copy through, skip until matching )
-                        let end = skip_raw_command_substitution(&chars, index + 1);
+                        // rubash#875: the same beyond-the-buffer sentinel the
+                        // braced branch clamps above — an unclosed $( whose
+                        // quoted span ends in a trailing backslash (the word
+                        // is $("a\ ) makes skip_raw_command_substitution
+                        // return len+1 through skip_raw_quote's `index += 2`,
+                        // and an unclamped copy loop then indexes chars[len]
+                        // and panics the whole shell (release-journey P7
+                        // panic, command_prepare.rs:3919, run 39233051251).
+                        // Clamp to the buffer: an unclosed body is copied
+                        // verbatim, which is exactly what the word contains
+                        // at this stage.
+                        let end = skip_raw_command_substitution(&chars, index + 1).min(chars.len());
                         while index < end {
                             output.push(chars[index]);
                             index += 1;
@@ -3942,9 +3953,14 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
         }
         if ch == '`' {
             // Backtick — copy through, skip the body
+            // rubash#875: same sentinel clamp as the $() branch above — a
+            // trailing backslash inside an unclosed backtick span (the word
+            // is `a\ ) sends skip_raw_backtick past the buffer (the
+            // `index += 2` escape hop), and the copy loop below would index
+            // chars[len] and panic the shell.
             output.push(ch);
             index += 1;
-            let end = skip_raw_backtick(&chars, index);
+            let end = skip_raw_backtick(&chars, index).min(chars.len());
             while index < end {
                 output.push(chars[index]);
                 index += 1;
@@ -4033,13 +4049,59 @@ fn mark_literal_ifs_chars(word: &str, ifs: &str) -> String {
 /// diverges (complex lexer transformations), we bail out without marking
 /// rather than misaligning.
 ///
+/// rubash#868: the simulator is carrier-aware. The lexer cook
+/// (lexer/quotes.rs `remove_shell_quotes` and its cursor walk) replaces
+/// quote-source bytes with the markers.rs carrier protocol on its way out,
+/// and a raw word whose cook produces or keeps carriers used to compare
+/// unequal to the simulation on every char — the mark pass silently
+/// degraded to the coarse split-everything-or-nothing fallback exactly for
+/// the words that most need the per-char rule. The simulator now replays
+/// the walk's carrier arms per the markers.rs registry:
+///
+/// - backslash escapes (in and out of quote spans) cook to DATA_DOLLAR /
+///   DATA_BACKTICK / DATA_SQUOTE / DATA_BACKSLASH / DATA_DQUOTE; escaped
+///   IFS blanks cook to the ANSI_C_IFS_GUARD pair (self-guarded — split
+///   sites convert the guard to IFS_GLUE, so no extra mark is recorded);
+///   escaped pattern-significant chars cook to CTLESC pairs;
+/// - `'...'` spans cook `$`/`` ` ``/`"` to their DATA_* carriers;
+/// - `"..."` spans additionally cook `'` to DATA_SQUOTE and the glob set
+///   `* ? [ @ + !` to CTLESC pairs, and a `$` that starts no expansion to
+///   DATA_DOLLAR (GNU parse.y skip_double_quoted);
+/// - `$'...'` decodes through the authoritative ANSI-C pipeline
+///   (`decode_ansi_c_quoted` + `escape_decoded_ansi_c_quotes`), whose
+///   output carries the same E010/E011/E401/CTLESC quoting the lexer emits;
+/// - `$"..."` enters the double-quote rules with the `$` dropped;
+/// - an unbraced `$name` keeps the walk's pending_name protocol: the next
+///   `$`/`'`/`"`/`\` trigger first emits PARAM_NAME_END_MARKER.
+///
+/// Quoted-segment IFS chars (including escaped and ANSI-C-decoded ones) are
+/// recorded and marked. A char that an IFS_GLUE in cooked_with_marks
+/// already protects is not marked a second time: the splitter consumes a
+/// glue as "protect the next char", so a doubled glue would spend the first
+/// on the second and release the IFS char itself (the #868 battery: with
+/// IFS=:, `"a:b"$w` used to split its quoted colon through exactly that
+/// double mark).
+///
 /// GNU subst.c:11639-11673 CTLESC-protects quoted source characters during
 /// expansion; the field splitter (subst.c:3119 list_string) skips them.
 /// This is the rubash port for the mixed-quote case: `"a b"$w` must protect
 /// the quoted space while the unquoted `$w` result still splits.
 fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> String {
+    use crate::executor::markers::{
+        ANSI_C_IFS_GUARD, CTLESC, DATA_BACKSLASH, DATA_BACKTICK, DATA_DOLLAR, DATA_DQUOTE,
+        DATA_SQUOTE, IFS_GLUE, PARAM_NAME_END_MARKER,
+    };
+
+    const fn is_name_start(c: char) -> bool {
+        c == '_' || c.is_ascii_alphabetic()
+    }
+    const fn is_name_byte(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
     // Strip existing \x1c marks to get the base cooked word for comparison.
-    let cooked: String = cooked_with_marks.replace(crate::executor::markers::IFS_GLUE, "");
+    let cooked: String = cooked_with_marks.replace(IFS_GLUE, "");
+
     let raw_chars: Vec<char> = raw.chars().collect();
     let mut simulated = String::with_capacity(raw.len());
     // Positions in `simulated` that were inside quotes and are IFS chars.
@@ -4047,59 +4109,140 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
     let mut index = 0usize;
     let mut in_single = false;
     let mut in_double = false;
+    // The walk's pending_name: the emitted tail is an unbraced `$name`, so
+    // the next trigger arm emits PARAM_NAME_END_MARKER first (outer `$` /
+    // `'` / `"` / `\` arms, and the closing `"` of a double-quote span).
+    let mut pending_name = false;
+
+    // Push one quoted-span char, recording its position when it is an IFS
+    // char. `recorded=false` covers the one shape that protects itself and
+    // must never take a second glue: the ANSI_C_IFS_GUARD blank pair —
+    // split sites convert the guard to IFS_GLUE, and a doubled glue would
+    // spend the first glue on the second and re-release the blank.
+    fn push_quoted_char(
+        simulated: &mut String,
+        quoted_ifs_positions: &mut Vec<usize>,
+        ch: char,
+        ifs: &str,
+        recorded: bool,
+    ) {
+        if recorded && ifs.contains(ch) {
+            quoted_ifs_positions.push(simulated.len());
+        }
+        simulated.push(ch);
+    }
+
     while index < raw_chars.len() {
         let ch = raw_chars[index];
         if ch == '\\' {
-            // Escaped char: copy both, not a quote toggle — except an
-            // escaped quote OUTSIDE any quote span, which the lexer cooks
-            // to its data-quote marker (`\'` -> DATA_SQUOTE, `\"` ->
-            // DATA_DQUOTE; probe 2026-10-13: raw `\'x\'" "` cooks to
-            // `\x17x\x17 `). The simulation must reproduce the cooked text
-            // or the closing comparison bails and the quoted-segment IFS
-            // protection is lost (rubash#795 followup: `\'${x//"'"/...}}\'
-            // " "` lost its quoted trailing space once the braced span made
-            // the word split-eligible again). Inside a quote span a
-            // backslash is span data and stays a pair.
-            if !in_single
-                && !in_double
-                && matches!(raw_chars.get(index + 1), Some('\'') | Some('"'))
-            {
-                simulated.push(if raw_chars[index + 1] == '\'' {
-                    crate::executor::markers::DATA_SQUOTE
-                } else {
-                    crate::executor::markers::DATA_DQUOTE
-                });
-            } else {
-                simulated.push(ch);
-                if index + 1 < raw_chars.len() {
-                    simulated.push(raw_chars[index + 1]);
-                }
+            // Backslash: quote-state dispatch, arm-for-arm with the lexer
+            // walk (lexer/quotes.rs remove_shell_quotes `\` arm and
+            // remove_double_quoted_into_cursor `\` arm).
+            if pending_name && !in_single && !in_double {
+                simulated.push(PARAM_NAME_END_MARKER);
+                pending_name = false;
             }
-            index += 2;
+            let next = raw_chars.get(index + 1).copied();
+            if in_single {
+                // Single-quote span: a backslash is span data and stays a
+                // pair (walk `'` span loop).
+                simulated.push(ch);
+                if let Some(n) = next {
+                    simulated.push(n);
+                }
+                index += 2;
+                continue;
+            }
+            if in_double {
+                // The walk's dquote `\` arm clears a pending name silently
+                // (no PARAM_NAME_END_MARKER inside the span).
+                pending_name = false;
+                match next {
+                    Some('\\') => simulated.push(DATA_BACKSLASH),
+                    Some('"') => simulated.push(DATA_DQUOTE),
+                    Some('$') => simulated.push(DATA_DOLLAR),
+                    Some('`') => simulated.push(DATA_BACKTICK),
+                    // \<newline> line continuation: both bytes drop.
+                    Some('\n') => {
+                        index += 2;
+                        continue;
+                    }
+                    // Any other escaped char keeps the backslash; the
+                    // payload is processed by the default arm on the next
+                    // iteration (walk dquote `\` else arm).
+                    _ => {
+                        simulated.push(ch);
+                        index += 1;
+                        continue;
+                    }
+                }
+                index += 2;
+                continue;
+            }
+            // Outside quotes (walk outer `\` arm).
+            match next {
+                // The five expansion-trigger bytes cook to their carriers and
+                // consume BOTH bytes — leaving the escaped char to the next
+                // iteration would let a data `\'` toggle the quote state and
+                // desync every later arm (probe 2026-10-19:
+                // `\'${x//"'"/...}}\'` bailed its quoted trailing space).
+                Some(c @ ('$' | '`' | '\'' | '"' | '\\')) => {
+                    simulated.push(match c {
+                        '$' => DATA_DOLLAR,
+                        '`' => DATA_BACKTICK,
+                        '\'' => DATA_SQUOTE,
+                        '"' => DATA_DQUOTE,
+                        _ => DATA_BACKSLASH,
+                    });
+                    index += 2;
+                    continue;
+                }
+                // Escaped IFS whitespace is quoted data: it travels as the
+                // ANSI_C_IFS_GUARD pair and is self-guarded at split time
+                // (rubash#742) — no extra mark recorded.
+                Some(b @ (' ' | '\t' | '\n')) => {
+                    simulated.push(ANSI_C_IFS_GUARD);
+                    simulated.push(b);
+                    index += 2;
+                    continue;
+                }
+                // GNU parse.y:5694-5706 got_escaped_character marks
+                // pattern-significant escaped chars with CTLESC.
+                Some(
+                    b @ ('*' | '?' | '[' | ']' | '@' | '+' | '!' | '(' | ')' | '|' | '/' | '-'
+                    | '^' | '.' | '=' | ':'),
+                ) => {
+                    simulated.push(CTLESC);
+                    push_quoted_char(&mut simulated, &mut quoted_ifs_positions, b, ifs, true);
+                    index += 2;
+                    continue;
+                }
+                // Any other escaped char is quoted data (push the char, drop
+                // the backslash).
+                Some(b) => {
+                    push_quoted_char(&mut simulated, &mut quoted_ifs_positions, b, ifs, true);
+                    index += 2;
+                    continue;
+                }
+                // Trailing backslash: the walk pushes it verbatim.
+                None => simulated.push(ch),
+            }
+            index += 1;
             continue;
         }
         if ch == '$' {
+            if in_single {
+                // Single-quote span: `$` is span data cooked to DATA_DOLLAR.
+                simulated.push(DATA_DOLLAR);
+                index += 1;
+                continue;
+            }
+            // Outer walk `$` arm: a pending unbraced name ends here.
+            if !in_double && pending_name {
+                simulated.push(PARAM_NAME_END_MARKER);
+            }
+            pending_name = false;
             match raw_chars.get(index + 1) {
-                Some('\'') | Some('"') => {
-                    // $'...' / $"..." — copy span verbatim (lexer-decoded).
-                    let quote = raw_chars[index + 1];
-                    simulated.push(ch);
-                    simulated.push(quote);
-                    index += 2;
-                    while index < raw_chars.len() && raw_chars[index] != quote {
-                        if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
-                            simulated.push(raw_chars[index]);
-                            index += 1;
-                        }
-                        simulated.push(raw_chars[index]);
-                        index += 1;
-                    }
-                    if index < raw_chars.len() {
-                        simulated.push(raw_chars[index]);
-                        index += 1;
-                    }
-                    continue;
-                }
                 Some('{') => {
                     // ${...} — copy span verbatim (quotes inside are syntax).
                     let mut depth = 1usize;
@@ -4140,32 +4283,105 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
                     }
                     continue;
                 }
+                // $'...' — the cook decodes the span through the ANSI-C
+                // pipeline and quotes every decoded byte
+                // (escape_decoded_ansi_c_quotes): decoded quote/dollar/
+                // backtick chars arrive as their carriers, decoded blanks as
+                // ANSI_C_IFS_GUARD pairs (self-guarded), decoded glob chars
+                // as CTLESC pairs. Span extraction keeps `\`+char pairs for
+                // the decoder (decode_ansi_c_span_cursor).
+                Some('\'') if !in_double => {
+                    let mut body = String::new();
+                    index += 2;
+                    let mut escaped = false;
+                    while index < raw_chars.len() {
+                        let c = raw_chars[index];
+                        if escaped {
+                            escaped = false;
+                            body.push('\\');
+                            body.push(c);
+                            index += 1;
+                            continue;
+                        }
+                        if c == '\\' {
+                            escaped = true;
+                            index += 1;
+                            continue;
+                        }
+                        if c == '\'' {
+                            index += 1;
+                            break;
+                        }
+                        body.push(c);
+                        index += 1;
+                    }
+                    if escaped {
+                        body.push('\\');
+                    }
+                    let decoded = crate::lexer::quotes::escape_decoded_ansi_c_quotes(
+                        &crate::lexer::ansi::decode_ansi_c_quoted(&body),
+                    );
+                    let mut guarded = false;
+                    for c in decoded.chars() {
+                        // A char right behind ANSI_C_IFS_GUARD is already
+                        // protected; a second mark would double-guard it.
+                        push_quoted_char(
+                            &mut simulated,
+                            &mut quoted_ifs_positions,
+                            c,
+                            ifs,
+                            !guarded,
+                        );
+                        guarded = c == ANSI_C_IFS_GUARD;
+                    }
+                    continue;
+                }
+                // $"..." — locale quoting: the `$` drops and the span cooks
+                // with the double-quote rules (walk dispatches into
+                // remove_double_quoted_into_cursor).
+                Some('"') if !in_double => {
+                    index += 2;
+                    in_double = true;
+                    continue;
+                }
                 _ => {}
             }
-            // $name etc. — copy through. If a quote follows the name, the
-            // lexer inserts PARAM_NAME_END_MARKER (\u{13}); replicate it.
-            simulated.push(ch);
-            let mut name_end = index + 1;
-            while name_end < raw_chars.len()
-                && matches!(
-                    raw_chars[name_end],
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_'
-                )
-            {
-                name_end += 1;
-            }
-            if name_end > index + 1 && matches!(raw_chars.get(name_end), Some('\'') | Some('"')) {
-                while index + 1 < name_end {
-                    index += 1;
-                    simulated.push(raw_chars[index]);
+            if in_double {
+                // Double-quote span `$` rules (walk dquote `$` arm).
+                match raw_chars.get(index + 1) {
+                    // Special parameters travel as the raw pair.
+                    Some(c @ ('?' | '$' | '!' | '#' | '-' | '@' | '*' | '0'..='9')) => {
+                        simulated.push(ch);
+                        simulated.push(*c);
+                        index += 2;
+                    }
+                    Some(c) if is_name_start(*c) => {
+                        simulated.push(ch);
+                        pending_name = true;
+                        index += 1;
+                    }
+                    // A `$` that starts no expansion is literal data
+                    // (GNU parse.y skip_double_quoted) — DATA_DOLLAR.
+                    _ => {
+                        simulated.push(DATA_DOLLAR);
+                        index += 1;
+                    }
                 }
-                simulated.push(crate::executor::markers::PARAM_NAME_END_MARKER);
+                continue;
             }
+            // Outside quotes: `$` copies raw; a name-start follower arms
+            // pending_name so the next trigger emits PARAM_NAME_END_MARKER
+            // (walk outer `$` arm; the name bytes themselves flow through
+            // the default arm).
+            simulated.push(ch);
+            pending_name = raw_chars.get(index + 1).is_some_and(|c| is_name_start(*c));
             index += 1;
             continue;
         }
-        if ch == '`' {
-            // Backtick span — copy verbatim.
+        if ch == '`' && !in_single && !in_double {
+            // Backtick span — copy verbatim (walk outer `` ` `` arm, no
+            // PARAM_NAME_END_MARKER emission).
+            pending_name = false;
             simulated.push(ch);
             index += 1;
             while index < raw_chars.len() && raw_chars[index] != '`' {
@@ -4183,19 +4399,73 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
             continue;
         }
         if ch == '\'' && !in_double {
+            if pending_name {
+                simulated.push(PARAM_NAME_END_MARKER);
+            }
+            pending_name = false;
             in_single = !in_single;
             index += 1; // drop the quote
             continue;
         }
         if ch == '"' && !in_single {
-            in_double = !in_double;
+            if in_double {
+                // Closing `"` of a double-quote span (walk dquote `"` arm).
+                if pending_name {
+                    simulated.push(PARAM_NAME_END_MARKER);
+                }
+                pending_name = false;
+                in_double = false;
+            } else {
+                // Opening `"` (walk outer `"` arm).
+                if pending_name {
+                    simulated.push(PARAM_NAME_END_MARKER);
+                }
+                pending_name = false;
+                in_double = true;
+            }
             index += 1; // drop the quote
             continue;
         }
-        // Regular char: record if it's an IFS char inside quotes.
-        if (in_single || in_double) && ifs.contains(ch) {
-            quoted_ifs_positions.push(simulated.len());
+        // Regular char, by span context.
+        if in_single {
+            // Single-quote span: only the three expansion-trigger bytes cook
+            // to carriers (walk `'` span loop); everything else is quoted
+            // data.
+            match ch {
+                '`' => simulated.push(DATA_BACKTICK),
+                '"' => simulated.push(DATA_DQUOTE),
+                _ => push_quoted_char(&mut simulated, &mut quoted_ifs_positions, ch, ifs, true),
+            }
+            index += 1;
+            continue;
         }
+        if in_double {
+            // Double-quote span: `'` cooks to DATA_SQUOTE and the glob set
+            // to CTLESC pairs (walk dquote arms); everything else is quoted
+            // data. pending_name continues only through name bytes.
+            match ch {
+                '\'' => {
+                    pending_name = false;
+                    simulated.push(DATA_SQUOTE);
+                }
+                '*' | '?' | '[' | '@' | '+' | '!' => {
+                    pending_name = false;
+                    simulated.push(CTLESC);
+                    push_quoted_char(&mut simulated, &mut quoted_ifs_positions, ch, ifs, true);
+                }
+                _ => push_quoted_char(&mut simulated, &mut quoted_ifs_positions, ch, ifs, true),
+            }
+            if !matches!(ch, '*' | '?' | '[' | '@' | '+' | '!' | '\'') {
+                pending_name = pending_name && is_name_byte(ch);
+            }
+            index += 1;
+            continue;
+        }
+        // Outside quotes: literal character (mark_literal_ifs_chars owns
+        // the literal IFS marks; nothing recorded here). pending_name
+        // continues only through name bytes (walk span arm's name-run
+        // logic).
+        pending_name = pending_name && is_name_byte(ch);
         simulated.push(ch);
         index += 1;
     }
@@ -4205,25 +4475,29 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
     }
     // Apply \x1c marks at the recorded positions. The cooked_with_marks may
     // already have marks from mark_literal_ifs_chars; we need to account for
-    // them when mapping positions.
+    // them when mapping positions — and a char those marks already protect
+    // must NOT be marked again: the splitter consumes each glue as "protect
+    // the next char", so a doubled glue spends the first glue on the second
+    // and releases the IFS char itself (rubash#868 battery: IFS=:,
+    // `"a:b"$w` split its quoted colon through exactly that double mark).
     let mut result = String::with_capacity(cooked_with_marks.len() + quoted_ifs_positions.len());
     let mut cooked_pos = 0usize;
-    let mut mark_idx = 0usize;
+    let mut prev_glued = false;
     let quoted_set: std::collections::HashSet<usize> = quoted_ifs_positions.into_iter().collect();
     for ch in cooked_with_marks.chars() {
-        if ch == crate::executor::markers::IFS_GLUE {
+        if ch == IFS_GLUE {
             result.push(ch);
             // Next char is the protected one; don't advance cooked_pos yet.
+            prev_glued = true;
             continue;
         }
-        if quoted_set.contains(&cooked_pos) {
-            result.push(crate::executor::markers::IFS_GLUE);
+        if quoted_set.contains(&cooked_pos) && !prev_glued {
+            result.push(IFS_GLUE);
         }
         result.push(ch);
+        prev_glued = false;
         cooked_pos += 1;
-        mark_idx += 1;
     }
-    let _ = mark_idx;
     result
 }
 
@@ -4396,6 +4670,7 @@ fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
 
 #[cfg(test)]
 mod command_word_materialization_tests {
+    use super::mark_literal_ifs_chars;
     use super::materialize_expanded_command_word;
 
     #[test]
@@ -4521,5 +4796,35 @@ mod command_word_materialization_tests {
             return None;
         }
         ast.commands.into_iter().next()
+    }
+
+    // rubash#875: the raw-skip helpers return beyond-the-buffer sentinels for
+    // unclosed spans whose trailing escape hop (`index += 2`) lands one past
+    // the end. The `$()` and backtick copy loops in mark_literal_ifs_chars
+    // must clamp to the buffer (the braced branch has clamped since the #743
+    // followup); before the clamp each of these words panicked the shell at
+    // chars[len] (release-journey P7 panic, run 39233051251: a theme script
+    // sets IFS, and an unquoted `$(...` expansion word reaches the marker).
+    #[test]
+    fn unclosed_command_substitution_with_quoted_trailing_backslash_does_not_panic() {
+        // The word is $("a\ : the double quote opens a quoted span whose
+        // trailing backslash sends skip_raw_quote to len+1; the copy loop
+        // must stop at the buffer edge instead of indexing chars[len].
+        let _ = mark_literal_ifs_chars(r#"$("a\"#, " \t\n");
+    }
+
+    #[test]
+    fn unclosed_backtick_with_trailing_backslash_does_not_panic() {
+        // The word is `a\ : the escape hop inside the unclosed backtick span
+        // lands one past the buffer; the copy loop must stop at the edge.
+        let _ = mark_literal_ifs_chars(r#"`a\"#, " \t\n");
+    }
+
+    #[test]
+    fn clamped_marker_keeps_ordinary_words_intact() {
+        // The clamp only bounds the copy loop; ordinary words must come out
+        // byte-identical, closed substitution bodies included.
+        assert_eq!(mark_literal_ifs_chars("plain", " "), "plain");
+        assert_eq!(mark_literal_ifs_chars("$(echo a b)", " "), "$(echo a b)");
     }
 }

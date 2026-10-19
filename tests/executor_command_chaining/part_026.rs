@@ -273,7 +273,10 @@ fn test_ulimit_redirects_output() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "1024\n");
+    // Windows emulation default soft NOFILE mirrors the WSL GNU 5.3.0
+    // oracle (10240 — rubash#773 raised it from the stub's 1024 so the fd
+    // table capacity follows the limit instead of a homemade ceiling).
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "10240\n");
     let _ = fs::remove_file(output_path);
 }
 
@@ -292,7 +295,7 @@ fn test_ulimit_appends_output() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "before\n1024\n");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "before\n10240\n");
     let _ = fs::remove_file(output_path);
 }
 

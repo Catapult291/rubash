@@ -181,6 +181,22 @@ impl FdTable {
         table
     }
 
+    /// Dynamic-fd ceiling when no `ulimit -n` value is in force. GNU has no
+    /// table cap of its own — fcntl F_DUPFD (redir.c:940) hands out the
+    /// lowest free descriptor >= SHELL_FD_BASE below the RLIMIT_NOFILE soft
+    /// limit — so the honest Windows emulation default is the oracle's own
+    /// soft limit (WSL GNU bash 5.3.0, 2026-10-19 probe: soft 10240, hard
+    /// 1048576), not a homemade 1024 (rubash#773: the old cap surfaced as
+    /// "cannot duplicate fd: Invalid argument" after exactly 1014 `{fd}`
+    /// allocations).
+    pub(crate) const DEFAULT_OPEN_FILES_SOFT_LIMIT: u32 = 10240;
+
+    /// Dynamic-fd ceiling for the unlimited case (`ulimit -Sn unlimited`
+    /// over an unlimited hard). Pinned at the oracle's hard default — on
+    /// Windows each slot is one real HANDLE, so the process handle budget,
+    /// not this number, is the true wall.
+    pub(crate) const UNLIMITED_OPEN_FILES_CEILING: u32 = 1_048_576;
+
     pub(crate) fn allocate_dynamic(&mut self) -> u32 {
         // Bash's F_DUPFD requests the lowest available descriptor at or above
         // SHELL_FD_BASE. Closed dynamic entries are reusable immediately.
@@ -195,25 +211,37 @@ impl FdTable {
         self.allocate_dynamic_with_limit(None).unwrap_or(10)
     }
 
+    /// GNU fcntl F_DUPFD with SHELL_FD_BASE=10 (redir.c:940, do_redirection_
+    /// internal REDIR_VARASSIGN): the kernel hands out the lowest free
+    /// descriptor >= 10 below the RLIMIT_NOFILE *soft* limit, failing with
+    /// EMFILE when every slot below it is taken and with EINVAL when the
+    /// base itself sits at/above the limit (`ulimit -n 6` then
+    /// `exec {v}</dev/null` leaves v unset — vredir6.sub). `limit` is that
+    /// soft limit (None = unlimited); walk the occupied slots in fd order
+    /// and stop at the first gap, so closed dynamic entries are reusable
+    /// exactly like freed kernel descriptors and the capacity follows the
+    /// limit instead of a homemade ceiling (rubash#773).
     pub(crate) fn allocate_dynamic_with_limit(&mut self, limit: Option<u32>) -> Option<u32> {
-        let upper = limit.map(|value| value as usize).unwrap_or(1024);
-        // GNU fcntl F_DUPFD with SHELL_FD_BASE=10 fails with EINVAL when the
-        // requested base is beyond RLIMIT_NOFILE (redir.c fcntl(...10) path).
-        // Mirror that by treating no fd >=10 and <limit as allocation failure
-        // (vredir6.sub: ulimit -n 6 then exec {v}</dev/null leaves v unset).
-        let fd = (10..1024).find(|fd| {
-            if limit.is_some_and(|lim| *fd >= lim) {
-                return false;
+        let upper = limit.unwrap_or(Self::UNLIMITED_OPEN_FILES_CEILING) as usize;
+        if upper <= 10 {
+            return None;
+        }
+        let mut candidate: usize = 10;
+        for (&fd, entry) in &self.entries {
+            if (fd as usize) < candidate || !Self::occupied(entry) {
+                continue;
             }
-            if (*fd as usize) >= upper {
-                return false;
+            if fd as usize == candidate {
+                candidate += 1;
+            } else {
+                break;
             }
-            self.entries
-                .get(fd)
-                .map_or(true, |entry| !Self::occupied(entry))
-        })?;
-        self.next_dynamic_fd = fd.saturating_add(1).max(10);
-        Some(fd)
+        }
+        if candidate >= upper {
+            return None;
+        }
+        self.next_dynamic_fd = (candidate as u32).saturating_add(1).max(10);
+        Some(candidate as u32)
     }
 
     pub(crate) fn open_input(&mut self, fd: u32, endpoint: FdReadEndpoint, dynamic: bool) {
