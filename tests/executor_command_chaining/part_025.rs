@@ -1,5 +1,6 @@
 use super::super::*;
 use std::fs;
+use std::path::Path;
 
 #[test]
 fn test_dirstack_expands_as_dynamic_array() {
@@ -184,10 +185,30 @@ fn test_popd_appends_stderr() {
 #[test]
 fn test_popd_double_dash_ignores_following_stack_index() {
     let _cwd_guard = CwdGuard::take();
-    let output_path = "target/rubash-popd-double-dash-index-output.txt";
-    let scratch_path = "target/rubash-popd-double-dash-index-scratch.txt";
-    let _ = fs::remove_file(output_path);
-    let _ = fs::remove_file(scratch_path);
+    // rubash#830: the top-pop popd now cds for real, so the shell process's
+    // cwd moves mid-script (`pushd /tmp; pushd /bin; popd` lands the process
+    // on the pop target). Redirect paths resolved against the moving cwd
+    // would scatter (and, under `>>`, accumulate across runs) — anchor the
+    // harness files at the crate's target directory in the shell's POSIX
+    // spelling, which resolves identically from every cwd; the Rust-side
+    // fs:: probes use the native form of the same location.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let anchor = {
+        let bytes = manifest.as_bytes();
+        format!(
+            "/{}{}",
+            (bytes[0] as char).to_ascii_lowercase(),
+            manifest[2..].replace('\\', "/")
+        )
+    };
+    let output_name = "rubash-popd-double-dash-index-output.txt";
+    let scratch_name = "rubash-popd-double-dash-index-scratch.txt";
+    let output_path = format!("{anchor}/target/{output_name}");
+    let scratch_path = format!("{anchor}/target/{scratch_name}");
+    let output_native = Path::new(manifest).join("target").join(output_name);
+    let scratch_native = Path::new(manifest).join("target").join(scratch_name);
+    let _ = fs::remove_file(&output_native);
+    let _ = fs::remove_file(&scratch_native);
     let input = format!(
         "PWD=/; pushd /tmp > {scratch_path}; pushd /bin >> {scratch_path}; \
          popd -- +8 > {output_path}; popd -- -8 >> {output_path}; echo $? >> {output_path}"
@@ -200,9 +221,12 @@ fn test_popd_double_dash_ignores_following_stack_index() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "/tmp /\n/\n0\n");
-    let _ = fs::remove_file(output_path);
-    let _ = fs::remove_file(scratch_path);
+    assert_eq!(
+        fs::read_to_string(&output_native).unwrap(),
+        "/tmp /\n/\n0\n"
+    );
+    let _ = fs::remove_file(&output_native);
+    let _ = fs::remove_file(&scratch_native);
 }
 
 #[test]
