@@ -255,8 +255,10 @@ fn run_rubash_in(dir: &Path, args: &[&str], limit: Duration) -> RunOutcome {
         // golden — has it unbound. Drop every user/tool variable and pass
         // only machine infrastructure plus the minimal PATH, so a local
         // run, a CI runner and any future image observe the same fixture
-        // world. (Suite snapshots deliberately keep the ambient env:
-        // their bytes were recorded with it.)
+        // world. (The suite-snapshot path below now follows the same
+        // airtight channel — env_clear + machine whitelist + the pinned
+        // THIS_SH/TMPDIR exports — because ambient leakage made the
+        // recorded bytes machine-dependent; see its own comment.)
         .env_clear()
         .env("PATH", minimal_path())
         // Real-world fixtures consult $HOME (nvm's NVM_DIR defaults under
@@ -1850,7 +1852,7 @@ mod issue_704 {
         );
     }
 
-    /// 704.2b — builtins/command.def:95-96 `if (list == 0) return
+    /// 704.2b — builtins/command.def:96-99 `if (list == 0) return
     /// (EXECUTION_SUCCESS);`: the no-operand early return comes BEFORE the
     /// describe loop, so `command -v`/`-V` with no names succeeds with no
     /// output instead of falling through to the any_found accumulator's

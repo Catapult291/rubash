@@ -476,7 +476,7 @@ mod numeric_validation_704 {
 
     #[test]
     fn lone_quote_is_a_nul_character_constant_without_error() {
-        // printf.def:1519-1544 asciicode(): arg[1] of a quoted operand, with
+        // printf.def:1520-1543 asciicode(): arg[1] of a quoted operand, with
         // no chk_converror — a lone quote reads the NUL at arg[1] (0).
         let (status, stdout, stderr, _) = run(&["%d|%d|%d", "'a", "'a ", "'"]);
         assert_eq!(status, EXECUTION_SUCCESS);

@@ -10,7 +10,7 @@
 //! command-name scan execute_cmd.c:5789 that `command`'s operand lands in
 //! (command.def builds a bare simple command from the operand list and
 //! execute_command dispatches it; -p is refused earlier at
-//! command.def:97-103, -v/-V return from the describe path before any
+//! command.def:98-104, -v/-V return from the describe path before any
 //! execution). The pre-fix rubash inverted cells 11/12 (allowed every
 //! write form whose target had no slash, refused `cat < slashed-file` with
 //! the output diagnostic) and skipped `command` operands entirely.
