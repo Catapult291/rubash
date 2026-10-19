@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "printf_tests/float_numeric.rs"]
 mod float_numeric;
+#[path = "printf_tests/nonfinite_prefix_871.rs"]
+mod nonfinite_prefix_871;
 
 fn run(args: &[&str]) -> (i32, String, String, crate::shell::var_table::VarTable) {
     let mut env_vars = crate::shell::var_table::VarTable::default();

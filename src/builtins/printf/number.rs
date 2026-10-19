@@ -281,27 +281,54 @@ fn scan_float_subject(value: &str) -> Option<FloatSubject> {
     let rest = &body[offset..];
     let rest_bytes = rest.as_bytes();
 
-    // inf / infinity / nan[(n-char-sequence)] -- C99 7.20.1.3; the parenthesised
-    // part belongs to the subject only when it closes.
-    let word_end = rest_bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_alphabetic())
-        .unwrap_or(rest_bytes.len());
-    match rest[..word_end].to_ascii_lowercase().as_str() {
-        "inf" | "infinity" | "nan" => {
-            let mut end = leading + offset + word_end;
-            if rest.as_bytes().get(word_end) == Some(&b'(') {
-                let close = rest_bytes[word_end..]
-                    .iter()
-                    .position(|byte| *byte == b')')
-                    .map(|position| word_end + position);
-                if let Some(close) = close {
-                    end = leading + offset + close + 1;
+    // inf / infinity / nan[(n-char-sequence)] -- C99 7.20.1.3; glibc strtod
+    // takes the case-insensitive `inf`/`nan` prefix and then the longest
+    // valid continuation: `inity` completes `infinity`, and a parenthesised
+    // n-char-sequence extends a `nan` subject only when it closes
+    // (rubash#871; getdouble in printf.def goes through strtod, so the
+    // diagnostic still fires on the rejected tail while the converted value
+    // is used). `infin`/`infx` convert `inf` with suffix `in`/`x`,
+    // `nann`/`nanx` convert `nan` with suffix `n`/`x`; `inf(2)` leaves `(2)`
+    // as the rejected suffix while `nan(2)` consumes it. Byte patterns keep
+    // multibyte input panic-free (no str slicing on unverified boundaries).
+    let mut word_len = 0usize;
+    let mut is_nan = false;
+    if let [a, b, c, ..] = rest_bytes {
+        if matches!(*a, b'i' | b'I')
+            && matches!(*b, b'n' | b'N')
+            && matches!(*c, b'f' | b'F')
+        {
+            word_len = 3;
+            if let [d, e, f, g, h, ..] = &rest_bytes[3..] {
+                if matches!(*d, b'i' | b'I')
+                    && matches!(*e, b'n' | b'N')
+                    && matches!(*f, b'i' | b'I')
+                    && matches!(*g, b't' | b'T')
+                    && matches!(*h, b'y' | b'Y')
+                {
+                    word_len = 8;
                 }
             }
-            return Some(FloatSubject { start: 0, end });
+        } else if matches!(*a, b'n' | b'N')
+            && matches!(*b, b'a' | b'A')
+            && matches!(*c, b'n' | b'N')
+        {
+            word_len = 3;
+            is_nan = true;
         }
-        _ => {}
+    }
+    if word_len > 0 {
+        let mut end = leading + offset + word_len;
+        if is_nan && rest_bytes.get(word_len) == Some(&b'(') {
+            let close = rest_bytes[word_len..]
+                .iter()
+                .position(|byte| *byte == b')')
+                .map(|position| word_len + position);
+            if let Some(close) = close {
+                end = leading + offset + close + 1;
+            }
+        }
+        return Some(FloatSubject { start: 0, end });
     }
 
     // Hexadecimal significand: 0x/0X plus at least one hex digit with the
