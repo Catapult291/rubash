@@ -697,21 +697,6 @@ impl Executor {
             self.shell_state.subshell_depth.set(saved_depth);
             return result;
         }
-        // GNU execute_cmd.c:4648-4649: every simple command — `true`,
-        // `false`, `:` included — prints its xtrace head line inside the
-        // substitution child. The hardcoded status shortcuts cannot express
-        // that side effect, so under `set -x` they are disqualified (the
-        // rubash#117 whitelist discipline: a shortcut must be provably
-        // equivalent, and it is not when tracing) and the body falls to the
-        // real parser/executor below, which traces it (rubash#254).
-        if source == "false" && !self.xtrace_enabled() {
-            self.last_command_substitution_status.set(Some(1));
-            return String::new();
-        }
-        if matches!(source, "true" | ":") && !self.xtrace_enabled() {
-            self.last_command_substitution_status.set(Some(0));
-            return String::new();
-        }
         if let Some(rest) = source.strip_prefix('<') {
             // GNU subst.c:7162-7179 command_substitute: a body whose first
             // non-blank character is `<` (not followed by `<`, `>`, or `&`)
@@ -758,6 +743,24 @@ impl Executor {
             if let Some(output) = self.command_list_substitution_output(source, context) {
                 return output;
             }
+            return String::new();
+        }
+        // GNU execute_cmd.c:4648-4649: every simple command — `true`,
+        // `false`, `:` included — prints its xtrace head line AND fires an
+        // inherited DEBUG trap inside the substitution child (the comsub
+        // child keeps the trap under functrace, trap.c:1466-1474). The
+        // hardcoded status shortcuts can express neither side effect, so
+        // under `set -x` or under the functrace+DEBUG gate above they are
+        // disqualified (the rubash#117 whitelist discipline: a shortcut must
+        // be provably equivalent, and it is not when tracing or when the
+        // inherited DEBUG trap fires) and the body falls to the real
+        // parser/executor below (rubash#254, rubash#825).
+        if source == "false" && !self.xtrace_enabled() {
+            self.last_command_substitution_status.set(Some(1));
+            return String::new();
+        }
+        if matches!(source, "true" | ":") && !self.xtrace_enabled() {
+            self.last_command_substitution_status.set(Some(0));
             return String::new();
         }
         // cd/pwd and heredoc word shortcuts predate the triviality gate and
