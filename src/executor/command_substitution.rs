@@ -1578,6 +1578,12 @@ impl Executor {
             backtick_body_diagnostic: Cell::new(false),
             parser_error_errexited: Cell::new(false),
             last_command_inverted: Cell::new(false),
+            // rubash#846: a forked comsub child is a fresh GNU frame with no
+            // :1831-equivalent — an inner compound's own redirect failure is
+            // status 1, never flipped (`x=$(! { :; } > bad)` is 1). The child
+            // starts clean and anything it sets stays inside (separate
+            // Executor); the parent never observes it.
+            compound_redirect_failed: Cell::new(false),
             exit_jump_pending: Cell::new(false),
             special_builtin_failed: Cell::new(false),
             last_builtin_write_failed: Cell::new(false),

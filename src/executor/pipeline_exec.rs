@@ -465,6 +465,11 @@ impl Executor {
         &mut self,
         command: &CommandNode,
     ) -> Result<bool, ExecuteError> {
+        // rubash#846: GNU execute_cmd.c:854-883 — the compound's own
+        // redirect failure returns before the :1204 invert step, so an
+        // enclosing `!` must not flip this status. The dispatch flip sites
+        // consult the mark; boundaries consume it.
+        self.note_compound_redirect_failure();
         self.exit_code = 1;
         self.maybe_run_error_trap(command)?;
         if self.errexit_enabled()
@@ -3080,7 +3085,18 @@ impl Executor {
         // the external spawner with no diagnostic and a 127 status where GNU
         // reports `$(echo a b): ambiguous redirect` and the stage dies with
         // status 1 (rubash#525).
-        let stage_redirect_rejected = self.reject_invalid_redirects(command)?;
+        // rubash#846: both preflights can return Err (notably an
+        // unopenable `>file` open failure). The thread-local stdout
+        // capture above is active, so restore it before propagating —
+        // otherwise every later stdout write in the script is swallowed
+        // into the orphaned buffer while stderr keeps working.
+        let stage_redirect_rejected = match self.reject_invalid_redirects(command) {
+            Ok(rejected) => rejected,
+            Err(error) => {
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                return Err(error);
+            }
+        };
         if stage_redirect_rejected.is_some() {
             // The rejected stage already placed its diagnostic on the
             // element's fd 1 (the pipe) via the capture above — GNU's
@@ -3098,7 +3114,14 @@ impl Executor {
                 1,
             )));
         }
-        if self.command_output_redirect_fails(command)? {
+        let stage_output_redirect_failed = match self.command_output_redirect_fails(command) {
+            Ok(failed) => failed,
+            Err(error) => {
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                return Err(error);
+            }
+        };
+        if stage_output_redirect_failed {
             let captured = crate::executor::shell_options::take_stdout_capture();
             crate::executor::shell_options::restore_stdout_capture(saved_capture);
             return Ok(Some((

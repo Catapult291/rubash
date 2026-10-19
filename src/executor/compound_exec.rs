@@ -328,8 +328,34 @@ impl Executor {
             commands: vec![(*inverted_command.command).clone()],
         };
         self.with_errexit_suppressed(|executor| executor.execute_ast(&commands))?;
+        // GNU execute_cmd.c:854-883 vs :1204: a compound's OWN redirect
+        // failure returns before the invert step, so the flip is suppressed
+        // while compound_redirect_failed is set (rubash#846). The mark is
+        // left set on purpose: an outer `! ! C` wrapper suppresses in turn
+        // (GNU: the inner command never runs — the outer redirect fails
+        // first — so both levels observe status 1), and the owning
+        // boundary consumes it (subshell-region single-inverted-body flip
+        // at :1831, pipeline wait-side flip at :763, comsub/function/eval
+        // completion discard, flat-loop backstop clear).
+        if self.compound_redirect_failed.get() {
+            return Ok(());
+        }
         self.exit_code = invert_exit_status(self.exit_code);
         Ok(())
+    }
+
+    /// Record a compound's own do_redirections failure (GNU
+    /// execute_cmd.c:854-883). Call only with the apply-stage IoError —
+    /// never ExpansionFailure (failglob aborts before do_redirections and
+    /// flips normally) and never a body write error.
+    pub(in crate::executor) fn note_compound_redirect_failure(&self) {
+        self.compound_redirect_failed.set(true);
+    }
+
+    /// Consume the compound-redirect-failure mark (fork/call boundaries and
+    /// the pipeline wait-side flip own the adjudicated status from here).
+    pub(in crate::executor) fn take_compound_redirect_failed(&self) -> bool {
+        self.compound_redirect_failed.replace(false)
     }
 
     pub(in crate::executor) fn execute_background_ast_command(
@@ -1365,7 +1391,12 @@ impl Executor {
         }
         self.print_time_shell(time_command.posix_format, started);
         if time_command.inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(())
     }
@@ -1418,7 +1449,12 @@ impl Executor {
         );
         result?;
         if inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(())
     }
@@ -1466,7 +1502,12 @@ impl Executor {
 
         self.print_time_shell(prefix.posix_format, started);
         if prefix.inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(Some(index + next_index))
     }
@@ -1703,11 +1744,20 @@ impl Executor {
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
         let mut if_command = if_command.clone();
-        let result = apply_if_redirects(self, &redirect_cmd, &mut if_command).and_then(|()| {
-            self.with_command_input_redirects(cmd, |executor| {
+        // rubash#846 (GNU execute_cmd.c:854-883): an apply-stage IoError
+        // is the if's OWN redirect failure — mark it for the `!` flip
+        // sites. Body-stage errors flow through unmarked and flip normally.
+        let result = match apply_if_redirects(self, &redirect_cmd, &mut if_command) {
+            Err(error) => {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                Err(error)
+            }
+            Ok(()) => self.with_command_input_redirects(cmd, |executor| {
                 executor.execute_if_command(&if_command)
-            })
-        });
+            }),
+        };
         let status = self.exit_code;
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         self.exit_code = status;
@@ -1734,14 +1784,23 @@ impl Executor {
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
         let mut loop_command = loop_command.clone();
-        let result = apply_redirects_to_commands(self, &redirect_cmd, &mut loop_command.body)
-            .and_then(|()| {
-                self.with_loop_fd_heredocs(cmd, |executor| {
-                    executor.with_command_input_redirects(cmd, |executor| {
-                        executor.execute_loop_command(&loop_command)
-                    })
+        // rubash#846 (GNU execute_cmd.c:854-883): an apply-stage IoError
+        // is the loop's OWN redirect failure — mark it for the `!` flip
+        // sites. Body-stage errors flow through unmarked and flip normally.
+        let result = match apply_redirects_to_commands(self, &redirect_cmd, &mut loop_command.body)
+        {
+            Err(error) => {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                Err(error)
+            }
+            Ok(()) => self.with_loop_fd_heredocs(cmd, |executor| {
+                executor.with_command_input_redirects(cmd, |executor| {
+                    executor.execute_loop_command(&loop_command)
                 })
-            });
+            }),
+        };
         let status = self.exit_code;
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         self.exit_code = status;
@@ -1908,7 +1967,18 @@ impl Executor {
             let mut body_ast = Ast {
                 commands: subshell_command.body.clone(),
             };
-            self.apply_command_output_redirects(&stdio_redirect_cmd, &mut body_ast)?;
+            // rubash#846 (GNU execute_cmd.c:1759-1762): the subshell's own
+            // redirect failure in the forked child exits inverted — the
+            // parent wait-side (:763) flips it back, netting status 1 with
+            // no flip. Mark it so an enclosing `!` suppresses its flip.
+            if let Err(error) =
+                self.apply_command_output_redirects(&stdio_redirect_cmd, &mut body_ast)
+            {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                return Err(error);
+            }
             body_owned = Some(body_ast.commands);
         }
         let body: &[CommandNode] = body_owned.as_deref().unwrap_or(&subshell_command.body);
@@ -2036,6 +2106,28 @@ impl Executor {
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
+        // rubash#846 (GNU execute_cmd.c:1808-1833 execute_in_subshell): the
+        // forked child lifts CMD_INVERT_RETURN off the direct body and flips
+        // the adjudicated result — `( ! C>bad )` is 0 while a top-level
+        // `! C>bad` is 1. Only the single-inverted-command body qualifies
+        // (tcom is the direct body; a `!` nested in a list keeps its flag
+        // into execute_command_internal and hits the :854 early return).
+        // Consume the mark when flipping; otherwise leave it for an
+        // enclosing `!` (`! ( C>bad )` suppresses) or the flat-loop backstop.
+        let mut status = status;
+        if self.compound_redirect_failed.get()
+            && body.len() == 1
+            && (body[0].inverted_command.is_some() || body[0].inverted)
+        {
+            self.take_compound_redirect_failed();
+            status = invert_exit_status(status);
+        } else {
+            // Body-set marks die with the forked child (GNU
+            // execute_in_subshell): the parent judges the region by status
+            // only. (The region's OWN redirect failure returns before this
+            // point, leaving the mark for an enclosing `!`.)
+            self.compound_redirect_failed.set(false);
+        }
         self.exit_code = status;
         finish_result?;
         self.exit_code = status;
@@ -2448,7 +2540,16 @@ impl Executor {
             } else {
                 child.stderr(Stdio::inherit());
             }
-            self.apply_coproc_redirects(cmd, &mut child)?;
+            // rubash#846 (GNU execute_cmd.c:1759-1762 + :2583): the
+            // coproc child's own redirect failure exits inverted and the
+            // parent flips it back — net status 1, no flip. Mark it so an
+            // enclosing `!` suppresses its flip.
+            if let Err(error) = self.apply_coproc_redirects(cmd, &mut child) {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                return Err(error);
+            }
 
             match child.spawn() {
                 Ok(mut child_proc) => {
@@ -2991,6 +3092,11 @@ impl Executor {
         let result = self.apply_case_command_redirects(&redirect_cmd, &mut case_command);
         let status = self.exit_code;
         if let Err(error) = result {
+            // rubash#846 (GNU execute_cmd.c:854-883): the case's OWN
+            // redirect failure — mark it for the `!` flip sites.
+            if matches!(error, ExecuteError::IoError(_)) {
+                self.note_compound_redirect_failure();
+            }
             let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
             self.exit_code = status;
             finish_result?;

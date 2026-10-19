@@ -546,6 +546,12 @@ impl Executor {
                 // is cleared before each top-level command, so a redirected
                 // control structure's flag never leaks into the next command.
                 self.shell_state.stdin_redir.set(false);
+                // rubash#846: same per-command hygiene for the
+                // compound-redirect-failure mark — a stale mark (set by a
+                // previous command whose `!` consult never ran) must never
+                // suppress the next command's flip. Nested scopes clear at
+                // their own fork/call boundaries.
+                self.compound_redirect_failed.set(false);
             }
             {
                 let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_JOBS);
@@ -1266,6 +1272,12 @@ impl Executor {
                     }
                 }
                 if command.inverted {
+                    // rubash#846: pipeline-level `!` always flips (GNU
+                    // execute_cmd.c:763 wait-side — `! true | cat > bad` is
+                    // 0). A stage's own redirect failure may have marked
+                    // compound_redirect_failed; the pipeline owns the
+                    // adjudicated status from here, so consume the mark.
+                    self.take_compound_redirect_failed();
                     self.exit_code = invert_exit_status(self.exit_code);
                 }
                 // GNU order: the ERR trap for a failing pipeline
@@ -1669,7 +1681,12 @@ impl Executor {
                 }
             }
             if command.inverted {
-                self.exit_code = invert_exit_status(self.exit_code);
+                // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a
+                // compound's OWN redirect failure suppresses the flip (mark
+                // left set for an outer `! !` wrapper; boundaries consume).
+                if !self.compound_redirect_failed.get() {
+                    self.exit_code = invert_exit_status(self.exit_code);
+                }
             }
             self.set_pipestatus([self.exit_code]);
 
@@ -1806,6 +1823,10 @@ impl Executor {
             self.with_errexit_suppressed(|executor| {
                 executor.execute_pipeline_command(pipeline_command)
             })?;
+            // rubash#846: pipeline-level `!` always flips (GNU
+            // execute_cmd.c:763 wait-side); consume any stage-set mark — the
+            // pipeline owns the adjudicated status from here.
+            self.take_compound_redirect_failed();
             self.exit_code = invert_exit_status(self.exit_code);
             return Ok(Some(end + 1));
         }
@@ -1815,6 +1836,8 @@ impl Executor {
         for command in pipeline {
             self.execute_command(command)?;
         }
+        // rubash#846: same pipeline-level always-flip rule as above.
+        self.take_compound_redirect_failed();
         self.exit_code = invert_exit_status(self.exit_code);
         Ok(Some(end + 1))
     }
