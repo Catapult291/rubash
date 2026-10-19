@@ -245,48 +245,161 @@ where
                 return Ok(EX_USAGE);
             };
 
-            match operand {
-                PopdOperand::Top { no_cd } => {
-                    if stack.len() <= 1 {
-                        writeln!(stderr, "{diagnostic_prefix}popd: directory stack empty")?;
-                        return Ok(EXECUTION_FAILURE);
-                    }
-                    stack.remove(if no_cd { 1 } else { 0 });
-                    if no_cd {
-                        save_stack(env_vars, &stack);
-                        writeln!(stdout, "{}", stack.join(" "))?;
-                        return Ok(EXECUTION_SUCCESS);
-                    }
-                }
+            // GNU pushd.def:383-391 resolves every ±N operand to one array
+            // slot before branching, and slot 0 (`popd`, `popd +0`,
+            // `popd -N` naming the bottom of the display) is the top-of
+            // -stack branch. The empty-stack verdict is pushd_error's
+            // (pushd.def:540-546): "directory stack empty" whenever the
+            // offset is 0, "directory stack index out of range" otherwise.
+            let (index, no_cd) = match operand {
+                PopdOperand::Top { no_cd } => (0usize, no_cd),
                 PopdOperand::Index {
                     index,
                     from_right,
                     no_cd,
-                } => {
-                    let index =
-                        resolved_index(index, from_right, stack.len()).unwrap_or(usize::MAX);
-                    if index >= stack.len() {
-                        writeln!(
+                } => match resolved_index(index, from_right, stack.len()) {
+                    Some(index) => (index, no_cd),
+                    None => {
+                        popd_range_error(
+                            stack.len(),
+                            args.last().copied().unwrap_or_default(),
+                            diagnostic_prefix,
                             stderr,
-                            "{diagnostic_prefix}popd: {}: directory stack index out of range",
-                            args.last().copied().unwrap_or_default()
                         )?;
                         return Ok(EXECUTION_FAILURE);
                     }
-                    stack.remove(index);
-                    if no_cd {
-                        save_stack(env_vars, &stack);
-                        writeln!(stdout, "{}", stack.join(" "))?;
-                        return Ok(EXECUTION_SUCCESS);
+                },
+            };
+
+            if index == 0 {
+                if stack.len() <= 1 {
+                    writeln!(stderr, "{diagnostic_prefix}popd: directory stack empty")?;
+                    return Ok(EXECUTION_FAILURE);
+                }
+                // With -n the element is freed and nothing else happens
+                // (pushd.def:397: cd_to_string is skipped entirely).
+                if no_cd {
+                    stack.remove(1);
+                    save_stack(env_vars, &stack);
+                    writeln!(stdout, "{}", stack.join(" "))?;
+                    return Ok(EXECUTION_SUCCESS);
+                }
+                // pushd.def:394-403: cd_to_string(new top) runs BEFORE the
+                // element is freed, so a failed chdir leaves the stack, PWD
+                // and the display untouched — cd_builtin's diagnostic (under
+                // the invoking builtin's prolog: `popd: word: strerror`) and
+                // its EXECUTION_FAILURE are the only effects (rubash#830;
+                // GNU bash 5.3.0 probes: rc 1, `dirs` still shows the entry).
+                let target = stack[1].clone();
+                let Some(chdir) = popd_chdir(&target, env_vars, stderr, diagnostic_prefix)? else {
+                    return Ok(EXECUTION_FAILURE);
+                };
+                // Success: cd_builtin's bindpwd refreshed OLDPWD/PWD and the
+                // display promotes the chdir target to the cwd slot — the
+                // same net stack the GNU free() of the popped word leaves.
+                let old_pwd = env_vars
+                    .get("PWD")
+                    .cloned()
+                    .unwrap_or_else(|| "/".to_string());
+                env_vars.insert("OLDPWD".to_string(), old_pwd);
+                stack.remove(0);
+                env_vars.insert("PWD".to_string(), stack[0].clone());
+                match chdir {
+                    // A real chdir drops the physical-pwd override so
+                    // `pwd -P` follows the real process cwd (cd.rs does the
+                    // same after a chdir).
+                    PopdChdir::Real => {
+                        env_vars.remove("__RUBASH_PHYSICAL_PWD");
+                    }
+                    // cd's Windows-host bridge for the POSIX system names
+                    // (cd.rs logical_posix_test_dir) pins the physical pwd to
+                    // the logical name instead of chdir(2); popd's inner cd
+                    // inherits that verdict verbatim.
+                    PopdChdir::Bridged => {
+                        env_vars.insert("__RUBASH_PHYSICAL_PWD".to_string(), stack[0].clone());
                     }
                 }
+                save_stack(env_vars, &stack);
+                writeln!(stdout, "{}", stack.join(" "))?;
+                return Ok(EXECUTION_SUCCESS);
             }
 
-            let pwd = stack.first().cloned().unwrap_or_else(|| "/".to_string());
-            env_vars.insert("PWD".to_string(), pwd);
+            // Any other slot (pushd.def:404-421): the element is freed and
+            // the remainder shifted; no chdir ever runs and PWD stays as it
+            // was (GNU 5.3.0 probe: `popd +1` leaves pwd -P and $PWD alone).
+            stack.remove(index);
             save_stack(env_vars, &stack);
             writeln!(stdout, "{}", stack.join(" "))?;
             Ok(EXECUTION_SUCCESS)
         }
     }
+}
+
+/// GNU pushd_error (pushd.def:540-546): an out-of-range operand names
+/// "directory stack empty" while the offset is 0 and sh_erange's "directory
+/// stack index out of range" otherwise.
+fn popd_range_error<E: Write>(
+    stack_len: usize,
+    operand: &str,
+    diagnostic_prefix: &str,
+    stderr: &mut E,
+) -> io::Result<()> {
+    if stack_len <= 1 {
+        writeln!(stderr, "{diagnostic_prefix}popd: directory stack empty")
+    } else {
+        writeln!(
+            stderr,
+            "{diagnostic_prefix}popd: {operand}: directory stack index out of range"
+        )
+    }
+}
+
+/// How the top-of-stack popd's inner cd (GNU cd_to_string) resolved.
+enum PopdChdir {
+    /// set_current_dir moved the shell process.
+    Real,
+    /// cd's Windows-host bridge (cd.rs logical_posix_test_dir): with no
+    /// configured logical root, `/bin`-class POSIX names are not physical
+    /// directories, so cd rewrites PWD and pins __RUBASH_PHYSICAL_PWD
+    /// without a chdir — popd's inner cd inherits the same verdict.
+    Bridged,
+}
+
+/// The top-of-stack popd chdir, GNU cd_to_string (pushd.def:559-572): a
+/// cd_builtin call with the raw stack word. Returns None when the chdir
+/// failed (diagnostic already printed).
+fn popd_chdir<E: Write>(
+    target: &str,
+    env_vars: &mut HashMap<String, String>,
+    stderr: &mut E,
+    diagnostic_prefix: &str,
+) -> io::Result<Option<PopdChdir>> {
+    if target.is_empty() {
+        // cd.def:331-336 judges an operand that expanded to "" before any
+        // path work; through cd_to_string the prolog names popd.
+        writeln!(stderr, "{diagnostic_prefix}popd: null directory")?;
+        return Ok(None);
+    }
+    // cd.rs's Windows-host bridge, same predicate and same match list: on an
+    // unconfigured host the POSIX system names have no physical directory,
+    // and cd reports success by rewriting the logical state only.
+    if cfg!(windows)
+        && !crate::executor::path::shell_root_configured(env_vars)
+        && matches!(target, "/" | "/bin" | "/etc" | "/tmp" | "/usr")
+    {
+        return Ok(Some(PopdChdir::Bridged));
+    }
+    let native = crate::executor::path::shell_path_to_windows(target, env_vars);
+    if let Err(error) = std::env::set_current_dir(&native) {
+        // cd.def:427: builtin_error("%s: %s", dirname, strerror(e)) reports
+        // the stored word, not the Windows-mapped path.
+        writeln!(
+            stderr,
+            "{diagnostic_prefix}popd: {target}: {}",
+            crate::posix_errors::message(&error)
+        )?;
+        stderr.flush()?;
+        return Ok(None);
+    }
+    Ok(Some(PopdChdir::Real))
 }
