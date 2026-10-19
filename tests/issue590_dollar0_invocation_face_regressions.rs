@@ -92,7 +92,7 @@ fn rbash_face_reports_rbash_as_dollar_zero() {
 #[test]
 fn forwarded_name_does_not_leak_into_the_shell_env() {
     let tree = ShimTree::new();
-    let (stdout, stderr, rc) = tree.run_face("sh", "echo [$NIU_INVOKED_AS]");
+    let (stdout, stderr, rc) = tree.run_face("sh", "echo \"[$NIU_INVOKED_AS]\"");
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
     assert_eq!(stdout, "[]\n", "stderr: {stderr:?}");
 }
@@ -187,7 +187,7 @@ fn stdin_script_keeps_the_forwarded_face_as_dollar_zero() {
         .stdin
         .as_mut()
         .expect("piped stdin")
-        .write_all(b"echo [$0]\n")
+        .write_all(b"echo \"[$0]\"\n")
         .expect("write stdin script");
     drop(child.stdin.take());
     let out = child.wait_with_output().expect("wait shim sh -s");

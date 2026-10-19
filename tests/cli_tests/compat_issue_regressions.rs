@@ -1941,16 +1941,28 @@ fn command_substitution_preserves_nested_quote_literals() {
     // GNU subst.c always parses the body. Top-level quote delimiters keep
     // the fast paths on purpose: stripping them matches bash, and the
     // heredoc backtick / IFS read probes rely on it.
+    //
+    // Every display wrapper is DOUBLE-QUOTED (rubash#832): an unquoted
+    // `[...]` word around a command substitution is a glob bracket
+    // expression over the substituted characters (subst.c:12601
+    // glob_expand_word_list -> pathexp.c:66 unquoted_glob_pattern_p; the
+    // substituted quotes are data per subst.c:6643 comsub_shouldquote), so
+    // `echo [$(echo "'s'")]` legitimately prints `s` — the matched
+    // FILENAME — whenever a 0-byte `s` sits in the test process's CWD (the
+    // package root under `cargo test`). The quoted wrappers keep the probe
+    // on the quote-preservation face and CWD-independent; the CWD-sensitive
+    // glob face itself is pinned byte-exact against GNU in
+    // tests/issue832_cmdsub_cwd_glob_regressions.rs.
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .arg("-c")
         .arg(concat!(
             "v=$(echo '{\"a\":1}')\n",
-            "echo [$v]\n",
-            "echo [$(echo \"{\\\"b\\\":2}\")]\n",
-            "echo A[$(echo '{\"c\":3}')]\n",
+            "echo \"[$v]\"\n",
+            "echo \"[$(echo \"{\\\"b\\\":2}\")]\"\n",
+            "echo \"A[$(echo '{\"c\":3}')]\"\n",
             "echo \"W=[$(echo '{\"d\":4}')]\"\n",
-            "echo [$(printf '{\"p\":6}\n' | head -1)]\n",
-            "echo [$(echo \"'s'\")]\n",
+            "echo \"[$(printf '{\"p\":6}\n' | head -1)]\"\n",
+            "echo \"[$(echo \"'s'\")]\"\n",
         ))
         .output()
         .expect("run cmdsub quote preservation probe");
