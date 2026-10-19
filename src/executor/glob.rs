@@ -124,17 +124,30 @@ fn contains_glob_or_extglob(word: &str) -> bool {
 }
 
 /// Expand glob patterns (* ? [...]) in a word against the filesystem.
+///
+/// Admission mirrors GNU exactly (rubash#832 family): the only pattern test
+/// is `unquoted_glob_pattern_p` below, the port of pathexp.c:66 — the same
+/// predicate glob_expand_word_list consults (subst.c:12626: "If the word
+/// isn't an assignment and contains an unquoted pattern matching character,
+/// then glob it"). Quote and brace characters are NOT on that list: once a
+/// `'` `"` `{` `}` reaches this function it is expansion OUTPUT data
+/// (subst.c:6643 comsub_shouldquote CTLESC-quotes only IFS-special bytes for
+/// an unquoted enclosing word, so `echo $(echo "'")*` globs in GNU), and a
+/// literal brace survives only when brace expansion did not consume it
+/// (`echo {a*` is an unmatched-brace literal word that still globs, GNU
+/// subst.c brace expansion runs before pathname expansion and never
+/// re-scans output). Genuine quoting suppression rides the CTLESC carrier
+/// (markers::CTLESC, handled inside unquoted_glob_pattern_p) and the
+/// callers' raw-word suppress_glob flags — never a re-sniff of the expanded
+/// text. The former `starts_with('"')/contains('{')` NoMatch shortcuts made
+/// globbing depend on word TEXT instead of quoting state: with a matching
+/// file in CWD, GNU printed `'y` / `{ab` where rubash kept the literal
+/// pattern — a CWD-observable divergence on the #832 face.
 pub(crate) fn pathname_expand_word(
     word: &str,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> PathnameExpansion {
     if word.is_empty() {
-        return PathnameExpansion::NoMatch;
-    }
-    if word.starts_with('"') || word.starts_with('\'') {
-        return PathnameExpansion::NoMatch;
-    }
-    if word.contains('{') || word.contains('}') {
         return PathnameExpansion::NoMatch;
     }
     if crate::builtins::set::shell_option_enabled(env_vars, "noglob") {

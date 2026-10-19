@@ -330,6 +330,18 @@ where
                 display: Some(PathBuf::from(home)),
                 print: PrintPath::Never,
             })),
+            // GNU builtins/cd.def:316-322: the operand-less refusal is
+            // `dirname == 0` (POSIX cd step 1) — a MISSING variable only. A
+            // set-but-EMPTY HOME flows on through make_absolute, glues the
+            // cwd onto the empty name, and the chdir is a same-directory
+            // success: rc 0, no diagnostic, PWD unchanged. (An empty
+            // OPERAND still trips cd.def:331-336's "null directory" — that
+            // is the `cd ~` path, not this one.)
+            None if env_vars.contains_key("HOME") => Ok(Some(Target {
+                path: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                display: None,
+                print: PrintPath::Never,
+            })),
             None => {
                 writeln!(stderr, "{}cd: HOME not set", diagnostic_prefix(env_vars))?;
                 Ok(None)

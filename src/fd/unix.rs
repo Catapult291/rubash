@@ -519,7 +519,11 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
             // GNU's forked children restore the entry signal dispositions
             // between fork and exec (trap.c:1489 restore_original_signals,
             // rubash#229): a policy/trap ignore in the shell must not make
-            // exec'd children unkillable by SIGQUIT et al.
+            // exec'd children unkillable by SIGQUIT et al. rubash#737/#866:
+            // the PDEATHSIG arm is decided INSIDE this hook from the
+            // spawning process's in-process wrapper role (never the ambient
+            // env — rubash#866 — and the race is adjudicated against the
+            // expected parent pid, never the constant 1 — rubash#867).
             crate::builtins::kill::child_pre_exec_reset()?;
             Ok(())
         });

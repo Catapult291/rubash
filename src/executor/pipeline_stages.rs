@@ -431,6 +431,11 @@ impl Executor {
         }
 
         subshell.stderr_capture = Some(Vec::new());
+        // rubash#815 profiler: this stage re-dispatches through
+        // execute_command, whose own prepared-command seam confirms the
+        // element — cancel the stage-level tentative frame so the element is
+        // not recorded twice.
+        super::profiler::cancel_pending_dispatch();
         let result = subshell.execute_command(&call);
         let output = crate::executor::shell_options::take_stdout_capture();
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
@@ -467,6 +472,13 @@ impl Executor {
     ) -> Result<Option<(String, String, i32)>, ExecuteError> {
         let (command, process_substitution_files) =
             self.command_with_process_substitution_files(command)?;
+        // rubash#815 profiler: external pipeline elements spawn here without
+        // passing execute_external, so the spawn face needs its own frame.
+        // Builtin elements need none — the stage body funnels through
+        // execute_command, whose dispatch seam confirms them already.
+        let _profiler_external = super::profiler::enter_external(
+            command.words.first().map(String::as_str).unwrap_or("?"),
+        );
         let result = self.execute_external_pipeline_stage_inner(&command, input, stdin_inherit);
         let finish_result = self.finish_process_substitutions(process_substitution_files);
         let output = result?;

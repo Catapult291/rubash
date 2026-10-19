@@ -282,29 +282,6 @@ mod builtin_doc_sync {
         );
     }
 
-    /// Command-substitution filter arms matched by
-    /// `command_substitution_pipeline_filter` (`command_substitution_values.rs`).
-    /// Same frozen-set rationale as the pipeline list. Note `sort`/`tail`/`uniq`
-    /// exist only here while `sed`/`tr`/`head`/`grep`/`wc` also have pipeline
-    /// arms — the overlap is expected and asserted only against this list.
-    #[test]
-    fn doc_substitution_fastpath_list_matches_substitution_filter_arms() {
-        let mut expected: Vec<String> = ["sort", "sed", "tr", "head", "grep", "wc", "tail", "uniq"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        expected.sort();
-
-        let mut doc_names = machine_list("substitution-fastpath-list");
-        doc_names.sort();
-        assert_eq!(
-            expected, doc_names,
-            "docs/builtins.md substitution-fastpath-list is out of sync with the \
-             filter arms in command_substitution_pipeline_filter \
-             (command_substitution_values.rs)"
-        );
-    }
-
     #[test]
     fn whitelist_never_leaks_fast_path_names() {
         for name in ["dirname", "basename", "sleep"] {

@@ -291,6 +291,14 @@ fn execute_source_with_args(
     let old_current_line = executor
         .get_env("__RUBASH_CURRENT_LINE")
         .map(str::to_string);
+    // rubash#817: GNU evalfile.c:253-257 push_stream gives the sourced
+    // file its own input stream — a read unit distinct from the sourcer's.
+    // Alias definitions inside record (read-generation, line) identity
+    // (arithmetic_aliases.rs), and this fresh generation is what keeps a
+    // definition at the file's line N from colliding with the sourcer's
+    // own later physical line N. Popped right after run_source_groups,
+    // where GNU's run_unwind_frame restores line_number.
+    let saved_read_generation = executor.enter_read_unit();
     if let Some(source_name) = source_name {
         // GNU builtins/evalfile.c:253-257 pushes a "source" frame for a
         // sourced file: BASH_SOURCE += filename, BASH_LINENO += the source
@@ -339,6 +347,13 @@ fn execute_source_with_args(
     // The depth feeds the trap bare-exit context check (rubash#524).
     executor.push_source_nest();
     let result = run_source_groups(executor, source, redirect_cmd);
+
+    // evalfile.c:395: run_unwind_frame pops the pushed stream (restoring
+    // line_number) BEFORE source_file's run_return_trap — the read
+    // generation drops with it, so the trap action and every later
+    // sourcer command are read by the sourcer's own unit again
+    // (rubash#817).
+    executor.exit_read_unit(saved_read_generation);
 
     if source_name.is_some() {
         // evalfile_internal's run_unwind_frame pops the "source" frame and

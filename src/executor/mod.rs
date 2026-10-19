@@ -90,7 +90,7 @@ mod external_finish;
 mod external_inner;
 mod external_redirects;
 mod external_setup;
-mod fd_table;
+pub(crate) mod fd_table;
 mod function_calls;
 mod function_locals;
 mod getopts_enable;
@@ -98,6 +98,7 @@ pub mod identity;
 mod init;
 
 pub use init::RESPAWNED_CHILD;
+pub mod profiler;
 // rubash#331: the binary crate renders its self-produced path values
 // (BASH, argv[0]-derived $0) through the same POSIX-form display the
 // executor uses for $PWD.
@@ -563,11 +564,31 @@ pub struct Executor {
     /// not against the map value (rubash perf12: the map-value gate
     /// produced stale alias/declare line numbers after an ambient restore).
     line_env_os_value: std::cell::RefCell<Option<String>>,
+    /// The background direct-spawn eligibility gate (#809) expands the async
+    /// command's words in the PARENT as a probe; GNU expands the forked
+    /// child's words inside the child, so the parent never observes a
+    /// failglob verdict. While this flag is set, `report_failglob` stays
+    /// silent — the wrapper fallback re-expands in the child and reports
+    /// exactly once, and the gate restores the expansion latches so the
+    /// parent-side discard never swallows the rest of the launch line
+    /// (`set -- /no/such/*.zzz & echo BG_after` lost its echo, 753.11).
+    expansion_probe_active: std::cell::Cell<bool>,
     /// GNU trap.c SIG_INPROGRESS: _run_trap_internal marks a trap
     /// in-progress before executing its action, and run_error_trap refuses
     /// to re-enter while it is set — an ERR trap action that itself fails
     /// must not recursively re-trigger the ERR trap (niubash #121).
     error_trap_running: bool,
+    /// GNU execute_cmd.c:1799-1806 (execute_in_subshell): a user-subshell
+    /// child whose whole body is a single simple or subshell command marks
+    /// that body CMD_NO_FORK; execute_cmd.c:662-663 then dispatches a
+    /// subshell body IN PLACE — no make_child, no wait_for, and therefore
+    /// no :769 run_error_trap in that frame. The forkless engine runs every
+    /// `( )` body in place already, so the frame boundary that GNU erased
+    /// is exactly the enclosing subshell whose body is one subshell
+    /// command: while this flag is set, a failing subshell command's
+    /// aggregate ERR adjudication is suppressed (rubash#720 form 1,
+    /// `( (false) )` fires 2 not 3).
+    subshell_fork_collapse: std::cell::Cell<bool>,
     /// GNU trap.c:124 trap_saved_exit_value — the shell status snapshot
     /// _run_trap_internal (trap.c:367) takes before running a trap action.
     /// get_exitstat (builtins/common.c:519, POSIX interp 1602) resolves a
@@ -854,6 +875,13 @@ pub struct Executor {
     /// walk re-opens `>f` and would truncate the bytes the child already
     /// wrote live through the shared description (niubash#144).
     pipeline_stage_fds_pre_wired: Cell<bool>,
+    /// Set by `restricted_command_error` when a sequential pipeline stage is
+    /// refused (#804): the driver then skips `route_pipeline_stage_streams`
+    /// for the stage, because the routing walk would OPEN the refused
+    /// redirect's target (`>& f`) and materialize the very file the
+    /// restricted shell must never create — GNU refuses the member inside
+    /// its subshell before do_redirections, so nothing opens.
+    pipeline_stage_restricted_refused: Cell<bool>,
     /// Tracks the source of the last heredoc EOF warning emitted from
     /// command_substitution_heredoc_output_mut_typed, to avoid duplicate
     /// warnings when the same comsub is expanded through multiple paths

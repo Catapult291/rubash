@@ -308,7 +308,15 @@ impl Executor {
         if free {
             want
         } else {
-            self.fd_table.allocate_dynamic()
+            // GNU's fallback for a busy high fd is move_to_high_fd
+            // (general.c:681): it scans downward for a free slot with
+            // fcntl F_GETFD and then dup2()s the descriptor there — a
+            // different mechanism from redir.c:942's fcntl F_DUPFD that
+            // backs {var} allocation. Our fallback instead routes through
+            // the limit-aware low-first allocator, so it is bounded by
+            // the same RLIMIT_NOFILE soft limit (rubash#773) but picks
+            // the lowest free slot rather than GNU's high-side scan.
+            self.allocate_dynamic_fd().unwrap_or(want)
         }
     }
 
@@ -363,12 +371,104 @@ impl Executor {
                 let _ = self.run_debug_trap(&inner_text)?;
             }
         }
+        let display_source = bash_command_source_text(&background_command.command);
+        // GNU execute_cmd.c:5884 (execute_disk_command) / :1761-1763
+        // (execute_in_subshell): the forked async subshell runs
+        // do_redirections(command->redirects, RX_ACTIVE) on its OWN
+        // descriptors and then dispose_redirects before the body executes,
+        // so `sleep 1 >/dev/null 2>&1 &` leaves no process holding the
+        // parent's stdout/stderr open and a caller reading the shell's pipes
+        // to EOF is released when the shell exits (niubash#122). The spawned
+        // `rubash -c` child stands in for that subshell: resolve the
+        // command's own redirections into its stdio here, and strip the
+        // consumed redirects from the serialized `-c` source so the child
+        // does not re-open them — `cmd >f 2>&1` must keep fd1/fd2 on the
+        // same open file description, which only the spawn-time stdio pair
+        // preserves.
+        let (stdio, consumed, captured_pipe_writer) =
+            self.resolve_background_stdio(&background_command.command);
+        // rubash#809: GNU executes a background SIMPLE command as fork+exec —
+        // execute_connection '&' (execute_cmd.c:5562+) forks, and the async
+        // child's execute_simple_command ends in shell_execve for an external,
+        // so no second shell process survives. The `rubash -c` wrapper respawn
+        // below pays one extra process spawn plus a full shell init for every
+        // `&` job (Windows cell: bgwait 750x `sleep &` measured ~2.2ms/job
+        // with the wrapper against ~0.05ms for a direct external spawn; the
+        // Android #809 2.47x gap has the same shape — wrapper respawn vs fork
+        // floor). When the background body is a bare external — no compound
+        // constructs, no assignments or redirects, no alias/function/builtin
+        // resolution, and not a script needing the shell fallback — spawn the
+        // external directly on the same async stdio (resolve_background_stdio
+        // rules apply unchanged). $! then names the external's pid (GNU's
+        // value), and the job table / wait / kill paths see the same
+        // registration shape they already handle for wrappers.
+        //
+        // The gate runs BEFORE any wrapper-only setup (exe resolution, env
+        // block, handle duplication): a direct spawn pays none of it.
+        let direct_plan = if !self.xtrace_enabled() && !captured_pipe_writer {
+            self.background_direct_external_command(&background_command.command)
+        } else {
+            None
+        };
+        if let Some((program, argv)) = direct_plan {
+            let mut process = std::process::Command::new(&program);
+            // argv[0] is the child's image name; the words after the
+            // command name are the real arguments.
+            process.args(&argv[1..]);
+            let [stdin_stdio, stdout_stdio, stderr_stdio] = stdio.map(|resolved| match resolved {
+                BackgroundStdio::Inherit => std::process::Stdio::inherit(),
+                BackgroundStdio::Null => std::process::Stdio::null(),
+                BackgroundStdio::File(file) => std::process::Stdio::from(file),
+            });
+            process
+                .stdin(stdin_stdio)
+                .stdout(stdout_stdio)
+                .stderr(stderr_stdio);
+            // Same environment application as every foreground external
+            // (exported shell vars; no assignments exist at this gate).
+            self.apply_external_environment(&background_command.command, &mut process);
+            // rubash#229/#737 unix arm: reset inherited signal dispositions
+            // in the child exactly like the foreground spawn path. The #737
+            // pdeathsig arm keys off __RUBASH_BACKGROUND_WRAPPER, which is
+            // never set here — a directly-exec'd async child survives shell
+            // exit, as GNU's does.
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+            }
+            match process.spawn() {
+                Ok(child) => {
+                    let pid = child.id();
+                    self.background_children
+                        .insert(pid, crate::fd::SpawnedChild::from(child));
+                    self.shell_state
+                        .job_table
+                        .register_process(pid, display_source.clone(), true);
+                    self.shell_state.job_table.set_job_control(
+                        pid,
+                        crate::builtins::set::shell_option_enabled(
+                            &self.shell_state.env_vars,
+                            "monitor",
+                        ),
+                    );
+                    self.shell_state.last_background_pid = Some(pid);
+                    // GNU expands the async simple command's words in the
+                    // exec'd child; no substitution status may leak into the
+                    // parent's bands (the next command must see the state it
+                    // had before).
+                    self.last_command_substitution_status.set(None);
+                    self.exit_code = 0;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
             .or_else(test_rubash_binary_from_current_exe)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| "rubash".into());
-        let display_source = bash_command_source_text(&background_command.command);
         // Environment block for the child: process env merged with the
         // shell's env_vars (same filter the old Command::env loop applied).
         let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
@@ -425,23 +525,19 @@ impl Executor {
         // wrapper when it's killed — otherwise `kill $!` leaves orphaned
         // grandchildren running (the wrapper is killed but the real work
         // survives).
-        env_map.insert("__RUBASH_BACKGROUND_WRAPPER".to_string(), "1".to_string());
+        // rubash#866: the marker is an unguessable spawn-time nonce carried
+        // by BOTH handshake channels (this env entry and the
+        // --internal-bg-wrapper argv flag spliced in below). The wrapper
+        // child arms its in-process role only when the two agree, then
+        // consumes both — so a user `export __RUBASH_BACKGROUND_WRAPPER=1`
+        // cannot arm PDEATHSIG for children that never went through this
+        // spawn path, and this constant "1" is never trusted again.
+        let wrapper_nonce = crate::builtins::kill::new_background_wrapper_nonce();
+        env_map.insert(
+            crate::builtins::kill::BACKGROUND_WRAPPER_ENV_KEY.to_string(),
+            wrapper_nonce.clone(),
+        );
 
-        // GNU execute_cmd.c:5884 (execute_disk_command) / :1761-1763
-        // (execute_in_subshell): the forked async subshell runs
-        // do_redirections(command->redirects, RX_ACTIVE) on its OWN
-        // descriptors and then dispose_redirects before the body executes,
-        // so `sleep 1 >/dev/null 2>&1 &` leaves no process holding the
-        // parent's stdout/stderr open and a caller reading the shell's pipes
-        // to EOF is released when the shell exits (niubash#122). The spawned
-        // `rubash -c` child stands in for that subshell: resolve the
-        // command's own redirections into its stdio here, and strip the
-        // consumed redirects from the serialized `-c` source so the child
-        // does not re-open them — `cmd >f 2>&1` must keep fd1/fd2 on the
-        // same open file description, which only the spawn-time stdio pair
-        // preserves.
-        let (stdio, consumed, captured_pipe_writer) =
-            self.resolve_background_stdio(&background_command.command);
         let mut child_command = background_command.command.clone();
         strip_consumed_redirects(&mut child_command, &consumed);
         let source = self.background_command_source(&child_command);
@@ -469,6 +565,18 @@ impl Executor {
                 respawn_temp = Some(path);
             }
         }
+        // rubash#866: second handshake channel — the nonce rides argv too,
+        // ahead of every other argument. main() consumes it (with the env
+        // entry above) before the GNU option parser or the `-c` driver sees
+        // anything; the wrapper role arms only when both channels agree.
+        spawn_args.insert(
+            0,
+            format!(
+                "{}{}",
+                crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
+                wrapper_nonce
+            ),
+        );
 
         // GNU forks the async subshell: the child's fd table is a copy of the
         // parent's. std::process::Command cannot express a per-spawn handle
@@ -609,6 +717,198 @@ impl Executor {
         self.shell_state.last_background_pid = Some(pid);
         self.exit_code = 0;
         Ok(())
+    }
+
+    /// rubash#809: resolve a background body to a directly-spawnable external
+    /// — `(program, argv)` — or None when the wrapper respawn must run.
+    /// The gate is deliberately narrow: every construct the `rubash -c`
+    /// wrapper exists to carry (compound semantics, assignment tempenv,
+    /// redirection application, substitution execution, fd>=3 forwarding,
+    /// restricted-shell rejection, alias/function/builtin dispatch, script
+    /// fallback, capture plumbing) falls back to the wrapper, whose behavior
+    /// is unchanged.
+    fn background_direct_external_command(
+        &mut self,
+        command: &CommandNode,
+    ) -> Option<(std::path::PathBuf, Vec<String>)> {
+        // A restricted shell refuses command names carrying `/' before any
+        // dispatch (execute_prepared_command -> restricted_command_error,
+        // pipeline_exec.rs:3564). The wrapper keeps that rejection exactly
+        // where it is today, so any `set -r` session never takes this path.
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted") {
+            return None;
+        }
+        // Only a bare simple command: any compound carrier, connector, or
+        // nested execution form needs the wrapper's subshell semantics.
+        if command.pipe.is_some()
+            || command.pipeline_command.is_some()
+            || command.and_or_list.is_some()
+            || command.and_or.is_some()
+            || command.time_command.is_some()
+            || command.background_command.is_some()
+            || command.inverted_command.is_some()
+            || command.inverted
+            || command.subshell
+            || command.subshell_end
+            || command.subshell_command.is_some()
+            || command.for_command.is_some()
+            || command.arithmetic_command.is_some()
+            || command.if_command.is_some()
+            || command.loop_command.is_some()
+            || command.conditional_command.is_some()
+            || command.case_command.is_some()
+            || command.select_command.is_some()
+            || command.function_command.is_some()
+            || command.brace_group.is_some()
+            || command.coproc_command.is_some()
+        {
+            return None;
+        }
+        // No assignments (tempenv belongs to the child in GNU) and no
+        // redirections beyond the async fd 0-2 stdio rules this caller
+        // already resolved into handles.
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+            || !command.assignment_raws.is_empty()
+            || !command.redirects.is_empty()
+            || command.redirect_in.is_some()
+            || command.redirect_out.is_some()
+            || command.append.is_some()
+            || command.redirect_err.is_some()
+            || command.redirect_err_append.is_some()
+            || command.heredoc.is_some()
+            || command.heredoc_body.is_some()
+            || command.heredoc_delimiter.is_some()
+            || !command.heredoc_redirects.is_empty()
+            || command.here_string.is_some()
+            || command.here_string_carrier.is_some()
+        {
+            return None;
+        }
+        // Process substitutions need the materialization plumbing the
+        // foreground external path owns; leave them to the wrapper.
+        if !command.process_substitutions.is_empty() {
+            return None;
+        }
+        // rubash#809 CR F2: GNU expands the async child's words INSIDE the
+        // forked child. Expanding substitution- or assignment-bearing words
+        // here in the parent would (a) double-fire side effects whenever the
+        // shape then falls back to the wrapper (the wrapper child re-expands
+        // the serialized source — `echo $(echo tick >> log) &` would append
+        // twice), (b) leak `${x:=v}` assignments into the parent shell, and
+        // (c) block the parent on the substitution's runtime. Such shapes
+        // keep the wrapper, whose child expands them exactly as today — the
+        // hot path (`sleep 0 &`, plain/parameter-expansion words) is
+        // unaffected. Raw-text scan: the structured parameter_expansion
+        // nodes are not populated by this parser, and `$((...))` rides the
+        // same `$(` marker as command substitution.
+        if command.word_metadata.iter().any(|metadata| {
+            metadata.raw.contains("$(")
+                || metadata.raw.contains('`')
+                || metadata.raw.contains(":=")
+                || parameter_expansion_assigns(&metadata.raw)
+        }) {
+            return None;
+        }
+        // rubash#180: a persistent `exec 3<file` descriptor must reach the
+        // child. The wrapper forwards live fd>=3 entries through the
+        // __RUBASH_FD_* env channel (spawn_external_process semantics); a
+        // native direct exec cannot, so any open fd>=3 keeps the wrapper.
+        if self
+            .fd_table
+            .entries
+            .iter()
+            .any(|(fd, entry)| *fd >= 3 && !entry.closed)
+        {
+            return None;
+        }
+        if command.words.is_empty() {
+            return None;
+        }
+        // rubash#809 CR F2-R2: the fatal parameter pre-scan lives on the
+        // dispatch path (command_execute.rs -> validate_command_parameter_
+        // expansions), NOT inside expand_command_words — without it the gate
+        // would swallow `set -u` unbound-variable and `${x:?msg}` /
+        // `${x?msg}` verdicts and hand degraded words to argv (sleep executed
+        // with an empty/message argument). Any fatal shape keeps the
+        // wrapper, whose child runs this same scan on its own dispatch and
+        // reports exactly as today. Safe to call here: the F2 arm above
+        // already routed every command-substitution-bearing word to the
+        // wrapper, so the scan's prefix-comsub side-effect replay can never
+        // fire in the parent.
+        if self.parameter_expansion_error(command).is_some() {
+            return None;
+        }
+        // A %jobspec leads execute_prepared_command's fg/bg dispatch, and an
+        // assignment-shaped first word is an assignment command — wrapper.
+        let first_raw = &command.words[0];
+        if first_raw.starts_with('%') {
+            return None;
+        }
+        if let Some((name, _)) = first_raw.split_once('=') {
+            if super::support_names::is_shell_name(name) {
+                return None;
+            }
+        }
+        // Expand with the same machinery the foreground dispatch uses; any
+        // expansion failure falls back to the wrapper, whose child re-parses
+        // the source and reports the error exactly as before. The probe is
+        // SIDE-EFFECT-FREE: GNU expands the async child's words inside the
+        // forked child, so the parent never observes a failglob verdict —
+        // a probe hit used to print `no match` here (the wrapper child
+        // re-reported → doubled, 753.11 line 4) AND arm the parent-side
+        // evalerror discard, which swallowed the rest of the launch line
+        // (`set -- /no/such/*.zzz & echo BG_after` lost its echo). Suppress
+        // the report and restore the expansion latches on the Err path.
+        let saved_exit_code = self.exit_code;
+        let saved_expansion_failed = self.command_expansion_failed.get();
+        let saved_evalerror_pending = self.evalerror_pending.get();
+        let saved_failglob_pending = self.evalerror_failglob_pending.get();
+        let saved_evalerror_line = self.evalerror_line.get();
+        self.expansion_probe_active.set(true);
+        let probe = self.expand_command_words(command);
+        self.expansion_probe_active.set(false);
+        let expanded = match probe {
+            Ok(expanded) => expanded,
+            Err(_) => {
+                self.exit_code = saved_exit_code;
+                self.command_expansion_failed.set(saved_expansion_failed);
+                self.evalerror_pending.set(saved_evalerror_pending);
+                self.evalerror_failglob_pending.set(saved_failglob_pending);
+                self.evalerror_line.set(saved_evalerror_line);
+                return None;
+            }
+        };
+        if self.shell_state.arithmetic_nounset_error.replace(false) {
+            self.shell_state.arithmetic_expansion_error.set(false);
+            return None;
+        }
+        if expanded.words.is_empty() {
+            return None;
+        }
+        let name = &expanded.words[0];
+        // Dispatch precedence (execute_prepared_command): jobspec, builtin,
+        // function and alias names all mean this is not a disk command.
+        if name.starts_with('%')
+            || super::builtin_names::is_shell_builtin_name(name)
+            || self.shell_state.functions.contains_key(name)
+            || (!self.shell_state.aliases.is_empty() && self.shell_state.aliases.contains_key(name))
+        {
+            return None;
+        }
+        // Same PATH resolution execute_external_inner uses; a name that does
+        // not resolve keeps today's child-side "command not found" behavior.
+        let Some(program) =
+            crate::executor::path::find_user_command(name, &self.shell_state.env_vars)
+        else {
+            return None;
+        };
+        // Script files need the shell fallback the wrapper's child provides.
+        if crate::executor::path::should_run_with_shell(&program) {
+            return None;
+        }
+        Some((program, expanded.words))
     }
 
     /// Mirror of GNU do_redirections (redir.c) restricted to fds 0-2 for the
@@ -1371,6 +1671,17 @@ impl Executor {
         cmd: &CommandNode,
         if_command: &IfCommand,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804): the compound's redirects apply before
+        // the body runs, so the refusal must land before any clone, splice
+        // or target creation — GNU leaves no file behind and never runs
+        // the body.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         if self.if_command_needs_alias_scan(if_command) {
             let flat = flatten_if_command_for_alias_scan(cmd, if_command);
             crate::builtins::source::execute_simple_if(self, &flat, 0)?;
@@ -1411,6 +1722,14 @@ impl Executor {
         cmd: &CommandNode,
         loop_command: &LoopCommand,
     ) -> Result<(), ExecuteError> {
+        // RESTRICTED_SHELL (#804): refuse before any splice or creation.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         let mut redirect_cmd = cmd.clone();
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
@@ -1466,6 +1785,19 @@ impl Executor {
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
         self.shell_state.loop_depth = 0;
+
+        // RESTRICTED_SHELL (#804): the subshell's redirects apply inside
+        // the child before the body (do_redirections precedes the list), so
+        // the refusal lands before any splice, anchor or target creation —
+        // nothing is created and the body never runs, like GNU's child
+        // dying at do_redirections with status 1.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
 
         // Assignment prefix (`x=1 (cmd)`, #452): GNU apply_shell_assignments
         // runs the prefix inside the forked child, so the values live only
@@ -1580,6 +1912,21 @@ impl Executor {
             body_owned = Some(body_ast.commands);
         }
         let body: &[CommandNode] = body_owned.as_deref().unwrap_or(&subshell_command.body);
+        // rubash#720 form 1: GNU execute_cmd.c:1799-1806 (execute_in_subshell)
+        // marks a user subshell's WHOLE body CMD_NO_FORK when it is a single
+        // simple or subshell command; execute_cmd.c:662-663 runs a subshell
+        // body so marked IN PLACE inside the already-forked child — no
+        // second fork, no wait_for, and therefore no :769 run_error_trap in
+        // that frame. With `( (false) )` the middle frame never observes the
+        // status, so only the innermost `false` and the outermost waiter
+        // fire ERR (GNU 5.3.0: 2 fires, not 3). The flag scopes exactly the
+        // body execution of a single-subshell-command body.
+        let body_fork_collapsed = body.len() == 1 && body[0].subshell_command.is_some();
+        let saved_fork_collapse = if body_fork_collapsed {
+            Some(self.subshell_fork_collapse.replace(true))
+        } else {
+            None
+        };
         // GNU execute_cmd.c resolves subshell redirections in the parent
         // context before the body runs: expand and anchor relative file
         // targets now, or a `cd` in the body relocates them (niubash#118).
@@ -1604,6 +1951,11 @@ impl Executor {
         let result = self.with_loop_fd_heredocs(cmd, |executor| {
             executor.with_ambient_line(subshell_line, |executor| {
                 executor.with_command_input_redirects(cmd, |executor| {
+                    // rubash#815 profiler: the flat-subshell frame (GNU
+                    // execute_cmd.c:1576 execute_in_subshell). The guard
+                    // spans the EXIT trap too — GNU runs it inside the
+                    // forked child.
+                    let _profiler_subshell = super::profiler::enter_subshell();
                     let body_result = executor.execute_ast_inner(body);
                     // GNU execute_cmd.c execute_in_subshell: expr.c
                     // evalerror's jump_to_top_level(DISCARD) reaches only the
@@ -1654,6 +2006,9 @@ impl Executor {
         let status = match result {
             Ok(()) => body_status.unwrap_or(self.exit_code),
             Err(error) => {
+                if let Some(saved) = saved_fork_collapse {
+                    self.subshell_fork_collapse.set(saved);
+                }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
@@ -1663,6 +2018,9 @@ impl Executor {
         let status = match trap_result {
             Some(Ok(trap_status)) => trap_status,
             Some(Err(error)) => {
+                if let Some(saved) = saved_fork_collapse {
+                    self.subshell_fork_collapse.set(saved);
+                }
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
@@ -1671,6 +2029,9 @@ impl Executor {
             None => status,
         };
 
+        if let Some(saved) = saved_fork_collapse {
+            self.subshell_fork_collapse.set(saved);
+        }
         self.restore_flat_subshell(saved_state, saved_cwd);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
@@ -2608,6 +2969,14 @@ impl Executor {
         // fields the cmd + case_command deep clones and the no-op redirect
         // application only add per-execution churn; keep the ambient line
         // binding (line_number = case_command->line) semantics intact.
+        // RESTRICTED_SHELL (#804): refuse before any splice or creation.
+        if compound_command_has_redirects(cmd) {
+            if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
+                self.write_default_stderr(&message)?;
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         if !compound_command_has_redirects(cmd) {
             let case_line = cmd.line;
             return self.with_ambient_line(case_line, |executor| {
@@ -2791,7 +3160,7 @@ fn if_condition_is_side_effect_free(condition: &[CommandNode]) -> bool {
 /// do. Mirrors every field consulted by materialize_compound_output_
 /// process_substitutions, apply_*_redirects, and with_command_input_redirects
 /// (rubash#619 fast path).
-fn compound_command_has_redirects(cmd: &CommandNode) -> bool {
+pub(in crate::executor) fn compound_command_has_redirects(cmd: &CommandNode) -> bool {
     cmd.redirect_in.is_some()
         || cmd.redirect_out.is_some()
         || cmd.append.is_some()
@@ -2920,6 +3289,49 @@ fn time_prefix_parts(words: &[String]) -> Option<TimePrefixParts> {
         inverted,
         posix_format,
     })
+}
+
+/// rubash#809 CR F2: does a raw word carry an assignment-typed braced
+/// parameter expansion — `${x=v}` / `${x:=v}` (also `${x=[w]}`)? These assign
+/// in the expanding shell, so they must expand in the wrapper child, never in
+/// the parent. `${x:-v}` / `${x-v}` / `${x:?v}` are reads and stay on the
+/// fast path.
+fn parameter_expansion_assigns(raw: &str) -> bool {
+    // All indexing below is on the BYTE slice: every offset is a raw byte
+    // position (no char counting). UTF-8 continuation bytes are >= 0x80, so
+    // the two-byte "${" window can only match at a character boundary, and
+    // the identifier walk only advances over ASCII bytes — both keep
+    // `cursor` on a boundary by construction without slicing `raw`.
+    let bytes = raw.as_bytes();
+    let mut scan_from = 0usize;
+    while scan_from + 1 < bytes.len() {
+        let Some(rel) = bytes[scan_from..]
+            .windows(2)
+            .position(|window| window == b"${")
+        else {
+            break;
+        };
+        let mut cursor = scan_from + rel + 2;
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        if cursor == name_start && cursor < bytes.len() && bytes[cursor] >= 0x80 {
+            // A multibyte character sits where the parameter name would be
+            // (`${中文=…}`): unicode names cannot be classified by the ASCII
+            // walk, so stay conservative and keep the wrapper.
+            return true;
+        }
+        if cursor > name_start
+            && (bytes[cursor..].starts_with(b"=") || bytes[cursor..].starts_with(b":="))
+        {
+            return true;
+        }
+        scan_from = name_start.max(scan_from + 1);
+    }
+    false
 }
 
 fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {

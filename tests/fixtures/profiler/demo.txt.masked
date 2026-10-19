@@ -1,0 +1,39 @@
+
+
+
+                    builtin:[ [2] self T children T
+                    builtin:echo [2] self T children T
+                  fib [2] self T children T
+                $(comsub) [2] self T children T
+                builtin:[ [4] self T children T
+                builtin:echo [4] self T children T
+              fib [4] self T children T
+            $(comsub) [4] self T children T
+            builtin:[ [2] self T children T
+            builtin:echo [2] self T children T
+          fib [2] self T children T
+        $(comsub) [2] self T children T
+        builtin:[ [1] self T children T
+        builtin:echo [1] self T children T
+      builtin:echo [1] self T children T
+      fib [1] self T children T
+    $(comsub) [1] self T children T
+    (subshell) [1] self T children T
+    T    P%    T       1    T  wrap
+    T   P%    T       9    T  fib
+    builtin:echo [1] self T children T
+    builtin:local [1] self T children T
+    external:ls [1] self T children T
+  wrap [1] self T children T
+# rubash script profile (deterministic instrumentation, rubash#815)
+# total wall: T
+(inclusive total/children double-count recursive nesting; self does not)
+== attribution (self-time split; faces sum to total wall) ==
+== call tree ==
+== functions by self time ==
+builtins                T    P%  (21 calls)
+external commands      T   P%  (1 spawns)
+interpreter self       T   P%
+main [1] self T children T
+self        self%  children    calls  total      function
+subshell + comsub      T   P%  (10 frames)

@@ -259,6 +259,24 @@ impl Executor {
         {
             self.maybe_run_error_trap(cmd)?;
             Err(ExecuteError::ExitCode(self.exit_code))
+        } else if matches!(result, Err(ExecuteError::Return(_)))
+            && (self.shell_state.function_depth > 0 || self.source_nest_depth > 0)
+        {
+            // rubash#720 form 4: a `return N` unwinding through dispatch is
+            // the builtin's own completion, not an errexit trigger at THIS
+            // gate. GNU's return_builtin (return.def:57-76) resolves N via
+            // get_exitstat (builtins/common.c) and sh_longjmps the
+            // return_catch (:71-72) — only the invalid-argument arm errors
+            // out (:67-69 posix / :73-75 outside a function). An in-range
+            // return unwinds via execute_function's return_catch, the
+            // function boundary stamps last_command_exit_value = N, and the
+            // CALL's own gate then adjudicates. Firing here would attribute
+            // the loop condition's stale status (`until false` leaves
+            // exit_code = 1 from the failing test) to the return and lose N:
+            // GNU prints ERR:7 and exits 7 for `until false; do f; done`
+            // with `f(){ return 7; }`, not ERR:1 / exit 1. The unwind passes
+            // through to the function (or source) boundary untouched.
+            result
         } else if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
             self.maybe_run_error_trap(cmd)?;
             Err(ExecuteError::ExitCode(self.exit_code))
@@ -273,6 +291,14 @@ impl Executor {
         let Some(word) = cmd.words.first() else {
             return Ok(());
         };
+        // rubash#815 profiler: the simple-command dispatch point (GNU
+        // execute_cmd.c:624 execute_command_internal). The frame is armed as
+        // TENTATIVE here — the real dispatcher classifies it: a function or
+        // external dispatch cancels the frame (the classifier is the
+        // dispatch that actually happened, no second admission list,
+        // rubash#117), and any other return confirms it as a builtin on
+        // drop. Off path: one relaxed AtomicBool load.
+        let _profiler_command = super::profiler::enter_prepared_command(word);
         // GNU execute_cmd.c:4750-4757: a simple command whose first word
         // starts with `%` is a job spec — dispatch to fg (bg when async)
         // before builtin/function/PATH lookup, with the `%` word itself as

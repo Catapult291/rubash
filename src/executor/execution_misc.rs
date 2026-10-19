@@ -161,6 +161,49 @@ pub(in crate::executor) fn is_closed_redirect_target(path: &str) -> bool {
     path == "&-"
 }
 
+/// GNU command.h:57 `WRITE_REDIRECT(ri)` over rubash's RedirectKind: the
+/// redirection directions a restricted shell refuses (vendored redir.c:919
+/// `if (restricted && (WRITE_REDIRECT (ri))) return RESTRICTED_REDIRECT;`).
+/// The set is `>` (r_output_direction), `>>` (r_appending_to), `<>`
+/// (r_input_output), `&>`/`>&word` (r_err_and_out), `&>>`
+/// (r_append_err_and_out), `>|` (r_output_force) — for ANY target
+/// filename, including slash-free ones and `/dev/null`. Read-only input
+/// (`<` `2<`, heredocs, here-strings, `<&N`) and fd dups/closes (`>&N`,
+/// `>&-`) are outside the set and stay allowed (niubash#413 matrix rows
+/// 11/12: rubash used to gate on a slash in the TARGET instead of on the
+/// direction, which let `echo hi > out.txt` through and refused
+/// `cat < /etc/hostname` with the output diagnostic).
+pub(in crate::executor) fn is_restricted_write_redirect(
+    kind: &crate::parser::RedirectKind,
+) -> bool {
+    matches!(
+        kind,
+        crate::parser::RedirectKind::Output
+            | crate::parser::RedirectKind::Append
+            | crate::parser::RedirectKind::ReadWrite
+            | crate::parser::RedirectKind::ClobberOutput
+            | crate::parser::RedirectKind::CombinedOutput
+            | crate::parser::RedirectKind::CombinedAppend
+    )
+}
+
+/// True when a DUP-kind redirect is, on its RAW word, decidable as the
+/// r_err_and_out translation (`>&word` with redirector 1 and a non-digit,
+/// non-variable word — redir.c:832-838). Undecidable shapes (`>&$v`,
+/// `>&2`) return false: the apply-time gate resolves them post-expansion.
+pub(in crate::executor) fn is_raw_err_and_out_redirect(redirect: &crate::parser::Redirect) -> bool {
+    if redirect.kind != crate::parser::RedirectKind::DuplicateOutput {
+        return false;
+    }
+    if redirect.fd.is_some_and(|fd| fd != 1) {
+        return false;
+    }
+    let Some(word) = redirect.target.strip_prefix('&') else {
+        return false;
+    };
+    !word.is_empty() && !word.starts_with('$') && redirect_target_fd(&redirect.target).is_none()
+}
+
 pub(in crate::executor) fn redirect_target_fd(target: &str) -> Option<u32> {
     redirect_target_fd_and_move(target).and_then(|(fd, move_fd)| (!move_fd).then_some(fd))
 }

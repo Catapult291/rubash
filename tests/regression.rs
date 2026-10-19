@@ -437,12 +437,104 @@ fn normalize_snapshot(bytes: &[u8], scratch: &Path) -> Vec<u8> {
 }
 
 #[cfg(windows)]
+/// rubash#812: a space-free directory to anchor machine-absolute paths the
+/// suite lane produces. The ambient temp dir is per-machine layout
+/// (`C:\Users\<name>\AppData\Local\Temp`, a mounted scratch volume, a
+/// spaced system profile) and its SHAPE must never decide snapshot bytes,
+/// so a spaced ambient falls back to `%SystemRoot%\Temp` — the same
+/// candidates the #812 THIS_SH pin uses — and a host where neither is
+/// space-free fails loudly instead of recording divergent bytes.
+fn space_free_temp_root() -> PathBuf {
+    let ambient = std::env::temp_dir();
+    if !ambient.to_string_lossy().contains(' ') {
+        return ambient;
+    }
+    if let Ok(sysroot) = std::env::var("SystemRoot") {
+        let sys_temp = Path::new(&sysroot).join("Temp");
+        if !sys_temp.to_string_lossy().contains(' ') {
+            return sys_temp;
+        }
+    }
+    panic!(
+        "rubash#812: no space-free temp root available; the snapshot lane \
+         cannot produce machine-independent bytes here"
+    );
+}
+
+#[cfg(windows)]
+/// rubash#812: pin THIS_SH to a space-free copy of the engine for suite
+/// runs. The upstream assets expand ${THIS_SH} UNQUOTED
+/// (errors.tests:369 `${THIS_SH} ./errors10.sub`; errors10.sub:10-16 then
+/// re-invokes it for every `after exit:`/`after shift:` status line), and
+/// with no explicit value the engine auto-detects current_exe's FULL path
+/// (executor/init.rs). When the checkout lives under a path containing a
+/// space — any per-machine layout outside this repo — every
+/// sub-invocation word-splits (`.../no: No such file or directory`) and
+/// the errors slice's status lines COLLAPSE: a host-shape-dependent byte
+/// set that no snapshot normalizer can repair (the lines are absent, not
+/// misspelled; errors.snap:63-80 disappears whole). GNU never sees this
+/// because /usr/local/bin/bash has no space, and true-baseline.sh pins
+/// the GNU side contractually (`THIS_SH=$GNU_BASH`); pin the snapshot
+/// side the same way with a copy of this test's own engine named
+/// `bash.exe` under a space-free directory. The engine keeps an inherited
+/// THIS_SH exactly when its basename stem is sh/bash and the path exists
+/// (executor/init.rs `inherited_sh`), so the child resolves ${THIS_SH} to
+/// the pinned copy on every host; a bash-named wrapper is the blessed
+/// conventional-name configuration (same comment). Bytes on a space-free
+/// host are unchanged — the same engine runs either way — so this is not
+/// a re-record; a spaced-host run converges onto the committed bytes.
+fn space_free_this_sh(scratch: &Path) -> (PathBuf, Option<PathBuf>) {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_rubash"));
+    let mut candidates = vec![(scratch.join(".thissh"), None)];
+    if let Ok(sysroot) = std::env::var("SystemRoot") {
+        let sys_temp = Path::new(&sysroot)
+            .join("Temp")
+            .join(format!("rubash-812-thissh-{}", std::process::id()));
+        // The fallback must be cleaned up by the caller (it lives outside
+        // the per-suite scratch dir).
+        candidates.push((sys_temp.clone(), Some(sys_temp)));
+    }
+    for (cdir, cleanup) in candidates {
+        if cdir.to_string_lossy().contains(' ') {
+            continue;
+        }
+        if std::fs::create_dir_all(&cdir).is_ok() {
+            let shadow = cdir.join("bash.exe");
+            if std::fs::copy(&exe, &shadow).is_ok() {
+                return (shadow, cleanup);
+            }
+        }
+    }
+    // The scratch dir passed here is anchored at a space-free root by the
+    // caller (space_free_temp_root), so the first candidate above wins in
+    // practice; the SystemRoot fallback stays as a belt against a future
+    // caller reorder, and the panic below is the loud host-shape failure
+    // the lane prefers over divergent bytes.
+    panic!(
+        "rubash#812: no space-free directory available to pin THIS_SH; \
+         the snapshot lane cannot produce machine-independent bytes here"
+    );
+}
+
+#[cfg(windows)]
 fn run_suite_snapshot(suite: &str) {
     let root = manifest_dir();
     let src = root.join(UPSTREAM_TESTS);
-    let dir = std::env::temp_dir().join(format!("rubash-snap-{suite}-{}", std::process::id()));
+    // rubash#812: anchor the scratch at a space-free root so the suite's
+    // whole path surface (HOME, the .thissh pin, TMPDIR below) keeps one
+    // shape on every host. The scratch path itself is scrubbed by
+    // normalize_snapshot, but what MATTERS is that assets expand the
+    // machine-absolute variables built from it UNQUOTED (see the TMPDIR
+    // pin below), so the space must never be there in the first place.
+    let dir = space_free_temp_root().join(format!("rubash-snap-{suite}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create snapshot scratch dir");
+    // rubash#812: the shell-visible temp dir, pinned like true-baseline.sh
+    // pins the GNU side (`TMPDIR="$w/tmp"` in scripts/true-baseline.sh).
+    // Created eagerly: the assets redirect into $TMPDIR with no mkdir.
+    let suite_tmp = dir.join("tmp");
+    std::fs::create_dir_all(&suite_tmp).expect("create snapshot TMPDIR");
+    let (this_sh, this_sh_cleanup) = space_free_this_sh(&dir);
 
     // Copy the suite and everything it may reference relative to cwd:
     // <suite>.tests plus every <suite>*.{sub,right} neighbor.
@@ -527,6 +619,32 @@ fn run_suite_snapshot(suite: &str) {
         .env_clear()
         .env("PATH", &path)
         .env("HOME", &dir)
+        // rubash#812: the pinned space-free THIS_SH (see
+        // space_free_this_sh) — the one deliberate variable, because the
+        // upstream assets invoke ${THIS_SH} unquoted and the auto-detected
+        // full exe path word-splits on any checkout layout with a space.
+        .env("THIS_SH", &this_sh)
+        // rubash#812, the second machine-absolute variable: the engine
+        // self-injects a Windows TMPDIR default from the process temp dir
+        // (executor/init.rs, the /tmp mapping fixture), and the upstream
+        // assets expand it UNQUOTED for real faces in three slices —
+        // heredoc.tests:115-124 (`cat > ${TMPDIR}/bash-zzz-$$` heredoc
+        // round-trip), quote.tests:136-141 (`printf ... > $TMPDIR/quote-$$`
+        // re-sourced through ${THIS_SH} $TMPDIR/...), and the redir.tests
+        // file battery (redir.tests:35-119, `> $TMPDIR/null-redir-a` plus
+        // the `testf`/`oops -- $1 not found` branch). Under a spaced
+        // ambient TEMP every one of those paths word-splits and the faces
+        // go silent or fall to the oops branch: verified, spaced-TEMP run
+        // shifted heredoc/quote/redir against the committed bytes (heredoc
+        // 1483 -> 1463; redir printed `oops -- /d/temp-812/rub not found`)
+        // while CI's space-free TEMP stayed green — the same machine
+        // dependence as the THIS_SH face one layer over. The value never
+        // prints on a success face in any of the 13 slices (file targets
+        // and PATH assignments only), so pinning it is byte-neutral on a
+        // space-free host and converges spaced hosts onto the committed
+        // bytes; being under the scratch, even a hypothetical leak renders
+        // as the normalized `<T>` shape.
+        .env("TMPDIR", &suite_tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -552,6 +670,9 @@ fn run_suite_snapshot(suite: &str) {
     let snap_path = root.join(SNAPSHOT_DIR).join(format!("{suite}.snap"));
     let normalized = normalize_snapshot(&out.stdout, &dir);
     let _ = std::fs::remove_dir_all(&dir);
+    if let Some(cleanup) = this_sh_cleanup {
+        let _ = std::fs::remove_dir_all(cleanup);
+    }
 
     if std::env::var("RUBASH_REGRESSION_RECORD").as_deref() == Ok("1") {
         std::fs::write(&snap_path, &normalized).expect("record snapshot");
@@ -1728,6 +1849,63 @@ mod issue_704 {
             "command describe status; stderr:\n{stderr}"
         );
     }
+
+    /// 704.2b — builtins/command.def:95-96 `if (list == 0) return
+    /// (EXECUTION_SUCCESS);`: the no-operand early return comes BEFORE the
+    /// describe loop, so `command -v`/`-V` with no names succeeds with no
+    /// output instead of falling through to the any_found accumulator's
+    /// failure. Same rule inside a substitution (the status rides
+    /// last_command_substitution_status).
+    #[test]
+    fn case_2b_command_v_without_operands_succeeds() {
+        let dir = case_scratch("704.2b");
+
+        let code = "command -v; echo direct:$?\n\
+                    command -V; echo verbose:$?\n\
+                    v=$(command -v); echo \"comsub:[${v}] rc:$?\"\n\
+                    v=$(command -V); echo \"comsubV:[${v}] rc:$?\"";
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            stdout, "direct:0\nverbose:0\ncomsub:[] rc:0\ncomsubV:[] rc:0",
+            "no-operand describe status; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "no-operand forms print nothing on stderr; got:\n{stderr}"
+        );
+    }
+
+    /// 704.2c — the substitution entry point shares the any-found rule, and
+    /// the `-V` per-operand "not found" diagnostic still reaches stderr
+    /// while the found operand's description is captured (WSL GNU bash
+    /// 5.3.0 probe: `v=$(command -V echo nosuch_xyz)` -> stdout captures
+    /// "echo is a shell builtin", stderr gets
+    /// "command: nosuch_xyz: not found", rc 0).
+    #[test]
+    fn case_2c_command_v_in_substitution_uses_any_found() {
+        let dir = case_scratch("704.2c");
+
+        let code = "v=$(command -v echo nosuch_xyz); echo \"any:[$v] rc:$?\"\n\
+                    v=$(command -v nosuch_one nosuch_two); echo \"miss:[$v] rc:$?\"\n\
+                    v=$(command -V echo nosuch_xyz); echo \"verbose:[$v] rc:$?\"";
+        let out = run_rubash_in(&dir, &["-c", code], Duration::from_secs(30));
+        let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            stdout, "any:[echo] rc:0\nmiss:[] rc:1\nverbose:[echo is a shell builtin] rc:0",
+            "substituted describe status; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("command: nosuch_xyz: not found"),
+            "-V not-found diagnostic must reach stderr; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("nosuch_one: not found"),
+            "-v (reusable) stays silent about misses; stderr:\n{stderr}"
+        );
+    }
 }
 
 /// rubash#759: `dirs -l` is the LONG form (`$HOME` stays un-collapsed), not the
@@ -2610,6 +2788,73 @@ fn sudo_is_not_reported_as_a_builtin() {
     assert!(
         !stdout.contains("sudo is a shell builtin"),
         "`type sudo` must not report a builtin: {stdout}"
+    );
+}
+
+/// #813 item 2 (the #810 CR F4 coverage gap, arm 1): with no elevation
+/// handler installed (the CLI binary's default), `sudo cmd` must take the
+/// PATH execution route — a fake `sudo` earlier on PATH actually runs and
+/// its status becomes the command's. Before #810 the name was answered by
+/// the host builtin with "elevation handler is not configured" (rc 1) and
+/// nothing on PATH was consulted. `routes_as_builtin`
+/// (src/executor/lookup_paths.rs) is the gate: windows + handler = builtin,
+/// everything else = PATH.
+#[cfg(windows)]
+#[test]
+fn sudo_without_handler_executes_the_path_command() {
+    let dir = case_scratch("813.sudo.path");
+    let bindir = dir.join("fakebin");
+    std::fs::create_dir_all(&bindir).expect("create fakebin");
+    // cmd.exe batch: emit a marker line, pass the child's status through.
+    std::fs::write(
+        bindir.join("sudo.cmd"),
+        "@echo off\r\necho FAKE_SUDO_RAN %*\r\nexit /b 0\r\n",
+    )
+    .expect("write fake sudo");
+    let script = format!(
+        "export PATH='{}':\"$PATH\"\nsudo --preserve-env probe\necho \"rc:$?\"",
+        bindir.display()
+    );
+    let out = run_rubash_in(&dir, &["-c", &script], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("FAKE_SUDO_RAN --preserve-env probe"),
+        "fake PATH sudo must actually run: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("rc:0"),
+        "fake sudo's status must become the command status: {stdout}"
+    );
+    assert!(
+        !stderr.contains("elevation handler"),
+        "the no-handler diagnostic must not resurface: {stderr}"
+    );
+}
+
+/// #813 item 2 (the #810 CR F4 coverage gap, arm 2): `builtin sudo` with no
+/// elevation handler falls through the hidden-builtin dispatch to
+/// `write_builtin_not_found` (src/executor/builtin_direct_command.rs) —
+/// GNU's "not a shell builtin" wording, rc 1.
+#[cfg(windows)]
+#[test]
+fn builtin_sudo_without_handler_reports_not_a_shell_builtin() {
+    let dir = case_scratch("813.sudo.builtin");
+    let out = run_rubash_in(
+        &dir,
+        &["-c", "builtin sudo\necho \"rc:$?\""],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout.trim_end(),
+        "rc:1",
+        "the builtin fall-through must fail rc 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("builtin: sudo: not a shell builtin"),
+        "GNU wording expected: {stderr}"
     );
 }
 

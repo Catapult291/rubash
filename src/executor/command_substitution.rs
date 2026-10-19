@@ -582,6 +582,12 @@ impl Executor {
         source: &str,
         context: SubstitutionQuoteContext,
     ) -> String {
+        // rubash#815 profiler: the command-substitution frame (subst.c:7143
+        // command_substitute) — the fork face of the attribution three-way
+        // split. enter_comsub deduplicates the engine's nested dispatch
+        // entries (the mut typed dispatcher opens its own; the typed child
+        // path below routes through this one).
+        let _profiler_comsub = super::profiler::enter_comsub();
         self.last_command_substitution_status.set(Some(0));
         self.last_command_substitution_parse_error.set(false);
         // A command substitution is a subshell boundary: GNU runs the body
@@ -691,21 +697,6 @@ impl Executor {
             self.shell_state.subshell_depth.set(saved_depth);
             return result;
         }
-        // GNU execute_cmd.c:4648-4649: every simple command — `true`,
-        // `false`, `:` included — prints its xtrace head line inside the
-        // substitution child. The hardcoded status shortcuts cannot express
-        // that side effect, so under `set -x` they are disqualified (the
-        // rubash#117 whitelist discipline: a shortcut must be provably
-        // equivalent, and it is not when tracing) and the body falls to the
-        // real parser/executor below, which traces it (rubash#254).
-        if source == "false" && !self.xtrace_enabled() {
-            self.last_command_substitution_status.set(Some(1));
-            return String::new();
-        }
-        if matches!(source, "true" | ":") && !self.xtrace_enabled() {
-            self.last_command_substitution_status.set(Some(0));
-            return String::new();
-        }
         if let Some(rest) = source.strip_prefix('<') {
             // GNU subst.c:7162-7179 command_substitute: a body whose first
             // non-blank character is `<` (not followed by `<`, `>`, or `&`)
@@ -752,6 +743,24 @@ impl Executor {
             if let Some(output) = self.command_list_substitution_output(source, context) {
                 return output;
             }
+            return String::new();
+        }
+        // GNU execute_cmd.c:4648-4649: every simple command — `true`,
+        // `false`, `:` included — prints its xtrace head line AND fires an
+        // inherited DEBUG trap inside the substitution child (the comsub
+        // child keeps the trap under functrace, trap.c:1466-1474). The
+        // hardcoded status shortcuts can express neither side effect, so
+        // under `set -x` or under the functrace+DEBUG gate above they are
+        // disqualified (the rubash#117 whitelist discipline: a shortcut must
+        // be provably equivalent, and it is not when tracing or when the
+        // inherited DEBUG trap fires) and the body falls to the real
+        // parser/executor below (rubash#254, rubash#825).
+        if source == "false" && !self.xtrace_enabled() {
+            self.last_command_substitution_status.set(Some(1));
+            return String::new();
+        }
+        if matches!(source, "true" | ":") && !self.xtrace_enabled() {
+            self.last_command_substitution_status.set(Some(0));
             return String::new();
         }
         // cd/pwd and heredoc word shortcuts predate the triviality gate and
@@ -1105,7 +1114,22 @@ impl Executor {
             // so a glob pattern would be a literal path, not a match list.
             self.expand_word(word)
         } else {
-            self.home_value()
+            // GNU builtins/cd.def:316-322: the operand-less cd refuses only
+            // a MISSING HOME (`dirname == 0`); a set-but-EMPTY value flows
+            // on through make_absolute and lands on the cwd. Delegate that
+            // case to the real cd/pwd pair (None = no fast path) so the
+            // shortcut cannot drift from the builtin; only the missing case
+            // takes the fast verdict (cd.def:320-321). (#754 family: one
+            // HOME baseline per operation.)
+            match self.shell_state.env_vars.get("HOME") {
+                Some(home) if !home.is_empty() => home.clone(),
+                Some(_) => return None,
+                None => {
+                    eprintln!("{}cd: HOME not set", self.parser_diagnostic_prefix());
+                    self.last_command_substitution_status.set(Some(1));
+                    return Some(String::new());
+                }
+            }
         };
         let target_display = target.clone();
         let target = shell_path_to_windows(&target, &self.shell_state.env_vars);
@@ -1218,6 +1242,10 @@ impl Executor {
 
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // rubash#815: the comsub frame is opened by the dispatch entries
+        // (expand_command_substitution_with_context / the mut typed
+        // dispatcher) — every route into this child executor passes one of
+        // them, so no second frame is opened here.
         // GNU subst.c:7393-7404 (command_substitute child): the body runs
         // through parse_and_execute inside the forked child, whose top_level
         // setjmp turns a fatal word-expansion longjmp (FORCE_EOF/DISCARD)
@@ -1519,9 +1547,11 @@ impl Executor {
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
             line_env_os_value: std::cell::RefCell::new(None),
+            expansion_probe_active: std::cell::Cell::new(false),
             return_trap_running: false,
             signal_trap_running: false,
             error_trap_running: false,
+            subshell_fork_collapse: std::cell::Cell::new(false),
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
             source_nest_depth: 0,
@@ -1539,6 +1569,7 @@ impl Executor {
             comsub_stdin_writeback: Cell::new(None),
             pipeline_stdin_consumed: Cell::new(None),
             pipeline_stage_fds_pre_wired: std::cell::Cell::new(false),
+            pipeline_stage_restricted_refused: std::cell::Cell::new(false),
             last_heredoc_warning_source: RefCell::new(None),
             comsub_leading_newlines: Cell::new(0),
             current_shell_substitution_exit: Cell::new(self.current_shell_substitution_exit.get()),
@@ -1655,6 +1686,9 @@ impl Executor {
         }
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // rubash#815 profiler: the `${ ... }` funsub runs as "nofork comsub"
+        // (subst.c:7101) — same independent fork-face frame as `$(...)`.
+        let _profiler_comsub = super::profiler::enter_comsub();
         // GNU subst.c:7101 runs the funsub body through parse_and_execute
         // ("nofork comsub") → evalstring.c:348 indirection_level++, so the
         // body's traces render one PS4 level deeper (`${ echo cur; }` under

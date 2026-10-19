@@ -324,21 +324,36 @@ mod plat {
 
     const KEY_PREFIX: &str = "__RUBASH_ULIMIT_";
 
+    /// Cell key for one resource. The option letter is UPPERCASED: the
+    /// consumers of these cells (`__RUBASH_ULIMIT_N` in
+    /// executor/trap_exec.rs `open_files_limit`, the `_N`/`_C`/`_F` rows of
+    /// the spawn-inheritance whitelist in executor/compound_exec.rs) all
+    /// spell the letter uppercase. rubash#773: the key used to carry the
+    /// typed lowercase letter, so every reader missed it — the emulated
+    /// limit existed but never reached the fd allocator, leaving that
+    /// capped at its homemade 1024 ceiling.
     fn key(option: char) -> String {
-        format!("{KEY_PREFIX}{option}")
+        format!("{KEY_PREFIX}{}", option.to_ascii_uppercase())
     }
 
-    /// Emulated defaults (documented in the module platform-contract note):
-    /// the old stub's visible values where it had an opinion (f/d/t/u/v
-    /// unlimited, n soft 1024, p 8x512, s 8192 kbytes), core off like a
-    /// stock Linux kernel, plus the remaining oracle-table rows.
+    /// Emulated defaults (documented in the module platform-contract note).
+    /// `n` mirrors the WSL GNU bash 5.3.0 oracle's own RLIMIT_NOFILE
+    /// (2026-10-19 probe) — the old stub's soft-1024 opinion is what capped
+    /// the fd table at 1014 `{fd}` allocations with a bogus EINVAL
+    /// (rubash#773). The pair is sourced from executor/fd_table.rs so the
+    /// reporting side and the allocator ceiling can never drift apart
+    /// (rubash#872): DEFAULT_OPEN_FILES_SOFT_LIMIT is what the fd
+    /// allocator clamps to, UNLIMITED_OPEN_FILES_CEILING is the hard cap.
     fn default_for(option: char) -> (u64, u64) {
         match option {
             'c' => (0, UNLIMITED), // Linux-typical: core dumps off by default
             'e' | 'r' => (0, 0),
-            'n' => (1024, 4096),
+            'n' => (
+                crate::executor::fd_table::FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT as u64,
+                crate::executor::fd_table::FdTable::UNLIMITED_OPEN_FILES_CEILING as u64,
+            ),
             'p' => (4096, 4096),
-            'q' => (819200, 819200),
+            'q' => (819_200, 819_200),
             's' => (8_388_608, UNLIMITED),
             _ => (UNLIMITED, UNLIMITED),
         }

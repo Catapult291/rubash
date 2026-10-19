@@ -874,11 +874,33 @@ impl Executor {
             return false;
         };
         let key = format!("__RUBASH_ALIAS_LINE_{word}");
-        self.shell_state
+        if self
+            .shell_state
             .env_vars
             .get(&key)
             .and_then(|line| line.parse::<usize>().ok())
-            == Some(current_line)
+            != Some(current_line)
+        {
+            return false;
+        }
+        // rubash#817: the physical line alone misfires across nested read
+        // units — a definition recorded by a `source`d file (renumbered
+        // from 1 per file) or an `eval` string (caller_line + i - 1)
+        // collides with the sourcer's own later physical lines, and GNU
+        // expands there: the rule is same-READ, not same-line (parse.y
+        // expands an alias only for tokens read after the definition in
+        // the same input stream). Suppress only when the executing
+        // generation matches the definition's; sibling units never share
+        // a value (monotonic ceiling), and a marker predating the
+        // generation field reads as generation 0 — the top level's own.
+        let gen_key = format!("__RUBASH_ALIAS_GEN_{word}");
+        let defined_generation = self
+            .shell_state
+            .env_vars
+            .get(&gen_key)
+            .and_then(|generation| generation.parse::<usize>().ok())
+            .unwrap_or(0);
+        defined_generation == self.shell_state.read_generation
     }
 }
 

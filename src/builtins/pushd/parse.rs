@@ -8,6 +8,10 @@ pub(super) enum PushdOperand {
         index: usize,
         from_right: bool,
         no_cd: bool,
+        /// The raw ±N word. GNU hands the word itself to pushd_error
+        /// (pushd.def:242 walks it inline), so the range diagnostic echoes
+        /// the offending operand verbatim — never a trailing option word.
+        word: String,
     },
     Dir {
         dir: String,
@@ -15,7 +19,7 @@ pub(super) enum PushdOperand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PopdOperand {
     Top {
         no_cd: bool,
@@ -24,6 +28,10 @@ pub(super) enum PopdOperand {
         index: usize,
         from_right: bool,
         no_cd: bool,
+        /// The raw ±N word: popd's walk records it as which_word
+        /// (pushd.def:374-377) and hands it to pushd_error at :382/:414,
+        /// so `popd +5 -n` reports "+5", not the option that follows it.
+        word: String,
     },
 }
 
@@ -57,6 +65,7 @@ where
             index: arg[1..].parse::<usize>().unwrap_or(usize::MAX),
             from_right: arg.starts_with('-'),
             no_cd,
+            word: arg.to_string(),
         }));
     }
 
@@ -84,6 +93,16 @@ where
     }
 
     let arg = args[0];
+    // GNU builtins/pushd.def:318 popd_builtin()'s option walk treats an
+    // operand word that expanded to the empty string as the END of the
+    // argument list (`else if (*list->word->word) { invalid argument } else
+    // break;`, pushd.def:356-363) — `HOME=; popd ~` lands here with "" and
+    // performs the default top-of-stack pop instead of erroring (#754
+    // family: an empty tilde expansion is a real word, and each builtin
+    // judges it by its own operand rules).
+    if arg.is_empty() {
+        return Ok(Some(PopdOperand::Top { no_cd }));
+    }
     if !is_stack_index(arg) {
         // GNU popd.def: a ±-shaped non-number is get_numeric_arg's
         // `%s: invalid number`; anything else in the operand position is
@@ -102,6 +121,7 @@ where
         index,
         from_right: arg.starts_with('-'),
         no_cd,
+        word: arg.to_string(),
     }))
 }
 

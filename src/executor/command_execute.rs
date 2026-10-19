@@ -93,6 +93,17 @@ impl Executor {
                 && self.errexit_is_active()
                 && self.exit_code != 0
             {
+                // rubash#720: GNU's user-subshell wait path adjudicates the
+                // ERR trap BEFORE the errexit jump — execute_cmd.c:769-778
+                // runs run_error_trap and :777-795 then jumps ERREXIT (that
+                // site runs no ERR fire of its own), so `set -E; set -e;
+                // trap 'echo E' ERR; (false)` prints E and exits 1. Under
+                // the rubash#720 fork-collapse this frame performs no
+                // wait-side adjudication at all (execute_cmd.c:662-663
+                // skips wait_for) — the failure is observed one frame up.
+                if !self.subshell_fork_collapse.get() {
+                    self.maybe_run_error_trap(cmd)?;
+                }
                 return Err(ExecuteError::ExitCode(self.exit_code));
             }
             return result;
@@ -1060,8 +1071,10 @@ impl Executor {
             return false;
         }
         let expanded = self.expand_word(first);
-        crate::executor::builtin_names::is_shell_builtin_name(&expanded)
-            || self.routes_as_builtin(&expanded)
+        // routes_as_builtin already covers the pure builtin table on both
+        // platforms (lookup_paths.rs) — testing is_shell_builtin_name
+        // separately is a subsumed disjunct (#813 item 4).
+        self.routes_as_builtin(&expanded)
             || self.function_name_for_command_word(&expanded).is_some()
     }
 

@@ -1304,8 +1304,19 @@ impl Executor {
             // literal  bytes in storage and every later read
             // (rubash#179: x="a*$(echo hi)*b"; echo $x printed
             // a*hi*b).
-            let prefix = crate::executor::markers::dequote_ctlesc_pairs(
-                &self.expand_embedded_parameters_mut(value.get(cursor..span.start)?),
+            // rubash#796: the ANSI_C_IFS_GUARD is field-split transport
+            // (rubash#379); an assignment value never field-splits, so this
+            // boundary drops the BARE guard exactly like the funnel's tail
+            // strip. It must fall here, BEFORE append_expanded_shell_text:
+            // the payload splice re-encodes marker-zone glyphs with the
+            // E400 literal-char escape, and an escaped E400 E401 pair is
+            // indistinguishable from rubash#735 user data — the tail strip
+            // would preserve it and the guard byte would reach the cell
+            // (`v2=$'p\nq'$(echo r)s` stored 6 characters instead of 5).
+            let prefix = crate::executor::markers::strip_ansi_c_ifs_guard(
+                &crate::executor::markers::dequote_ctlesc_pairs(
+                    &self.expand_embedded_parameters_mut(value.get(cursor..span.start)?),
+                ),
             );
             // Walker output is storage-domain text, not source text: its
             // raw-byte marker pairs are transport for payload bytes. GNU's
@@ -1333,8 +1344,13 @@ impl Executor {
             word.append_substitution(output);
             cursor = span.end;
         }
-        let suffix = crate::executor::markers::dequote_ctlesc_pairs(
-            &self.expand_embedded_parameters_mut(value.get(cursor..)?),
+        // Same guard drop as the prefix fragment above (rubash#796): the
+        // suffix's bare guard must not ride the payload splice into an
+        // E400-escaped pair.
+        let suffix = crate::executor::markers::strip_ansi_c_ifs_guard(
+            &crate::executor::markers::dequote_ctlesc_pairs(
+                &self.expand_embedded_parameters_mut(value.get(cursor..)?),
+            ),
         );
         // Same payload provenance as the prefix fragment above (rubash#296).
         word.append_expanded_shell_text(&suffix, true);

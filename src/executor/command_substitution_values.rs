@@ -2,220 +2,6 @@ use super::*;
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 
 impl Executor {
-    pub(in crate::executor) fn command_substitution_pipeline_filter(
-        &self,
-        words: &[String],
-        input: &str,
-    ) -> Option<(String, i32)> {
-        match words.first().map(String::as_str)? {
-            "sort" => {
-                // Only bare `sort` and `sort -u` are represented inline; any
-                // other flag (`-r`, `-n`, ...) or a file operand must run the
-                // real sort instead of being silently ignored.
-                let mut unique = false;
-                for word in &words[1..] {
-                    match self.expand_word(word).as_str() {
-                        "-u" => unique = true,
-                        _ => return None,
-                    }
-                }
-                let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
-                lines.sort();
-                if unique {
-                    lines.dedup();
-                }
-                let mut output = lines.join("\n");
-                if !output.is_empty() {
-                    output.push('\n');
-                }
-                Some((output, 0))
-            }
-            "sed" => {
-                let args = words[1..]
-                    .iter()
-                    .map(|word| {
-                        self.expand_word(word)
-                            .replace(crate::executor::markers::PROTECTED_BACKSLASH, "\\")
-                            .replace(DATA_DOLLAR, "$")
-                            .replace(crate::executor::markers::CTLESC, "")
-                    })
-                    .collect::<Vec<_>>();
-                apply_simple_sed_args(input, &args).map(|output| (output, 0))
-            }
-            "tr" => {
-                let args = words[1..]
-                    .iter()
-                    .map(|word| {
-                        self.expand_word(word)
-                            .replace(crate::executor::markers::PROTECTED_BACKSLASH, "\\")
-                            .replace(DATA_DOLLAR, "$")
-                    })
-                    .collect::<Vec<_>>();
-                // niubash#166: option-shaped words (`tr -d b`) are not set operands —
-                // never take the translate fast path.
-                if args.iter().any(|arg| arg.starts_with('-')) {
-                    return None;
-                }
-                if args.len() != 2 {
-                    return None;
-                }
-                if matches!(args[0].as_str(), "\\n" | "\n") {
-                    Some((input.replace('\n', &args[1]), 0))
-                } else if crate::executor::pipeline_exec::inline_expand_tr_set(&args[0]).is_some()
-                    && crate::executor::pipeline_exec::inline_expand_tr_set(&args[1]).is_some()
-                {
-                    Some((
-                        crate::executor::pipeline_exec::translate_tr(input, &args[0], &args[1]),
-                        0,
-                    ))
-                } else {
-                    // Syntax the inline fast path cannot represent must run
-                    // the real external `tr`.
-                    None
-                }
-            }
-            "head" => {
-                let args = words[1..]
-                    .iter()
-                    .map(|word| self.expand_word(word))
-                    .collect::<Vec<_>>();
-                // Byte mode, unknown options, operands and malformed/missing
-                // counts must run the real head (niubash#708); only the plain
-                // line-count shapes are represented inline.
-                let spec = crate::executor::pipeline_exec::parse_head_line_count(&args)?;
-                Some((spec.apply(input), 0))
-            }
-            "grep" => {
-                // The inline fast path only represents the exact two-word
-                // form `grep PATTERN`. Flags (`-c`, `-n`, ...), `--`, and
-                // file operands change semantics this arm cannot model, and
-                // treating them as the pattern produced silently empty or
-                // wrong captures; fall back to the real parser, which runs
-                // the actual grep (its stderr is not swallowed there).
-                if words.len() != 2 {
-                    return None;
-                }
-                let raw_pattern = words[1].as_str();
-                if raw_pattern.starts_with('-') && raw_pattern.len() > 1 {
-                    return None;
-                }
-                let pattern = self.expand_word(raw_pattern);
-                let mut output = String::new();
-                let mut matched = false;
-                for line in input.split_inclusive('\n') {
-                    let comparable = line.strip_suffix('\n').unwrap_or(line);
-                    if crate::executor::simple_grep_pattern_matches(comparable, &pattern) {
-                        matched = true;
-                        output.push_str(line);
-                        if !line.ends_with('\n') {
-                            output.push('\n');
-                        }
-                    }
-                }
-                Some((output, i32::from(!matched)))
-            }
-            "wc" => {
-                let option = words.get(1).map(String::as_str).unwrap_or("-l");
-                let value = match option {
-                    // niubash#383: the substitution input is transport text,
-                    // so a byte count must decode the carrier pairs first
-                    // (0x1B is stored as U+E000 U+E01B, six bytes) instead of
-                    // measuring the encoding. `-l` needs no decode: 0x0A is
-                    // not a carrier byte.
-                    "-c" => {
-                        crate::executor::substitution_metadata::shell_text_to_raw_bytes(input).len()
-                    }
-                    "-l" => input.bytes().filter(|byte| *byte == b'\n').count(),
-                    _ => return None,
-                };
-                Some((format!("{value}\n"), 0))
-            }
-            "tail" => {
-                let args = words[1..]
-                    .iter()
-                    .map(|word| self.expand_word(word))
-                    .collect::<Vec<_>>();
-                // Byte mode has no line-count representation; the real tail
-                // must run instead of silently emitting whole lines.
-                if args.iter().any(|a| a == "-c" || a == "--bytes") {
-                    return None;
-                }
-                let count = crate::executor::pipeline_exec::head_line_count(&args).unwrap_or(10);
-                let lines = input.split_inclusive('\n').collect::<Vec<_>>();
-                let start = lines.len().saturating_sub(count);
-                Some((lines[start..].concat(), 0))
-            }
-            "uniq" => {
-                // No uniq flags (`-d`, `-u`, `-c`, ...) or operands are
-                // represented inline; anything beyond bare `uniq` must run
-                // the real uniq rather than silently ignoring the flag.
-                if words.len() != 1 {
-                    return None;
-                }
-                let mut output = String::new();
-                let mut previous = None;
-                for line in input.split_inclusive('\n') {
-                    let comparable = line.strip_suffix('\n').unwrap_or(line);
-                    if previous != Some(comparable) {
-                        output.push_str(line);
-                    }
-                    previous = Some(comparable);
-                }
-                Some((output, 0))
-            }
-            _ => {
-                let cmd_name = self.expand_word(&words[0]);
-                let expanded_args: Vec<String> =
-                    words[1..].iter().map(|w| self.expand_word(w)).collect();
-                use std::io::Write;
-                use std::process::Stdio;
-                let program = find_user_command(&cmd_name, &self.shell_state.env_vars)?;
-                let (dev_args, dev_ops) = self.materialize_dev_fd_operands(
-                    &expanded_args,
-                    crate::executor::dev_fd_operands::DevOperandStdin::Payload(
-                        crate::executor::substitution_metadata::shell_text_to_raw_bytes(input),
-                    ),
-                    crate::executor::dev_fd_operands::DevOperandStdout::Capture,
-                );
-                let (mut process, _) = external_command_for_named_program(
-                    &program,
-                    Some(&cmd_name),
-                    &dev_args,
-                    &self.shell_state.env_vars,
-                );
-                self.apply_child_environment(&mut process);
-                // rubash#438: /dev/fd/N operand words stay literal on Unix;
-                // pin the substitution pipe read ends at their numbers.
-                #[cfg(unix)]
-                crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(
-                    &mut process,
-                    &dev_ops,
-                );
-                let mut child = process
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok()?;
-                child
-                    .stdin
-                    .as_mut()?
-                    .write_all(
-                        &crate::executor::substitution_metadata::shell_text_to_raw_bytes(input),
-                    )
-                    .ok()?;
-                let mut output = child.wait_with_output().ok()?;
-                output.stdout.extend(self.collect_dev_fd_capture(&dev_ops));
-                Some((
-                    crate::executor::substitution_metadata::bytes_to_shell_text(&output.stdout)
-                        .trim_capture_terminator()
-                        .to_string(),
-                    crate::executor::wait_status::process_exit_status(&output.status),
-                ))
-            }
-        }
-    }
-
     /// Expand one command-substitution argument word, applying pathname
     /// expansion for unquoted words. GNU Bash runs expand_words (subst.c)
     /// on the substitution body's word list before dispatching the command:
@@ -305,16 +91,37 @@ impl Executor {
         };
 
         let mut stdout = Vec::new();
-        let mut status = 0;
-        for name in &words[1 + first_name..] {
+        // rubash#704 R6.2: same GNU any-found rule as the direct path
+        // (builtins/command.def:111-121): one resolved operand suffices for
+        // status 0, and the command.def:95-96 no-operand early return makes
+        // `$(command -v)` succeed with empty output.
+        let mut any_found = false;
+        let names = &words[1 + first_name..];
+        if names.is_empty() {
+            self.last_command_substitution_status.set(Some(0));
+            return Some(String::new());
+        }
+        for name in names {
             let name = self.expand_word(name);
             match self.describe_name_with_io(&name, mode, use_standard_path, false, &mut stdout) {
-                Ok(true) => {}
-                Ok(false) => status = 1,
-                Err(_) => status = 1,
+                Ok(true) => any_found = true,
+                // command.def:115-117: the per-operand "not found" diagnostic
+                // belongs to -V only, and GNU routes it to the shell's stderr
+                // even from inside a substitution (oracle probe:
+                // `$(command -V echo nosuch)` captures the description while
+                // `command: nosuch: not found` reaches stderr). eprintln! is
+                // this file's established carrier for expansion-time stderr
+                // (the `cat` shortcut above the describe call).
+                Ok(false) => {
+                    if mode == TypeDescribeMode::Verbose {
+                        eprintln!("{}command: {name}: not found", self.diagnostic_prefix());
+                    }
+                }
+                Err(_) => {}
             }
         }
-        self.last_command_substitution_status.set(Some(status));
+        self.last_command_substitution_status
+            .set(Some(if any_found { 0 } else { 1 }));
         Some(
             crate::executor::substitution_metadata::bytes_to_shell_text(&stdout)
                 .trim_capture_terminator()

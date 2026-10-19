@@ -451,8 +451,19 @@ impl Executor {
         let expression = if preexpansion_is_identity {
             std::borrow::Cow::Borrowed(expression)
         } else {
-            let with_assoc_keys =
-                self.expand_arithmetic_assoc_subscripts(expression, assoc_noexpand);
+            let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+                expression,
+                assoc_noexpand,
+                // GNU expr.c:340,368: the `let` operand arrives EXP_EXPANDED
+                // (already word-expanded), so `$'...'` is data there, while
+                // the `(( ))` body reaches expand_subscript_string raw and
+                // its ANSI-C arm decodes (issue rubash#828).
+                if expand {
+                    crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode
+                } else {
+                    crate::executor::subscript_expansion::ArithAnsiSpanMode::LetOperand
+                },
+            );
             let expanded = if expand {
                 self.expand_arithmetic_expression_mut(&with_assoc_keys)
             } else {
@@ -712,8 +723,14 @@ impl Executor {
         // GNU arrayfunc.c:1376 evalexp(t, eflag): eflag=0 for compat>51 —
         // the nested assoc subscript scan stays flag-0 even under
         // array_expand_once (AV_NOEXPAND applied to the OUTER subscript's
-        // expand_arith_string, not this inner evaluation).
-        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(&reexpanded, false);
+        // expand_arith_string, not this inner evaluation). The nested scan
+        // is a reader-side expand_subscript_string pass, so its `$'...'`
+        // spans decode (issue rubash#828).
+        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+            &reexpanded,
+            false,
+            crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode,
+        );
 
         let expression = normalize_arithmetic_quotes(&with_assoc_keys);
         // GNU expr.c:1190-1216 expr_streval: an unset (or invisible)
@@ -895,7 +912,13 @@ impl Executor {
             }
             return None;
         }
-        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(expression, false);
+        // `$(( ))` is a reader entry: GNU's expand_subscript_string decodes
+        // the raw `$'...'` spelling (issue rubash#828).
+        let with_assoc_keys = self.expand_arithmetic_assoc_subscripts(
+            expression,
+            false,
+            crate::executor::subscript_expansion::ArithAnsiSpanMode::Decode,
+        );
         let expanded = self.expand_arithmetic_expression_mut(&with_assoc_keys);
         let expression = normalize_arithmetic_quotes(&expanded);
         *self.arithmetic_last_eval_input.borrow_mut() = expression.to_string();
@@ -1019,6 +1042,7 @@ impl Executor {
         &mut self,
         expression: &str,
         noexpand: bool,
+        ansi_mode: crate::executor::subscript_expansion::ArithAnsiSpanMode,
     ) -> String {
         let bytes = expression.as_bytes();
         let mut output = String::with_capacity(expression.len());
@@ -1096,13 +1120,44 @@ impl Executor {
                         // only the lexer's data-quote/dollar markers come
                         // back to their characters (eval_indexed_subscript_
                         // expression's ExpandedOnce branch does the same).
-                        raw.replace('', "$")
-                            .replace('', "`")
-                            .replace('', "\\")
-                            .replace('', "'")
-                            .replace('', "\"")
+                        raw.replace(crate::executor::markers::DATA_DOLLAR, "$")
+                            .replace(crate::executor::markers::DATA_BACKTICK, "`")
+                            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+                            .replace(crate::executor::markers::DATA_SQUOTE, "'")
+                            .replace(crate::executor::markers::DATA_DQUOTE, "\"")
                     } else {
-                        self.expand_assoc_subscript_once(raw)
+                        let key = self.expand_assoc_subscript_once(raw, ansi_mode);
+                        if key.is_empty() {
+                            // rubash#860 empty-span family: the resolution is
+                            // empty, and GNU's law branches on the TOKEN text
+                            // (the bracket content after the body-level
+                            // expansion kept single quotes and stripped double
+                            // quotes). Route the parser into the right class
+                            // instead of encoding an empty key: an empty
+                            // token text takes the `name[]` law (bind:
+                            // `` `name[]': not a valid identifier ``; read:
+                            // `name[]` x2), a nonempty one (`['']`,
+                            // `[$'']`) takes the `*akey == 0` law (bind:
+                            // `name['']: bad array subscript`, no store;
+                            // read: bare `name` once).
+                            if self.arith_assoc_subscript_token_text(raw).is_empty() {
+                                output.push_str(name);
+                                output.push_str("[]");
+                            } else {
+                                // The parse-cooked token text (`$''` -> `''`,
+                                // `''''''` preserved verbatim — the sq rides
+                                // the arith token as syntax) feeds the
+                                // parser's empty-resolution law so the
+                                // diagnostics print GNU's word.
+                                output.push_str(name);
+                                output.push('[');
+                                output.push_str(&requote_arith_span_token_text(raw));
+                                output.push(']');
+                            }
+                            index = end;
+                            continue;
+                        }
+                        key
                     };
                     output.push_str(name);
                     output.push('[');
@@ -1201,14 +1256,31 @@ impl Executor {
     /// single-quoted span, which is why `A['$v']` keys on `$v` — and anything
     /// else goes through the ordinary word expansion, which stops at one round.
     ///
-    /// NOTE: the arithmetic evaluator is handed the `(( ))` body AFTER the
-    /// lexer's own escape pass, so its subscript text is not the source
-    /// spelling; re-running the assignment path's quote-removal pass here
-    /// would drop one backslash too many (`A[a\\b]` read `a\b` instead of
-    /// `ab`). The assignment path owns the faithful
-    /// `expand_subscript_string`; this path keeps its own one-round word
-    /// expansion until the `(( ))` body reaches the evaluator unescaped.
-    fn expand_assoc_subscript_once(&mut self, raw: &str) -> String {
+    /// `ansi_mode` owns the literal `$'...'` spans (issue rubash#828): the
+    /// `((...))`-family entries decode them ANSI-C style with backslash
+    /// protection, while `let` — whose operand GNU considers already
+    /// word-expanded — drops the quotes verbatim without decoding. Bare
+    /// (non-`$'`) spellings are NOT re-processed here: the arithmetic
+    /// evaluator is handed the `(( ))` body AFTER the lexer's own escape
+    /// pass, so its subscript text is not the source spelling; re-running
+    /// the assignment path's quote-removal pass here would drop one
+    /// backslash too many (`A[a\\b]` read `a\b` instead of `ab`). The
+    /// assignment path owns the faithful `expand_subscript_string`; this
+    /// path keeps its own one-round word expansion until the `(( ))` body
+    /// reaches the evaluator unescaped.
+    fn expand_assoc_subscript_once(
+        &mut self,
+        raw: &str,
+        ansi_mode: crate::executor::subscript_expansion::ArithAnsiSpanMode,
+    ) -> String {
+        let raw_owned;
+        let raw = if raw.contains("$'") {
+            raw_owned =
+                crate::executor::subscript_expansion::transform_arith_ansi_c_spans(raw, ansi_mode);
+            raw_owned.as_str()
+        } else {
+            raw
+        };
         if let Some(literal) =
             crate::executor::subscript_expansion::wholly_single_quoted_literal(raw)
         {
@@ -1221,7 +1293,37 @@ impl Executor {
         // emits it verbatim instead of consuming it as an sq opener —
         // without this the key stored `80s` (assoc9.sub `let "++a[$b]"`).
         let raw = crate::executor::subscript_expansion::mark_expanded_once_data_squotes(raw);
-        self.expand_word_mut_with_context(&raw, SubstitutionQuoteContext::Unquoted)
+        let expanded = self.expand_word_mut_with_context(&raw, SubstitutionQuoteContext::Unquoted);
+        // The expansion owns the final key text, so the data carriers the
+        // pre-pass marked (`\x17` for the expanded-once `'` above, the
+        // span/dollar carriers of a kept `$'...'` spelling) dequote here —
+        // markers.rs:380 decode_word_position_carriers, GNU subst.c:4807
+        // dequote_string. Without it a dquoted span kept raw by the
+        // rubash#847 dual-state law stored a literal \x17 mid-key
+        // (`((G["pre$'x'post"]=1))` keyed `pre$\x17x'post` and the
+        // variable-spelling read missed the cell).
+        crate::executor::markers::decode_word_position_carriers(&expanded)
+    }
+
+    /// The bracket text GNU's arith token carries for this subscript — the
+    /// body-level expansion with single quotes PRESERVED as syntax and
+    /// double quotes stripped (verified GNU 5.3.0, rubash#860: `((C['']=1))`
+    /// tokens `C['']` while `((C3[""]=1))` tokens `C3[]`). `$'...'` spans
+    /// are decoded and re-quoted at that phase (`$''` tokens `['']`), and
+    /// `$name`/arithmetic expansions run once (`[$u]` with u empty tokens
+    /// `[]`). Only the empty/nonempty VERDICT feeds the empty-key class
+    /// split, so the protected-sq rendering never reaches output.
+    fn arith_assoc_subscript_token_text(&self, raw: &str) -> String {
+        let requoted = requote_arith_span_token_text(raw);
+        if !requoted.contains('$') && !requoted.contains('"') {
+            // No expansion sites: the quotes are the token text verbatim
+            // (`''` stays `''` — nonempty — while the walker would strip it).
+            return requoted;
+        }
+        // expand_arithmetic_special_parameters protects `'` as data for the
+        // walker (its own doc: single quotes are literal data for expr.c)
+        // and the walker strips paired `"` — exactly the body-level law.
+        self.expand_arithmetic_special_parameters(&requoted)
     }
 
     pub(super) fn expand_arithmetic_special_parameters(&self, expression: &str) -> String {
@@ -1278,6 +1380,77 @@ impl Executor {
         self.expand_embedded_parameters(&protected)
             .replace(DATA_DOLLAR_STR, "$")
     }
+}
+
+/// The parse-cooked form of an arith subscript's `$'...'` spans: each closed
+/// span is decoded and sh_single_quote'd (`$''` -> `''`), everything else —
+/// including the span-less majority — rides verbatim. Mirrors the scan of
+/// [`crate::executor::subscript_expansion::transform_arith_ansi_c_spans`]
+/// (dual quote state, backslash pairs literal, unterminated spans verbatim);
+/// this is the rendering GNU's read_token_word/ansiexpand gives the word at
+/// parse time, which is what its diagnostics print (rubash#860 row
+/// `D[$'']=1` -> `D['']: bad array subscript`).
+pub(in crate::executor) fn requote_arith_span_token_text(text: &str) -> String {
+    if !text.contains("$'") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
+                output.push_str(
+                    &crate::executor::subscript_expansion::diagnostic_single_quote(&decoded),
+                );
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
 }
 
 pub(super) fn eval_arith_value(value: &str) -> i128 {

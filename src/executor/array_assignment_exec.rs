@@ -29,8 +29,11 @@ impl Executor {
         // Expand only for the associative branch: expand_subscript_string
         // runs command substitutions, and an indexed subscript must see its
         // single expansion inside eval_indexed_subscript below — expanding
-        // here too would execute `a[$(echo INJ)]=v` twice.
-        let key = self.expand_subscript_string(raw_subscript);
+        // here too would execute `a[$(echo INJ)]=v` twice. The assignment
+        // variant: GNU's lexer decoded `$'...'` spans at parse time with
+        // CTLESC protection, so decoded backslashes survive (`A[$'a\\b']=v`
+        // stores `a\b`, arrayfunc.c:392-398; issue #734 item 3).
+        let key = self.expand_assignment_subscript_string(raw_subscript);
         // expand_subscript_string is the subscript's ONE expansion pass
         // (GNU subst.c:11063 — W_NOTILDE is deliberately absent, so a leading
         // unquoted `~` inside the subscript tilde-expands). When its result
@@ -300,11 +303,23 @@ impl Executor {
             if key.is_empty() {
                 // An associative key is data, so nothing can fill in an empty
                 // one: GNU rejects `A[]`, `A[""]` and `A[$unset]` with the
-                // subscript as written (assoc.c assign_array_element).
-                eprintln!(
-                    "{}{lhs_as_written}: bad array subscript",
-                    self.diagnostic_prefix()
-                );
+                // subscript as written (assoc.c assign_array_element). The
+                // written subscript carries `$'...'` spans the way the SOURCE
+                // spelled them; GNU's word was cooked at parse time
+                // (read_token_word ansiexpand + sh_single_quote requote), so
+                // `A[$'']=1` reports `A['']: bad array subscript`
+                // (rubash#860 empty-span row).
+                let lhs = if raw_subscript.is_some_and(|raw| raw.contains("$'")) {
+                    format!(
+                        "{name}[{}]",
+                        super::arithmetic::requote_arith_span_token_text(
+                            raw_subscript.unwrap_or_default()
+                        )
+                    )
+                } else {
+                    lhs_as_written
+                };
+                eprintln!("{}{lhs}: bad array subscript", self.diagnostic_prefix());
                 self.exit_code = 1;
                 return true;
             }

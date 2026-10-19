@@ -78,6 +78,20 @@ pub struct ShellState {
     pub(crate) expanding_aliases: Vec<String>,
     /// execute_cmd.c loop_level — break/continue scope boundary.
     pub(crate) loop_depth: usize,
+    /// rubash#817 read-unit identity for the executor-level alias same-read
+    /// guard (arithmetic_aliases.rs alias_defined_on_current_line). GNU
+    /// expands an alias use only when the definition was consumed by an
+    /// earlier read of the SAME input stream (parse.y read-time expansion);
+    /// `read_generation` is the stream identity of the commands executing
+    /// now, and `read_generation_ceiling` is the monotonic high-water every
+    /// nested read unit draws a fresh value from, so sibling units never
+    /// share an identity. enter_read_unit/exit_read_unit push/pop at the
+    /// evalfile.c:253-257 push_stream boundaries (builtins/source/
+    /// execution.rs for `source`, executor/trap_exec.rs execute_eval_source
+    /// for `eval`). Cloned across the fork boundary like every C global —
+    /// a subshell body is the same read unit as its parent.
+    pub(crate) read_generation: usize,
+    pub(crate) read_generation_ceiling: usize,
     /// shell.c:183 `current_command_number` (init 1): the reader_loop
     /// increments it per command list read, before execution (eval.c:178).
     /// `\#` in prompt expansion reads it (parse.y:6568-6574; in a script
@@ -337,6 +351,8 @@ impl Clone for ShellState {
             local_typed_scopes: self.local_typed_scopes.clone(),
             expanding_aliases: self.expanding_aliases.clone(),
             loop_depth: self.loop_depth,
+            read_generation: self.read_generation,
+            read_generation_ceiling: self.read_generation_ceiling,
             command_number: self.command_number,
             function_depth: self.function_depth,
             dollar_vars_changed_by_set: self.dollar_vars_changed_by_set,

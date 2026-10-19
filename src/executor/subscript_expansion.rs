@@ -91,6 +91,29 @@ const LITERAL_DOLLAR: char = crate::executor::markers::DATA_DOLLAR;
 impl Executor {
     /// One `expand_subscript_string` pass over the raw subscript text.
     pub(in crate::executor) fn expand_subscript_string(&self, raw: &str) -> String {
+        self.expand_subscript_string_inner(raw, false)
+    }
+
+    /// The assignment-word variant (`arrayfunc.c:392-398
+    /// assign_array_element_internal`, the `akey = expand_subscript_string
+    /// (sub, 0)` arm). GNU reaches `expand_subscript_string` from entries
+    /// whose `$'...'` spans are decoded at DIFFERENT phases: the assignment
+    /// word is decoded by the LEXER at parse time (parse.y:5551-5572
+    /// read_token_word's `$'` arm — `ansiexpand` at :5566 then
+    /// `sh_single_quote` re-quote), so the decoded bytes reach the runtime
+    /// pass as single-quoted word data and a decoded backslash survives
+    /// (`A[$'a\\b']=v` stores key `a\b`, byte-verified against GNU bash
+    /// 5.3.0). The `${A[...]}` reader hands the raw `$'...'` spelling to the
+    /// runtime decode WITHOUT that protection, so its decoded backslash is
+    /// re-read as escape syntax and drops (`${A[$'a\\b']}` keys on `ab` —
+    /// GNU's own write/read asymmetry, probed 2026-10-13). Only the
+    /// assignment entries use this variant; readers keep
+    /// [`Executor::expand_subscript_string`].
+    pub(in crate::executor) fn expand_assignment_subscript_string(&self, raw: &str) -> String {
+        self.expand_subscript_string_inner(raw, true)
+    }
+
+    fn expand_subscript_string_inner(&self, raw: &str, preserve_ansi_backslashes: bool) -> String {
         // Nothing expands inside a single-quoted span, so a subscript covered
         // entirely by single quotes is literal data: `A['$v']` keys on `$v`
         // and `A['a\b']` keeps the backslash.
@@ -104,7 +127,7 @@ impl Executor {
         // carrier-marked data form the embedded walker already consumes.
         let raw_owned;
         let raw = if raw.contains("$'") {
-            raw_owned = decode_ansi_c_spans(raw);
+            raw_owned = decode_ansi_c_spans(raw, preserve_ansi_backslashes);
             raw_owned.as_str()
         } else {
             raw
@@ -121,10 +144,19 @@ impl Executor {
         // cooked text only (GNU expand_subscript_string -> expand_string
         // yields plain bytes), so the tags come off here — otherwise a key
         // like `20 40 80` stores marker-laden bytes that never match the
-        // canonical form reads and the kvlist path produce.
-        let expanded = expanded
-            .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-            .replace(crate::executor::markers::IFS_GLUE, "");
+        // canonical form reads and the kvlist path produce. The decoded
+        // `$'...'` blank guard (E401) comes off with them: a resolved key is
+        // plain bytes in GNU (the CTLESC-quoted blank is word DATA whose
+        // protection the finished word drops), so `A[$'x\ty']` must store and
+        // look up the same clean key the `$k` / `"x<TAB>y"` spellings
+        // produce. E400-aware: user data U+E401 rides the E400 pair and
+        // survives (rubash#735; issue #734 item 2 — the marker leaked into
+        // `declare -p` through the stored key).
+        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(
+            &expanded
+                .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
+                .replace(crate::executor::markers::IFS_GLUE, ""),
+        );
         // A leading unquoted `~` tilde-expands; `x~` and `a:~` stay literal
         // and `"~"` never reaches here (its first character is the quote).
         if raw.starts_with('~') {
@@ -799,12 +831,22 @@ impl Executor {
                                 self.expand_subscript_string(sub)
                             };
                             if key.is_empty() {
-                                // GNU err_badarraysub prints the element
-                                // word as rebuilt by
-                                // expand_compound_array_assignment.
-                                self.report_bad_array_subscript(&compound_element_diagnostic_word(
-                                    inner, index, sub_end, &key, true,
-                                ));
+                                // GNU err_badarraysub (arrayfunc.c:765-767
+                                // assign_compound_array_list) prints the
+                                // ELEMENT WORD as the parsed list carries it:
+                                // the raw `[sub]=value` text with `$'...'`
+                                // spans parse-cooked — `[$'']=1` reports
+                                // `['']=1`, while the quotes and value ride
+                                // verbatim (`[""]=1`, `[$u]=1`, `[]=1`). The
+                                // declare operand path keeps the rebuilt
+                                // `[key]='value'` form (its
+                                // expand_compound_array_assignment rebuild is
+                                // a different producer; pinned as parity).
+                                self.report_bad_array_subscript(
+                                    &crate::executor::arithmetic::requote_arith_span_token_text(
+                                        compound_element_word(inner, index),
+                                    ),
+                                );
                                 return Err(format!("({out})"));
                             }
                             out.push('[');
@@ -1324,11 +1366,29 @@ pub(super) fn scan_compound_subscript(
 /// expand_subscript_string -> expand_word_internal's ANSI-C arm). The decoded
 /// bytes pass through escape_decoded_ansi_c_quotes so quotes and `$` in the
 /// result stay DATA for the embedded-parameter walker.
-fn decode_ansi_c_spans(text: &str) -> String {
+///
+/// `preserve_backslashes` doubles the backslashes of the DECODED product so
+/// the following mask_subscript_escapes pass — which owns the token's quote
+/// removal — collapses them back to one literal backslash instead of eating
+/// the escape. This is the assignment-word entry only: GNU's lexer decoded
+/// the span at parse time with CTLESC protection (see
+/// [`Executor::expand_assignment_subscript_string`]), while the `${...}`
+/// reader's runtime decode is unprotected and its backslashes drop.
+///
+/// The scan carries the same dual quote state as
+/// [`transform_arith_ansi_c_spans`] (rubash#839): a span only OPENS outside
+/// both quotes, and `'`/`"` toggle their own state only outside the other
+/// quote. Inside `"pre$'x'post"` the spelling is DATA — GNU's
+/// expand_word_internal does not recognize ANSI-C quoting inside double
+/// quotes, so the whole spelling reaches the key verbatim (probe 2026-10-19:
+/// `M["pre$'x'post"]=w` stores `pre$'x'post`, byte-for-byte) — and decoding
+/// it there stored the merged `prexpost` (rubash#847 E3b face).
+fn decode_ansi_c_spans(text: &str, preserve_backslashes: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut output = String::with_capacity(text.len());
     let mut index = 0usize;
     let mut in_single = false;
+    let mut in_double = false;
     while index < chars.len() {
         let ch = chars[index];
         if ch == '\\' && !in_single && index + 1 < chars.len() {
@@ -1339,13 +1399,19 @@ fn decode_ansi_c_spans(text: &str) -> String {
             index += 2;
             continue;
         }
-        if ch == '\'' {
+        if ch == '\'' && !in_double {
             in_single = !in_single;
             output.push(ch);
             index += 1;
             continue;
         }
-        if !in_single && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
             // `$'...'`: the close quote is the first unescaped `'`.
             let mut inner_end = index + 2;
             let mut inner = String::new();
@@ -1367,7 +1433,213 @@ fn decode_ansi_c_spans(text: &str) -> String {
             }
             if closed {
                 let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
-                output.push_str(&crate::lexer::escape_decoded_ansi_c_quotes(&decoded));
+                let escaped = crate::lexer::escape_decoded_ansi_c_quotes(&decoded);
+                if preserve_backslashes && escaped.contains('\\') {
+                    output.push_str(&escaped.replace('\\', "\\\\"));
+                } else {
+                    output.push_str(&escaped);
+                }
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+/// How an arithmetic entry's associative subscript treats literal `$'...'`
+/// spans (issue rubash#828 — the fourth write-entry family, alongside the
+/// two entries [`Executor::expand_assignment_subscript_string`] serves).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum ArithAnsiSpanMode {
+    /// `((...))` / `$((...))` / nested-subscript readers: the raw spelling
+    /// reaches GNU's runtime `expand_subscript_string`, whose
+    /// `expand_word_internal` arm ANSI-C-decodes the span with the product
+    /// quoted (CTLESC), so the decoded bytes ride as data and decoded
+    /// backslashes survive (`((D[$'a\\b']=2))` stores `61 5c 62`, GNU bash
+    /// 5.3.0 probe, 2026-10-13).
+    Decode,
+    /// `let`: the operand was word-expanded once (let.def passes
+    /// EXP_EXPANDED) and GNU's expand_arith_string does NOT re-recognize
+    /// `$'` as ANSI-C there: the `$` stays literal data, the span quotes
+    /// drop as shell quotes and the raw spelling rides verbatim
+    /// (`let "B[$'x\ty']=1"` stores `24 78 5c 74 79` = `$x\ty` — GNU's own
+    /// scrambled-key quirk, pinned as parity, probed 2026-10-13).
+    LetOperand,
+}
+
+/// Rewrite the literal `$'...'` spans of an arithmetic associative
+/// subscript into data-carrier form — no live `$`, quote or backslash
+/// survives inside a span product, so the embedded-parameter walker
+/// expands only the text outside the spans. Scanning mirrors
+/// [`decode_ansi_c_spans`] and extends it with dquote state (arithmetic
+/// subscript text carries live `"..."` segments, which the #822
+/// lexer-cooked assignment words never do): backslash pairs are literal
+/// syntax, quotes toggle their own state outside the other quote, a
+/// `$'...'` span only OPENS outside both quotes (rubash#839 CR — inside
+/// `"pre$'x'post"` the spelling is data, and in `'a$'b'c'` the `$'` at
+/// the single-quote close boundary is that span's data dollar followed by
+/// its closer), a span closes at its first unescaped `'`, and an
+/// unterminated span stays verbatim.
+pub(in crate::executor) fn transform_arith_ansi_c_spans(
+    text: &str,
+    mode: ArithAnsiSpanMode,
+) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                match mode {
+                    ArithAnsiSpanMode::Decode => {
+                        let decoded = crate::lexer::decode_ansi_c_quoted(&inner);
+                        output.push_str(&mark_arith_span_data(&decoded));
+                    }
+                    ArithAnsiSpanMode::LetOperand => {
+                        output.push(LITERAL_DOLLAR);
+                        output.push_str(&mark_arith_span_data(&inner));
+                    }
+                }
+                index = inner_end + 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+/// CTLESC port for an arithmetic span product: every character the
+/// embedded-parameter walker would re-read as syntax rides its data
+/// carrier, so the bytes land in the resolved key verbatim (the walker's
+/// tail restore decodes them; see embedded_mutations.rs).
+fn mark_arith_span_data(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\\' => LITERAL_BACKSLASH,
+            '$' => LITERAL_DOLLAR,
+            '`' => LITERAL_BACKTICK,
+            '\'' => LITERAL_SINGLE_QUOTE,
+            '"' => LITERAL_DOUBLE_QUOTE,
+            other => other,
+        })
+        .collect()
+}
+
+/// GNU unset's deferred operand pass (rubash#847, the u-family): a
+/// `name[sub]` operand whose subscript carries a QUOTED-source `$'...'`
+/// spelling — `unset 'A[$'"'"'x\ty'"'"']'`, `unset "A[$'x\ty']"` — reaches
+/// `unbind_array_element` as plain post-quote-removal text, and GNU's
+/// second expand_subscript_string pass there does NOT re-recognize the
+/// span as ANSI-C. It quote-removes it instead: the quotes drop, the span
+/// dollar stays literal and the content rides verbatim, so `$'x\ty'`
+/// resolves to the key `$x\ty` (probe 2026-10-19: with a literal `$x` cell
+/// present, `unset "C[\$'x']"` deletes THAT cell) and no ordinary
+/// `$'...'`-written cell matches — the cell survives. Decoding the span
+/// instead resolved the stored clean key and deleted the cell (the
+/// divergence #839 pinned as CR Nit 2).
+///
+/// The scan mirrors [`transform_arith_ansi_c_spans`]'s dual quote state:
+/// `$'` opens a span only outside both quotes, `'`/`"` toggle outside the
+/// other quote, a span closes at its first unescaped `'`, an unterminated
+/// span stays verbatim. `$k`-style expansions in the operand are untouched
+/// — they keep expanding on the deferred pass (probe: `unset 'P3[$k]'`
+/// with k=Q deletes the `Q` cell) — and every syntax character inside a
+/// span rides [`mark_arith_span_data`]'s carrier so the embedded-parameter
+/// walker expands none of it.
+pub(in crate::executor) fn quote_remove_ansi_c_spans(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && index + 1 < chars.len() {
+            output.push(ch);
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch == '$' && chars.get(index + 1) == Some(&'\'') {
+            let mut inner_end = index + 2;
+            let mut inner = String::new();
+            let mut closed = false;
+            while inner_end < chars.len() {
+                let c = chars[inner_end];
+                if c == '\\' && inner_end + 1 < chars.len() {
+                    inner.push(c);
+                    inner.push(chars[inner_end + 1]);
+                    inner_end += 2;
+                    continue;
+                }
+                if c == '\'' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c);
+                inner_end += 1;
+            }
+            if closed {
+                // The span dollar stays literal data and the quotes drop;
+                // the content rides verbatim (no ANSI-C decode here).
+                output.push(LITERAL_DOLLAR);
+                output.push_str(&mark_arith_span_data(&inner));
                 index = inner_end + 1;
                 continue;
             }
@@ -1474,7 +1746,7 @@ fn compound_element_diagnostic_word(
 
 /// lib/sh/shquote.c sh_single_quote: wrap in single quotes, rendering each
 /// embedded quote as `'\''`.
-fn diagnostic_single_quote(s: &str) -> String {
+pub(in crate::executor) fn diagnostic_single_quote(s: &str) -> String {
     let mut quoted = String::with_capacity(s.len() + 2);
     quoted.push('\'');
     for ch in s.chars() {
@@ -1525,7 +1797,18 @@ fn dequote_compound_subscript(sub: &str) -> String {
     // it can carry the \x1c/E309 expansion-whitespace data tags; the resolved
     // key is cooked text only — strip the tags the same way
     // expand_subscript_string does for its freshly-expanded result.
-    out.replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
+    //
+    // A kept `$'...'` spelling (the #847 dual-state law) rides the lexer's
+    // E010/E011 data-quote markers in that cooked text; the key is plain
+    // bytes (subst.c dequote_list drops the CTLESC protection), so restore
+    // them here. Without this the kvlist strict path stored
+    // `pre$<E010>x<E010>post` for `K=( ["pre$'x'post']=v )` while every
+    // reader resolved the plain spelling — the cell was unreachable by
+    // direct read (rubash#861: write parity, read miss, count=2 after a
+    // clean-spelling overwrite).
+    out.replace(crate::executor::markers::ANSI_C_QUOTE_MARKER, "'")
+        .replace(crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\"")
+        .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
         .replace(crate::executor::markers::IFS_GLUE, "")
 }
 
@@ -1654,7 +1937,22 @@ fn mask_subscript_escapes(raw: &str) -> String {
                 out.push('\\');
                 out.push(next);
             }
-            _ => out.push(next),
+            _ => {
+                // An escape product is QUOTED DATA for the walker's `$name`
+                // scan: GNU's expand_word_internal scans left to right, so in
+                // `$x\ty` the name extraction at `$` stops at the backslash
+                // (subst.c:10934 param_expand's legal_variable_char loop) and
+                // the escaped `t` arrives after it — key `ty`. Masking the
+                // escape away first would glue the product INTO the name
+                // (`$xty` — the empty-key pseudo-diagnostic of rubash#860),
+                // so a name-character product rides the quote-boundary
+                // marker the lexer emits for the same job (#742); the
+                // embedded walker's tail strips it.
+                if next == '_' || next.is_ascii_alphanumeric() {
+                    out.push(crate::lexer::PARAM_NAME_END_MARKER);
+                }
+                out.push(next);
+            }
         }
     }
     out

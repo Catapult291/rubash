@@ -478,7 +478,28 @@ impl Executor {
     /// Reparse and execute one eval-source string with the caller's line
     /// numbering (GNU variables.c:parse_and_execute SEVAL flags; eval-input
     /// line i sits at script line caller_line+i-1).
+    ///
+    /// rubash#817: the string is its own read unit — evalstring.c
+    /// parse_and_execute pushes it as fresh parser input — so alias
+    /// definitions inside record a fresh read-generation (enter_read_unit)
+    /// and an eval-body line that renumbers onto the caller's physical
+    /// line N must not collide with a use at the caller's line N (GNU
+    /// expands there: the definition was read in the eval string's stream,
+    /// earlier than the caller's token). The generation drops when the
+    /// string's execution returns, on every path.
     fn execute_eval_source(
+        &mut self,
+        source: &str,
+        caller_line: usize,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let saved_read_generation = self.enter_read_unit();
+        let result = self.execute_eval_source_inner(source, caller_line, cmd);
+        self.exit_read_unit(saved_read_generation);
+        result
+    }
+
+    fn execute_eval_source_inner(
         &mut self,
         source: &str,
         caller_line: usize,
@@ -1262,6 +1283,38 @@ impl Executor {
         &mut self,
         command: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, None, None, false)
+    }
+
+    /// Run the ERR adjudication for a flat `f() ( list )` region boundary —
+    /// the rubash#720 form 2 fire. GNU runs a user subshell's completion ERR
+    /// check in the frame that waited for the fork, after wait_for
+    /// (execute_cmd.c:769-778), keyed on the subshell command itself: the
+    /// site checks user_subshell, was_error_trap, ignore_return, invert and
+    /// the status — there is NO &&/|| exemption there (probe: `f() ( false
+    /// && true ); f` fires). The forkless engine has no command node for
+    /// the region, so `command_text` carries the region's print_cmd text —
+    /// GNU's the_printed_command_except_trap is make_command_string of the
+    /// subshell, fixed by the fork preamble (execute_cmd.c:703-710) — and
+    /// `line` is the subshell's own close-paren line (execute_cmd.c:696
+    /// SET_LINE_NUMBER(command->value.Subshell->line), the line the :769
+    /// fire reports as $LINENO).
+    pub(crate) fn maybe_run_error_trap_for_flat_region(
+        &mut self,
+        command: &CommandNode,
+        command_text: String,
+        line: Option<usize>,
+    ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, Some(command_text), line, true)
+    }
+
+    fn maybe_run_error_trap_inner(
+        &mut self,
+        command: &CommandNode,
+        command_text_override: Option<String>,
+        line_override: Option<usize>,
+        bypass_and_or_gate: bool,
+    ) -> Result<(), ExecuteError> {
         // GNU trap.c run_error_trap (execute_cmd.c callers): the ERR trap
         // refuses to run while it is already in progress —
         // `signal_in_progress (ERROR_TRAP)` — so a failing command inside
@@ -1269,7 +1322,7 @@ impl Executor {
         // error_trap_running flag mirrors SIG_INPROGRESS.
         if self.exit_code == 0
             || command.inverted
-            || command.and_or().is_some()
+            || (command.and_or().is_some() && !bypass_and_or_gate)
             || self.suppress_errexit != 0
             || self.error_trap_running
             || self.host_internal_depth.get() > 0
@@ -1319,13 +1372,18 @@ impl Executor {
         // failed: a failing function call reports the function body's
         // last inner command (cond-error1.sub: `func` at line 28 reports
         // `[[ -z nonempty ]]`), and a failing pipeline reports its last
-        // stage (`true | false` reports `false`).
-        *self.shell_state.debug_trap_command.borrow_mut() = self
-            .shell_state
-            .env_vars
-            .get("__RUBASH_LAST_COMMAND")
-            .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
-            .cloned()
+        // stage (`true | false` reports `false`). The flat-region caller
+        // overrides with the region's own `( list )` text: GNU's
+        // except_trap at the :769 wait still holds make_command_string of
+        // the subshell from the fork preamble, not the body's last command.
+        *self.shell_state.debug_trap_command.borrow_mut() = command_text_override
+            .or_else(|| {
+                self.shell_state
+                    .env_vars
+                    .get("__RUBASH_LAST_COMMAND")
+                    .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
+                    .cloned()
+            })
             .or_else(|| {
                 Some(crate::executor::command_text::bash_command_source_text(
                     command,
@@ -1336,8 +1394,9 @@ impl Executor {
         // the ERR action's $LINENO print 8). The action AST re-parses with
         // position-1 lines, which set_current_line would otherwise clobber
         // the tracking value with — pin the action's node lines instead, the
-        // way run_debug_trap does.
-        let failed_line = command.line;
+        // way run_debug_trap does. The flat-region caller pins the subshell's
+        // close-paren line (execute_cmd.c:696, honored by the :769 fire).
+        let failed_line = line_override.or(command.line);
         let action = self.comsub_body_alias_splice(&action);
         let tokens = crate::lexer::tokenize(&action);
         let mut ast = crate::parser::parse(&tokens);
@@ -2884,6 +2943,17 @@ impl Executor {
         cmd: &CommandNode,
         auto_close: bool,
     ) -> Result<bool, ExecuteError> {
+        // RESTRICTED_SHELL (#804 F1/N2): the refusal must precede
+        // redir_varassign — GNU checks restricted before the varassign arm
+        // opens or creates the target — and it speaks at the FIRST
+        // restricted-write entry in the list (`> s1.txt {v}> s2.txt`
+        // refuses `s1.txt`, never materializing either; `2>/dev/null
+        // {v}> g.txt` refuses the /dev/null form itself, GNU 5.3), on
+        // every applier path (simple-command preflight and the
+        // exec-with-operand site alike).
+        if self.reject_restricted_write_redirect_entry(cmd)? {
+            return Ok(true);
+        }
         let mut redirect_failed = false;
         self.fd_var_external_undo.clear();
         for redirect in &cmd.redirects {
@@ -2989,9 +3059,15 @@ impl Executor {
             String::new()
         };
         let Some(fd) = self.allocate_dynamic_fd() else {
+            // GNU exhausts {var} heredocs through the same REDIR_VARASSIGN
+            // fcntl F_DUPFD path (probe: ulimit -Sn 6 then exec {v}<<E
+            // prints "redirection error: cannot duplicate fd: ..." too), so
+            // carry the identical errno-aware payload; GNU's own line-2
+            // target word for heredocs is the internal doc pointer, the
+            // variable name is the honest stand-in.
             return Err(ExecuteError::IoError(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("{name}: cannot allocate fd"),
+                self.fd_dup_error_payload(name),
             )));
         };
         self.fd_table
@@ -3444,24 +3520,59 @@ impl Executor {
         self.close_persistent_input_fd(target_fd);
     }
 
-    fn open_files_limit(&self) -> Option<u32> {
-        let value = self.shell_state.env_vars.get("__RUBASH_ULIMIT_N")?;
-        if value == "unlimited" {
+    /// The RLIMIT_NOFILE *soft* limit the {var} allocator must stay below
+    /// (GNU redir.c:940 fcntl F_DUPFD semantics), or None for unlimited.
+    ///
+    /// The Windows emulation stores the pair as `"<soft>:<hard>"` decimal
+    /// under `__RUBASH_ULIMIT_N` (builtins/ulimit.rs plat::set; u64::MAX
+    /// means unlimited) and forwards it to spawned children, so parse the
+    /// soft side. An absent key is NOT unlimited: it is the default soft
+    /// limit (10240 — the WSL GNU 5.3.0 oracle's RLIMIT_NOFILE soft, which
+    /// is also what the emulation reports before any `ulimit` call).
+    /// rubash#773: the old parser ran `parse::<u32>()` over the whole
+    /// `"soft:hard"` cell, so it failed on every stored value and the
+    /// allocator silently fell back to its 1024 hard cap.
+    pub(in crate::executor) fn open_files_limit(&self) -> Option<u32> {
+        const UNLIMITED: u64 = u64::MAX;
+        let raw = self.shell_state.env_vars.get("__RUBASH_ULIMIT_N");
+        let Some(value) = raw else {
+            return Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT);
+        };
+        let soft = value.split(':').next().unwrap_or(value);
+        if soft == "unlimited" {
             return None;
         }
-        value.parse::<u32>().ok()
+        match soft.parse::<u64>() {
+            Ok(UNLIMITED) => None,
+            Ok(soft) => Some(u32::try_from(soft).unwrap_or(u32::MAX)),
+            Err(_) => Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT),
+        }
     }
 
-    fn allocate_dynamic_fd(&mut self) -> Option<u32> {
+    pub(in crate::executor) fn allocate_dynamic_fd(&mut self) -> Option<u32> {
         let limit = self.open_files_limit();
         self.fd_table.allocate_dynamic_with_limit(limit)
     }
 
+    /// GNU redir.c:940-946 (REDIR_VARASSIGN): a failed
+    /// `fcntl(fd, F_DUPFD, SHELL_FD_BASE)` reports
+    /// `sys_error("redirection error: cannot duplicate fd")` carrying the
+    /// F_DUPFD errno. Which errno that is depends on where the limit bit
+    /// the request (WSL GNU 5.3.0 probes, 2026-10-19): EMFILE — "Too many
+    /// open files" — when the table is saturated below the soft limit
+    /// (default 10240: exhaustion lands at ~10229 allocations); EINVAL —
+    /// "Invalid argument" — when the base 10 itself sits at/above the soft
+    /// limit (`ulimit -Sn 6`). rubash#773: report the same split instead of
+    /// the hardcoded EINVAL text, which sent EMFILE scripts debugging the
+    /// wrong layer.
     fn fd_dup_error_payload(&self, target: &str) -> String {
+        let errno = match self.open_files_limit() {
+            Some(limit) if limit <= 10 => "Invalid argument",
+            _ => "Too many open files",
+        };
         format!(
-            "redirection error: cannot duplicate fd: Invalid argument\n{}{}: Invalid argument",
-            self.diagnostic_prefix(),
-            target
+            "redirection error: cannot duplicate fd: {errno}\n{}{target}: {errno}",
+            self.diagnostic_prefix()
         )
     }
 

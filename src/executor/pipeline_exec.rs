@@ -200,7 +200,24 @@ impl Executor {
             }
 
             let mut command = command.clone();
-            command.and_or = None;
+            // GNU execute_connection marks every &&/|| operand
+            // CMD_IGNORE_RETURN except the one the list finally executes —
+            // execute_cmd.c:2943 marks the lhs of every AND_AND/OR_OR
+            // connection and nesting propagates the flag down — and the
+            // simple-command ERR site refuses to fire on ignore_return
+            // (execute_cmd.c:1000). So a non-last element never fires the ERR
+            // trap (`set -E; g() ( false && true ); g` fires for the region
+            // and the call, never for `false`), while the last element keeps
+            // firing. The and_or marker is exactly that gate: set it on
+            // non-last elements, clear it on the last (rubash#720 CR round 2,
+            // GNU case 11).
+            if index < and_or_list.connectors.len() {
+                if command.and_or.is_none() {
+                    command.and_or = Some(true);
+                }
+            } else {
+                command.and_or = None;
+            }
             let commands = Ast {
                 commands: vec![command],
             };
@@ -243,6 +260,26 @@ impl Executor {
         command: &CommandNode,
     ) -> Result<bool, ExecuteError> {
         if let Some(brace_group) = &command.brace_group {
+            // RESTRICTED_SHELL (#804): the group's do_redirections precede
+            // the body (GNU applies a compound's redirects before executing
+            // it, execute_cmd.c:5606 for the builtin/function class and
+            // do_redirection_internal for the group class), so a restricted
+            // shell refuses here — BEFORE apply_brace_group_redirects
+            // creates any target file or splices into the body — and skips
+            // the body with status 1 (GNU: `{ echo down; } >& f` leaves no
+            // file, prints "<f>: restricted: cannot redirect output", body
+            // never runs). Without this the group's mirrors went straight
+            // to create_redirect_output, materializing the file the
+            // restricted shell must never create.
+            if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted")
+                && compound_command_has_redirects(command)
+            {
+                if let Some(message) = self.restricted_compound_redirect_error(command)? {
+                    self.write_default_stderr(&message)?;
+                    self.exit_code = 1;
+                    return Ok(true);
+                }
+            }
             // GNU execute_cmd.c:826-828: cm_group is a shell control
             // structure, so `{ } <f` sets the sticky stdin_redir flag the
             // same way `while ... done <f` does — the check lives in
@@ -315,7 +352,25 @@ impl Executor {
             let mut body_owned;
             let body: &[CommandNode] = if brace_splice_needed {
                 body_owned = brace_group.body.clone();
-                self.apply_brace_group_redirects(redirect_command, &mut body_owned)?;
+                if let Err(error) =
+                    self.apply_brace_group_redirects(redirect_command, &mut body_owned)
+                {
+                    // The application site already reported the failed open
+                    // (GNU redir.c:135 redirection_error) with the parse-order
+                    // fd-2 bindings in force, and undid those bindings. What
+                    // remains is the single adjudication the main dispatch
+                    // owns for a compound's own failed redirection: status 1,
+                    // the ERR trap, errexit — and NO re-dispatch (the old
+                    // fall-through re-ran the same failing command through
+                    // the leaf path, printing the diagnostic twice, rubash#826
+                    // faces 1-2).
+                    return match error {
+                        ExecuteError::IoError(_) => self.finish_brace_redirect_failure(command),
+                        // A failglob abort was reported at the expansion;
+                        // keep the existing dispatch contract for it.
+                        other => Err(other),
+                    };
+                }
                 &body_owned
             } else {
                 &brace_group.body
@@ -396,6 +451,30 @@ impl Executor {
             crate::lexer::tokenize_comsub_body(inner, self.posix_mode_enabled(), start_line, false);
         let commands = crate::parser::parse(&tokens);
         self.execute_ast(&commands)?;
+        Ok(true)
+    }
+
+    /// Single adjudication for a brace group's own failed redirect open,
+    /// after the application site reported the diagnostic (rubash#826):
+    /// GNU execute_cmd.c:826-828 abandons the compound with status 1, fires
+    /// the ERR trap for the wrapper's own failure (redir12.sub: the trap
+    /// fires for a command killed by its redirection) and lets errexit act
+    /// on the fresh status — the same contract the main dispatch's IoError
+    /// arm applies to the loop/if wrappers. The command is NOT re-dispatched.
+    fn finish_brace_redirect_failure(
+        &mut self,
+        command: &CommandNode,
+    ) -> Result<bool, ExecuteError> {
+        self.exit_code = 1;
+        self.maybe_run_error_trap(command)?;
+        if self.errexit_enabled()
+            && self.errexit_is_active()
+            && self.suppress_errexit == 0
+            && !command.inverted
+            && command.and_or().is_none()
+        {
+            return Err(ExecuteError::ExitCode(1));
+        }
         Ok(true)
     }
 
@@ -789,7 +868,14 @@ impl Executor {
             // below would re-open `>f` and truncate what the child wrote
             // live.
             let stage_fds_pre_wired = self.pipeline_stage_fds_pre_wired.replace(false);
+            // #804: a stage `restricted_command_error` refused must not have
+            // its write redirects materialized by the routing walk — GNU
+            // refuses the member inside its subshell BEFORE
+            // do_redirections, so `echo hi >& f | cat` never creates `f`
+            // (the refusal already rides `next_stderr`/`next_status`).
+            let stage_restricted_refused = self.pipeline_stage_restricted_refused.replace(false);
             if !stage_fds_pre_wired
+                && !stage_restricted_refused
                 && !command_is_compound_pipeline_stage(command)
                 && !in_shell_stage
             {
@@ -1201,6 +1287,12 @@ impl Executor {
             specs.push(spec);
         }
 
+        // rubash#815 profiler: the all-external concurrent pipeline spawns
+        // every member outside execute_external_pipeline_stage, so the spawn
+        // face gets one composite frame around spawn+wait. Per-element frames
+        // would break the profiler's stack discipline — the members' wall
+        // time overlaps, which a sequential frame stack cannot represent.
+        let _profiler_external_pipeline = super::profiler::enter_external("pipeline");
         let results = self.spawn_wait_concurrent_external_stages(commands, specs)?;
         let (_, stderr, _) = results.last().unwrap();
         self.write_pipeline_output(
@@ -2962,10 +3054,6 @@ impl Executor {
                 .map(Some);
         };
 
-        if let Some(restricted) = self.restricted_command_error(command, name) {
-            return Ok(Some((String::new(), restricted, 1)));
-        }
-
         // Bash applies a pipeline element's redirections before running the
         // command (redir.c do_redirection_internal runs for every command, and
         // the dup arms report failures through the already-redirected fd2).
@@ -2975,6 +3063,13 @@ impl Executor {
         // into the pipe. Run the same ordered redirect preflight the top-level
         // builtin path uses; with the stdout capture active, a 2>&1-routed
         // diagnostic lands in this stage's stdout (the pipe) like GNU's.
+        // #804 F2: the gate runs BEFORE the restricted scan — GNU's
+        // do_redirections (execute_builtin_or_function execute_cmd.c:5606)
+        // precedes the builtin, and per-entry it reports ambiguity before
+        // the RESTRICTED_REDIRECT refusal (redir.c:914 precedes :919), with
+        // the diagnostic routed through the dup already applied (`2>&1 >& f`
+        // reports into the pipe). The scan below therefore only speaks for
+        // the command-NAME forms the gate cannot see.
         let saved_capture = crate::executor::shell_options::begin_stdout_capture();
         // GNU applies the element's redirections before the command runs
         // (redir.c do_redirections in the forked element), so an invalid or
@@ -3013,6 +3108,11 @@ impl Executor {
             )));
         }
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
+
+        if let Some(restricted) = self.restricted_command_error(command, name) {
+            self.pipeline_stage_restricted_refused.set(true);
+            return Ok(Some((String::new(), restricted, 1)));
+        }
 
         // GNU execute_simple_command (execute_cmd.c): a pipeline element
         // whose words all expand to zero fields is a null command - its
@@ -3123,6 +3223,15 @@ impl Executor {
             }
         }
 
+        // rubash#815 profiler: the pipeline-stage dispatch point (GNU runs
+        // every element through execute_simple_command in its forked child,
+        // execute_cmd.c:2620 execute_pipeline -> 4617). Armed TENTATIVE like
+        // the top-level dispatch frame: the arms that re-route through the
+        // classified helpers cancel it (external stage guard, function
+        // entry, the builtin stage's re-dispatch through execute_command),
+        // and a pure inline fast-path arm (`echo`/`printf`/`tr`/...) is
+        // confirmed as a builtin when the stage returns.
+        let _profiler_stage = super::profiler::enter_prepared_command(name);
         match name {
             "true" | ":" => Ok(Some((String::new(), String::new(), 0))),
             "false" => Ok(Some((String::new(), String::new(), 1))),
@@ -3471,8 +3580,11 @@ impl Executor {
                 // transport text counts `printf 'a\014b' | wc -w` as 1 where
                 // GNU reports 2, and payload must never be fed to
                 // `decode_to_visible_text` (internal-text decoder: a payload
-                // control byte maps to CTLESC and trips its postcondition,
-                // locale.rs:545). The line-count arm needs no decode:
+                // control byte such as 0x11 is taken as the CTLESC carrier
+                // and consumes the following character, corrupting the byte
+                // stream — the output-side asserts that used to catch this
+                // were removed by #838, so the corruption is silent). The
+                // line-count arm needs no decode:
                 // 0x0A is not a carrier byte, so every `\n` is already real.
                 // Only the single-flag fast paths are emulated inline; every
                 // other invocation (-L, -m, --words, combined flags, file
@@ -3612,28 +3724,86 @@ impl Executor {
                 }
             }
         }
-        if name == "command"
-            && command
-                .words
-                .iter()
-                .skip(1)
-                .any(|word| self.expand_word(word) == "-p")
-        {
-            return Some(format!(
-                "{}command: -p: restricted\n",
-                self.diagnostic_prefix()
-            ));
+        if name == "command" {
+            // #804 gap 13: GNU strips the `command` prefix at
+            // execute_simple_command (CMD_COMMAND_BUILTIN pseudo-reserved
+            // prefix, execute_cmd.c) and dispatches the operand as the
+            // command, so the RESTRICTED_SHELL '/' scan at
+            // execute_disk_command (execute_cmd.c:5789) fires on the FIRST
+            // operand word — `command /bin/echo` reports
+            // "/bin/echo: restricted: cannot specify `/' in command names".
+            // Option forms mirror command_builtin's own option loop
+            // (command.def:68-103 + internal_getopt): `-p` in OPTION
+            // position is refused before anything else (sh_restricted("-p")
+            // — `command echo -p` treats the `-p` as echo's argument and
+            // runs it), `-v`/`-V` take the describe path that returns
+            // before any execution (command.def:104-118) so their operands
+            // are not checked, `--` ends the option list, and any other
+            // option is a usage error at the builtin that never reaches
+            // execution either.
+            let mut option_scan = true;
+            let mut verbose = false;
+            let mut operand: Option<String> = None;
+            for word in command.words.iter().skip(1) {
+                let value = self.expand_word(word);
+                if option_scan {
+                    match value.as_str() {
+                        "--" => {
+                            option_scan = false;
+                            continue;
+                        }
+                        "-p" => {
+                            return Some(format!(
+                                "{}command: -p: restricted\n",
+                                self.diagnostic_prefix()
+                            ));
+                        }
+                        "-v" | "-V" => {
+                            verbose = true;
+                            continue;
+                        }
+                        other if other.starts_with('-') && other.len() > 1 => continue,
+                        _ => option_scan = false,
+                    }
+                }
+                operand = Some(value);
+                break;
+            }
+            if !verbose {
+                if let Some(operand) = operand {
+                    if slash(&operand) {
+                        return Some(format!(
+                            "{}{}: restricted: cannot specify `/' in command names\n",
+                            self.diagnostic_prefix(),
+                            operand
+                        ));
+                    }
+                }
+            }
         }
         for redirect in &command.redirects {
-            let target = self.expand_redirect_target(redirect);
-            if redirect.fd_var.is_none() && redirect_target_fd(&target).is_none() && slash(&target)
+            // #804 gaps 11/12: GNU refuses the redirection DIRECTION, not a
+            // slash in the target (command.h:57 WRITE_REDIRECT over
+            // redir.c:919). The exact post-expansion resolution lives in the
+            // apply-time gate (reject_invalid_redirects, this file's stage
+            // sites run it right after this scan); the scan here decides the
+            // plain file directions and the dup words that are ALREADY
+            // decidable on the raw text (`>& out.txt`), so a refused member
+            // still diverts the concurrent fast paths to the sequential
+            // executor instead of spawning with the write wired natively.
+            // Read-only input stays allowed.
+            if !is_restricted_write_redirect(&redirect.kind)
+                && !is_raw_err_and_out_redirect(redirect)
             {
-                return Some(format!(
-                    "{}{}: restricted: cannot redirect output\n",
-                    self.diagnostic_prefix(),
-                    target
-                ));
+                continue;
             }
+            let target = self.expand_redirect_target(redirect);
+            let filename = target.strip_prefix('&').unwrap_or(&target);
+            return Some(format!(
+                "{}{}: restricted: cannot redirect output\n",
+                self.diagnostic_prefix(),
+                filename
+            ));
         }
         None
     }
@@ -3708,9 +3878,10 @@ pub(crate) fn command_is_compound_pipeline_stage(command: &CommandNode) -> bool 
 /// niubash#383: `wc -w` (and the flagless words field) must count words over
 /// the payload bytes the external wc would receive. It must NOT decode
 /// through `crate::locale::decode_to_visible_text`: that is an internal-text
-/// decoder, and a payload control byte (e.g. piped 0x11) decodes to CTLESC,
-/// tripping its `debug_assert!(!contains(CTLESC))` postcondition
-/// (locale.rs:545) and, without asserts, silently miscounting.
+/// decoder, and a payload control byte (e.g. piped 0x11) is decoded as the
+/// CTLESC carrier that consumes the following character — silently
+/// miscounting (its output-side asserts were removed by #838, so nothing
+/// trips any more).
 fn inline_wc_word_count(input: &str) -> usize {
     const ASCII_WHITESPACE: [u8; 6] = [b' ', b'\t', b'\n', 0x0B, 0x0C, b'\r'];
     crate::executor::substitution_metadata::shell_text_to_raw_bytes(input)

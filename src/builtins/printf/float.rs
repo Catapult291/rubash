@@ -1,25 +1,54 @@
 use super::FormatSpec;
 
 pub(super) fn format_float(value: f64, spec: &FormatSpec, mode: char) -> String {
-    let mut rendered = match mode {
-        'e' | 'E' => {
-            let precision = spec.precision.unwrap_or(6);
-            let rendered = if mode == 'E' {
-                format!("{value:.precision$E}")
+    // glibc printf renders non-finite values as inf/nan spelled per
+    // conversion case (%f/%e/%g/%a -> "inf"/"nan", %F/%E/%G/%A -> "INF"/
+    // "NAN"), keeps the sign bit as a literal minus ("-nan"), ignores
+    // precision and the alternate-form decimal point, and still applies
+    // the '+'/space sign flags ("%+f" inf -> "+inf"). Rust spells NaN as
+    // "NaN" and has no uppercase inf, so the words are produced here
+    // instead of via format! (issue #704 R6.1: getdouble's strtod subject
+    // scan newly delivers nan operands to the renderer).
+    let nonfinite = value.is_nan() || value.is_infinite();
+    let mut rendered = if nonfinite {
+        let uppercase = matches!(mode, 'E' | 'F' | 'G' | 'A');
+        let word = if value.is_nan() {
+            if uppercase {
+                "NAN"
             } else {
-                format!("{value:.precision$e}")
-            };
-            normalize_float_exponent(rendered, mode == 'E')
+                "nan"
+            }
+        } else if uppercase {
+            "INF"
+        } else {
+            "inf"
+        };
+        if value.is_sign_negative() {
+            format!("-{word}")
+        } else {
+            word.to_string()
         }
-        'g' | 'G' => format_general_float(value, spec, mode == 'G'),
-        'a' | 'A' => format_hex_float(value, spec, mode == 'A'),
-        _ => {
-            let precision = spec.precision.unwrap_or(6);
-            format!("{value:.precision$}")
+    } else {
+        match mode {
+            'e' | 'E' => {
+                let precision = spec.precision.unwrap_or(6);
+                let rendered = if mode == 'E' {
+                    format!("{value:.precision$E}")
+                } else {
+                    format!("{value:.precision$e}")
+                };
+                normalize_float_exponent(rendered, mode == 'E')
+            }
+            'g' | 'G' => format_general_float(value, spec, mode == 'G'),
+            'a' | 'A' => format_hex_float(value, spec, mode == 'A'),
+            _ => {
+                let precision = spec.precision.unwrap_or(6);
+                format!("{value:.precision$}")
+            }
         }
     };
 
-    if spec.alternate_form && matches!(mode, 'f' | 'e' | 'E') {
+    if spec.alternate_form && !nonfinite && matches!(mode, 'f' | 'e' | 'E') {
         ensure_float_decimal_point(&mut rendered);
     }
 

@@ -683,12 +683,20 @@ impl Executor {
             // once; with array_expand_once (ASS_NOEXPAND) that text is the
             // literal key, otherwise unbind performs the deferred
             // expand_subscript_string pass here.
+            // GNU's deferred expand_subscript_string pass does NOT
+            // re-recognize a quoted-source `$'...'` spelling as ANSI-C —
+            // it quote-removes it (quotes drop, dollar stays literal,
+            // content verbatim), so `unset 'A[$'"'"'x\ty'"'"']'` resolves
+            // the key `$x\ty` and the `$'...'`-written cell SURVIVES
+            // (rubash#847; the divergence #839 pinned as CR Nit 2).
+            let deferred =
+                crate::executor::subscript_expansion::quote_remove_ansi_c_spans(&subscript);
             let source = if arrayref {
                 // VA_NOEXPAND: akey = sub verbatim (arrayfunc.c:1166) — the
                 // `'`/`"` inside `dict["$k"]` already dequoted to data.
                 SubscriptSource::Protected(&subscript)
             } else {
-                SubscriptSource::ExpandedOnce(&subscript)
+                SubscriptSource::ExpandedOnce(&deferred)
             };
             let key = self.resolve_array_subscript(source);
             if !arrayref && key.is_empty() && !subscript.is_empty() {
@@ -708,10 +716,15 @@ impl Executor {
                 return Some(1);
             }
             let mut entries = assoc_entries(&current);
+            let before = entries.len();
             entries.retain(|(entry_key, _)| *entry_key != key);
-            self.shell_state
-                .env_vars
-                .insert(array_name.to_string(), format_assoc_storage(entries));
+            if entries.len() != before
+                || !is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, array_name)
+            {
+                self.shell_state
+                    .env_vars
+                    .insert(array_name.to_string(), format_assoc_storage(entries));
+            }
             return Some(0);
         }
 

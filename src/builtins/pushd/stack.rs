@@ -21,19 +21,17 @@ pub(super) fn is_stack_index(arg: &str) -> bool {
 
 pub(crate) fn load_stack(env_vars: &HashMap<String, String>) -> Vec<String> {
     if let Some(value) = env_vars.get(DIR_STACK) {
-        let dirs: Vec<String> = value
-            .split(SEP)
-            .filter(|dir| !dir.is_empty())
-            .map(str::to_string)
-            .collect();
-        if !dirs.is_empty() {
-            return dirs;
+        if !value.is_empty() {
+            // GNU pushd.def:301 pushes the RAW -n operand word (savestring),
+            // so a blank element is a real stack member (`HOME=; pushd -n ~`
+            // yields `<cwd> ""`) and must survive the round trip. Only the
+            // fully-emptied representation (`dirs -c` saving []) falls back
+            // to the live cwd: GNU get_directory_stack
+            // (builtins/pushd.def:669) always appends the working directory
+            // after the pushed entries, so `dirs -c; declare -p DIRSTACK`
+            // prints ([0]="<cwd>") and ${#DIRSTACK[@]} stays 1.
+            return value.split(SEP).map(str::to_string).collect();
         }
-        // An emptied stack (`dirs -c`) still exposes the working directory
-        // as element 0: GNU get_directory_stack (builtins/pushd.def:669)
-        // always appends the live cwd after the pushed entries, so
-        // `dirs -c; declare -p DIRSTACK` prints ([0]="<cwd>") and
-        // ${#DIRSTACK[@]} stays 1.
     }
 
     vec![env_vars
@@ -71,24 +69,6 @@ pub(super) fn resolved_index(value: usize, from_right: bool, len: usize) -> Opti
     } else {
         None
     }
-}
-
-pub(super) fn set_pwd_from_stack(
-    env_vars: &mut HashMap<String, String>,
-    stack: &[String],
-    update_oldpwd: bool,
-) {
-    let Some(pwd) = stack.first().cloned() else {
-        return;
-    };
-    if update_oldpwd {
-        let old = env_vars
-            .get("PWD")
-            .cloned()
-            .unwrap_or_else(|| "/".to_string());
-        env_vars.insert("OLDPWD".to_string(), old);
-    }
-    env_vars.insert("PWD".to_string(), pwd);
 }
 
 pub(super) fn logical_dir_exists(dir: &str, env_vars: &HashMap<String, String>) -> bool {

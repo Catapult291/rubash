@@ -52,6 +52,16 @@ impl Executor {
         // procsub.tests bug()) must therefore keep fd 3 open for the whole
         // compound command - condition and body alike - and restore the
         // previous descriptor state afterwards.
+        // RESTRICTED_SHELL (#804 N1): this binder reaches fd-var entries
+        // through execute_dynamic_fd_var_redirect DIRECTLY and opens the
+        // compound's output targets below, so the first restricted-write
+        // entry refuses here — before anything opens or binds — and the
+        // body never runs (status 1, GNU's in-child do_redirections
+        // refusal).
+        if self.reject_restricted_write_redirect_entry(cmd)? {
+            let default_result = T::default();
+            return Ok(default_result);
+        }
         let dynamic_names = cmd
             .redirects
             .iter()
@@ -601,7 +611,15 @@ impl Executor {
                     if !redirect.append {
                         self.create_redirect_output(&target, redirect.clobber)?;
                     }
-                    self.set_fd_output_file(fd, target.clone(), fd >= 10, redirect.append)
+                    // rubash#826: an fd-2 file binding is a diagnostics
+                    // destination — the compound wrapper's own failure
+                    // reports now route through fd_table fd 2, so the handle
+                    // must keep every write at EOF like GNU's shared open
+                    // file description (the create above did the single
+                    // O_TRUNC). An fd-1 binding keeps the trunc handle the
+                    // body's own sequential writes expect.
+                    let append = redirect.append || fd == 2;
+                    self.set_fd_output_file(fd, target.clone(), fd >= 10, append)
                         .map_err(|error| crate::posix_errors::path_error(&target, error))?;
                 }
             }

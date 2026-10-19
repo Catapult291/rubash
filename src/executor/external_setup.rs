@@ -287,6 +287,13 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#815 profiler: the external-spawn seam (GNU execute_cmd.c
+        // dispatches disk commands through execute_command_internal's
+        // simple-command tail; this is the fork face of the attribution
+        // three-way split). Drop guard covers every exit form; the off path
+        // is one relaxed AtomicBool load.
+        let _profiler_external =
+            super::profiler::enter_external(cmd.words.first().map(String::as_str).unwrap_or("?"));
         let (mut cmd, mut process_substitutions) =
             self.command_with_process_substitution_files(cmd)?;
         self.apply_default_external_stdin_file(&mut cmd, &mut process_substitutions)?;
@@ -955,7 +962,15 @@ impl Executor {
             fd -= 1;
         }
         if fd <= 3 {
-            return self.fd_table.allocate_dynamic();
+            // move_to_high_fd (general.c:681) is dup2-backed in GNU — it
+            // scans downward from maxfd-1 via fcntl F_GETFD and dup2()s
+            // into the first free slot — a different mechanism from the
+            // fcntl F_DUPFD that backs {var} allocation (redir.c:942).
+            // The limit-aware fallback below is bounded by the same
+            // RLIMIT_NOFILE soft limit as every other dynamic allocation
+            // (rubash#773); its low-first pick order is a pre-existing
+            // simplification of GNU's high-side scan.
+            return self.allocate_dynamic_fd().unwrap_or(63);
         }
         self.fd_table.open_input(
             fd,

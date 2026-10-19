@@ -40,6 +40,14 @@ Exit status:
 
 Add a case by appending one dict to CASES; `known` marks a confirmed,
 issue-tracked divergence that is expected to fail.
+
+Families beyond fast paths (rubash#746): this harness stays scoped to the
+fast-path matrix; per-issue behavioural cases for every other family live in
+`scripts/regression-catalog/` (one case per filed issue, `diverges` ->
+`must-match` ratchet).  The wiring contract: case ids trace to issues on both
+sides (`known="rubash#NNN"` here, the manifest's issue column there), and a
+known divergence that starts passing is promoted OUT of CASES and into a
+`must-match` catalogue row -- the two lists never both carry a fixed face.
 """
 
 import argparse

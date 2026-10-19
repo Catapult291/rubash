@@ -115,6 +115,41 @@ fn assignment_positions_store_clean_values() {
     );
 }
 
+/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): the mixed
+/// command-substitution splice expands its text fragments as payload, and
+/// the payload splice re-encodes marker-zone glyphs with the E400
+/// literal-char escape. The ANSI_C_IFS_GUARD riding a decoded `$'...'`
+/// blank is field-split transport, not user data — the BARE guard must be
+/// dropped BEFORE the splice, otherwise it crosses as E400 E401 ("user
+/// data" to every downstream strip, rubash#735's escaping contract) and a
+/// guard byte reaches the stored cell (`v2=$'p\nq'$(echo r)s` stored len 6
+/// instead of 5). Prefix, suffix and both-adjacent fragments ride the same
+/// boundary; the for-list face keeps the decoded newline literal and
+/// field-splits only the substitution output.
+#[test]
+fn assignment_comsub_fragments_store_clean_values() {
+    assert_eq!(
+        rubash("v2=$'p\\nq'$(echo r)s; printf '%s' \"$v2\" | tr '\\n' 'N'; echo; printf 'len=%d' \"${#v2}\"; echo"),
+        b"pNqrs\nlen=5\n",
+        "prefix fragment: the guard byte never reaches the cell"
+    );
+    assert_eq!(
+        rubash("v4=$(echo r)$'p\\nq'; printf 'len=%d' \"${#v4}\"; echo"),
+        b"len=4\n",
+        "suffix fragment stores a clean value too"
+    );
+    assert_eq!(
+        rubash("v5=x$(echo r)$'p\\nq'; printf 'len=%d' \"${#v5}\"; echo"),
+        b"len=5\n",
+        "text on both sides of the substitution stays clean"
+    );
+    assert_eq!(
+        rubash("n=0; for k in $'p\\nq'$(echo r)s; do n=$((n+1)); printf 'k%d-len=%d' \"$n\" \"${#k}\"; done; echo"),
+        b"k1-len=5\n",
+        "for-list face: one field, decoded newline stays literal word data"
+    );
+}
+
 #[test]
 fn decoded_glob_metachars_stay_literal() {
     // pathexp.c:57: decoded metacharacters are CTLESC-protected data, so

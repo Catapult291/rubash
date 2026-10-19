@@ -4,6 +4,16 @@ use crate::executor::markers::DATA_DOLLAR;
 // Private markers used by the patsub replacement pipeline. They survive
 // expand_embedded_parameters untouched and are resolved by
 // finish_patsub_replacement into the final replacement text.
+//
+// rubash#843: user replacement data may legally BE one of these codepoints
+// (`${v/b/$'\uE312x'}` must substitute the U+E312 glyph, GNU prints it
+// verbatim). The scan pass therefore E400-escapes every literal
+// registry-zone char it copies (push_replacement_literal, the #735
+// mechanism) and the ANSI-C span decoder escapes typed glyphs at body
+// collection, so a bare E310-E313 in the marked text is always pipeline
+// protocol and an escaped pair is always user data; finish_patsub_
+// replacement consumes the former, copies the latter verbatim, and its
+// leak probe (strip_escape_pairs) asserts only live markers.
 const PATSUB_QUOTED_VALUE_START: char = crate::executor::markers::PATSUB_QUOTED_VALUE_START;
 const PATSUB_QUOTED_VALUE_END: char = crate::executor::markers::PATSUB_QUOTED_VALUE_END;
 const PATSUB_QUOTED_AMP: char = crate::executor::markers::PATSUB_QUOTED_AMP;
@@ -227,7 +237,7 @@ impl Executor {
                     // become quoted replacement data (CTLESC in GNU).
                     index += 1;
                     while index < chars.len() && chars[index] != '\'' {
-                        push_single_quoted_replacement_char(&mut marked, chars[index]);
+                        push_single_quoted_replacement_char(&mut marked, chars[index], false);
                         index += 1;
                     }
                     index += 1;
@@ -273,7 +283,7 @@ impl Executor {
                     index = end;
                 }
                 other => {
-                    marked.push(other);
+                    push_replacement_literal(&mut marked, other);
                     index += 1;
                 }
             }
@@ -286,11 +296,40 @@ impl Executor {
     /// data consumed by strcreplace (quote_string_for_repl, subst.c:3921);
     /// with the shopt off, plain quote removal applies and `&` stays
     /// literal data.
+    ///
+    /// Escape pairs ride verbatim (rubash#843): the replacement carries
+    /// user data that may legally be a registry-zone glyph (`${v/b/$'\uE312'}`
+    /// is an E312 character for GNU, not a marker), so the scan pass
+    /// E400-escapes every literal zone char and expansion results arrive
+    /// pair-encoded from storage. A pair member must therefore never be
+    /// read as a live PATSUB marker here — the E400/E000 lead arms copy
+    /// lead + payload intact and the Output boundary decodes the escape
+    /// exactly once.
     fn finish_patsub_replacement(&self, expanded: &str, patsub_replacement: bool) -> String {
         let mut output = String::with_capacity(expanded.len());
         let mut in_quoted_value = false;
-        for ch in expanded.chars() {
+        let mut chars = expanded.chars();
+        while let Some(ch) = chars.next() {
             match ch {
+                crate::executor::markers::LITERAL_CHAR_ESCAPE => {
+                    // E400 + c: literal-char escape (markers::push_literal_char)
+                    // for user registry-zone data — copy the pair verbatim.
+                    output.push(ch);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                c if c as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE => {
+                    // E000 + payload: raw-byte marker pair (bytes that ride
+                    // the owner-tagged transport, e.g. $'\x10' decoded from
+                    // an ANSI-C replacement span, or a stored value's
+                    // non-UTF-8 byte). Copy intact — a payload landing in
+                    // E310..=E313 must not be eaten as a PATSUB marker.
+                    output.push(c);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
                 PATSUB_QUOTED_VALUE_START => in_quoted_value = true,
                 PATSUB_QUOTED_VALUE_END => in_quoted_value = false,
                 PATSUB_QUOTED_AMP => {
@@ -319,23 +358,28 @@ impl Executor {
                 other => output.push(other),
             }
         }
-        // Golden assertion: PATSUB markers must never leak to output
-        // These are function-local PUA markers (U+E310-E313) with no
-        // external boundary; if they appear in output, the decode pass failed.
+        // Golden assertion (#838): live PATSUB markers must never leak to
+        // patsub output. Escape pairs are excluded from the probe first
+        // (strip_escape_pairs): since rubash#843 an E400-escaped marker
+        // codepoint in the output is restored user data — `${v/b/$'\uE312'}`
+        // must emit U+E312 — not a decode failure. The function-local PUA
+        // markers (U+E310-E313) have no external boundary; if a BARE one
+        // appears here, the decode pass failed.
+        let live = strip_escape_pairs(&output);
         debug_assert!(
-            !output.contains(PATSUB_QUOTED_VALUE_START),
+            !live.contains(PATSUB_QUOTED_VALUE_START),
             "PATSUB_QUOTED_VALUE_START leaked to patsub output"
         );
         debug_assert!(
-            !output.contains(PATSUB_QUOTED_VALUE_END),
+            !live.contains(PATSUB_QUOTED_VALUE_END),
             "PATSUB_QUOTED_VALUE_END leaked to patsub output"
         );
         debug_assert!(
-            !output.contains(PATSUB_QUOTED_AMP),
+            !live.contains(PATSUB_QUOTED_AMP),
             "PATSUB_QUOTED_AMP leaked to patsub output"
         );
         debug_assert!(
-            !output.contains(PATSUB_QUOTED_BACKSLASH),
+            !live.contains(PATSUB_QUOTED_BACKSLASH),
             "PATSUB_QUOTED_BACKSLASH leaked to patsub output"
         );
         output
@@ -367,10 +411,34 @@ impl Executor {
     }
 }
 
+/// Copy one literal replacement-content char into the marked transport
+/// text (rubash#843). Registry-zone glyphs (U+E000..=U+E401) ride the E400
+/// literal-char escape (#735 mechanism): bare, a user `$'\uE312'`-style
+/// glyph — typed directly into the replacement or decoded inside a plain
+/// `'...'` span — is indistinguishable from the pipeline's own PATSUB
+/// markers, and finish_patsub_replacement consumes it (E312 rendered as
+/// `&`, E310/E311 dropped, E313 as `\`). The raw-byte introducer E000 is
+/// copied verbatim: it owns the raw-byte pair protocol, and an E400 prefix
+/// would split a pair (the rubash#296 frozen-carrier class). Plain chars
+/// pass through unchanged.
+fn push_replacement_literal(marked: &mut String, ch: char) {
+    if ch as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE {
+        marked.push(ch);
+        return;
+    }
+    crate::executor::markers::push_literal_char(marked, ch);
+}
+
 /// Copy a char from a single-quoted replacement span: `$` and backticks are
 /// literal (no expansion inside single quotes), `&` and backslash become
 /// quoted replacement data.
-fn push_single_quoted_replacement_char(marked: &mut String, ch: char) {
+///
+/// `decoded_ansi_c` marks content that already went through the canonical
+/// ANSI-C decoder (push_ansi_c_replacement_span): its zone glyphs arrive
+/// E400-escaped and its bytes as raw-byte pairs, so those ride `other`
+/// verbatim — re-escaping would double-encode the pair (the decode
+/// boundary restores it exactly once).
+fn push_single_quoted_replacement_char(marked: &mut String, ch: char, decoded_ansi_c: bool) {
     match ch {
         '&' => marked.push(PATSUB_QUOTED_AMP),
         '\\' | crate::executor::markers::DATA_BACKSLASH => marked.push(PATSUB_QUOTED_BACKSLASH),
@@ -384,7 +452,8 @@ fn push_single_quoted_replacement_char(marked: &mut String, ch: char) {
         '"' | crate::executor::markers::DATA_DQUOTE => {
             marked.push(crate::executor::markers::DATA_DQUOTE)
         }
-        other => marked.push(other),
+        other if decoded_ansi_c => marked.push(other),
+        other => push_replacement_literal(marked, other),
     }
 }
 
@@ -424,7 +493,7 @@ fn push_double_quoted_replacement_char(marked: &mut String, chars: &[char], inde
                         marked.push(crate::executor::markers::DATA_SQUOTE)
                     }
                     '&' => marked.push(PATSUB_QUOTED_AMP),
-                    _ => marked.push(*other),
+                    other => push_replacement_literal(marked, other),
                 }
                 index + 2
             }
@@ -464,7 +533,7 @@ fn push_double_quoted_replacement_char(marked: &mut String, chars: &[char], inde
             index + 1
         }
         other => {
-            marked.push(other);
+            push_replacement_literal(marked, other);
             index + 1
         }
     }
@@ -481,7 +550,7 @@ fn push_double_quoted_replacement_char(marked: &mut String, chars: &[char], inde
 /// hand-rolled table here previously knew only \xHH, \' and \, so the
 /// common C escapes stayed two-character literal text — `${s//,/$'\n'}` /
 /// `$'\t'` stored backslash+n instead of a newline (rubash#323; GNU
-/// subst.c:4462 expand_string_for_rhs hands the replacement through
+/// subst.c:3950 expand_string_for_patsub hands the replacement through
 /// expand_word_internal, whose $' handling calls ansicstr on the whole
 /// table).
 fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usize) -> usize {
@@ -494,18 +563,23 @@ fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usiz
         let ch = chars[cursor];
         if ch == '\\' && cursor + 1 < chars.len() {
             body.push(ch);
-            body.push(chars[cursor + 1]);
+            // rubash#843: a LITERAL registry-zone glyph typed inside the
+            // span body rides the canonical decoder verbatim (only
+            // `\u`-decoded codepoints get the E400 escape there). Escape it
+            // at collection so the decoded output is pair-safe and the
+            // finish pass never reads user data as a PATSUB marker.
+            push_replacement_literal(&mut body, chars[cursor + 1]);
             cursor += 2;
             continue;
         }
         if ch == '\'' || ch == crate::executor::markers::DATA_SQUOTE {
             let decoded = crate::lexer::decode_ansi_c_quoted(&body);
             for decoded_char in decoded.chars() {
-                push_single_quoted_replacement_char(marked, decoded_char);
+                push_single_quoted_replacement_char(marked, decoded_char, true);
             }
             return cursor + 1;
         }
-        body.push(ch);
+        push_replacement_literal(&mut body, ch);
         cursor += 1;
     }
     // Unterminated $' span: decode what is there (GNU parse_matched_pair
@@ -514,7 +588,7 @@ fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usiz
     // the consumed text.
     let decoded = crate::lexer::decode_ansi_c_quoted(&body);
     for decoded_char in decoded.chars() {
-        push_single_quoted_replacement_char(marked, decoded_char);
+        push_single_quoted_replacement_char(marked, decoded_char, true);
     }
     cursor
 }
@@ -549,7 +623,7 @@ fn push_unquoted_escape(marked: &mut String, chars: &[char], index: usize) -> us
             index + 2
         }
         Some(_) => {
-            marked.push(chars[index + 1]);
+            push_replacement_literal(marked, chars[index + 1]);
             index + 2
         }
         None => {
@@ -601,7 +675,7 @@ fn push_replacement_dollar(
                 index + 2
             }
             Some(other) => {
-                marked.push(*other);
+                push_replacement_literal(marked, *other);
                 index + 2
             }
             None => index + 1,
@@ -760,4 +834,24 @@ fn backtick_replacement_span_end(chars: &[char], start: usize) -> usize {
         }
     }
     chars.len()
+}
+
+/// Drop E400/E000 escape pairs (lead + following char) so the finish-pass
+/// leak probe sees only LIVE markers: since rubash#843 an escaped marker
+/// codepoint in the output is restored user data (`${v/b/$'\uE312'}` emits
+/// U+E312), not a decode failure. A trailing lead with no payload is
+/// skipped with the pair.
+fn strip_escape_pairs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE
+            || ch as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE
+        {
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }

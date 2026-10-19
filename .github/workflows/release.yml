@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v[0-9]*.[0-9]*.0"
+      - "v[0-9]*.[0-9]*.[0-9]+"
   workflow_dispatch:
     inputs:
       tag:
@@ -123,7 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Release tags must look like v0.2.0, v1.0.0, etc. Got: $tag" >&2
             exit 1
           fi
@@ -242,7 +242,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Release tags must look like v0.2.0, v1.0.0, etc. Got: $tag" >&2
             exit 1
           fi
