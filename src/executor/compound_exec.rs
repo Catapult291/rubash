@@ -309,9 +309,13 @@ impl Executor {
             want
         } else {
             // GNU's fallback for a busy high fd is move_to_high_fd
-            // (general.c:681), another fcntl F_DUPFD consumer — bounded by
-            // the same RLIMIT_NOFILE soft limit as {var} allocation
-            // (rubash#773), so route through the limit-aware allocator.
+            // (general.c:681): it scans downward for a free slot with
+            // fcntl F_GETFD and then dup2()s the descriptor there — a
+            // different mechanism from redir.c:942's fcntl F_DUPFD that
+            // backs {var} allocation. Our fallback instead routes through
+            // the limit-aware low-first allocator, so it is bounded by
+            // the same RLIMIT_NOFILE soft limit (rubash#773) but picks
+            // the lowest free slot rather than GNU's high-side scan.
             self.allocate_dynamic_fd().unwrap_or(want)
         }
     }
