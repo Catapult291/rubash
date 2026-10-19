@@ -2672,6 +2672,73 @@ fn sudo_is_not_reported_as_a_builtin() {
     );
 }
 
+/// #813 item 2 (the #810 CR F4 coverage gap, arm 1): with no elevation
+/// handler installed (the CLI binary's default), `sudo cmd` must take the
+/// PATH execution route — a fake `sudo` earlier on PATH actually runs and
+/// its status becomes the command's. Before #810 the name was answered by
+/// the host builtin with "elevation handler is not configured" (rc 1) and
+/// nothing on PATH was consulted. `routes_as_builtin`
+/// (src/executor/lookup_paths.rs) is the gate: windows + handler = builtin,
+/// everything else = PATH.
+#[cfg(windows)]
+#[test]
+fn sudo_without_handler_executes_the_path_command() {
+    let dir = case_scratch("813.sudo.path");
+    let bindir = dir.join("fakebin");
+    std::fs::create_dir_all(&bindir).expect("create fakebin");
+    // cmd.exe batch: emit a marker line, pass the child's status through.
+    std::fs::write(
+        bindir.join("sudo.cmd"),
+        "@echo off\r\necho FAKE_SUDO_RAN %*\r\nexit /b 0\r\n",
+    )
+    .expect("write fake sudo");
+    let script = format!(
+        "export PATH='{}':\"$PATH\"\nsudo --preserve-env probe\necho \"rc:$?\"",
+        bindir.display()
+    );
+    let out = run_rubash_in(&dir, &["-c", &script], Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("FAKE_SUDO_RAN --preserve-env probe"),
+        "fake PATH sudo must actually run: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("rc:0"),
+        "fake sudo's status must become the command status: {stdout}"
+    );
+    assert!(
+        !stderr.contains("elevation handler"),
+        "the no-handler diagnostic must not resurface: {stderr}"
+    );
+}
+
+/// #813 item 2 (the #810 CR F4 coverage gap, arm 2): `builtin sudo` with no
+/// elevation handler falls through the hidden-builtin dispatch to
+/// `write_builtin_not_found` (src/executor/builtin_direct_command.rs) —
+/// GNU's "not a shell builtin" wording, rc 1.
+#[cfg(windows)]
+#[test]
+fn builtin_sudo_without_handler_reports_not_a_shell_builtin() {
+    let dir = case_scratch("813.sudo.builtin");
+    let out = run_rubash_in(
+        &dir,
+        &["-c", "builtin sudo\necho \"rc:$?\""],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout.trim_end(),
+        "rc:1",
+        "the builtin fall-through must fail rc 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("builtin: sudo: not a shell builtin"),
+        "GNU wording expected: {stderr}"
+    );
+}
+
 /// CR follow-up on rubash#757 (F1): the prompt-pass containment. GNU
 /// subst.c:4392-4418 expand_prompt_string runs the expansion with
 /// `no_longjmp_on_fatal_error = 1` and RETURNS THE PASSED STRING when the

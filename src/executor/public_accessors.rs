@@ -63,6 +63,12 @@ impl Executor {
         // render channel snapshots and restores both status words here.
         let saved_exit_code = self.exit_code;
         let saved_pipestatus = self.shell_state.pipestatus.clone();
+        // The same parse.y:6684-6697 bracket covers last_command_subst_status
+        // (:6687/:6697): the embedded engine's substitution boundary leaves
+        // the rendered body's reaped status in the comsub-status cell, and a
+        // residue here could be published by the next command's
+        // substitution-publication sites. Restore it with the status words.
+        let saved_comsub_status = self.last_command_substitution_status.replace(None);
         let decoded = self.decode_prompt_string(value);
         // Same promptvars/posix gate as the transform channel (parse.y:6683):
         // `shopt -u promptvars` stops the expansion pass entirely. The pass
@@ -110,6 +116,8 @@ impl Executor {
         let rendered = super::prompt_expansion::strip_prompt_ignore_markers(&rendered);
         self.exit_code = saved_exit_code;
         self.shell_state.pipestatus = saved_pipestatus;
+        self.last_command_substitution_status
+            .set(saved_comsub_status);
         rendered
     }
 
