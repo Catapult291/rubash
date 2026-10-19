@@ -521,7 +521,18 @@ impl Executor {
         // wrapper when it's killed — otherwise `kill $!` leaves orphaned
         // grandchildren running (the wrapper is killed but the real work
         // survives).
-        env_map.insert("__RUBASH_BACKGROUND_WRAPPER".to_string(), "1".to_string());
+        // rubash#866: the marker is an unguessable spawn-time nonce carried
+        // by BOTH handshake channels (this env entry and the
+        // --internal-bg-wrapper argv flag spliced in below). The wrapper
+        // child arms its in-process role only when the two agree, then
+        // consumes both — so a user `export __RUBASH_BACKGROUND_WRAPPER=1`
+        // cannot arm PDEATHSIG for children that never went through this
+        // spawn path, and this constant "1" is never trusted again.
+        let wrapper_nonce = crate::builtins::kill::new_background_wrapper_nonce();
+        env_map.insert(
+            crate::builtins::kill::BACKGROUND_WRAPPER_ENV_KEY.to_string(),
+            wrapper_nonce.clone(),
+        );
 
         let mut child_command = background_command.command.clone();
         strip_consumed_redirects(&mut child_command, &consumed);
@@ -550,6 +561,18 @@ impl Executor {
                 respawn_temp = Some(path);
             }
         }
+        // rubash#866: second handshake channel — the nonce rides argv too,
+        // ahead of every other argument. main() consumes it (with the env
+        // entry above) before the GNU option parser or the `-c` driver sees
+        // anything; the wrapper role arms only when both channels agree.
+        spawn_args.insert(
+            0,
+            format!(
+                "{}{}",
+                crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
+                wrapper_nonce
+            ),
+        );
 
         // GNU forks the async subshell: the child's fd table is a copy of the
         // parent's. std::process::Command cannot express a per-spawn handle
