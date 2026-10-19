@@ -4115,10 +4115,16 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
     let mut pending_name = false;
 
     // Push one quoted-span char, recording its position when it is an IFS
-    // char. `recorded=false` covers the one shape that protects itself and
-    // must never take a second glue: the ANSI_C_IFS_GUARD blank pair —
-    // split sites convert the guard to IFS_GLUE, and a doubled glue would
-    // spend the first glue on the second and re-release the blank.
+    // char. The position is the BYTE offset in `simulated` (which the
+    // equality guard below pins to `cooked`), and the apply loop counts in
+    // the same byte units (`ch.len_utf8()`) — a char-count basis desyncs the
+    // moment a multi-byte char precedes the IFS char (rubash#876: with
+    // IFS=' :', `"é a"$w` recorded the space at byte 2 but applied at char
+    // 1, so the quoted space split). `recorded=false` covers the one shape
+    // that protects itself and must never take a second glue: the
+    // ANSI_C_IFS_GUARD blank pair — split sites convert the guard to
+    // IFS_GLUE, and a doubled glue would spend the first glue on the second
+    // and re-release the blank.
     fn push_quoted_char(
         simulated: &mut String,
         quoted_ifs_positions: &mut Vec<usize>,
@@ -4480,6 +4486,10 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
     // the next char", so a doubled glue spends the first glue on the second
     // and releases the IFS char itself (rubash#868 battery: IFS=:,
     // `"a:b"$w` split its quoted colon through exactly that double mark).
+    // Positions are byte offsets in `cooked` (== `simulated`, rubash#876):
+    // IFS_GLUE is skipped without advancing the counter, every other char
+    // advances it by its UTF-8 length, so the counter always names the byte
+    // offset of the current char.
     let mut result = String::with_capacity(cooked_with_marks.len() + quoted_ifs_positions.len());
     let mut cooked_pos = 0usize;
     let mut prev_glued = false;
@@ -4496,7 +4506,7 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
         }
         result.push(ch);
         prev_glued = false;
-        cooked_pos += 1;
+        cooked_pos += ch.len_utf8();
     }
     result
 }
@@ -4670,8 +4680,8 @@ fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
 
 #[cfg(test)]
 mod command_word_materialization_tests {
-    use super::materialize_expanded_command_word;
     use super::mark_literal_ifs_chars;
+    use super::materialize_expanded_command_word;
 
     #[test]
     fn materializes_legacy_payload_at_single_boundary() {
