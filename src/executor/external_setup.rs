@@ -962,7 +962,10 @@ impl Executor {
             fd -= 1;
         }
         if fd <= 3 {
-            return self.fd_table.allocate_dynamic();
+            // move_to_high_fd (general.c:681) is fcntl F_DUPFD-backed in
+            // GNU, so the fallback is bounded by the same RLIMIT_NOFILE
+            // soft limit as every other dynamic allocation (rubash#773).
+            return self.allocate_dynamic_fd().unwrap_or(63);
         }
         self.fd_table.open_input(
             fd,
