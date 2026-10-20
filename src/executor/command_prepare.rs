@@ -572,6 +572,13 @@ impl Executor {
                             format_indexed_array_storage(BTreeMap::new()),
                         );
                         mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, base);
+                        // Keep the structured cell in lockstep (empty array).
+                        crate::executor::arrays::sync_typed_indexed_array(
+                            &mut self.shell_state.variables,
+                            base,
+                            &std::collections::BTreeMap::new(),
+                        );
+                        self.shell_state.env_vars.clear_array_cells_dirty();
                     }
                 }
                 return Err(ExecuteError::ExpansionFailure(1));

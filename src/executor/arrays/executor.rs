@@ -379,6 +379,35 @@ impl Executor {
             }
             return None;
         }
+        // Typed-cell fast path (#916 follow-up): executor writes keep the
+        // structured cell in sync with the mirror, while builtin-side
+        // writes only set the dirty flag (VarTable has no access to the
+        // structured store). Trust the cell only when clean; otherwise
+        // fall through to the mirror parse below. assoc/dynamic/scalar
+        // bases returned above and never reach a typed cell.
+        if !self.shell_state.env_vars.array_cells_dirty() {
+            if let Ok(typed_index) = i64::try_from(index) {
+                if let Some(cell_value) = self
+                    .shell_state
+                    .variables
+                    .indexed_element(&storage_name, typed_index)
+                {
+                    let typed = crate::executor::arrays::normalize_array_expanded_value(
+                        cell_value.to_string(),
+                    );
+                    // Safety net (debug builds = the test suite): the cell
+                    // must agree with the mirror. A mismatch means a mirror
+                    // write path missed its sync-or-dirty handling.
+                    debug_assert_eq!(
+                        Some(typed.clone()),
+                        resolve_indexed_array_subscript(&storage, index)
+                            .and_then(|resolved| array_value_at(&storage, resolved)),
+                        "typed cell disagrees with mirror for {storage_name}[{index}]"
+                    );
+                    return Some(typed);
+                }
+            }
+        }
         let Some(index) = resolve_indexed_array_subscript(&storage, index) else {
             eprintln!(
                 "{}{}: bad array subscript",
@@ -408,8 +437,12 @@ impl Executor {
         // skips the fast path: its mirror resolves through
         // resolved_variable_name inside parameter_array_storage, and the
         // structured cell is keyed by the raw name. RUBASH_ARRAY_STORE=0
-        // bypasses the read entirely (Q4 escape hatch).
-        if array_store_enabled(&self.shell_state.env_vars) {
+        // bypasses the read entirely (Q4 escape hatch). Like the element
+        // read path, the cell is only trusted when no unsynced builtin
+        // write happened since the last executor sync.
+        if array_store_enabled(&self.shell_state.env_vars)
+            && !self.shell_state.env_vars.array_cells_dirty()
+        {
             if let Some(crate::shell::ShellValue::IndexedArray(entries)) = self
                 .shell_state
                 .variables

@@ -2855,9 +2855,15 @@ impl Executor {
                 }
             }
             if changed {
+                crate::executor::arrays::sync_typed_indexed_array(
+                    &mut self.shell_state.variables,
+                    name.as_str(),
+                    &entries,
+                );
                 self.shell_state
                     .env_vars
                     .insert(name, format_indexed_array_storage(entries));
+                self.shell_state.env_vars.clear_array_cells_dirty();
             }
         }
     }

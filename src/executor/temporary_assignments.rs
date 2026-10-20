@@ -91,6 +91,14 @@ impl Executor {
                 format_indexed_array_storage(BTreeMap::new()),
             );
             mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, base_name);
+            // Keep the structured cell in lockstep (empty array), same as
+            // command_prepare's fail-compound path.
+            crate::executor::arrays::sync_typed_indexed_array(
+                &mut self.shell_state.variables,
+                base_name,
+                &std::collections::BTreeMap::new(),
+            );
+            self.shell_state.env_vars.clear_array_cells_dirty();
         }
         false
     }
@@ -534,9 +542,15 @@ impl Executor {
             value.to_string()
         };
         entries.insert(index, element);
+        crate::executor::arrays::sync_typed_indexed_array(
+            &mut self.shell_state.variables,
+            elem_base,
+            &entries,
+        );
         self.shell_state
             .env_vars
             .insert(elem_base.to_string(), format_indexed_array_storage(entries));
+        self.shell_state.env_vars.clear_array_cells_dirty();
         self.exit_code = 0;
         true
     }
