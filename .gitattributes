@@ -6,6 +6,7 @@ tests/gnu-compat/GNU-TIMEOUT.txt -text
 # breaks WSL-side test running (bash sees spurious CR => $'\r': command not found).
 *.sh eol=lf
 *.rs eol=lf
+*.py eol=lf
 .gitattributes eol=lf
 .github/workflows/*.yml eol=lf
 
