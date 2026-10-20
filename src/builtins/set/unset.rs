@@ -1,7 +1,5 @@
 use super::{
-    ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, DECLARED_UNSET_VARS, EXECUTION_FAILURE,
-    EXECUTION_SUCCESS, EXPORTED_VARS, INTEGER_VARS, LOWERCASE_VARS, NAMEREF_VARS, READONLY_VARS,
-    UPPERCASE_VARS,
+    ARRAY_VARS, ASSOC_VARS, EXECUTION_FAILURE, EXECUTION_SUCCESS, NAMEREF_VARS, READONLY_VARS,
 };
 use std::io::{self, Write};
 
@@ -235,16 +233,9 @@ where
     // so only special names can need unbinding here. Runs before the
     // unmark calls below.
     crate::executor::local_helpers::unset_process_env(&unset_name);
-    unmark_variable(env_vars, EXPORTED_VARS, &unset_name);
-    unmark_variable(env_vars, READONLY_VARS, &unset_name);
-    unmark_variable(env_vars, ARRAY_VARS, &unset_name);
-    unmark_variable(env_vars, ASSOC_VARS, &unset_name);
-    unmark_variable(env_vars, ASSOC_128_VARS, &unset_name);
-    unmark_variable(env_vars, INTEGER_VARS, &unset_name);
-    unmark_variable(env_vars, UPPERCASE_VARS, &unset_name);
-    unmark_variable(env_vars, LOWERCASE_VARS, &unset_name);
-    unmark_variable(env_vars, NAMEREF_VARS, &unset_name);
-    unmark_variable(env_vars, DECLARED_UNSET_VARS, &unset_name);
+    // #916: one attrs.remove clears all SHELL_VAR bits instead of ten
+    // attr_of + write_flag round-trips (ASSOC_128 string dropped inside).
+    env_vars.remove_unset_marks(&unset_name);
     Ok(EXECUTION_SUCCESS)
 }
 
@@ -257,13 +248,6 @@ pub(super) fn is_marked_variable(
     // is_marked falls back to the string only for names with no flag entry,
     // which a lazy write can never leave behind.
     env_vars.is_marked(key, name)
-}
-
-fn unmark_variable(env_vars: &mut crate::shell::var_table::VarTable, key: &str, name: &str) {
-    // VarTable::unmark_name clears the structured attribute bit (for the
-    // ten SHELL_VAR attribute keys) and rewrites the serialized list only
-    // when the membership actually changes (variables.h:124-133).
-    env_vars.unmark_name(key, name);
 }
 
 pub(super) fn valid_identifier(name: &str) -> bool {

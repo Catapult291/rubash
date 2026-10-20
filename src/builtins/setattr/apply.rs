@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{self, Write};
 
 use super::marks::{
@@ -60,7 +59,12 @@ where
                 return Ok(EXECUTION_FAILURE);
             }
 
-            if value.is_none() && !env_vars.contains_key(name) && env::var(name).is_err() {
+            // #916: fresh names short-circuit on contains_key; env_vars is seeded
+            // from the process env at startup, so a preset name is always present
+            // here and never reaches the fallback. The old env::var probe paid a
+            // locked O(n) environ scan per fresh export and resurrected stale
+            // process values after unset (bash leaves them empty).
+            if value.is_none() && !env_vars.contains_key(name) {
                 mark_exported(env_vars, name);
                 return Ok(EXECUTION_SUCCESS);
             }
@@ -70,7 +74,7 @@ where
             // attribute is applied only for an explicit assignment word;
             // `export -a name` alone just marks att_exported.
             let has_assign = value.is_some();
-            let converted = env_vars.contains_key(name) || env::var(name).is_ok();
+            let converted = env_vars.contains_key(name);
             let (value, bound_array) = value
                 .map(|value| {
                     array_attribute_assignment_value(
@@ -79,11 +83,7 @@ where
                 })
                 .unwrap_or_else(|| {
                     (
-                        env_vars
-                            .get(name)
-                            .cloned()
-                            .or_else(|| env::var(name).ok())
-                            .unwrap_or_default(),
+                        env_vars.get(name).cloned().unwrap_or_default(),
                         array || assoc,
                     )
                 });
@@ -196,7 +196,8 @@ where
         return Ok(EXECUTION_FAILURE);
     }
 
-    if value.is_none() && !env_vars.contains_key(name) && env::var(name).is_err() {
+    // #916: same fresh-name short-circuit as export above.
+    if value.is_none() && !env_vars.contains_key(name) {
         mark_readonly(env_vars, name);
         return Ok(EXECUTION_SUCCESS);
     }
@@ -205,18 +206,14 @@ where
     // `declare -gr{a,A} name=value`; without `=` the flags only filter the
     // printed list, so the marks below need the assignment word.
     let has_assign = value.is_some();
-    let converted = env_vars.contains_key(name) || env::var(name).is_ok();
+    let converted = env_vars.contains_key(name);
     let (value, bound_array) = value
         .map(|value| {
             array_attribute_assignment_value(value, array, assoc, append, env_vars, name, oob_word)
         })
         .unwrap_or_else(|| {
             (
-                env_vars
-                    .get(name)
-                    .cloned()
-                    .or_else(|| env::var(name).ok())
-                    .unwrap_or_default(),
+                env_vars.get(name).cloned().unwrap_or_default(),
                 array || assoc,
             )
         });
