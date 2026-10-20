@@ -436,9 +436,15 @@ impl Executor {
             IndexedSubscript::Index(index) => {
                 let mut entries = indexed_array_entries(&current);
                 entries.insert(index as usize, value);
+                crate::executor::arrays::sync_typed_indexed_array(
+                    &mut self.shell_state.variables,
+                    base.as_str(),
+                    &entries,
+                );
                 self.shell_state
                     .env_vars
                     .insert(base.clone(), format_indexed_array_storage(entries));
+                self.shell_state.env_vars.clear_array_cells_dirty();
                 if !is_marked_array_var(&self.shell_state.env_vars, &base) {
                     mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, &base);
                 }
