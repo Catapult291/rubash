@@ -255,6 +255,16 @@ impl VarTable {
         self.string_append(key, name);
     }
 
+    /// Bulk clear for `unset` (#916): one HashMap removal drops all SHELL_VAR
+    /// attribute bits instead of ten attr_of + write_flag round-trips. The
+    /// ASSOC_128 bucket-count list is non-attribute bookkeeping and is
+    /// dropped through its string path; TRACE goes with the rest (the
+    /// variable is gone, GNU keeps no trace without a variable).
+    pub(crate) fn remove_unset_marks(&mut self, name: &str) {
+        self.attrs.remove(name);
+        self.string_remove(crate::executor::types::ASSOC_128_VARS, name);
+    }
+
     /// Remove `name` from a marker list (same contract as `mark_name`:
     /// attribute keys touch only the structured map).
     pub(crate) fn unmark_name(&mut self, key: &str, name: &str) {
