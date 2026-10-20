@@ -162,12 +162,13 @@ impl Executor {
         } else {
             self.dynamic_stack_array_values(array_name)
         };
-        let storage = if dynamic_values.is_some() {
-            // Never consumed on this path; the divert below returns first.
-            String::new()
+        let storage_opt = if dynamic_values.is_some() {
+            // Never consumed on this path; the divert above returns first.
+            None
         } else {
-            self.parameter_array_storage(array_name).unwrap_or_default()
+            self.parameter_array_storage(array_name)
         };
+        let storage = storage_opt.clone().unwrap_or_default();
         if assoc_marked {
             // GNU parameters.c assoc_reference: a literal * subscript means
             // all elements, not the key "*"; a quoted * joins with IFS[0]
@@ -359,8 +360,21 @@ impl Executor {
             // that owns this reference (expand_braced_ops), so this
             // lower-level fetcher stays silent to avoid a double report.
             // The scalar text must never be re-parsed as a list
-            // (rubash#755).
+            // (rubash#755). A dynamic scalar (RANDOM/SECONDS/...) reads
+            // live: element 0 is the current dynamic value, shadowing
+            // any stored seed text — the same dynamic-first precedence
+            // plain `$name` expansion uses. An UNSET base has no
+            // element 0 at all: report the reference as unset (None)
+            // so `-`/`=`/`+`/`?` see an unset parameter, exactly like
+            // any other missing element. A set-but-empty scalar keeps
+            // its empty element 0.
             if index == 0 {
+                if let Some(dynamic) = self.dynamic_parameter_value(&storage_name) {
+                    return Some(dynamic);
+                }
+                if storage_opt.is_none() {
+                    return None;
+                }
                 return Some(crate::executor::shell_safe_value(&storage));
             }
             return None;
