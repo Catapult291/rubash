@@ -27,14 +27,19 @@ answer at least once:
 *   every arm is bounded, and on timeout the **whole process tree** is killed;
     an arm that does not reach the end of its own script is recorded as
     INCOMPLETE and is **never** scored as a pass;
-*   each arm builds its own fixtures in its own work dir; nothing is shared or
-    pre-staged;
+*   each arm builds its own fixtures in its own work dir
+    (`out/<case>/{arm,gnu}/`); nothing is shared or pre-staged;
 *   no positional argument is ever passed to an arm (the host rewrites them);
 *   byte claims are made by this runner on the captured files, never by the
     shells under test;
 *   line-ending normalisation skips binaries: rewriting CRLF in a helper EXE
     turns it into ERROR_BAD_EXE_FORMAT (os error 216) and every helper-dependent
-    case then fails for both arms.
+    case then fails for both arms;
+*   the manifest is exhaustive: a case file with no manifest row is UNSCORED
+    (the ratchet cannot see it — four files once shipped this way), and on a
+    full run a manifest row with no case file is a dangling row.  Both are
+    reported and fail the run, because a case that is not scored is a hole in
+    the guard.
 
 Usage:
     python3 scripts/regression-catalog/runner.py \
@@ -45,7 +50,8 @@ Usage:
         [--timeout 30] [--only case1,case2] [--allow-stale]
 
 Exit status: 0 when every case matches its expectation, 1 when any alarm is
-raised, 2 on a usage/environment error (including a stale arm).
+raised, 2 on a usage/environment error (a stale arm, an unscored case file,
+or a manifest row with no case).
 """
 
 import argparse
@@ -58,7 +64,6 @@ import sys
 import time
 
 WSL = r"C:\Windows\System32\wsl.exe"
-SCRIPT = "#!/usr/bin/env bash\nexec \"{exe}\" \"$@\"\n"
 
 
 def wsl_path(winpath):
@@ -159,22 +164,23 @@ def main():
     for name in names:
         case_src = os.path.join(a.cases, name + ".sh")
         w = os.path.join(out, "out", name)
-        stage(case_src, w)
-        wslw = wsl_path(w)
+        armw = stage(case_src, os.path.join(w, "arm"))
+        gnuw = stage(case_src, os.path.join(w, "gnu"))
 
-        rrc, rto = run_bounded([arm, "./probe.sh"], w, a.timeout,
+        rrc, rto = run_bounded([arm, "./probe.sh"], armw, a.timeout,
                                os.path.join(w, "arm.out"), os.path.join(w, "arm.err"))
-        grc, gto = run_bounded([WSL, "--cd", wslw, "-e", "env", "LC_ALL=C",
-                                "bash", "./probe.sh"], w, a.timeout,
+        grc, gto = run_bounded([WSL, "--cd", wsl_path(gnuw), "-e", "env",
+                                "LC_ALL=C", "bash", "./probe.sh"], w, a.timeout,
                                os.path.join(w, "gnu.out"), os.path.join(w, "gnu.err"))
         open(os.path.join(w, "arm.rc"), "w").write(str(rrc))
         open(os.path.join(w, "gnu.rc"), "w").write(str(grc))
 
         # normalise only the harness's own scratch paths, in every spelling
-        for tag, home in (("gnu", "/tmp/armhome"), ("arm", os.path.join(w, "home"))):
-            win = os.path.abspath(w)
+        for tag, home, cwd_dir in (("gnu", "/tmp/armhome", gnuw),
+                                   ("arm", os.path.join(armw, "home"), armw)):
+            win = os.path.abspath(cwd_dir)
             toks = [home, "/" + win[0].lower() + win[2:].replace("\\", "/"),
-                    wslw, win, win.replace("\\", "/")]
+                    wsl_path(cwd_dir), win, win.replace("\\", "/")]
             for ext in ("out", "err"):
                 p = os.path.join(w, f"{tag}.{ext}")
                 open(p + ".n", "w", encoding="utf-8", errors="surrogateescape").write(
@@ -244,6 +250,24 @@ def main():
     if not alarms and not promote:
         print(f"all {len([r for r in rows if r[0] in expect])} catalogued cases match "
               f"their declared expectation")
+
+    # ---- manifest exhaustiveness: an unscored case is a hole in the guard --
+    # A case file with no manifest row runs but is never scored (four files
+    # shipped that way before this check).  A manifest row with no case file
+    # is silently dead.  Either way the run cannot be trusted: exit 2.
+    unscored = sorted(n for n in names if n not in expect)
+    if unscored:
+        print("\nUNSCORED (case file with no manifest row; the ratchet cannot "
+              "see it):")
+        for n in unscored:
+            print(f"  {n} — add a manifest.tsv row")
+    dangling = [] if a.only else sorted(set(expect) - set(names))
+    if dangling:
+        print("\nDANGLING (manifest row with no case file):")
+        for n in dangling:
+            print(f"  {n} — drop the row or add cases/{n}.sh")
+    if unscored or dangling:
+        return 2
     return 1 if alarms else 0
 
 
