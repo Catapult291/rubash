@@ -217,7 +217,7 @@ fn apply_invocation_shell_mode(executor: &mut Executor, argv0: Option<&str>) {
     // GNU shell.c set_shell_name: an argv[0] whose first character is '-'
     // (after the basename) marks a login shell, independent of --login/-l.
     if name.starts_with('-') {
-        executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+        executor.mark_login_shell();
     }
     // GNU shell.c shell_is_restricted/maybe_make_restricted
     // (shell.c:1258-1299, config-bot.h:96): a shell invoked under the name
@@ -447,7 +447,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 // GNU shell.c:497-503: --login/-l flips LOGIN_SHELL; a login
                 // shell accepts the logout builtin and runs ~/.bash_logout
                 // at exit.
-                executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+                executor.mark_login_shell();
                 index += 1;
             }
             "--noprofile" | "--norc" => {
@@ -812,7 +812,7 @@ fn parse_long_options(
                 return (index, Some(0));
             }
             "login" => {
-                executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+                executor.mark_login_shell();
             }
             "posix" => {
                 // GNU shell.c:566-572: --posix runs sv_strict_posix (the

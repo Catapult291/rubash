@@ -895,6 +895,17 @@ impl Executor {
         true
     }
 
+    /// Mark this executor as a login shell (GNU `LOGIN_SHELL`): records
+    /// the `__RUBASH_LOGIN_SHELL` carrier the startup/profile/logout
+    /// paths read, and reports the `login_shell` shopt as on (`shopt -q
+    /// login_shell`). Every login marking (flag, argv[0] `-` mark, lib
+    /// API) funnels through here so the shopt can never drift from the
+    /// carrier.
+    pub fn mark_login_shell(&mut self) {
+        self.set_env("__RUBASH_LOGIN_SHELL", "1");
+        self.set_shopt_option("login_shell", true);
+    }
+
     pub(in crate::executor) fn restore_shell_env(
         &mut self,
         saved_env: crate::shell::var_table::VarTable,
