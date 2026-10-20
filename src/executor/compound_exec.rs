@@ -1604,6 +1604,18 @@ impl Executor {
         }
 
         let mut ran_body = false;
+        // Canonical-counter fast loop (see run_arith_counter_fast_loop): the
+        // slow init above already ran with full semantics (DEBUG fire,
+        // xtrace, failure handling), so a failed init never reaches here.
+        if !arithmetic_failed {
+            if let Some(counter) = self.try_enter_arith_counter_fast_loop(arithmetic, body) {
+                let result = self.run_arith_counter_fast_loop(&counter, body, for_line);
+                // Mirror the function tail below: the entry `loop_depth += 1`
+                // is balanced here; the fast loop always ends with status 0.
+                self.shell_state.loop_depth -= 1;
+                return result;
+            }
+        }
         // Header strings are borrowed from the parsed node, so the body
         // cannot mutate them: trim once per loop entry. GNU eval_arith_for_
         // expr (execute_cmd.c:3163) consults the trap table per evaluation;
@@ -1729,6 +1741,187 @@ impl Executor {
         // `break` was treated as in-loop and aborted the rest of the script
         // (arith-for.tests: `for ((j=;;))` with `j=` empty RHS). Match GNU.
         self.shell_state.loop_depth -= 1;
+        Ok(())
+    }
+
+    /// Admission probe for the canonical-counter fast loop: `Some` admits,
+    /// `None` is doubt and the caller runs the slow loop unchanged.
+    /// Whitelist only (rubash#117): the counter shapes
+    /// (`arith_counter_loop_shapes`), a single bare-`:` body, the canonical
+    /// init binding left by the slow init, clean variable marks, an empty
+    /// arithmetic write log, no installed trap actions, no tracing, an
+    /// enabled builtin-`:` target and no background jobs. Every condition
+    /// the skipped per-iteration work could observe is verified here; the
+    /// `:` body cannot change any of them (it runs no code at all on the
+    /// fast path), and no trap handler can run either, so entry validation
+    /// holds for the whole loop by induction.
+    fn try_enter_arith_counter_fast_loop(
+        &self,
+        arithmetic: &ArithmeticForCommand,
+        body: &[CommandNode],
+    ) -> Option<crate::executor::arithmetic::ArithCounterLoop> {
+        for_body_is_bare_colon(body)?;
+        let counter = crate::executor::arithmetic::arith_counter_loop_shapes(
+            &arithmetic.init,
+            &arithmetic.test,
+            &arithmetic.update,
+        )?;
+        // The slow init ran first: the binding must be exactly its canonical
+        // decimal rendering, proving the variable reads plainly.
+        let rendered = counter.init.to_string();
+        if self
+            .shell_state
+            .env_vars
+            .get(&counter.var)
+            .map(String::as_str)
+            != Some(rendered.as_str())
+        {
+            return None;
+        }
+        if crate::executor::arithmetic::arith_counter_var_doubtful(
+            &self.shell_state.env_vars,
+            &counter.var,
+        ) {
+            return None;
+        }
+        if !crate::executor::arithmetic::arith_write_log_is_empty() {
+            return None;
+        }
+        if self.arith_counter_trap_installed() {
+            return None;
+        }
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "xtrace")
+            || crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "verbose")
+        {
+            return None;
+        }
+        // `enable -n :` is mishandled by the slow path today (rubash still
+        // runs the builtin where GNU reports 127); a function named `:`
+        // overrides the builtin in both shells. Either doubt runs slow so
+        // the fast loop can never diverge from the slow one.
+        if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, ":")
+            || self.shell_state.functions.contains_key(":")
+        {
+            return None;
+        }
+        if !self.shell_state.job_table.jobs.is_empty() || !self.background_children.is_empty() {
+            return None;
+        }
+        Some(counter)
+    }
+
+    /// Whether any trap action is installed. The fast loop executes no
+    /// commands, so a trapped signal delivered mid-loop would sit in the
+    /// mailbox until the loop ends while the slow path dispatches it at the
+    /// next `:` boundary. Any non-empty `__RUBASH_TRAP_*` action —
+    /// DEBUG/ERR/EXIT/RETURN/signal alike, including reset-suppressed ones
+    /// (doubt runs slow) — disqualifies. Empty actions (`trap '' SIG` =
+    /// SIG_IGN) install no shell code and stay admissible: dispositions
+    /// cannot change without a `trap` call, which nothing on the fast path
+    /// can issue. Metadata keys (`TRAP_RESET`, `TRAP_ORIG_IGNORES`) are not
+    /// actions and are skipped.
+    fn arith_counter_trap_installed(&self) -> bool {
+        use crate::builtins::trap::{TRAP_ORIG_IGNORES, TRAP_PREFIX, TRAP_RESET};
+        self.shell_state.env_vars.iter().any(|(key, action)| {
+            key.starts_with(TRAP_PREFIX)
+                && key.as_str() != TRAP_RESET
+                && key.as_str() != TRAP_ORIG_IGNORES
+                && !action.is_empty()
+        })
+    }
+
+    /// Fast driver for canonical `for ((v=C0; v<C1; v++)); do :; done`
+    /// loops admitted by `try_enter_arith_counter_fast_loop`. GNU
+    /// execute_arith_for_command (execute_cmd.c:3219) re-evaluates the test
+    /// and update through expr.c descent and dispatches the `:` body through
+    /// execute_command_internal on every iteration; the fast loop performs
+    /// the identical counter directly (i64 wrapping, mirroring bash_arith),
+    /// the identical update write pipeline (env insert, write-log record,
+    /// process-env mirror, typed-cell sync — the same calls in the same
+    /// order as the slow `PostInc` path) and the identical net end-state
+    /// (line/command stamps, `_`, status 0). Per-iteration work the slow
+    /// path repeats — the DEBUG/line/xtrace probes, the arithmetic ticket
+    /// (pre-expansion scans, nounset machinery, dynamic-context snapshot,
+    /// parse and diagnostics) and the full `:` dispatch — is provably
+    /// unobservable here: no DEBUG action or trace can fire (gated at
+    /// entry, nothing mid-loop can arm one), the counter variable stays
+    /// canonical (only fast writes touch it), and no jobs, traps or
+    /// failures can appear. A fatal signal soldiers through the periodic
+    /// mailbox drain exactly as the slow body's per-command boundary does
+    /// (delivery timing is inherently racy either way).
+    fn run_arith_counter_fast_loop(
+        &mut self,
+        counter: &crate::executor::arithmetic::ArithCounterLoop,
+        body: &[CommandNode],
+        for_line: Option<usize>,
+    ) -> Result<(), ExecuteError> {
+        // Pure-function admission over the same slice: entry verified a bare
+        // `:` body, so this re-derivation yields the same node (precedent:
+        // the `changed implies present` expect).
+        let colon = for_body_is_bare_colon(body).expect("fast-loop entry admits only bare-`:`");
+        let var = counter.var.clone();
+        let mut current = counter.init;
+        let mut iters: u64 = 0;
+        // GNU pins the for line as the ambient line_number while the body
+        // runs (execute_cmd.c:3236); the envelope keeps that net effect
+        // while nothing inside observes it.
+        let result: Result<(), ExecuteError> = self.with_ambient_line(for_line, |executor| {
+            loop {
+                if current >= counter.bound {
+                    break Ok(());
+                }
+                // Signal-death parity with the slow body's per-command
+                // boundary (see above); with no actions installed only the
+                // fatal-delivery Err paths can trigger, which propagate
+                // exactly as a slow body error does. The 1024-iteration tick
+                // amortizes the mailbox poll to ~zero per iteration.
+                if iters & 1023 == 0 {
+                    executor.run_pending_signal_traps()?;
+                }
+                // Wrapping increment mirrors bash_arith (`value as i64`).
+                let updated = current.wrapping_add(1);
+                let new_value = updated.to_string();
+                // By induction `old` is exactly the stored rendering: entry
+                // verified the canonical init and only fast writes (same
+                // rendering) touch the binding mid-loop.
+                let old_value = Some(current.to_string());
+                executor
+                    .shell_state
+                    .env_vars
+                    .insert(var.clone(), new_value.clone());
+                crate::executor::arithmetic::record_arith_write(&var, old_value);
+                crate::executor::sync_shell_assignment_process_env(
+                    &executor.shell_state.env_vars,
+                    &var,
+                    &new_value,
+                );
+                crate::executor::arithmetic::sync_arith_writes(executor);
+                current = updated;
+                iters += 1;
+            }
+        });
+        result?;
+        if iters > 0 {
+            // The skipped `:` iterations each stamped these byte-identical
+            // values; one call each leaves the identical net state (all
+            // three helpers are equality-gated no-ops on repeat).
+            self.set_current_line(colon);
+            self.set_current_command(colon);
+            self.bind_underscore(":");
+        }
+        // Net CURRENT_LINE of the slow loop: the update-restore stamps the
+        // for line after the last body (and the failing test-restore stamps
+        // it on a zero-trip loop).
+        if let Some(line) = for_line {
+            self.set_current_line_value(line);
+        }
+        // Every fast evaluation succeeds, as the slow ones provably do for
+        // admitted shapes; no diagnostic slot is ever written.
+        self.shell_state.arithmetic_last_error_category.set(None);
+        // Verified against GNU 5.3: the loop always ends 0 here — a ran body
+        // of `:` leaves 0, and a zero-trip loop returns 0 (`false;
+        // for ((i=5;i<3;i++)); do :; done; echo $?` prints 0).
+        self.exit_code = 0;
         Ok(())
     }
 
@@ -3310,8 +3503,74 @@ fn if_condition_is_side_effect_free(condition: &[CommandNode]) -> bool {
         && command.coproc_command.is_none()
 }
 
-/// True when the compound statement's own CommandNode carries any redirect,
-/// heredoc, here-string, or structured process substitution — i.e. when the
+/// Whitelist for the arith-for counter fast driver: exactly one bare `:`
+/// command with every assignment/redirect/substitution/channel field empty —
+/// the same structural admission as #661's `if_condition_is_side_effect_free`
+/// (kept in sync field-for-field), narrowed to `:` alone. `Some` admits and
+/// hands back the node for the fast loop's end-state replication;
+/// everything else is doubt and runs the slow loop. Shadowing (a `:`
+/// function, a disabled `:`) is gated at the call site.
+fn for_body_is_bare_colon(body: &[CommandNode]) -> Option<&CommandNode> {
+    let [command] = body else {
+        return None;
+    };
+    if !matches!(command.words.as_slice(), [word] if word == ":") {
+        return None;
+    }
+    if !(command.assignments.is_empty()
+        && command.assignment_raws.is_empty()
+        && command.compound_assignments.is_empty()
+        && command.array_element_assignments.is_empty()
+        && command.process_substitutions.is_empty()
+        && command.command_substitutions.is_empty()
+        && command.arithmetic_expansions.is_empty()
+        && command.parameter_expansions.is_empty()
+        && command.brace_expansions.is_empty()
+        && command.extglob_patterns.is_empty()
+        && command.tilde_expansions.is_empty()
+        && command.pathname_patterns.is_empty()
+        && command.word_quotes.is_empty()
+        && command.redirects.is_empty()
+        && command.redirect_in.is_none()
+        && command.redirect_out.is_none()
+        && command.append.is_none()
+        && command.redirect_err.is_none()
+        && command.redirect_err_append.is_none()
+        && command.heredoc.is_none()
+        && command.heredoc_body.is_none()
+        && command.heredoc_delimiter.is_none()
+        && command.heredoc_redirects.is_empty()
+        && command.here_string.is_none()
+        && command.here_string_carrier.is_none()
+        && command.pipe.is_none()
+        && !command.background
+        && command.and_or.is_none()
+        && !command.inverted
+        && !command.subshell
+        && !command.subshell_end
+        && command.pipeline_command.is_none()
+        && command.and_or_list.is_none()
+        && command.time_command.is_none()
+        && command.background_command.is_none()
+        && command.inverted_command.is_none()
+        && command.for_command.is_none()
+        && command.arithmetic_command.is_none()
+        && command.if_command.is_none()
+        && command.loop_command.is_none()
+        && command.conditional_command.is_none()
+        && command.subshell_command.is_none()
+        && command.case_command.is_none()
+        && command.select_command.is_none()
+        && command.function_command.is_none()
+        && command.brace_group.is_none()
+        && command.coproc_command.is_none())
+    {
+        return None;
+    }
+    Some(command)
+}
+
+/// True when the compound statement's own CommandNode carries any redirect,/// heredoc, here-string, or structured process substitution — i.e. when the
 /// clone-and-apply machinery in the `*_with_redirects` wrappers has work to
 /// do. Mirrors every field consulted by materialize_compound_output_
 /// process_substitutions, apply_*_redirects, and with_command_input_redirects
@@ -4033,6 +4292,205 @@ mod case_arm_static_tests {
             let mut executor = Executor::new();
             executor.execute_ast(&ast).ok();
             assert_eq!(executor.last_exit_code(), code, "{script:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod arith_counter_fast_loop_tests {
+    //! Contract for the canonical-counter fast driver
+    //! (`try_enter_arith_counter_fast_loop` / `run_arith_counter_fast_loop`):
+    //! whitelisted shapes must admit and evaluate exactly like the slow
+    //! loop, and every doubt shape must fall through to it. The differential
+    //! test below runs each script twice — once fast, once forced slow via
+    //! an undelivered WINCH trap that installs an action (so the trap gate
+    //! disqualifies) without changing any other semantics — and compares
+    //! the full observable end-state.
+    use super::for_body_is_bare_colon;
+    use crate::executor::arithmetic::{arith_counter_loop_shapes, ArithCounterLoop};
+    use crate::executor::Executor;
+
+    fn for_body(script: &str) -> Vec<crate::parser::CommandNode> {
+        let tokens = crate::lexer::tokenize(script);
+        let ast = crate::parser::parse(&tokens);
+        ast.commands
+            .first()
+            .and_then(|cmd| cmd.for_command.as_ref())
+            .map(|for_command| for_command.body.clone())
+            .unwrap_or_else(|| panic!("no for body in {script:?}"))
+    }
+
+    #[test]
+    fn counter_shapes_admit_canonical() {
+        assert_eq!(
+            arith_counter_loop_shapes("i=0", "i<200000", "i++"),
+            Some(ArithCounterLoop {
+                var: "i".to_string(),
+                init: 0,
+                bound: 200000,
+            })
+        );
+        // Whitespace around the tokens still parses to the same counter.
+        assert_eq!(
+            arith_counter_loop_shapes("i = 0", "i < 200000", "i ++"),
+            Some(ArithCounterLoop {
+                var: "i".to_string(),
+                init: 0,
+                bound: 200000,
+            })
+        );
+    }
+
+    #[test]
+    fn counter_shapes_reject_doubt() {
+        // Empty sections, other operators, other updates, name mismatches,
+        // signed/octal/huge bounds, dynamic names: all slow.
+        for (init, test, update) in [
+            ("", "i<3", "i++"),
+            ("i=0", "", "i++"),
+            ("i=0", "i<3", ""),
+            ("i=0", "i<=3", "i++"),
+            ("i=0", "i==3", "i++"),
+            ("i=0", "i!=3", "i++"),
+            ("i=0", "i>3", "i++"),
+            ("i=0", "i<3", "i--"),
+            ("i=0", "i<3", "++i"),
+            ("i=0", "i<3", "i+=1"),
+            ("i=0", "i<3", "i=i+1"),
+            ("i=0", "i<3", "i=3"),
+            ("j=0", "i<3", "i++"),
+            ("i=0", "i<3", "j++"),
+            ("i=0", "i<N", "i++"),
+            ("i=+0", "i<3", "i++"),
+            ("i=-1", "i<3", "i++"),
+            ("i=00", "i<3", "i++"),
+            ("i=0", "i<007", "i++"),
+            ("i=0", "i<99999999999999999999999", "i++"),
+            ("i=99999999999999999999999", "i<3", "i++"),
+            ("RANDOM=0", "RANDOM<3", "RANDOM++"),
+            ("i=0", "i<3", "RANDOM++"),
+            ("i=0", "i++", "i++"),
+            ("i<3", "i<3", "i++"),
+        ] {
+            assert!(
+                arith_counter_loop_shapes(init, test, update).is_none(),
+                "admitted doubt ({init:?}, {test:?}, {update:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_colon_body_admission() {
+        assert!(for_body_is_bare_colon(&for_body("for ((i=0;i<3;i++)); do :; done")).is_some());
+        for script in [
+            "for ((i=0;i<3;i++)); do : x; done",
+            "for ((i=0;i<3;i++)); do :>f; done",
+            "for ((i=0;i<3;i++)); do true; done",
+            "for ((i=0;i<3;i++)); do :; :; done",
+            "for ((i=0;i<3;i++)); do ((x++)); done",
+            "for ((i=0;i<3;i++)); do ! :; done",
+            "for ((i=0;i<3;i++)); do : & done",
+        ] {
+            assert!(
+                for_body_is_bare_colon(&for_body(script)).is_none(),
+                "admitted non-trivial body {script:?}"
+            );
+        }
+    }
+
+    /// Observable end-state compared field-for-field between the fast loop
+    /// and the same loop forced slow.
+    fn run_and_snapshot(script: &str) -> (i32, Vec<(String, String)>) {
+        let tokens = crate::lexer::tokenize(script);
+        let ast = crate::parser::parse(&tokens);
+        let mut executor = Executor::new();
+        executor.execute_ast(&ast).ok();
+        let code = executor.last_exit_code();
+        let mut watched = [
+            "i",
+            "_",
+            "__RUBASH_CURRENT_LINE",
+            "__RUBASH_CMD_START_LINE",
+            "__RUBASH_LAST_COMMAND",
+            "__RUBASH_CURRENT_COMMAND",
+        ];
+        watched.sort();
+        let mut snapshot = Vec::new();
+        for key in watched {
+            snapshot.push((
+                key.to_string(),
+                executor.get_env(key).unwrap_or("<unset>").to_string(),
+            ));
+        }
+        // The arithmetic write log must drain on both paths.
+        assert!(
+            crate::executor::arithmetic::arith_write_log_is_empty(),
+            "write log pending after {script:?}"
+        );
+        (code, snapshot)
+    }
+
+    #[test]
+    fn fast_and_slow_loops_agree() {
+        // (script body, expected final `i`)
+        for (body, expected_i) in [
+            ("for ((i=0;i<0;i++)); do :; done", "0"),
+            ("for ((i=0;i<1;i++)); do :; done", "1"),
+            ("for ((i=0;i<50;i++)); do :; done", "50"),
+            ("for ((i = 0; i < 50; i ++)); do :; done", "50"),
+            ("i=999; for ((i=0;i<50;i++)); do :; done", "50"),
+            ("for ((i=7;i<60;i++)); do :; done", "60"),
+        ] {
+            // A `: PIVOT` prefix pins `_` identically on both arms: the
+            // slow-forcing `trap` command below would otherwise bind its own
+            // last word (`WINCH`) and skew the comparison.
+            let fast_script = format!(": PIVOT; {body}");
+            let (fast_code, fast_state) = run_and_snapshot(&fast_script);
+            // An installed-but-undelivered WINCH action disqualifies the
+            // fast loop via the trap gate without changing any semantics.
+            let slow_script = format!("trap 'true' WINCH; : PIVOT; {body}");
+            let (slow_code, slow_state) = run_and_snapshot(&slow_script);
+            assert_eq!(fast_code, slow_code, "exit of {body:?}");
+            assert_eq!(fast_state, slow_state, "state of {body:?}");
+            assert_eq!(fast_code, 0, "loop must end 0: {body:?}");
+            let final_i = fast_state
+                .iter()
+                .find(|(key, _)| key == "i")
+                .map(|(_, value)| value.as_str());
+            assert_eq!(final_i, Some(expected_i), "final i of {body:?}");
+        }
+    }
+
+    #[test]
+    fn fast_loop_binds_canonical_counter() {
+        let tokens = crate::lexer::tokenize("for ((i=0;i<5;i++)); do :; done");
+        let ast = crate::parser::parse(&tokens);
+        let mut executor = Executor::new();
+        executor.execute_ast(&ast).ok();
+        assert_eq!(executor.get_env("i"), Some("5"));
+        assert_eq!(executor.get_env("_"), Some(":"));
+        assert_eq!(executor.last_exit_code(), 0);
+    }
+
+    #[test]
+    fn gates_fall_back_without_changing_semantics() {
+        // Each gate-breaker forces the slow loop; results must still match
+        // GNU (verified byte-for-byte against system bash during review).
+        for script in [
+            // DEBUG action installed: trap fires on the slow path.
+            "trap 'echo -n' DEBUG; for ((i=0;i<3;i++)); do :; done; echo \"i=$i\"",
+            // `:` shadowed by a function.
+            ":() { echo -n FN; }; for ((i=0;i<3;i++)); do :; done; echo \"i=$i\"",
+            // Non-canonical body.
+            "for ((i=0;i<3;i++)); do echo -n \"B$i \"; done",
+            // Non-canonical update.
+            "for ((i=0;i<3;i++)); do :; done; for ((i=0;i<3;i+=1)); do :; done; echo \"i=$i\"",
+        ] {
+            let tokens = crate::lexer::tokenize(script);
+            let ast = crate::parser::parse(&tokens);
+            let mut executor = Executor::new();
+            executor.execute_ast(&ast).ok();
+            assert_eq!(executor.get_env("i"), Some("3"), "{script:?}");
         }
     }
 }
