@@ -8,7 +8,6 @@ mod stack;
 
 pub(crate) use stack::{load_stack, save_stack, set_stack_value, stack_value, stack_words};
 
-use crate::executor::markers::DATA_DOLLAR;
 use crate::executor::types::READONLY_VARS;
 use parse::{parse_popd_operand, parse_pushd_operand, PopdOperand, PushdOperand};
 use stack::{
@@ -36,7 +35,7 @@ pub enum StackBuiltin {
 pub fn execute(
     builtin: StackBuiltin,
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     diagnostic_prefix: &str,
 ) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
@@ -54,7 +53,7 @@ pub fn execute(
 pub(crate) fn execute_with_io<'a, I, W, E>(
     builtin: StackBuiltin,
     args: I,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     diagnostic_prefix: &str,
     stdout: &mut W,
     stderr: &mut E,
@@ -489,7 +488,7 @@ fn stack_range_error<E: Write>(
 /// under the invoking builtin's prolog, and the caller skips its stack
 /// mutation. Returns true when any bind failed.
 fn bindpwd_write<E: Write>(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     old_pwd: &str,
     new_pwd: &str,
     diagnostic_prefix: &str,
@@ -513,11 +512,8 @@ fn bindpwd_write<E: Write>(
 
 /// The same readonly-marker membership cd.rs reads for its own bindpwd mirror
 /// (`__RUBASH_READONLY_VARS`, DATA_DOLLAR-separated names).
-fn var_is_readonly(env_vars: &HashMap<String, String>, name: &str) -> bool {
-    env_vars
-        .get(READONLY_VARS)
-        .map(|vars| vars.split(DATA_DOLLAR).any(|var| var == name))
-        .unwrap_or(false)
+fn var_is_readonly(env_vars: &crate::shell::var_table::VarTable, name: &str) -> bool {
+    env_vars.is_marked(READONLY_VARS, name)
 }
 
 /// How the top-of-stack popd's inner cd (GNU cd_to_string) resolved.

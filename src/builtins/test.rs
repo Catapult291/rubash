@@ -606,16 +606,9 @@ fn test_path(operand: &str, env_vars: &crate::shell::var_table::VarTable) -> std
 }
 
 fn marked_vars(env_vars: &crate::shell::var_table::VarTable, key: &str) -> Vec<String> {
-    env_vars
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    // Rendered from the structured flags, not the serialized string
+    // (writers no longer maintain it per mark; #916).
+    env_vars.marked_names(key)
 }
 
 fn is_binary_operator(op: &str) -> bool {

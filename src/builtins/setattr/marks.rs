@@ -2,13 +2,11 @@ use std::collections::HashSet;
 
 use super::value::valid_identifier;
 use super::{ARRAY_VARS, ASSOC_VARS, EXPORTED_VARS, NAMEREF_VARS, READONLY_VARS};
-use crate::executor::markers::DATA_DOLLAR;
 
 /// GNU variables.h:124-133: attributes are att_* bits on the SHELL_VAR.
-/// The writers below delegate to `VarTable`, which keeps the structured
-/// attribute map authoritative and the `__RUBASH_*_VARS` marker strings
-/// (the serialization child shells and list consumers read) synchronized
-/// bit-for-bit.
+/// The writers below delegate to `VarTable`, whose structured attribute
+/// map is authoritative; serialized marker strings are rendered on demand
+/// (`VarTable::marked_names`) instead of rewritten per mark (#916).
 pub(super) fn mark_exported(env_vars: &mut crate::shell::var_table::VarTable, name: &str) {
     env_vars.mark_name(EXPORTED_VARS, name);
 }
@@ -52,16 +50,10 @@ pub(super) fn marked_vars(
     env_vars: &crate::shell::var_table::VarTable,
     key: &str,
 ) -> HashSet<String> {
-    env_vars
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    // Rendered from the structured flags (VarTable::marked_names), not
+    // the serialized string: writers no longer maintain it per mark
+    // (#916 follow-up). Non-attribute keys still read their string.
+    env_vars.marked_names(key).into_iter().collect()
 }
 
 pub(super) fn nameref_target_name(

@@ -1,4 +1,4 @@
-use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
+use crate::executor::markers::STORAGE_WORD_PREFIX;
 use std::env;
 
 const ARRAY_VARS: &str = "__RUBASH_ARRAY_VARS";
@@ -281,14 +281,7 @@ fn strip_array_value_quotes(value: &str) -> &str {
 }
 
 fn marked_vars(env_vars: &crate::shell::var_table::VarTable, key: &str) -> Vec<String> {
-    env_vars
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    // Rendered from the structured flags, not the serialized string
+    // (writers stopped maintaining it per mark; #916).
+    env_vars.marked_names(key)
 }

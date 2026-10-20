@@ -3,7 +3,6 @@
 //! GNU Bash source ownership:
 //! - builtins/exec.def (`exec_builtin`)
 
-use crate::executor::markers::DATA_DOLLAR;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
@@ -27,7 +26,7 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
     "rubash: ".to_string()
 }
 
-pub fn execute(args: &[String], env_vars: &HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(args: &[String], env_vars: &crate::shell::var_table::VarTable) -> io::Result<i32> {
     // Route through the capture-aware stdout: the exec builtin's direct
     // process-stdout writes (env dumps, printenv fallback) must land in the
     // active pipeline-stage/command-substitution capture instead of leaking
@@ -51,7 +50,7 @@ pub(crate) fn replaces_shell(args: &[String]) -> bool {
 
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     stdout: &mut W,
     stderr: &mut E,
     child_stdin: Stdio,
@@ -65,7 +64,7 @@ where
 
 pub(crate) fn execute_with_child_stdio<W, E>(
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     stdout: &mut W,
     stderr: &mut E,
     child_stdout: Stdio,
@@ -88,7 +87,7 @@ where
 
 fn execute_impl<W, E>(
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     stdout: &mut W,
     stderr: &mut E,
     child_stdio: Option<(Stdio, Stdio)>,
@@ -303,7 +302,7 @@ where
 fn run_external_exec<W, E>(
     program: &std::path::Path,
     operands: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     child_stdin: Stdio,
     stdout: &mut W,
@@ -351,7 +350,7 @@ where
 fn run_external_exec_with_stdio<E>(
     program: &std::path::Path,
     operands: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     child_stdout: Stdio,
     child_stderr: Stdio,
@@ -391,7 +390,7 @@ where
 fn external_exec_process(
     program: &std::path::Path,
     operands: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
 ) -> Command {
     // GNU builtins/exec.def (exec_builtin): `com2 = full_pathname (command)`
@@ -451,13 +450,14 @@ fn full_pathname_word(program: &std::path::Path) -> String {
     parts.join("/")
 }
 
-fn apply_exported_environment(process: &mut Command, env_vars: &HashMap<String, String>) {
+fn apply_exported_environment(process: &mut Command, env_vars: &crate::shell::var_table::VarTable) {
     // GNU variables.c make_env_array_from_var_list: array and associative
     // variables never cross the child env boundary (rubash#534) — `exec
-    // printenv A` must not see a storage-encoded array either.
-    let arrays = marked_vars(env_vars, "__RUBASH_ARRAY_VARS");
-    let assocs = marked_vars(env_vars, "__RUBASH_ASSOC_VARS");
-    let mut names = marked_vars(env_vars, EXPORTED_VARS);
+    // printenv A` must not see a storage-encoded array either. Rendered
+    // from the structured flags, not the (write-behind) serialized string.
+    let arrays = env_vars.marked_names(crate::executor::types::ARRAY_VARS);
+    let assocs = env_vars.marked_names(crate::executor::types::ASSOC_VARS);
+    let mut names = env_vars.marked_names(crate::executor::types::EXPORTED_VARS);
     names.sort();
     for name in names {
         if arrays.iter().any(|n| n == &name) || assocs.iter().any(|n| n == &name) {
@@ -471,7 +471,7 @@ fn apply_exported_environment(process: &mut Command, env_vars: &HashMap<String, 
 
 fn run_printenv_fallback<W>(
     names: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
     stdout: &mut W,
 ) -> io::Result<i32>
@@ -486,12 +486,12 @@ where
         });
     }
 
-    let exported = marked_vars(env_vars, EXPORTED_VARS);
+    let exported = env_vars.marked_names(EXPORTED_VARS);
     // GNU variables.c make_env_array_from_var_list: array and associative
     // variables never cross the child env boundary (rubash#534) — the
     // internal printenv emulation must mirror the real spawn path.
-    let arrays = marked_vars(env_vars, "__RUBASH_ARRAY_VARS");
-    let assocs = marked_vars(env_vars, "__RUBASH_ASSOC_VARS");
+    let arrays = env_vars.marked_names(crate::executor::types::ARRAY_VARS);
+    let assocs = env_vars.marked_names(crate::executor::types::ASSOC_VARS);
     let exported: Vec<String> = exported
         .into_iter()
         .filter(|name| !arrays.iter().any(|n| n == name) && !assocs.iter().any(|n| n == name))
@@ -519,19 +519,6 @@ where
     }
 
     Ok(if found_all { EXECUTION_SUCCESS } else { 1 })
-}
-
-fn marked_vars(env_vars: &HashMap<String, String>, key: &str) -> Vec<String> {
-    env_vars
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn write_usage<W>(stderr: &mut W) -> io::Result<()>

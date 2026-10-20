@@ -978,7 +978,21 @@ impl Executor {
     }
 
     pub fn env_vars_snapshot(&self) -> HashMap<String, String> {
-        self.shell_state.env_vars.values_map().clone()
+        // Materialize marker strings so snapshots keep the historical
+        // shape (child-env bootstrapping reads them); the live table
+        // itself stays write-behind (#916).
+        let mut snapshot = self.shell_state.env_vars.values_map().clone();
+        for key in crate::shell::var_table::ATTR_KEYS {
+            match self.shell_state.env_vars.rendered_attr_list(key) {
+                Some(rendered) => {
+                    snapshot.insert(key.to_string(), rendered);
+                }
+                None => {
+                    snapshot.remove(key);
+                }
+            }
+        }
+        snapshot
     }
 
     pub fn env_vars(&self) -> &HashMap<String, String> {
