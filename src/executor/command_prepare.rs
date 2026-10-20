@@ -5,12 +5,14 @@ use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 fn materialize_expanded_command_word(word: &str) -> String {
     // rubash#237 perf: when no carrier-family byte is present, every marker
     // replace below (CTLESC, carriers, protected/data backslash, ANSI-C
-    // markers) is an identity copy, and restore_pathname_escape_markers'
-    // \u{1c}-prefix strips cannot match — only the comsub payload decode,
-    // whose `__RUBASH_CSB1_` prefix is plain ASCII, still has work to do.
-    // One scan replaces ten allocations per plain word.
+    // markers) is an identity copy, restore_pathname_escape_markers'
+    // \u{1c}-prefix strips cannot match, and the comsub payload decode
+    // cannot fire either — its U+E319 introducer is a registry-zone PUA
+    // char the marker-byte probe covers (rubash#840 moved it off the
+    // typeable ASCII prefix). One scan replaces ten allocations per plain
+    // word.
     if !crate::executor::markers::contains_word_marker_bytes(word) {
-        return decode_command_substitution_payload(word);
+        return word.to_string();
     }
     // Strip CTLESC (\x11) markers — they protect glob metacharacters during
     // expansion and must not reach argv (find -name "*.txt" received \x11*
@@ -32,11 +34,19 @@ fn materialize_expanded_command_word(word: &str) -> String {
         // ordinary word data. E400-aware: user U+E401 (E400 E401) survives
         // (rubash#735).
         &crate::executor::markers::strip_ansi_c_ifs_guard(
-            &word
-                .replace(crate::executor::markers::PROTECTED_BACKSLASH, "\\")
-                .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
-                .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
-                .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\""),
+            // E400-aware (rubash#840): the ANSI-C markers are registry-zone
+            // sentinels — a typed `$'\uE010'`/`$'\uE011'` arrives as the
+            // escaped member of an E400 pair and is user data, so only
+            // BARE carriers restore here.
+            &crate::executor::markers::restore_bare_sentinels(
+                &word,
+                &[
+                    (crate::executor::markers::PROTECTED_BACKSLASH, "\\"),
+                    (crate::executor::markers::DATA_BACKSLASH, "\\"),
+                    (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+                    (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+                ],
+            ),
         ),
     ))
 }
@@ -1232,8 +1242,7 @@ impl Executor {
                 // the expanded word instead of copying it twice more. Literal
                 // words take this on every loop iteration.
                 let plain_materializes_to_self = !arrayref_marked
-                    && !crate::executor::markers::contains_word_marker_bytes(word_text)
-                    && !word_text.contains(crate::executor::markers::COMSUB_PAYLOAD_PREFIX);
+                    && !crate::executor::markers::contains_word_marker_bytes(word_text);
                 if suppress_glob {
                     if plain_materializes_to_self {
                         words.push(remark(word));
@@ -2280,8 +2289,8 @@ impl Executor {
             &decode_command_substitution_payload(&expanded),
         ) {
             // Command-substitution output arrives payload-protected (control
-            // bytes such as \n are encoded as __RUBASH_CSB1_ markers). Field
-            // splitting must see the real IFS bytes — GNU subst.c splits the
+            // bytes such as \n ride U+E319<hex>; sentinel payloads, rubash#840).
+            // Field splitting must see the real IFS bytes — GNU subst.c splits the
             // expanded word before any of this protection is undone — so
             // decode here for the split decision and the split itself. The
             // no-split path keeps the protected form and decodes later.
@@ -3750,10 +3759,17 @@ fn field_split_values_with_quoted_nulls(value: &str, ifs: Option<&str>) -> Vec<S
     field_split_values_with_ifs(value, ifs)
         .into_iter()
         .map(|field| {
-            let had_quoted_null =
-                field.contains(crate::executor::embedded_mutations::QUOTED_NULL_MARKER);
-            let stripped =
-                field.replace(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, "");
+            // BARE carriers only: a typed `$'\uE002'` arrives E400-escaped
+            // and is user data — the escaped member neither marks an empty
+            // field nor strips here (rubash#840).
+            let had_quoted_null = crate::executor::markers::contains_bare_sentinel(
+                &field,
+                crate::executor::embedded_mutations::QUOTED_NULL_MARKER,
+            );
+            let stripped = crate::executor::markers::restore_bare_sentinels(
+                &field,
+                &[(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, "")],
+            );
             match stripped.is_empty() {
                 true if had_quoted_null => String::new(),
                 _ => stripped,
@@ -4975,10 +4991,26 @@ mod command_word_materialization_tests {
     use super::materialize_expanded_command_word;
 
     #[test]
-    fn materializes_legacy_payload_at_single_boundary() {
+    fn materializes_payload_at_single_boundary() {
+        // The payload introducer is the registry-zone sentinel U+E319
+        // (rubash#840): <sentinel><hex><hex>`;` decodes to the byte.
+        assert_eq!(
+            materialize_expanded_command_word(&format!(
+                "prefix{}41;suffix",
+                crate::executor::markers::COMSUB_PAYLOAD_SENTINEL
+            )),
+            "prefixAsuffix"
+        );
+    }
+
+    /// rubash#840 divergence 2: the retired ASCII `__RUBASH_CSB1_<hex>;`
+    /// form is plain typeable text — a typed lookalike is user data and
+    /// passes this boundary verbatim where GNU prints it literally.
+    #[test]
+    fn typed_ascii_lookalike_passes_verbatim() {
         assert_eq!(
             materialize_expanded_command_word("prefix__RUBASH_CSB1_41;suffix"),
-            "prefixAsuffix"
+            "prefix__RUBASH_CSB1_41;suffix"
         );
     }
 
@@ -4999,10 +5031,11 @@ mod command_word_materialization_tests {
     fn materializes_pathname_marker_before_payload_decode() {
         assert_eq!(
             materialize_expanded_command_word(&format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 "prefix",
                 crate::executor::markers::PROTECTED_BACKSLASH_STR,
-                "__RUBASH_CSB1_41;suffix"
+                crate::executor::markers::COMSUB_PAYLOAD_SENTINEL,
+                "41;suffix"
             )),
             "prefix\\Asuffix"
         );

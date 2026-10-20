@@ -747,14 +747,24 @@ fn compound_element_operator_offset(token: &str) -> Option<(usize, usize)> {
 /// survive into raw assignment tokens, after operator-level quote removal
 /// has consumed the structural quotes (niubash #103 follow-up).
 fn restore_quote_carriers(value: &str) -> String {
-    value
-        .replace(DATA_DOLLAR, "$")
-        .replace(crate::executor::markers::DATA_BACKTICK, "`")
-        .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
-        .replace(crate::executor::markers::DATA_SQUOTE, "'")
-        .replace(crate::executor::markers::DATA_DQUOTE, "\"")
-        .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
-        .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\"")
+    // The ANSI-C markers are registry-zone sentinels: a typed
+    // `$'\uE010'`/`$'\uE011'` arrives as the escaped member of an E400
+    // pair and is user data, so only BARE carriers restore and the pair
+    // rides through verbatim for the boundary decode (rubash#840). C0
+    // carriers stay plain replaces — typed C0 bytes never arrive bare
+    // (they ride raw-byte marker pairs).
+    crate::executor::markers::restore_bare_sentinels(
+        &value
+            .replace(DATA_DOLLAR, "$")
+            .replace(crate::executor::markers::DATA_BACKTICK, "`")
+            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+            .replace(crate::executor::markers::DATA_SQUOTE, "'")
+            .replace(crate::executor::markers::DATA_DQUOTE, "\""),
+        &[
+            (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+            (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+        ],
+    )
 }
 
 /// Exactly-once decode for a compound element that carries spliced command
@@ -768,7 +778,7 @@ fn restore_quote_carriers(value: &str) -> String {
 /// word into the value cell verbatim), or the literal `$`/backtick/backslash
 /// bytes vanish from the stored element (issue #249: COMPREPLY=($(compgen -P
 /// "$ "...)) dropped the prefix `$`). Control bytes travel as
-/// `__RUBASH_CSB1_XX;` payload escapes and decode here too.
+/// U+E319<hex>; sentinel payloads (rubash#840) and decode here too.
 fn finalize_comsub_element(value: &str) -> String {
     crate::executor::execution_misc::decode_command_substitution_payload(
         &crate::executor::execution_misc::restore_command_substitution_output(value),
@@ -1314,13 +1324,13 @@ pub(crate) fn dequote_compound_element_rhs(rhs: &str) -> String {
         // quote boundary terminates an unbraced `$name` (lexer quotes.rs
         // contract); storage never re-expands, so the transport-only
         // marker must not survive into the element value.
-        decode_compound_expansion_carriers(
+        decode_compound_expansion_carriers(&crate::executor::markers::restore_bare_sentinels(
             &crate::executor::markers::dequote_ctlesc_pairs(&restore_quote_carriers(
                 &remove_shell_quotes(rhs),
             ))
-            .replace(crate::executor::markers::IFS_GLUE, "")
-            .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, ""),
-        )
+            .replace(crate::executor::markers::IFS_GLUE, ""),
+            &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
+        ))
         .replace(crate::executor::markers::PARAM_NAME_END_MARKER, "")
     } else {
         // No quote syntax ($'...' whole words, bare values, or internal
