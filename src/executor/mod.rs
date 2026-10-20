@@ -187,7 +187,7 @@ mod command_text;
 mod env_helpers;
 mod execution_misc;
 mod function_env;
-mod local_helpers;
+pub(crate) mod local_helpers;
 mod parameter_case;
 mod parameter_decode;
 mod parameter_ops;

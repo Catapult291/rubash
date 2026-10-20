@@ -7,6 +7,7 @@ use super::{
     ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, CAPCASE_VARS, EXECUTION_FAILURE, EXPORTED_VARS,
     INTEGER_VARS, LOWERCASE_VARS, NAMEREF_VARS, READONLY_VARS, TRACE_VARS, UPPERCASE_VARS,
 };
+use crate::executor::local_helpers::sync_shell_assignment_process_env;
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
 #[derive(Clone, Copy)]
@@ -355,7 +356,11 @@ where
                     }
                 };
                 variables.insert(name.to_string(), value.clone());
-                env::set_var(name, value);
+                // Same gate as plain assignments (#916): mirror to the
+                // process env only when exported or special (children get
+                // the table explicitly; an unconditional mirror paid a
+                // locked O(n) environ scan per call).
+                sync_shell_assignment_process_env(variables, name, &value);
             }
         }
     }
@@ -366,19 +371,13 @@ where
             let name = name.split_once('=').map(|(name, _)| name).unwrap_or(name);
             if let Some(value) = variables.get(name).cloned().or_else(|| env::var(name).ok()) {
                 variables.insert(name.to_string(), value.clone());
-                // GNU variables.c make_env_array_from_var_list: array and
-                // associative variables never cross the child env boundary
-                // (rubash#534) — `declare -x A` on an array keeps the
-                // exported attribute without publishing the storage value.
-                if !variables.is_marked(crate::executor::types::ARRAY_VARS, name)
-                    && !variables.is_marked(crate::executor::types::ASSOC_VARS, name)
-                {
-                    env::set_var(name, value);
-                }
+                // Same gate as plain assignments (#916): mirror only when
+                // exported or special (scalar children get the table via
+                // env_clear + explicit env; arrays never cross anyway).
+                sync_shell_assignment_process_env(variables, name, &value);
                 mark_exported(variables, name);
             } else if has_assignment {
                 variables.insert((*name).to_string(), String::new());
-                env::set_var(name, "");
                 mark_exported(variables, name);
             } else {
                 mark_exported(variables, name);

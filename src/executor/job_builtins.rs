@@ -1932,6 +1932,10 @@ impl Executor {
                 )
                 .unwrap_or_else(|| std::path::PathBuf::from(&editor_name));
                 let mut edit_command = std::process::Command::new(&editor_path);
+                // The editor is an external child like any other: it gets
+                // the exported table vars explicitly (#916 — no process-env
+                // mirror to inherit from anymore).
+                self.apply_child_environment(&mut edit_command);
                 edit_command.arg(&path);
                 suppress_orphan_console(&mut edit_command);
                 let edit_status = edit_command.status();

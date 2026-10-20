@@ -4,7 +4,6 @@ use super::{
     UPPERCASE_VARS,
 };
 use crate::executor::markers::DATA_DOLLAR;
-use std::env;
 use std::io::{self, Write};
 
 /// GNU shell.h:76 `EX_UTILERROR = 263` — a Posix special builtin utility error
@@ -233,7 +232,10 @@ where
         crate::builtins::shopt::set_option(env_vars, "dotglob", false);
     }
     env_vars.remove(&unset_name);
-    env::remove_var(&unset_name);
+    // Gated mirror removal (#916): ordinary names were never mirrored,
+    // so only special names can need unbinding here. Runs before the
+    // unmark calls below.
+    crate::executor::local_helpers::unset_process_env(&unset_name);
     unmark_variable(env_vars, EXPORTED_VARS, &unset_name);
     unmark_variable(env_vars, READONLY_VARS, &unset_name);
     unmark_variable(env_vars, ARRAY_VARS, &unset_name);

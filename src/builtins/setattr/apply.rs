@@ -9,9 +9,8 @@ use super::value::{
     array_attribute_assignment_value, diagnostic_prefix, readonly_error_subject, split_assignment,
     valid_identifier,
 };
-use super::{
-    ExportMode, ARRAY_VARS, ASSOC_VARS, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS,
-};
+use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
+use crate::executor::local_helpers::sync_shell_assignment_process_env;
 
 pub(super) fn apply_export_arg<W>(
     arg: &str,
@@ -107,15 +106,18 @@ where
             // associative variables never cross the child env boundary
             // (ARRAY_EXPORT off), so `export A` / `export -a A=(x y)` on an
             // array keeps the exported attribute (declare -p shows -a -x)
-            // while the storage-encoded value stays out of the process env
-            // (rubash#534: printenv A must print nothing).
-            if !env_vars.is_marked(ARRAY_VARS, name) && !env_vars.is_marked(ASSOC_VARS, name) {
-                env::set_var(name, value);
-            }
+            // while the storage-encoded value stays out of the child env
+            // (rubash#534: printenv A must print nothing). Scalar values
+            // cross via the explicit child env; mirror to the process env
+            // only when exported-or-special, like plain assignments (#916).
+            sync_shell_assignment_process_env(env_vars, name, &value);
             mark_exported(env_vars, name);
         }
         ExportMode::Unset => {
-            env::remove_var(name);
+            // Gated mirror removal (#916): only special names were ever
+            // mirrored. Plain `unset FOO` on an ordinary var skips the
+            // locked O(n) environ scan entirely.
+            crate::executor::local_helpers::unset_process_env(name);
             unmark_exported(env_vars, name);
         }
     }
@@ -231,10 +233,9 @@ where
     }
     // Same array-export contract as apply_export_arg above (GNU variables.c
     // make_env_array_from_var_list, rubash#534): a readonly array keeps the
-    // attribute but its storage value never enters the process env.
-    if !env_vars.is_marked(ARRAY_VARS, name) && !env_vars.is_marked(ASSOC_VARS, name) {
-        env::set_var(name, value);
-    }
+    // attribute but its storage value never enters the child env. Mirrored
+    // through the same gate as every other write (#916).
+    sync_shell_assignment_process_env(env_vars, name, &value);
     mark_readonly(env_vars, name);
     Ok(EXECUTION_SUCCESS)
 }
