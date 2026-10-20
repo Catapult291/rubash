@@ -152,14 +152,16 @@ a `diverges` row points at live work.
 | #856 | open | `issue-856` (diverges): literal-PUA spelling eaten at the output boundary; `$'\uE000'` escape control matches |
 | #860/#861 | closed/fixed (PR #883) | manifest rows added — the case files shipped unscored |
 | #868/#876 | closed/fixed | manifest rows added — the case files shipped unscored |
-| #871 | closed; residual | `issue-871` (diverges): `infin`/`nann`/`infx`/`nanx` print the value but emit `invalid number` + rc 1 |
+| #871 | closed; residual matches | `issue-871` (must-match): `infin`/`nann`/`infx`/`nanx` print the value and emit `invalid number` + rc 1 — byte-identical to GNU (promoted from diverges per PR #944 review) |
 | #879 | open | `issue-879` (diverges): `%f 1e999`/`%a 1e999` expand as `inf` vs long-double |
 
 Residuals found while building this batch and filed for the record:
 #938 (read empty via `</dev/stdin` / `<&0` in pipeline context) and #940
 (redirect-failure diagnostic bypasses the ordered fd table on `()`/simple
 faces; `!`+compound+redirect failure inside a group aborts the script).
-#871's prefix-subclass residual is noted on its own row rather than reopened.
+#871's prefix-subclass residual is noted on its own row rather than
+reopened; that face has since been verified byte-identical to GNU and
+its row promoted to must-match (PR #944 rework).
 
 Not pinned by this batch: #705 (needs argv/stdin at the launcher — the runner
 deliberately passes a script file with fd 0 on /dev/null) and the static/

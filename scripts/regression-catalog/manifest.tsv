@@ -47,6 +47,6 @@ issue-860	860	must-match	unset empty-span/mask pseudo-diagnostic family — fixe
 issue-861	861	must-match	assoc kvlist self-read miss — fixed by PR #883 (manifest row landed late under #746)
 issue-866	866	must-match	forged ambient __RUBASH_BACKGROUND_WRAPPER arms nothing (nonce handshake, rubash#866) - fixed
 issue-868	868	must-match	mark_quoted_ifs_from_raw carrier-blind — fixed (manifest row landed late under #746)
-issue-871	871	diverges	printf inf/nan prefix subclass (infin/nann/infx/nanx) prints the value but emits invalid number + rc 1 — residual of the #869 fix
+issue-871	871	must-match	printf inf/nan prefix subclass (infin/nann/infx/nanx) prints the value but emits invalid number + rc 1 — verified byte-identical to GNU incl. rc 1 + diag; promoted from diverges per PR #944 review
 issue-876	876	must-match	mark_quoted_ifs_from_raw byte-offset vs char-count on multibyte leads — fixed (manifest row landed late under #746)
 issue-879	879	diverges	printf %f/%e/%g long-double expansion (1e999 -> inf on the arm) + %a/%A mantissa style — open
