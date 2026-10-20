@@ -63,6 +63,7 @@ src/executor/conditional.rs::is_shell_name_start\(bytes\[name_start\] as char\)
 src/executor/declare_local.rs::is_shell_name_(start|char)\(c as char\)
 src/executor/execution_misc.rs::(as_bytes\(\)\[0\] as char|out\.push\(byte as char\)|b'0' \+ .*as char)
 src/executor/init.rs::bytes\[0\] as char
+src/executor/parameter_case.rs::\} as char\);
 src/executor/parameter_core.rs::bytes\[index\] as char
 src/executor/path.rs::(as_bytes\(\)|bytes)\[[0-9]+\] as char
 src/executor/pipeline_exec.rs::\|byte\| byte as char

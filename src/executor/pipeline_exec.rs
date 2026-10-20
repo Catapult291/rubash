@@ -1583,6 +1583,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < consumer_count {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {
@@ -2018,6 +2019,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < commands.len() {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {
@@ -2246,6 +2248,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             processes.push(child);
         }
 
@@ -2636,6 +2639,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < commands.len() {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {

@@ -917,6 +917,7 @@ impl Executor {
         drop(process);
         match spawned {
             Ok(mut child) => {
+                adopt_orphan_console(child.id());
                 for dup in parent_side_dups {
                     crate::fd::close_handle(dup);
                 }
