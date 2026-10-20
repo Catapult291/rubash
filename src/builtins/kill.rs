@@ -1958,12 +1958,43 @@ pub fn kernel_handler_installed(signal: i32) -> bool {
 pub const BACKGROUND_WRAPPER_ENV_KEY: &str = "__RUBASH_BACKGROUND_WRAPPER";
 
 /// rubash#866: the internal argv flag carrying the handshake nonce. Like the
-/// other `--internal-*` faces it is consumed in main() before the GNU option
-/// parser ever sees it; the wrapper role arms only when the flag's nonce and
-/// the environment nonce agree (both constructed by the wrapper spawn site in
-/// compound_exec), so guessing or exporting the environment name alone is
-/// not enough.
+/// other `--internal-*` faces it is consumed by the host CLI's startup
+/// consume call before any option parser ever sees it; the wrapper role arms
+/// only when the flag's nonce and the environment nonce agree (both
+/// constructed by the wrapper spawn site in compound_exec), so guessing or
+/// exporting the environment name alone is not enough.
+///
+/// The flag is niu-CLI-specific: a host that never calls
+/// `consume_background_wrapper_handshake` (an embedder's own launcher, or a
+/// foreign bash on PATH) would reject it as an invalid option and kill the
+/// background command. The wrapper spawn site therefore attaches it only
+/// when `background_wrapper_flag_consumer_present()` is set — rubash#873
+/// CI: the niubash launcher respawned its host CLI with the flag and
+/// the launcher's GNU-aligned parser replied
+/// `bash: --internal-bg-wrapper=<nonce>: invalid option` + usage, killing
+/// every wrapper respawn.
 pub const BACKGROUND_WRAPPER_FLAG: &str = "--internal-bg-wrapper=";
+
+/// rubash#873: marks that THIS process's command-line face understands the
+/// background-wrapper handshake — set unconditionally at the top of
+/// `consume_background_wrapper_handshake`, which rubash's own main() calls
+/// at every startup (embedders adopt the same one call). The wrapper spawn
+/// site consults it before splicing `BACKGROUND_WRAPPER_FLAG` into a
+/// respawned child's argv: a host that never consumes must never RECEIVE
+/// the flag, or the child's option parser rejects it and the background
+/// command dies (the niubash launcher CI failure). The env nonce channel
+/// stays unconditionally: for a non-consuming child it is an inert reserved
+/// key (a consumer scrub it at startup; a non-consumer never reads it), and
+/// a single channel can never arm — that is the rubash#866 contract.
+static BACKGROUND_WRAPPER_FLAG_CONSUMER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// rubash#873: whether this process's CLI consumes the background-wrapper
+/// handshake (see `BACKGROUND_WRAPPER_FLAG_CONSUMER`). Gates the argv side
+/// of the handshake at the wrapper spawn site.
+pub fn background_wrapper_flag_consumer_present() -> bool {
+    BACKGROUND_WRAPPER_FLAG_CONSUMER.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// rubash#866: in-process wrapper role. Decided ONCE per process at startup
 /// by `consume_background_wrapper_handshake` (nonce handshake) and consulted
@@ -2032,7 +2063,14 @@ pub fn new_background_wrapper_nonce() -> String {
 /// is scrubbed unconditionally so a user-forged value can neither arm
 /// anything nor leak into grandchildren. On mismatch (hand forgery, stale
 /// spawn, tampering) the process simply runs without the wrapper role.
+///
+/// The call itself (regardless of whether a handshake is present) marks the
+/// process as a flag consumer — see `BACKGROUND_WRAPPER_FLAG_CONSUMER`.
+/// Hosts that adopt this call opt into receiving the argv channel on their
+/// own wrapper respawns; hosts that never call it get env-only respawns and
+/// the flag never reaches their CLI.
 pub fn consume_background_wrapper_handshake(args: &mut Vec<String>) {
+    BACKGROUND_WRAPPER_FLAG_CONSUMER.store(true, std::sync::atomic::Ordering::Release);
     let nonce = match args
         .get(1)
         .and_then(|arg| arg.strip_prefix(BACKGROUND_WRAPPER_FLAG))
@@ -2172,9 +2210,10 @@ mod kernel_signal_tests {
 #[cfg(all(test, unix))]
 mod background_wrapper_handshake_tests {
     use super::{
-        background_wrapper_role_armed, consume_background_wrapper_handshake,
-        new_background_wrapper_nonce, BACKGROUND_WRAPPER_ENV_KEY,
-        BACKGROUND_WRAPPER_EXPECTED_PARENT, BACKGROUND_WRAPPER_FLAG, BACKGROUND_WRAPPER_ROLE,
+        background_wrapper_flag_consumer_present, background_wrapper_role_armed,
+        consume_background_wrapper_handshake, new_background_wrapper_nonce,
+        BACKGROUND_WRAPPER_ENV_KEY, BACKGROUND_WRAPPER_EXPECTED_PARENT, BACKGROUND_WRAPPER_FLAG,
+        BACKGROUND_WRAPPER_ROLE,
     };
     use std::sync::atomic::Ordering;
 
@@ -2285,6 +2324,22 @@ mod background_wrapper_handshake_tests {
         assert!(a
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// rubash#873: any consume call — even the plain-invocation scrub —
+    /// marks the process as an argv-flag consumer, which is what licenses
+    /// the wrapper spawn site to splice `--internal-bg-wrapper=` into a
+    /// respawned child. The inverse (no consume call → no flag) cannot be
+    /// asserted in this shared test process (sibling tests above already
+    /// flipped the bit; only nextest's process-per-test lane could); it is
+    /// pinned end-to-end by the niubash launcher suite, whose host CLI
+    /// never consumed and must never RECEIVE the flag (rubash#873 CI).
+    #[test]
+    fn consume_marks_the_process_as_a_flag_consumer() {
+        let _lock = HANDSHAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut args = vec!["rubash".to_string(), "-c".to_string(), "true".to_string()];
+        consume_background_wrapper_handshake(&mut args);
+        assert!(background_wrapper_flag_consumer_present());
     }
 }
 

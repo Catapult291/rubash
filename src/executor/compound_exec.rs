@@ -592,17 +592,40 @@ impl Executor {
             }
         }
         // rubash#866: second handshake channel — the nonce rides argv too,
-        // ahead of every other argument. main() consumes it (with the env
-        // entry above) before the GNU option parser or the `-c` driver sees
+        // ahead of every other argument. The host CLI consumes it (with the
+        // env entry above) before any option parser or the `-c` driver sees
         // anything; the wrapper role arms only when both channels agree.
-        spawn_args.insert(
-            0,
-            format!(
-                "{}{}",
-                crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
-                wrapper_nonce
-            ),
-        );
+        // rubash#873: the flag is niu-CLI-specific, so it rides ONLY when
+        // this process's own CLI declared itself a handshake consumer
+        // (rubash main.rs — and adopting hosts — call
+        // consume_background_wrapper_handshake at startup). A launcher that
+        // never consumes (niubash's niu) or any foreign face would reject
+        // the unknown option — `bash: --internal-bg-wrapper=<nonce>:
+        // invalid option` + usage — and the background command would die at
+        // spawn (the niubash background_spawn_args CI red). For those hosts
+        // the respawn is env-nonce-only: the key is inert for a
+        // non-consumer (never read; scrubbed by any rubash that does
+        // start), and a single channel can never arm — the rubash#866
+        // contract holds either way.
+        //
+        // cfg(test): this crate's OWN unit tests drive the Executor
+        // in-process — the test harness process never runs main.rs, so the
+        // consumer bit would make the attach order-dependent (true only
+        // after the handshake unit tests happened to run first). In the
+        // unit-test process the respawn target is always this repo's own
+        // engine binary (CARGO_BIN_EXE / test_rubash_binary_from_current_
+        // exe), whose main does consume — attaching unconditionally there
+        // is exactly the pre-gate behavior the suite was green under.
+        if crate::builtins::kill::background_wrapper_flag_consumer_present() || cfg!(test) {
+            spawn_args.insert(
+                0,
+                format!(
+                    "{}{}",
+                    crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
+                    wrapper_nonce
+                ),
+            );
+        }
 
         // GNU forks the async subshell: the child's fd table is a copy of the
         // parent's. std::process::Command cannot express a per-spawn handle
