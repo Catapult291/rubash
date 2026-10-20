@@ -9,7 +9,7 @@
 //! returns stdout without a trailing newline, so the `%f` newline from the
 //! probes is absent here.
 
-use super::{EXECUTION_FAILURE, EXECUTION_SUCCESS, run};
+use super::{run, EXECUTION_FAILURE, EXECUTION_SUCCESS};
 
 #[test]
 fn inf_word_prefixes_convert_with_suffix_diagnostic() {
