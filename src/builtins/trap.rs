@@ -7,7 +7,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
 const TRAP_LIST: &str = "__RUBASH_TRAPS";
-const TRAP_PREFIX: &str = "__RUBASH_TRAP_";
+/// Action-key prefix for installed traps (`__RUBASH_TRAP_<SIGNAL>`).
+/// `pub(crate)` for the arith-for counter fast driver's whitelist gate
+/// (`compound_exec.rs`): the fast loop runs no commands, so any installed
+/// action — including a reset-suppressed one, which the gate conservatively
+/// treats as doubt — disqualifies and the slow loop runs instead.
+pub(crate) const TRAP_PREFIX: &str = "__RUBASH_TRAP_";
 /// Signals whose disposition was SIG_IGN when this shell started (trap.c
 /// sigmodes SIG_HARD_IGNORE). They cannot be trapped or reset, and POSIX
 /// reports no error when attempted (trap.c set_signal/ignore_signal).
@@ -17,7 +22,9 @@ pub(crate) const TRAP_ORIG_IGNORES: &str = "__RUBASH_TRAP_ORIG_IGN";
 /// restores the original handler for trapped signals but deliberately does
 /// not free trap_list strings, so `trap` in a subshell still lists the
 /// parent's traps; the reset set records which entries may not fire.
-const TRAP_RESET: &str = "__RUBASH_TRAP_RESET";
+/// `pub(crate)` alongside [`TRAP_PREFIX`] for the same fast-driver gate,
+/// which skips exactly this metadata key (and [`TRAP_ORIG_IGNORES`]).
+pub(crate) const TRAP_RESET: &str = "__RUBASH_TRAP_RESET";
 const EX_USAGE: i32 = 2;
 /// GNU's internal EX_USAGE (builtins/common.h): what trap.def returns before
 /// execute_cmd.c:4886-4888 converts it for `$?`. It exceeds EX_SHERRBASE,

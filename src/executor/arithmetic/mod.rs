@@ -3473,6 +3473,120 @@ fn arith_value_is_plain_decimal(value: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Canonical counter triple for the arith-for fast driver
+/// (`compound_exec.rs`): `for ((v=C0; v<C1; v++))` over one plain variable
+/// with pure-decimal bounds. GNU evaluates the same shapes through
+/// execute_arith_for_command (execute_cmd.c:3219) + expr.c descent on every
+/// iteration; the fast driver performs the identical counter directly and
+/// the identical write pipeline, so admission is a strict whitelist and any
+/// semantic doubt falls through to the slow loop. The test/update halves
+/// reuse the parse-cache admission (identity alphabet, ticket shape,
+/// forbidden-op rejection, strict `v<N` / `v++` parse, non-dynamic var);
+/// the init half parses its `v=C0` shape here under the same strictness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArithCounterLoop {
+    /// Loop variable (`i` in `for ((i=0; i<N; i++))`).
+    pub var: String,
+    /// Canonical init value (`C0`).
+    pub init: i64,
+    /// Canonical test bound (`C1`).
+    pub bound: i64,
+}
+
+/// Strict canonical decimal: ASCII digits only, no sign, no leading-zero
+/// multi-digit form (GNU strlong reads that as octal — doubt, not fast),
+/// fitting `i64` exactly as rendered (bash_arith wraps every literal, so an
+/// overflowing bound takes a different slow value and stays slow).
+fn arith_counter_canonical_decimal(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if trimmed.len() > 1 && trimmed.starts_with('0') {
+        return None;
+    }
+    let value: i64 = trimmed.parse().ok()?;
+    if value.to_string() != trimmed {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whitelist admission for the counter fast driver over the RAW header
+/// strings. `Some` admits, `None` is doubt and runs the slow loop.
+/// Requires non-empty init/test/update spelling exactly `v=C0`, `v<C1`,
+/// `v++` over ONE variable; everything else (`<=`, `==`, `++v`, `v+=1`,
+/// `v=i+1`, signed/octal/huge bounds, empty sections, name mismatches)
+/// stays slow.
+pub(crate) fn arith_counter_loop_shapes(
+    init: &str,
+    test: &str,
+    update: &str,
+) -> Option<ArithCounterLoop> {
+    if init.trim().is_empty() || test.trim().is_empty() || update.trim().is_empty() {
+        return None;
+    }
+    let (test_var, cached_bound) = match arith_parse_cache_try_admit(test)? {
+        (ArithParseCacheKind::CmpLt { var, bound }, _) => (var, bound),
+        _ => return None,
+    };
+    let update_var = match arith_parse_cache_try_admit(update)? {
+        (ArithParseCacheKind::PostInc { var }, _) => var,
+        _ => return None,
+    };
+    if test_var != update_var {
+        return None;
+    }
+    // The cached bound is `i64`-wrapped (bash_arith); re-derive it from the
+    // raw text and require the exact value so an overflowing literal keeps
+    // its slow (differently-wrapped) semantics.
+    let angle = test.find('<')?;
+    let bound = arith_counter_canonical_decimal(&test[angle + 1..])?;
+    if i128::from(bound) != cached_bound {
+        return None;
+    }
+    if test[..angle].trim() != test_var {
+        return None;
+    }
+    // Init is the one shape the parse cache never admits (it rejects `=`);
+    // parse it under the same strictness: exactly `v=C0`.
+    let (name, value) = init.split_once('=')?;
+    if name.trim() != test_var {
+        return None;
+    }
+    Some(ArithCounterLoop {
+        var: test_var,
+        init: arith_counter_canonical_decimal(value)?,
+        bound,
+    })
+}
+
+/// Binding half of the counter gate, mirroring the write-path guards of
+/// `arith_parse_cache_exec_post_inc` (readonly must diagnose, arrays and
+/// assocs bind through their own helpers, namerefs retarget) plus the
+/// dynamic-name rejection: any doubt runs the slow loop, which keeps the
+/// exact slow handling.
+pub(crate) fn arith_counter_var_doubtful(
+    env_vars: &crate::shell::var_table::VarTable,
+    var: &str,
+) -> bool {
+    arith_parse_cache_is_dynamic(var)
+        || is_marked_var(env_vars, ARRAY_VARS, var)
+        || is_marked_var(env_vars, ASSOC_VARS, var)
+        || is_marked_var(env_vars, ASSOC_128_VARS, var)
+        || is_marked_var(env_vars, NAMEREF_VARS, var)
+        || is_marked_var(env_vars, READONLY_VARS, var)
+}
+
+/// Whether the arithmetic write log is empty. The counter fast driver
+/// performs its update writes through the same record/sync pipeline as the
+/// slow path (which drains the log per evaluation), so a non-empty log on
+/// entry means an unevaluated push is pending and only the slow loop's
+/// handling is correct.
+pub(crate) fn arith_write_log_is_empty() -> bool {
+    ARITH_WRITES.with(|log| log.borrow().is_empty())
+}
+
 /// First-knife arithmetic parse cache: only `CmpLT(i<N)` and
 /// `PostInc(i++)` specializations. GNU expr.c (5.3) has no parse cache —
 /// readtok/re-descent runs per evaluation — so this is pure acceleration;
