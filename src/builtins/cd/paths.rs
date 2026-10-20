@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use crate::executor::path::shell_path_to_windows;
@@ -81,8 +80,10 @@ pub(super) fn filesystem_path_for_display(
 }
 
 pub(super) fn set_shell_env(env_vars: &mut HashMap<String, String>, name: &str, value: String) {
+    // Gated like every other mirror (#916): PWD/OLDPWD are always special,
+    // so behavior is unchanged, but future callers inherit the gate.
     env_vars.insert(name.to_string(), value.clone());
-    env::set_var(name, OsString::from(value));
+    crate::executor::local_helpers::set_process_env(name, &value);
 }
 
 pub(super) fn shell_display_path(path: &Path) -> String {

@@ -630,7 +630,7 @@ impl Executor {
                 if let Some(value) = process_value {
                     set_process_env(&name, value);
                 } else {
-                    env::remove_var(&name);
+                    crate::executor::local_helpers::unset_process_env(&name);
                 }
                 continue;
             }
@@ -641,7 +641,7 @@ impl Executor {
                 set_process_env(&name, value);
             } else {
                 self.shell_state.env_vars.remove(&name);
-                env::remove_var(&name);
+                crate::executor::local_helpers::unset_process_env(&name);
             }
             self.restore_typed_temporary_value(&name, typed_value);
             // GNU variables.c pop_scope: the saved variable object — value
