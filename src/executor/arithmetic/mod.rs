@@ -40,11 +40,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 
     /// First-knife arithmetic parse cache (rubash#156 follow-up): one
-    /// thread-local entry holding at most one CmpLT (`i<N`) and one PostInc
-    /// (`i++`) specialization side by side (a single static, bounded — never
-    /// a growing map). GNU expr.c has no such cache, so this is pure
-    /// acceleration: any semantic doubt falls back to the slow parser and
-    /// the entry is kept (never evicted on a hit-fallback).
+    /// thread-local entry holding at most one CmpLT (`i<N`), one PostInc
+    /// (`i++`) and one AddAssign (`x+=i` / `x+=1`) specialization side by
+    /// side (a single static, bounded — never a growing map). GNU expr.c
+    /// has no such cache, so this is pure acceleration: any semantic doubt
+    /// falls back to the slow parser and the entry is kept (never evicted
+    /// on a hit-fallback).
     static ARITH_PARSE_CACHE: std::cell::RefCell<ArithParseCache> =
         const { std::cell::RefCell::new(ArithParseCache::EMPTY) };
 }
@@ -2778,6 +2779,11 @@ fn eval_mutable_arith_result(
                     return (Some(result), None);
                 }
             }
+            ArithParseCacheKind::AddAssign { dst, src } => {
+                if let Some(result) = arith_parse_cache_exec_add_assign(&dst, &src, env_vars) {
+                    return (Some(result), None);
+                }
+            }
         }
     } else if let Some((kind, slot)) = arith_parse_cache_try_admit(value) {
         arith_parse_cache_store(slot, value.to_string(), no_expand, kind);
@@ -3587,32 +3593,44 @@ pub(crate) fn arith_write_log_is_empty() -> bool {
     ARITH_WRITES.with(|log| log.borrow().is_empty())
 }
 
-/// First-knife arithmetic parse cache: only `CmpLT(i<N)` and
-/// `PostInc(i++)` specializations. GNU expr.c (5.3) has no parse cache —
-/// readtok/re-descent runs per evaluation — so this is pure acceleration;
-/// any semantic doubt falls back to the slow parser.
+/// First-knife arithmetic parse cache: `CmpLT(i<N)`, `PostInc(i++)` and
+/// `AddAssign(x+=i|x+=1)` specializations. GNU expr.c (5.3) has no parse
+/// cache — readtok/re-descent runs per evaluation — so this is pure
+/// acceleration; any semantic doubt falls back to the slow parser.
 #[derive(Clone, Debug)]
 enum ArithParseCacheKind {
     CmpLt { var: String, bound: i128 },
     PostInc { var: String },
+    AddAssign { dst: String, src: ArithAddAssignSrc },
+}
+
+/// AddAssign right-hand side: a live variable read or an immediate literal.
+/// `((x+=i))` evaluates to the NEW value (unlike PostInc's old value).
+#[derive(Clone, Debug)]
+enum ArithAddAssignSrc {
+    Var(String),
+    Imm(i128),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArithParseCacheSlot {
     CmpLt,
     PostInc,
+    AddAssign,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ArithParseCache {
     cmp_lt: Option<(String, bool, String, i128)>,
     post_inc: Option<(String, bool, String)>,
+    add_assign: Option<(String, bool, String, ArithAddAssignSrc)>,
 }
 
 impl ArithParseCache {
     const EMPTY: Self = Self {
         cmp_lt: None,
         post_inc: None,
+        add_assign: None,
     };
 }
 
@@ -3663,10 +3681,88 @@ fn arith_parse_cache_has_forbidden_op(expression: &str) -> bool {
         || expression.contains("||")
 }
 
+/// Strict AddAssign shape: exactly one contiguous `+=` splitting a plain
+/// shell-name `dst` and a `src` that is either a plain shell name (Var) or an
+/// ASCII-decimal immediate (Imm). Rejects `==`/`<=`/`!=` (equality/relational
+/// spellings), any other operator symbol, leading-zero multi-digit immediates
+/// (GNU strlong octal arm: `08`/`010` stay slow), overflowing literals
+/// (`parse` failure stays slow) and dynamic names. Whitespace around the
+/// operands is allowed; anything else is doubt -> None.
+fn arith_parse_cache_parse_add_assign(
+    expression: &str,
+) -> Option<(ArithParseCacheKind, ArithParseCacheSlot)> {
+    // Only one `+=` join; `==`/`<=`/`!=`/shifts never contain `+=`.
+    if expression.matches("+=").count() != 1 {
+        return None;
+    }
+    // Defensive symbol rejection: the AddAssign alphabet is names, decimal
+    // digits, blanks and the single `+=` join only.
+    if expression.contains("==") || expression.contains("<=") || expression.contains("!=") {
+        return None;
+    }
+    if expression.contains('<')
+        || expression.contains('>')
+        || expression.contains('!')
+        || expression.contains('?')
+        || expression.contains(':')
+        || expression.contains(',')
+        || expression.contains('/')
+        || expression.contains('%')
+        || expression.contains('*')
+        || expression.contains('&')
+        || expression.contains('|')
+        || expression.contains('^')
+        || expression.contains('~')
+        || expression.contains('(')
+        || expression.contains(')')
+    {
+        return None;
+    }
+    let (left_raw, right_raw) = expression.split_once("+=")?;
+    let dst = left_raw.trim();
+    let src = right_raw.trim();
+    if dst.is_empty() || src.is_empty() {
+        return None;
+    }
+    if !is_shell_name(dst) || arith_parse_cache_is_dynamic(dst) {
+        return None;
+    }
+    // Immediate path: unsigned ASCII digits only (a leading `-`/`+` stays
+    // slow via the doubt below, keeping the union pre-filter minimal).
+    if src.bytes().all(|b| b.is_ascii_digit()) {
+        if src.len() > 1 && src.starts_with('0') {
+            return None;
+        }
+        let imm: i128 = src.parse().ok()?;
+        let imm = imm as i64 as i128;
+        return Some((
+            ArithParseCacheKind::AddAssign {
+                dst: dst.to_string(),
+                src: ArithAddAssignSrc::Imm(imm),
+            },
+            ArithParseCacheSlot::AddAssign,
+        ));
+    }
+    // Variable path: a single plain shell name, never dynamic.
+    if !is_shell_name(src) || arith_parse_cache_is_dynamic(src) {
+        return None;
+    }
+    Some((
+        ArithParseCacheKind::AddAssign {
+            dst: dst.to_string(),
+            src: ArithAddAssignSrc::Var(src.to_string()),
+        },
+        ArithParseCacheSlot::AddAssign,
+    ))
+}
+
 /// Strict shape parse over the RAW expression text (no normalization):
-/// exactly `name < decimal` (single `<`, no `<=`/`<<`/`=`/`>`/`!`) or
-/// exactly `name++` (suffix only, whitespace allowed). Anything else is
-/// doubt -> None (slow path).
+/// exactly `name < decimal` (single `<`, no `<=`/`<<`/`=`/`>`/`!`),
+/// exactly `name++` (suffix only, whitespace allowed), or exactly
+/// `dst += src` where `src` is a variable name or a decimal immediate
+/// (single `+=`, no `==`/`<=`/`!=`, no other operator symbols, no
+/// leading-zero multi-digit immediates, no overflowing literals, no dynamic
+/// names). Anything else is doubt -> None (slow path).
 fn arith_parse_cache_parse(expression: &str) -> Option<(ArithParseCacheKind, ArithParseCacheSlot)> {
     let trimmed = expression.trim();
     if trimmed.is_empty() {
@@ -3692,6 +3788,12 @@ fn arith_parse_cache_parse(expression: &str) -> Option<(ArithParseCacheKind, Ari
             ));
         }
         return None;
+    }
+    // AddAssign: exactly `dst+=src` / `dst += src` with a plain-name dst
+    // and a Var|Imm src. Single `+=`, no `==`/`<=`/`!=`/other symbols, no
+    // leading-zero immediates, no overflowing literals, no dynamic names.
+    if let Some(parsed) = arith_parse_cache_parse_add_assign(expression) {
+        return Some(parsed);
     }
     // CmpLT: exactly one `<`, otherwise only name/digits/blanks.
     if expression.as_bytes().iter().filter(|b| **b == b'<').count() != 1 {
@@ -3738,19 +3840,18 @@ fn arith_parse_cache_parse(expression: &str) -> Option<(ArithParseCacheKind, Ari
 /// Admission: three-layer AND reusing the existing whitelist gates plus the
 /// new shape rejection. Returns the parsed specialization and its slot.
 ///
-/// The union-alphabet pre-filter runs first: neither cached shape contains
-/// any byte outside `[A-Za-z0-9_ \t<+]`, so a single short-circuiting scan
-/// rejects assignment-heavy traffic like `x+=i` (the `=` fails at index 1)
-/// before the identity + ticket + forbidden scans run. Any expression the
-/// pre-filter rejects would also fail the strict parse below, so the
-/// short-circuit is semantics-preserving.
+/// The union-alphabet pre-filter runs first: every cached shape only contains
+/// bytes in `[A-Za-z0-9_ \t<+=]`, so a single short-circuiting scan rejects
+/// anything outside it before the identity + ticket + forbidden scans run.
+/// Any expression the pre-filter rejects would also fail the strict parse
+/// below, so the short-circuit is semantics-preserving.
 fn arith_parse_cache_try_admit(
     expression: &str,
 ) -> Option<(ArithParseCacheKind, ArithParseCacheSlot)> {
     if !expression.as_bytes().iter().all(|b| {
         matches!(
             b,
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b' ' | b'\t' | b'<' | b'+'
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b' ' | b'\t' | b'<' | b'+' | b'='
         )
     }) {
         return None;
@@ -3783,6 +3884,14 @@ fn arith_parse_cache_lookup(expression: &str, no_expand: bool) -> Option<ArithPa
                 return Some(ArithParseCacheKind::PostInc { var: var.clone() });
             }
         }
+        if let Some((expr, flag, dst, src)) = cache.add_assign.as_ref() {
+            if expr == expression && *flag == no_expand {
+                return Some(ArithParseCacheKind::AddAssign {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                });
+            }
+        }
         None
     })
 }
@@ -3801,6 +3910,9 @@ fn arith_parse_cache_store(
             }
             (ArithParseCacheSlot::PostInc, ArithParseCacheKind::PostInc { var }) => {
                 cache.post_inc = Some((expression, no_expand, var));
+            }
+            (ArithParseCacheSlot::AddAssign, ArithParseCacheKind::AddAssign { dst, src }) => {
+                cache.add_assign = Some((expression, no_expand, dst, src));
             }
             _ => {}
         }
@@ -3883,23 +3995,93 @@ fn arith_parse_cache_exec_post_inc(
     Some(current)
 }
 
+/// Whether a cached-shape variable is currently unbound (no shell entry and
+/// no process-environment entry). An unbound read takes the slow path so the
+/// nounset trap and the exact slow binding creation stay intact; the cache
+/// entry is kept (never evicted on this hit-fallback).
+fn arith_parse_cache_is_unbound(env_vars: &crate::shell::var_table::VarTable, var: &str) -> bool {
+    env_vars.get(var).is_none() && std::env::var(var).is_err()
+}
+
+fn arith_parse_cache_exec_add_assign(
+    dst: &str,
+    src: &ArithAddAssignSrc,
+    env_vars: &mut crate::shell::var_table::VarTable,
+) -> Option<i128> {
+    // Write guards mirror the slow path: readonly must diagnose,
+    // arrays/assocs/namerefs bind through their own helpers, dynamic names
+    // read live -> all slow. Unbound or non-plain-decimal loads are plain
+    // doubt -> slow; the entry is kept in every fallback.
+    if arith_parse_cache_var_doubtful(env_vars, dst) || is_marked_var(env_vars, READONLY_VARS, dst)
+    {
+        return None;
+    }
+    if arith_parse_cache_is_unbound(env_vars, dst) {
+        return None;
+    }
+    let addend = match src {
+        ArithAddAssignSrc::Imm(imm) => *imm,
+        ArithAddAssignSrc::Var(var) => {
+            if arith_parse_cache_var_doubtful(env_vars, var) {
+                return None;
+            }
+            if arith_parse_cache_is_unbound(env_vars, var) {
+                return None;
+            }
+            let raw = env_vars
+                .get(var)
+                .cloned()
+                .or_else(|| std::env::var(var).ok())
+                .unwrap_or_default();
+            arith_parse_cache_plain_load(&raw)?
+        }
+    };
+    let raw_dst = env_vars
+        .get(dst)
+        .cloned()
+        .or_else(|| std::env::var(dst).ok())
+        .unwrap_or_default();
+    let current = arith_parse_cache_plain_load(&raw_dst)?;
+    let updated = current.wrapping_add(addend) as i64 as i128;
+    let old_value = env_vars.get(dst).cloned();
+    let new_value = updated.to_string();
+    env_vars.insert(dst.to_string(), new_value.clone());
+    record_arith_write(dst, old_value);
+    sync_shell_assignment_process_env(env_vars, dst, &new_value);
+    // `((x+=i))` evaluates to the NEW value, unlike PostInc's old value.
+    Some(updated)
+}
+
 #[cfg(test)]
 mod arith_parse_cache_tests {
     use super::{arith_parse_cache_parse, arith_parse_cache_try_admit, ArithParseCacheKind};
     use crate::executor::Executor;
 
     #[test]
-    fn only_cmp_lt_and_post_inc_admit() {
+    fn only_cached_shapes_admit() {
         assert!(arith_parse_cache_try_admit("i<200000").is_some());
         assert!(arith_parse_cache_try_admit("i++").is_some());
         assert!(arith_parse_cache_try_admit("i ++").is_some());
+        assert!(arith_parse_cache_try_admit("x+=i").is_some());
+        assert!(arith_parse_cache_try_admit("x+=1").is_some());
+        assert!(arith_parse_cache_try_admit("x += i").is_some());
         // Everything else is doubt -> slow path, no store.
         for expression in [
             "i<=n",
             "i<<2",
             "i==n",
             "i=0",
-            "x+=i",
+            "x==i",
+            "x<=1",
+            "x!=i",
+            "x+=RANDOM",
+            "RANDOM+=1",
+            "x+=08",
+            "x+=010",
+            "x+=1+2",
+            "x+=i*2",
+            "x+=--1",
+            "x+=-1",
             "i--",
             "++i",
             "a?b:c",
@@ -3911,6 +4093,7 @@ mod arith_parse_cache_tests {
             "a||b",
             "RANDOM<10",
             "RANDOM++",
+            "x+=170141183460469231731687303715884105728",
             "i<N ",
         ] {
             if expression == "i<N " {
@@ -3945,6 +4128,29 @@ mod arith_parse_cache_tests {
         assert_eq!(executor.eval_arithmetic_command_value("i<10"), Some(1));
         assert_eq!(executor.eval_arithmetic_command_value("i++"), Some(3));
         assert_eq!(executor.get_env("i"), Some("4"));
+    }
+
+    #[test]
+    fn add_assign_evaluates_to_new_value() {
+        let mut executor = Executor::new();
+        executor.set_env("x", "5");
+        executor.set_env("i", "3");
+        // First evaluation misses (stores), the rest hit the closure.
+        // Unlike PostInc (old value), AddAssign returns the NEW value.
+        for _ in 0..3 {
+            executor.set_env("x", "5");
+            assert_eq!(executor.eval_arithmetic_command_value("x+=i"), Some(8));
+            assert_eq!(executor.get_env("x"), Some("8"));
+            executor.set_env("x", "5");
+            assert_eq!(executor.eval_arithmetic_command_value("x+=1"), Some(6));
+            assert_eq!(executor.get_env("x"), Some("6"));
+        }
+        // Doubtful loads fall back to slow without changing the outcome.
+        executor.set_env("x", "010");
+        assert_eq!(executor.eval_arithmetic_command_value("x+=i"), Some(11));
+        executor.set_env("x", "1+2");
+        executor.set_env("i", "3");
+        assert_eq!(executor.eval_arithmetic_command_value("x+=i"), Some(6));
     }
 
     #[test]
