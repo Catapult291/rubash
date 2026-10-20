@@ -1569,6 +1569,7 @@ impl Executor {
                 process.stdout(Stdio::piped());
                 process.stderr(Stdio::piped());
             }
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2003,6 +2004,7 @@ impl Executor {
             // niubash#141: keep the failed stage's resolved program in the
             // diagnostic — a bare `line 1: Unknown error` hid which stage's
             // CreateProcess failed (and with which binary).
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2230,6 +2232,7 @@ impl Executor {
             process.stdout(stdio_from_transferred_handle(
                 write.take().expect("producer writer already transferred"),
             ));
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2619,6 +2622,7 @@ impl Executor {
                 process.stderr(Stdio::piped());
             }
 
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),

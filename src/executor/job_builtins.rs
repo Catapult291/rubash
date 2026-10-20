@@ -1931,7 +1931,10 @@ impl Executor {
                     &self.shell_state.env_vars,
                 )
                 .unwrap_or_else(|| std::path::PathBuf::from(&editor_name));
-                let edit_status = std::process::Command::new(&editor_path).arg(&path).status();
+                let mut edit_command = std::process::Command::new(&editor_path);
+                edit_command.arg(&path);
+                suppress_orphan_console(&mut edit_command);
+                let edit_status = edit_command.status();
                 match edit_status {
                     Ok(st) if st.success() => {}
                     Ok(st) => {
