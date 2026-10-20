@@ -162,15 +162,8 @@ impl Executor {
         } else {
             self.dynamic_stack_array_values(array_name)
         };
-        let storage_opt = if dynamic_values.is_some() {
-            // Never consumed on this path; the divert above returns first.
-            None
-        } else {
-            self.parameter_array_storage(array_name)
-        };
-        let storage_is_none = storage_opt.is_none();
-        let storage = storage_opt.unwrap_or_default();
         if assoc_marked {
+            let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             // GNU parameters.c assoc_reference: a literal * subscript means
             // all elements, not the key "*"; a quoted * joins with IFS[0]
             // (string_list_pos_params). Expanded subscripts such as
@@ -178,14 +171,14 @@ impl Executor {
             if key == "*" {
                 return Some(
                     assoc_hash_ordered_values(
-                        &storage,
+                        &storage_assoc,
                         assoc_nbuckets(&self.shell_state.env_vars, &storage_name),
                     )
                     .join(&self.ifs_first_char_separator()),
                 );
             }
             let key = self.assoc_subscript_key(key);
-            return assoc_value_at(&storage, &key);
+            return assoc_value_at(&storage_assoc, &key);
         }
         // Use expand_arithmetic_special_parameters for array subscripts so that
         // $- expands to 0 (not shell flags) in arithmetic contexts. See array.tests line 60.
@@ -349,6 +342,63 @@ impl Executor {
                 }
             }
         }
+        // Typed-cell fast path, hoisted BEFORE the mirror clone (#916
+        // follow-up): executor writes keep the structured cell in sync
+        // with the mirror, while builtin-side writes only set the dirty
+        // flag (VarTable has no access to the structured store). Trust
+        // the cell only when clean; otherwise fall through to the mirror
+        // parse below. assoc/dynamic/scalar bases returned above or miss
+        // the cell lookup and never return from here.
+        //
+        // GNU arrayfunc.c:1492 array_value_internal orders the read as
+        // array_variable_part (variable lookup) -> array_expand_index
+        // (arrayfunc.c:1356 expand_arith_string + evalexp, expr.c:1183
+        // expr_streval) -> array_reference (element fetch): the subscript
+        // above already ran its expand+evalexp pass with side effects
+        // (`$((i++))`, RNG, PENDING_SUBSCRIPT_WRITES), and the mirror
+        // fetch below is a pure read, so deferring it until after the
+        // index is resolved preserves GNU's observable order while
+        // skipping the per-read O(n) mirror clone on a typed hit.
+        if !self.shell_state.env_vars.array_cells_dirty() {
+            if let Ok(typed_index) = i64::try_from(index) {
+                if let Some(cell_value) = self
+                    .shell_state
+                    .variables
+                    .indexed_element(&storage_name, typed_index)
+                {
+                    let typed = crate::executor::arrays::normalize_array_expanded_value(
+                        cell_value.to_string(),
+                    );
+                    // Safety net (debug builds = the test suite): the cell
+                    // must agree with the mirror. A mismatch means a mirror
+                    // write path missed its sync-or-dirty handling. The
+                    // mirror is re-fetched on demand here so release builds
+                    // (where debug_assert_eq! compiles out) skip the O(n)
+                    // clone entirely on this fast path.
+                    debug_assert_eq!(
+                        Some(typed.clone()),
+                        {
+                            let mirror =
+                                self.parameter_array_storage(array_name).unwrap_or_default();
+                            resolve_indexed_array_subscript(&mirror, index)
+                                .and_then(|resolved| array_value_at(&mirror, resolved))
+                        },
+                        "typed cell disagrees with mirror for {storage_name}[{index}]"
+                    );
+                    return Some(typed);
+                }
+            }
+        }
+        // Mirror fetch for the remaining scalar/mirror legs only. The
+        // assoc leg fetched its own mirror above (before subscript eval);
+        // the dynamic leg never consumes a mirror (divert returned).
+        let storage_opt = if dynamic_values.is_some() {
+            None
+        } else {
+            self.parameter_array_storage(array_name)
+        };
+        let storage_is_none = storage_opt.is_none();
+        let storage = storage_opt.unwrap_or_default();
         if !assoc_marked
             && dynamic_values.is_none()
             && !self.parameter_is_array_variable(&storage_name)
@@ -379,35 +429,6 @@ impl Executor {
                 return Some(crate::executor::shell_safe_value(&storage));
             }
             return None;
-        }
-        // Typed-cell fast path (#916 follow-up): executor writes keep the
-        // structured cell in sync with the mirror, while builtin-side
-        // writes only set the dirty flag (VarTable has no access to the
-        // structured store). Trust the cell only when clean; otherwise
-        // fall through to the mirror parse below. assoc/dynamic/scalar
-        // bases returned above and never reach a typed cell.
-        if !self.shell_state.env_vars.array_cells_dirty() {
-            if let Ok(typed_index) = i64::try_from(index) {
-                if let Some(cell_value) = self
-                    .shell_state
-                    .variables
-                    .indexed_element(&storage_name, typed_index)
-                {
-                    let typed = crate::executor::arrays::normalize_array_expanded_value(
-                        cell_value.to_string(),
-                    );
-                    // Safety net (debug builds = the test suite): the cell
-                    // must agree with the mirror. A mismatch means a mirror
-                    // write path missed its sync-or-dirty handling.
-                    debug_assert_eq!(
-                        Some(typed.clone()),
-                        resolve_indexed_array_subscript(&storage, index)
-                            .and_then(|resolved| array_value_at(&storage, resolved)),
-                        "typed cell disagrees with mirror for {storage_name}[{index}]"
-                    );
-                    return Some(typed);
-                }
-            }
         }
         let Some(index) = resolve_indexed_array_subscript(&storage, index) else {
             eprintln!(
