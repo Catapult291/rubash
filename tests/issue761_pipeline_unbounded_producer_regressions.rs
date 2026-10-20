@@ -11,7 +11,10 @@
 //! is the process that exits) and `yes | cat | true` hangs too.  The
 //! discriminator is whether some stage bounds the producer.
 //!
-//! Every test here is bounded on purpose.  A hang test that is not bounded turns
+//! These four reproductions were `#[ignore]`d while the defect was live; the fix
+//! has landed (rubash#761, PR #784) and they are now armed as ordinary tests.
+//!
+//! Every test here stays bounded on purpose.  A hang test that is not bounded turns
 //! a red CI into a stuck CI, and a red run that does not kill the tree leaves a
 //! `yes` behind to be inherited by the next test.  On expiry the whole process
 //! tree is killed with `taskkill /T` and the test fails with the bound it hit.
@@ -93,7 +96,6 @@ fn control_bounded_pipeline_with_shell_tail_terminates() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "rubash#761: hangs on master (unbounded drain, RSS grows ~250 MB/s); un-ignore with the fix"]
 fn yes_piped_into_true_terminates() {
     let (terminated, code) = run_bounded("yes | true");
     assert!(
@@ -104,7 +106,6 @@ fn yes_piped_into_true_terminates() {
 }
 
 #[test]
-#[ignore = "rubash#761: hangs on master"]
 fn yes_piped_into_colon_terminates() {
     let (terminated, code) = run_bounded("yes | :");
     assert!(terminated, "`yes | :` did not terminate within {BOUND:?}");
@@ -112,7 +113,6 @@ fn yes_piped_into_colon_terminates() {
 }
 
 #[test]
-#[ignore = "rubash#761: hangs on master — two externals before the shell tail is not a bound"]
 fn yes_piped_through_cat_into_true_terminates() {
     let (terminated, code) = run_bounded("yes | cat | true");
     assert!(
@@ -123,7 +123,6 @@ fn yes_piped_through_cat_into_true_terminates() {
 }
 
 #[test]
-#[ignore = "rubash#761: diverges on master — a bounded but huge producer is fully drained instead of stopped early"]
 fn seq_into_true_terminates_promptly() {
     let (terminated, code) = run_bounded("seq 1 20000000 | true");
     assert!(

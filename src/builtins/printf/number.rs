@@ -294,10 +294,7 @@ fn scan_float_subject(value: &str) -> Option<FloatSubject> {
     let mut word_len = 0usize;
     let mut is_nan = false;
     if let [a, b, c, ..] = rest_bytes {
-        if matches!(*a, b'i' | b'I')
-            && matches!(*b, b'n' | b'N')
-            && matches!(*c, b'f' | b'F')
-        {
+        if matches!(*a, b'i' | b'I') && matches!(*b, b'n' | b'N') && matches!(*c, b'f' | b'F') {
             word_len = 3;
             if let [d, e, f, g, h, ..] = &rest_bytes[3..] {
                 if matches!(*d, b'i' | b'I')

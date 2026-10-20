@@ -30,7 +30,7 @@ issue-798	798	must-match	exit inside source terminates the shell — fixed in #8
 loc-l1-substring	772	must-match	${x:off:len} opaque bytes — fixed by PR #781
 loc-l2-comsub	772	diverges	$(cat) non-UTF-8 second shape still drops content + bogus UTF-8 diagnostic (residual of #781)
 loc-l5-read-cr	772	diverges	read -r still strips a trailing CR (#769-class byte-opacity face, still open)
-lim-f5-fd-cap	773	diverges	fd table caps at 1014 with 'cannot duplicate fd: Invalid argument'
+lim-f5-fd-cap	773	must-match	fd table no longer caps at 1014 — PROMOTE on the 2026-10-20 run (arm 62a30ab1)
 lim-f6-nul	773	diverges	read counts NUL bytes (8 vs 6); comsub does not warn
 lim-f7-closed-fd0	773	diverges	closed fd 0 then re-redirect -> Bad file descriptor
 issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (the CR Nit 2 unset-operand row landed as parity in #847, see tests/issue828)
