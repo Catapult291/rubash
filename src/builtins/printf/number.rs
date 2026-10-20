@@ -130,7 +130,7 @@ pub(super) fn invalid_number_error(value: &str) -> String {
 
 /// printf.def:1416-1419 getintmax(): an operand whose first byte is a quote
 /// goes to asciicode() BEFORE any numeric parse, and asciicode
-/// (printf.def:1519-1544) converts arg[1] with mbrtowc without any
+/// (printf.def:1520-1543) converts arg[1] with mbrtowc without any
 /// chk_converror -- so `'a ` yields 'a' (97) with no diagnostic, and a lone
 /// quote yields the NUL at arg[1] (0, also no diagnostic).
 fn printf_char_constant(value: &str) -> Option<char> {
