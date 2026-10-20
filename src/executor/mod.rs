@@ -243,7 +243,10 @@ use substitution_metadata::*;
 use support_names::*;
 
 pub(crate) mod conditional;
-use conditional::{case_pattern_matches, case_pattern_matches_nocase, simple_grep_pattern_matches};
+use conditional::{
+    case_pattern_matches, case_pattern_matches_nocase, case_pattern_matches_nocase_with_word_chars,
+    case_pattern_matches_with_word_chars, simple_grep_pattern_matches,
+};
 
 use crate::builtins::alias::Alias;
 use crate::expand::tilde::tilde as tilde_expand;

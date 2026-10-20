@@ -14,11 +14,11 @@ pub(crate) use storage::{ansic_quote, ansic_shouldquote};
 pub(super) use storage::{
     append_indexed_mirror_segments, array_indices, array_store_enabled, array_value_at,
     array_values, format_indexed_array_storage, format_indexed_array_values, indexed_array_entries,
-    is_array_storage, is_marked_array_var, normalize_array_expanded_value,
-    parse_array_integer_subscript, parse_array_numeric_subscript, parse_array_subscript,
-    parse_expanded_array_subscript, quote_array_value, resolve_indexed_array_subscript,
-    store_indexed_array, store_indexed_array_state, sync_typed_indexed_array,
-    sync_typed_indexed_element,
+    indexed_array_entries_cached, is_array_storage, is_marked_array_var,
+    normalize_array_expanded_value, parse_array_integer_subscript, parse_array_numeric_subscript,
+    parse_array_subscript, parse_expanded_array_subscript, quote_array_value,
+    resolve_indexed_array_subscript, store_indexed_array, store_indexed_array_state,
+    sync_typed_indexed_array, sync_typed_indexed_element,
 };
 pub(crate) use storage::{
     drop_typed_indexed_array, replace_typed_indexed_array, sync_typed_indexed_storage,

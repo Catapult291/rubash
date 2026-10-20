@@ -24,7 +24,7 @@ fn run_with_env(
     env_vars: &crate::shell::var_table::VarTable,
 ) -> (i32, String) {
     let mut stderr = Vec::new();
-    let status = execute_with_stderr(args.iter().copied(), bracket, env_vars, &mut stderr).unwrap();
+    let status = execute_with_stderr(args, bracket, env_vars, &mut stderr).unwrap();
     (status, String::from_utf8(stderr).unwrap())
 }
 
