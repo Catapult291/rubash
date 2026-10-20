@@ -999,6 +999,31 @@ impl Executor {
         self.shell_state.env_vars.values_map()
     }
 
+    /// Test/diagnostic visibility into the typed indexed-array dirty flag
+    /// (`VarTable::array_cells_dirty`): true after an unsynced mirror write
+    /// (arithmetic element stores) until the executor re-syncs the
+    /// structured cell. Integration tests (`tests/executor_tests.rs`)
+    /// cannot reach the `pub(crate)` shell state, so this accessor exposes
+    /// the bit.
+    pub fn array_cells_dirty(&self) -> bool {
+        self.shell_state.env_vars.array_cells_dirty()
+    }
+
+    /// Re-sync one array's structured cell from its mirror and clear the
+    /// dirty flag (same two steps the executor sync points in
+    /// `temporary_assignments.rs` / `compound_exec.rs` perform, scoped to
+    /// `name`). Test/diagnostic support for the dirty-flag unit tests.
+    pub fn sync_array_cells_from_mirror(&mut self, name: &str) {
+        if let Some(storage) = self.shell_state.env_vars.get(name).cloned() {
+            crate::executor::arrays::sync_typed_indexed_storage(
+                &mut self.shell_state.variables,
+                name,
+                &storage,
+            );
+        }
+        self.shell_state.env_vars.clear_array_cells_dirty();
+    }
+
     /// GNU execute_cmd.c:5080 — the source builtin holds sourcenest for its
     /// whole execution (sourced body plus the evalfile.c:395 RETURN trap
     /// action). The depth feeds the trap bare-exit context check

@@ -920,3 +920,66 @@ fn decode_ansic_escapes(value: &str) -> String {
     // unicode1.sub U+0018/U+001B/U+001C/U+001D).
     crate::executor::substitution_metadata::bytes_to_assignment_shell_text(&out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::{ShellValue, VariableStore};
+    use std::collections::BTreeMap;
+
+    fn readonly_indexed_store(name: &str, values: &[&str]) -> VariableStore {
+        let mut store = VariableStore::default();
+        store.set_scalar(name, "").unwrap();
+        let entries: BTreeMap<i64, String> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as i64, value.to_string()))
+            .collect();
+        let variable = store.get_mut(name).unwrap();
+        variable.value = ShellValue::IndexedArray(entries);
+        variable.readonly = true;
+        store
+    }
+
+    fn usize_entries(values: &[&str]) -> BTreeMap<usize, String> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index, value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_reads_fall_back_to_mirror() {
+        // storage.rs:432-436: a refused write (readonly typed cell while the
+        // mirror write still lands, e.g. `read -a` on a readonly array) must
+        // not leave the structured cell shadowing the mirror — drop it so
+        // reads fall back to the mirror projection.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO", &["old0", "old1"]);
+        let fresh = usize_entries(&["new0", "new1"]);
+        sync_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO", &fresh);
+        assert!(
+            store.get("RUBASH_DIRTY_RO").is_none(),
+            "refused sync must drop the stale typed cell"
+        );
+        // The landed mirror still serves the fresh values.
+        let mirror = format_indexed_array_storage(fresh);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+        assert_eq!(array_value_at(&mirror, 1).as_deref(), Some("new1"));
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_on_dense_replace() {
+        // Same contract through the dense replacer used by `read -a` /
+        // declare sync writers: refusal drops the cell, the mirror stays
+        // authoritative.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO2", &["old0"]);
+        replace_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO2", ["new0"]);
+        assert!(
+            store.get("RUBASH_DIRTY_RO2").is_none(),
+            "refused replace must drop the stale typed cell"
+        );
+        let mirror = format_indexed_array_values(vec!["new0".to_string()]);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+    }
+}
