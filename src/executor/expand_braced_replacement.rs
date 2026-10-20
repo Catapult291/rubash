@@ -32,7 +32,7 @@ thread_local! {
 /// `$`/`0`/`!`). `@`/`*` are handled by the positional-list arm above.
 fn patsub_special_parameter_value(exec: &Executor, var_name: &str) -> Option<String> {
     match var_name {
-        "#" => Some(exec.shell_state.positional_params.len().to_string()),
+        "#" => Some(exec.shell_state.positional_window().len().to_string()),
         "?" => Some(exec.dollar_question_status().to_string()),
         "-" => Some(exec.shell_option_flags()),
         "$" => Some(exec.shell_pid_value().to_string()),
@@ -102,7 +102,7 @@ impl Executor {
             };
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|value| self.replace_patsub_pattern(value, &pattern, &replacement, global))
                     .collect::<Vec<_>>()
@@ -112,7 +112,7 @@ impl Executor {
         if let Ok(index) = var_name.parse::<usize>() {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index.saturating_sub(1))
                     .map(|value| {
                         self.replace_patsub_pattern(

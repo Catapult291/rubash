@@ -106,7 +106,7 @@ impl Executor {
         if matches!(var_name, "@" | "*") {
             let result = self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .iter()
                 .map(|value| {
                     remove_parameter_pattern(value, &pattern, operation, self.extglob_enabled())
@@ -128,7 +128,7 @@ impl Executor {
         if let Ok(index) = var_name.parse::<usize>() {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index.saturating_sub(1))
                     .map(|value| {
                         remove_parameter_pattern(value, &pattern, operation, self.extglob_enabled())

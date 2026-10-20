@@ -1406,7 +1406,7 @@ impl Executor {
             b'1'..=b'9' => {
                 let index = usize::from(parameter.as_bytes()[0] - b'0' - 1);
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index)
                     .cloned()
                     .unwrap_or_default()
@@ -1416,12 +1416,12 @@ impl Executor {
             // with space, IFS empty joins with nothing), while $@ always
             // joins with a space (subst.c:3006 string_list_dollar_at —
             // PF_ASSIGNRHS || ifs == 0 || *ifs == 0 selects ' ').
-            b'@' => self.shell_state.positional_params.join(" "),
+            b'@' => self.shell_state.positional_window().join(" "),
             b'*' => self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .join(&self.ifs_first_char_separator()),
-            b'#' => self.shell_state.positional_params.len().to_string(),
+            b'#' => self.shell_state.positional_window().len().to_string(),
             b'?' => self.exit_code.to_string(),
             b'$' => self.shell_pid_value().to_string(),
             b'!' => self.last_background_pid_value(),
@@ -1615,7 +1615,7 @@ impl Executor {
                 if at_quoted {
                     values.extend(
                         self.shell_state
-                            .positional_params
+                            .positional_window()
                             .iter()
                             .map(|value| store!(value)),
                     );
@@ -1629,7 +1629,7 @@ impl Executor {
                     // kvpair consumer keeps the word unsplit
                     // (arrayfunc.c:630).
                     let fields = field_split_positional_values_with_ifs(
-                        self.shell_state.positional_params.clone(),
+                        self.shell_state.positional_window_cloned(),
                         self.shell_state.env_vars.get("IFS").map(String::as_str),
                     );
                     if bare {
@@ -1638,7 +1638,7 @@ impl Executor {
                         values.extend(compound_field_split_transport(
                             &self
                                 .shell_state
-                                .positional_params
+                                .positional_window()
                                 .join(&self.ifs_first_char_separator()),
                             fields,
                         ));
@@ -1655,7 +1655,7 @@ impl Executor {
                 changed = true;
                 values.push(store!(&self
                     .shell_state
-                    .positional_params
+                    .positional_window()
                     .join(&self.ifs_first_char_separator())));
             } else if let Some(indirect_keys_name) = whole_word_braced_parameter_body(&token)
                 .or_else(|| whole_word_braced_parameter_body(token.trim_matches('\u{E302}')))
@@ -1893,7 +1893,7 @@ impl Executor {
                     .unwrap_or(var_name);
                 let storage_opt = self.parameter_array_storage(storage_name);
                 let element_values: Vec<String> = if var_name == "@" || var_name == "*" {
-                    self.shell_state.positional_params.clone()
+                    self.shell_state.positional_window_cloned()
                 } else {
                     match storage_opt {
                         Some(storage) => array_values(&storage),
@@ -2027,7 +2027,7 @@ impl Executor {
                 let element_values: Vec<String> = if quoted_at_operator.var_name() == "@"
                     || quoted_at_operator.var_name() == "*"
                 {
-                    self.shell_state.positional_params.clone()
+                    self.shell_state.positional_window_cloned()
                 } else {
                     match self.parameter_array_storage(storage_name) {
                         Some(storage) => array_values(&storage),
@@ -2113,7 +2113,7 @@ impl Executor {
                         changed = true;
                         values.extend(
                             positional_parameter_substring_with_zero(
-                                &self.shell_state.positional_params,
+                                self.shell_state.positional_window(),
                                 &self.script_name_value(),
                                 offset,
                                 length,
@@ -2213,7 +2213,7 @@ impl Executor {
                             Some(self.script_name_value())
                         } else if let Ok(index) = name.parse::<usize>() {
                             self.shell_state
-                                .positional_params
+                                .positional_window()
                                 .get(index.saturating_sub(1))
                                 .cloned()
                         } else {
@@ -2402,7 +2402,7 @@ impl Executor {
             alternate
         };
         let members: Vec<String> = if list_body == "$@" || list_body == "${@}" {
-            self.shell_state.positional_params.clone()
+            self.shell_state.positional_window_cloned()
         } else if let Some(array_name) = whole_word_braced_parameter_body(list_body)
             .and_then(|name| name.strip_suffix("[@]"))
             .filter(|name| is_shell_name(name))
@@ -2432,7 +2432,7 @@ impl Executor {
             // stays on the general element path.
             ("@", false) => Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|m| quote_array_value(m))
                     .collect(),
@@ -2673,7 +2673,7 @@ impl Executor {
             "@" => {
                 return Some(
                     self.shell_state
-                        .positional_params
+                        .positional_window()
                         .iter()
                         .map(|value| quote_array_value(value))
                         .collect(),
@@ -2683,7 +2683,7 @@ impl Executor {
                 return Some(vec![quote_array_value(
                     &self
                         .shell_state
-                        .positional_params
+                        .positional_window()
                         .join(&self.ifs_first_char_separator()),
                 )])
             }

@@ -60,6 +60,12 @@ pub struct ShellState {
     pub(crate) function_definition_locations: HashMap<String, FunctionDefinitionLocation>,
     /// variables.c positional_params ($1..$#, $*, $@).
     pub(crate) positional_params: Vec<String>,
+    /// Offset-window base for `shift` (variables.c `loptend` port): `$1`
+    /// is `positional_params[positional_offset]`, `$#` is
+    /// `len - offset`. `shift n` bumps the offset instead of
+    /// clone+drain; `set --` replaces the storage and resets it to 0.
+    /// Invariant: `offset <= len` (empty window is `offset == len`).
+    pub(crate) positional_offset: usize,
     /// execute_cmd.c/jobs.c pipeline status vector ($PIPESTATUS).
     pub(crate) pipestatus: Vec<i32>,
     /// variables.c FUNCNAME stack.
@@ -261,6 +267,28 @@ impl InteriorSnapshot {
 }
 
 impl ShellState {
+    /// Live positional window (`shift`-visible `$1..$#`): the storage tail
+    /// starting at `positional_offset`. GNU keeps the whole `list` and
+    /// moves `loptend` (bash variables.c); every reader must go through
+    /// this instead of the raw field so a shifted prefix stays invisible.
+    pub(crate) fn positional_window(&self) -> &[String] {
+        self.positional_params
+            .get(self.positional_offset..)
+            .unwrap_or(&[])
+    }
+
+    /// `$#` — the live window length, not the backing storage length.
+    pub(crate) fn positional_len(&self) -> usize {
+        self.positional_params
+            .len()
+            .saturating_sub(self.positional_offset)
+    }
+
+    /// Owned copy of the live window (what `$@` clones).
+    pub(crate) fn positional_window_cloned(&self) -> Vec<String> {
+        self.positional_window().to_vec()
+    }
+
     /// subst.c:7143 command_substitute / execute_cmd.c:1576
     /// execute_in_subshell: a `$( )` body runs in a forked child, so none
     /// of its state mutations may reach the parent. Shared-executor fast
@@ -340,6 +368,7 @@ impl Clone for ShellState {
             function_def_infos: self.function_def_infos.clone(),
             function_definition_locations: self.function_definition_locations.clone(),
             positional_params: self.positional_params.clone(),
+            positional_offset: self.positional_offset,
             pipestatus: self.pipestatus.clone(),
             function_name_stack: self.function_name_stack.clone(),
             bash_argc_stack: self.bash_argc_stack.clone(),

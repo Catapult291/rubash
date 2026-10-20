@@ -496,7 +496,7 @@ impl Executor {
 
     fn expand_braced_length_parameter(&self, var_name: &str) -> String {
         if matches!(var_name, "@" | "*") {
-            return self.shell_state.positional_params.len().to_string();
+            return self.shell_state.positional_window().len().to_string();
         }
         if is_special_parameter_name(var_name) || var_name.parse::<usize>().is_ok() {
             return self
@@ -728,7 +728,7 @@ impl Executor {
                 " ".to_string()
             };
             return positional_parameter_substring_with_zero(
-                &self.shell_state.positional_params,
+                self.shell_state.positional_window(),
                 &self.script_name_value(),
                 offset,
                 length,

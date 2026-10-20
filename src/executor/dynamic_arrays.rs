@@ -254,9 +254,9 @@ impl Executor {
         match ifs.chars().next() {
             Some(separator) => self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .join(&separator.to_string()),
-            None => self.shell_state.positional_params.concat(),
+            None => self.shell_state.positional_window().concat(),
         }
     }
 
