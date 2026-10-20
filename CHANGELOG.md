@@ -12,6 +12,7 @@
 
 ### 变更
 
+- **wrapper 重spawn 的 argv 握手旗标按消费者在位门控**（#873 后续）：`--internal-bg-wrapper=<nonce>` 是 niu CLI 专属旗标，此前 wrapper 重spawn 无条件附加——嵌入式宿主（niubash 的 niu 启动器）与任何不经 `consume_background_wrapper_handshake` 的 CLI 会把它当未知选项拒收（`bash: --internal-bg-wrapper=<nonce>: invalid option` + usage），后台命令 spawn 即死（niubash master CI background_spawn_args 两红）。现旗标仅当本进程 CLI 在启动时调用过 consume（`background_wrapper_flag_consumer_present()`，rubash main.rs 每次启动必调）才附加；非消费者宿主得到 env-nonce-only 重spawn——env 键对非消费者惰性（不被读、消费者启动即清洗），单通道永不 arm（#866 契约不变）。rubash 本体行为逐 spawn 等价（消费者恒在位）；宿主采纳 consume 即恢复完整双通道握手与 #737 cascade。
 - **Windows 无宿主 sudo 回落 PATH 执行**（#810 行为变化披露，#813 补记）：`sudo cmd` 在 Windows 且嵌入宿主**未注册 elevation handler** 时，曾一律由 host builtin 应答 "elevation handler is not configured"（rc 1），PATH 从不被咨询；自 #810 起该名字按外部命令走 PATH 解析——有 sudo.exe 的机器（Win11 System32）真实提升执行，没有的报 command-not-found rc 127，`builtin sudo` 无 handler 时报 `builtin: sudo: not a shell builtin`（rc 1）。introspection 契约不变：`command -v`/`type -a`/`enable -a`/`compgen -b` 依旧把 sudo 报告为外部命令（docs/builtins.md §3 隐藏 builtin 条款）。方向与 GNU 更近（GNU 无 sudo builtin）。#813 以两条 windows-only 测试钉死两臂执行路由（假 sudo PATH 实跑、`builtin sudo` rc 1）。
 
 ### 性能
