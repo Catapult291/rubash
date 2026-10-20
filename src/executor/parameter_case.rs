@@ -117,6 +117,31 @@ pub(in crate::executor) fn apply_parameter_case_mod(
     pattern: &str,
 ) -> String {
     if pattern.is_empty() {
+        // lib/sh/casemod.c:99 sh_modcase skips the per-character strmatch
+        // when pat is NULL and transforms directly. ASCII case pairs map
+        // 1:1, so for ASCII input this byte pass is exactly equivalent and
+        // skips UTF-8 decode plus the per-char iterator chain; multibyte
+        // input keeps the char path below.
+        if value.is_ascii()
+            && matches!(
+                operation,
+                CaseMod::UpperAll | CaseMod::LowerAll | CaseMod::ToggleAll
+            )
+        {
+            let mut out = String::with_capacity(value.len());
+            for b in value.bytes() {
+                // `as char` is exact: ASCII verified above, mapping stays
+                // in range, so no UTF-8 validity question arises.
+                out.push(match operation {
+                    CaseMod::UpperAll => b.to_ascii_uppercase(),
+                    CaseMod::LowerAll => b.to_ascii_lowercase(),
+                    _ if b.is_ascii_lowercase() => b.to_ascii_uppercase(),
+                    _ if b.is_ascii_uppercase() => b.to_ascii_lowercase(),
+                    _ => b,
+                } as char);
+            }
+            return out;
+        }
         match operation {
             CaseMod::UpperAll => return value.chars().flat_map(char::to_uppercase).collect(),
             CaseMod::LowerAll => return value.chars().flat_map(char::to_lowercase).collect(),
