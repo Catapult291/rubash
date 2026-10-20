@@ -187,6 +187,57 @@ fn untracked_files_do_not_dirty_the_stamp() {
 }
 
 #[test]
+fn the_dirty_suffix_is_exactly_the_stamps_dirty_half() {
+    // build_info.rs composes a pinned `RUBASH_BUILD_HASH` as
+    // `pin + RUBASH_GIT_DIRTY_SUFFIX`, so the suffix emitted for a dirty
+    // tree must be exactly what the git stamp carries after the revision —
+    // otherwise a pinned dirty build prints a different stamp than an
+    // unpinned one (#939 rework: the two halves now travel separately).
+    let repo = FixtureRepo::new("suffix");
+    repo.write("engine.txt", "committed content\n");
+    repo.commit_all("initial");
+    let head = repo.head_short();
+
+    assert_eq!(
+        build_rs::dirty_suffix_for_checkout(&repo.dir),
+        "",
+        "a clean tree must carry an empty dirty suffix"
+    );
+
+    repo.write("engine.txt", "committed content\nuncommitted edit\n");
+    let suffix = build_rs::dirty_suffix_for_checkout(&repo.dir);
+    assert!(
+        suffix.starts_with("-dirty"),
+        "the dirty suffix must carry the marker itself, got {suffix:?}"
+    );
+    assert_eq!(
+        repo.stamp(),
+        format!("{head}{suffix}"),
+        "the stamp must be exactly revision + dirty suffix"
+    );
+}
+
+/// The invalidation contract the #939 rework fixed: the stamp is only
+/// fresh because cargo's default whole-package rescan re-runs build.rs on
+/// every tracked-file edit. Emitting ANY `cargo:rerun-if-*` directive —
+/// `rerun-if-changed` OR `rerun-if-env-changed` — opts the script out of
+/// that scan and serves a stale stamp into a changed tree (the review
+/// blocker: `rerun-if-env-changed` alone reproduced the "clean hash,
+/// dirty content" incident shape). Cargo invalidation is not reachable
+/// from an in-process test, so guard the source: no `rerun-if` emission
+/// may ever reappear in build.rs.
+#[test]
+fn build_rs_emits_no_rerun_if_directives() {
+    let source = include_str!("../build.rs");
+    // Anchor on the opening quote of a directive string — the words
+    // `rerun-if` legitimately appear in comments explaining the contract.
+    assert!(
+        !source.contains("\"cargo:rerun-if") && !source.contains("\"cargo::rerun-if"),
+        "build.rs must never emit a rerun-if directive (see its header)"
+    );
+}
+
+#[test]
 fn restoring_the_tree_restores_the_bare_head_stamp() {
     let repo = FixtureRepo::new("restore");
     let original = "committed content\n";
