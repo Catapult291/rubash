@@ -413,6 +413,7 @@ fn external_exec_process(
         apply_exported_environment(&mut process, env_vars);
         crate::executor::path::apply_required_windows_child_environment(&mut process, env_vars);
     }
+    crate::executor::path::suppress_orphan_console(&mut process);
     process
 }
 

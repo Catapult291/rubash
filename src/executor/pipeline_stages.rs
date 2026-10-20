@@ -924,6 +924,7 @@ impl Executor {
         // literal argv word resolves through the OS /dev/fd layer.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
         // Drop the Command NOW: std retains the `Stdio::from(PipeWriter)`
         // values set above, and a live Command keeps the merged pipe's

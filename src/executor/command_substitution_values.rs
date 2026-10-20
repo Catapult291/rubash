@@ -773,6 +773,7 @@ impl Executor {
         // substitution pipe read ends at their numbers in the child.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        suppress_orphan_console(&mut process);
         let mut spawned = process.spawn().ok()?;
         if let Some(input) = piped_stdin.as_deref() {
             if let Some(mut child_stdin) = spawned.stdin.take() {

@@ -1172,6 +1172,36 @@ pub fn external_command_for_named_program(
     (command, false)
 }
 
+/// niubash#379, grandchild level: a console-less rubash (agent/CI/git-hook
+/// spawn — e.g. the `bash.exe` forwarder's DETACHED_PROCESS child) has no
+/// console for a console-subsystem child to inherit, so a plain
+/// CreateProcess makes Windows allocate a *visible* console window for that
+/// child — one flash per external command. CREATE_NO_WINDOW gives the child
+/// a hidden console instead: functionally identical to the inherited hidden
+/// console the pre-DETACHED layout delivered, and harmless for GUI children
+/// (the flag is ignored outside the console subsystem).
+///
+/// The gate is GetConsoleCP()==0 — "this process is attached to no console".
+/// GetConsoleWindow() is NOT a usable gate: it returns NULL under ConPTY,
+/// which would tax every Windows Terminal spawn with a needless hidden
+/// console and detach the child from the pseudoconsole. stdio is_terminal()
+/// is no gate either: `cmd > out` in a real terminal must still let the
+/// child inherit the real console.
+pub(crate) fn suppress_orphan_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetConsoleCP() -> u32;
+        }
+        // CREATE_NO_WINDOW = 0x08000000 (WinBase.h)
+        if unsafe { GetConsoleCP() } == 0 {
+            command.creation_flags(0x0800_0000);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// The script argument a shell-wrapped child reports as `$0`.
 ///
 /// GNU search_for_command (findcmd.c:395-397) returns a slash-bearing word
@@ -1570,6 +1600,7 @@ fn winuxcmd_has_command(dispatcher: &Path, name: &str, env_vars: &HashMap<String
             command.env(key, value);
         }
     }
+    suppress_orphan_console(&mut command);
     command.output().is_ok_and(|output| output.status.success())
 }
 

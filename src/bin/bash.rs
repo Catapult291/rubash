@@ -14,6 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() {
+    // niubash#379/#451: a plainly-spawned shim gets a *visible* console
+    // window before this code runs — same auto-allocation the niu.exe
+    // hardlink faces hit. When the invocation is provably non-interactive
+    // (-c/script/piped stdin), release a console that exists for this
+    // process alone so the forward runs windowless; interactive launches
+    // keep it so the forwarded shell has a real console to inherit.
+    if !interactive_launch_wanted() {
+        release_orphan_console();
+    }
     let Some(shell) = locate_shell() else {
         let _ = writeln!(
             io::stderr(),
@@ -88,24 +97,92 @@ fn suppress_child_console_window(command: &mut Command) {
         // SetConsoleMode) fail in it, so an interactive niu session must keep
         // inheriting the real console.
         //
-        // niubash#379 picked CREATE_NO_WINDOW to stop the visible flash, and
-        // that allocates a *hidden console* for the child: starting conhost.exe
-        // with it costs ~22 ms per invocation, measured on every `bash -c`/
-        // `sh -c` with piped stdio - which is the case agents, CI and git hooks
-        // hit. With all three streams redirected the child has no console to
-        // inherit and does not need one, so DETACHED_PROCESS gives it that for
-        // free. Neither flag lets the child receive the parent's Ctrl+C (a
-        // CREATE_NO_WINDOW child has a console of its own, not the parent's),
-        // so cancellation semantics are unchanged.
+        // Flag history: niubash#379 picked CREATE_NO_WINDOW to stop the
+        // visible flash; #751 switched to DETACHED_PROCESS to skip the ~22 ms
+        // hidden-console allocation — but a detached niu has no console to
+        // pass on, so Windows auto-allocated a *visible* console for every
+        // console-subsystem grandchild (#451: the flash returned one level
+        // down). CREATE_NO_WINDOW is back deliberately: niu's hidden console
+        // is inherited by every grandchild, so the whole tree pays ~22 ms
+        // ONCE here instead of per child spawn. Paired with
+        // release_orphan_console's GetConsoleWindow() rail, which keeps this
+        // hidden console alive (it owns no window).
         if !io::stdin().is_terminal() && !io::stdout().is_terminal() && !io::stderr().is_terminal()
         {
-            command.creation_flags(0x0000_0008);
+            command.creation_flags(0x0800_0000);
         }
     }
     #[cfg(not(windows))]
     {
         let _ = command;
     }
+}
+
+/// niubash#451: the same "plausibly interactive" gate niu.exe applies
+/// before releasing an auto-allocated console. Bare `shim` on a terminal
+/// stdin keeps the console (the desktop/shortcut face); `-i`/`-l`/
+/// `--interactive`/`--login` in the leading option group does too. The
+/// auto-allocated console binds its handles onto stdio, so a terminal
+/// check on stdout would lie — the gate deliberately errs toward keeping.
+#[cfg(windows)]
+fn interactive_launch_wanted() -> bool {
+    use std::io::IsTerminal as _;
+    let rest: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
+    if rest.is_empty() {
+        return io::stdin().is_terminal();
+    }
+    for arg in &rest {
+        let Some(arg) = arg.to_str() else { break };
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if matches!(long, "interactive" | "login") {
+                return true;
+            }
+            continue;
+        }
+        let flags = &arg[1..];
+        if flags.bytes().all(|b| b.is_ascii_alphabetic()) && flags.contains(['i', 'l']) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Free a console that this process is the sole attachment of — i.e. one
+/// Windows auto-allocated for a console-subsystem binary spawned by a
+/// console-less parent. An inherited console (the caller's real terminal)
+/// has other processes attached and is never touched. A *hidden* console
+/// (a CREATE_NO_WINDOW child of a forwarder like this shim) reports no
+/// window and is kept: it costs nothing visible and its grandchildren
+/// inherit it for free.
+#[cfg(windows)]
+fn release_orphan_console() {
+    extern "system" {
+        fn GetConsoleCP() -> u32;
+        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        fn FreeConsole() -> i32;
+    }
+    unsafe {
+        if GetConsoleCP() == 0 || GetConsoleWindow().is_null() {
+            return;
+        }
+        let mut pids = [0u32; 64];
+        if GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) != 1 {
+            return;
+        }
+        FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn release_orphan_console() {}
+
+#[cfg(not(windows))]
+fn interactive_launch_wanted() -> bool {
+    false
 }
 
 fn locate_shell() -> Option<PathBuf> {

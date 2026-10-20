@@ -463,6 +463,7 @@ impl Executor {
                 use std::os::unix::process::CommandExt;
                 process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
             }
+            suppress_orphan_console(&mut process);
             match process.spawn() {
                 Ok(child) => {
                     let pid = child.id();
@@ -2574,6 +2575,7 @@ impl Executor {
                 return Err(error);
             }
 
+            suppress_orphan_console(&mut child);
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
