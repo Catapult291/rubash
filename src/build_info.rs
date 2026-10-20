@@ -10,6 +10,12 @@
 /// Short git hash captured by `build.rs` (`git rev-parse --short HEAD`).
 /// "unknown" means git was unavailable at build time (tarball, sandboxed
 /// checkout); release pipelines pin the value via `RUBASH_BUILD_HASH`.
+///
+/// rubash#827: a tree carrying uncommitted changes stamps
+/// `<rev>-dirty-<8 hex>` where the digest covers `git diff HEAD` — a bare
+/// HEAD hash never guarantees content, and two different dirty trees can
+/// no longer print the same banner. The digest suffix may be absent when
+/// the diff could not be computed, leaving a plain `-dirty` marker.
 pub fn build_hash() -> &'static str {
     match option_env!("RUBASH_BUILD_HASH") {
         Some(hash) => hash,
@@ -54,13 +60,21 @@ mod tests {
     #[test]
     fn build_hash_is_short_hex_or_unknown() {
         let hash = build_hash();
+        // `<rev>` optionally followed by `-dirty` or `-dirty-<8 hex>`
+        // (rubash#827: the stamp names WHICH dirty tree was compiled).
+        let (rev, dirty) = hash.split_once("-dirty").unwrap_or((hash, ""));
+        let dirty_ok = dirty.is_empty()
+            || (dirty.starts_with('-')
+                && dirty.len() == 9
+                && dirty[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
         let valid = hash == "unknown"
-            || (!hash.is_empty()
-                && hash.len() >= 7
-                && hash.len() <= 40
-                && hash
+            || (!rev.is_empty()
+                && rev.len() >= 7
+                && rev.len() <= 40
+                && rev
                     .chars()
-                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+                && dirty_ok);
         assert!(
             valid,
             "build hash {hash:?} is not a short git hash or unknown"
