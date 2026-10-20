@@ -46,6 +46,78 @@ fn supports_string_and_numeric_binary_operators() {
 }
 
 #[test]
+#[ignore]
+fn bench_arith_three_paths() {
+    let env_vars = crate::shell::var_table::VarTable::default();
+    for (label, args) in [
+        ("canonical-fast", ["1", "-eq", "2", "]"]),
+        ("leading-zero-slow", ["007", "-eq", "7", "]"]),
+        ("string-eq-parser", ["x", "=", "x", "]"]),
+    ] {
+        let start = std::time::Instant::now();
+        let mut sink = 0;
+        for _ in 0..200_000 {
+            let mut stderr = Vec::new();
+            sink += execute_with_stderr(&args, true, &env_vars, &mut stderr).unwrap();
+        }
+        eprintln!("{}: {:?} (sink={})", label, start.elapsed(), sink);
+    }
+}
+
+#[test]
+fn decimal_fast_path_matches_slow_path_semantics() {
+    // Canonical pure decimals take the whitelist fast path (all six ops,
+    // both polarities, negatives, zero, `-0 == 0`, 18-digit max width).
+    for (args, expected) in [
+        (["1", "-eq", "1"], EXECUTION_SUCCESS),
+        (["1", "-eq", "2"], EXECUTION_FAILURE),
+        (["1", "-ne", "2"], EXECUTION_SUCCESS),
+        (["1", "-lt", "2"], EXECUTION_SUCCESS),
+        (["2", "-le", "2"], EXECUTION_SUCCESS),
+        (["3", "-gt", "2"], EXECUTION_SUCCESS),
+        (["2", "-ge", "2"], EXECUTION_SUCCESS),
+        (["-5", "-lt", "-2"], EXECUTION_SUCCESS),
+        (["-5", "-eq", "-5"], EXECUTION_SUCCESS),
+        (["0", "-eq", "-0"], EXECUTION_SUCCESS),
+        (["999999999999999999", "-gt", "1"], EXECUTION_SUCCESS),
+        (["-999999999999999999", "-lt", "1"], EXECUTION_SUCCESS),
+    ] {
+        assert_eq!(run(&args, false).0, expected, "test {}", args.join(" "));
+        // Same through the `[` entry (bracket trim + 3-arg fast path).
+        let closed = [args[0], args[1], args[2], "]"];
+        assert_eq!(run(&closed, true).0, expected, "[ {} ]", args.join(" "));
+    }
+    // Non-canonical operands fall back to `valid_number` (GNU strtoimax
+    // semantics): leading zeros compare by value, surrounding whitespace
+    // and `+` are accepted, 19-digit in-range values work.
+    for (args, expected) in [
+        (["007", "-eq", "7"], EXECUTION_SUCCESS),
+        (["08", "-lt", "9"], EXECUTION_SUCCESS),
+        (["00", "-eq", "0"], EXECUTION_SUCCESS),
+        (["-01", "-eq", "-1"], EXECUTION_SUCCESS),
+        ([" 1", "-eq", "1"], EXECUTION_SUCCESS),
+        (["1 ", "-eq", "1"], EXECUTION_SUCCESS),
+        (["+1", "-eq", "1"], EXECUTION_SUCCESS),
+        (["9223372036854775807", "-gt", "1"], EXECUTION_SUCCESS),
+        (["-9223372036854775808", "-lt", "1"], EXECUTION_SUCCESS),
+    ] {
+        assert_eq!(run(&args, false).0, expected, "test {}", args.join(" "));
+    }
+    // Invalid integers keep the `integer expected` diagnostic, exit 2.
+    for args in [
+        ["", "-eq", "0"],
+        ["1", "-eq", ""],
+        ["abc", "-eq", "1"],
+        ["99999999999999999999999", "-eq", "1"],
+        ["-", "-eq", "1"],
+    ] {
+        let (status, stderr) = run(&args, false);
+        assert_eq!(status, EX_BADUSAGE, "test {}", args.join(" "));
+        assert!(stderr.contains("integer expected"), "stderr: {stderr}");
+    }
+}
+
+#[test]
 fn supports_not_and_logical_operators() {
     assert_eq!(run(&["!", ""], false).0, EXECUTION_SUCCESS);
     assert_eq!(run(&["x", "-a", ""], false).0, EXECUTION_FAILURE);

@@ -429,6 +429,22 @@ fn eval_expr_with_bracket(
     bracket: bool,
     env_vars: &crate::shell::var_table::VarTable,
 ) -> Result<bool, String> {
+    // Hot-path whitelist for `[ <int> -op <int> ]` / `test <int> -op <int>`
+    // with canonical pure-decimal operands and a `-eq/-ne/-lt/-le/-gt/-ge`
+    // operator: compares integers directly, skipping both the TestParser
+    // skeleton (GNU test.c `three_arguments` -> `binary_operator` ->
+    // `arithcomp`, test.c:805-836/444) and the double `valid_number`
+    // re-parse (`trim` + `String` collect + generic-radix `from_str_radix`,
+    // once per side). Any non-canonical operand — empty, whitespace,
+    // `+` sign, leading zeros (`007`), non-digits, or >=19 digits that
+    // could overflow i64 — returns `None` and falls through to the parser,
+    // so the full GNU `strtoimax`-base-10 semantics (general.c:248-281)
+    // stay exact, including `integer expected` diagnostics.
+    if args.len() == 3 {
+        if let Some(value) = fast_arith_three(args[0], args[1], args[2]) {
+            return Ok(value);
+        }
+    }
     let mut parser = TestParser {
         args,
         pos: 1,
@@ -640,12 +656,19 @@ fn eval_binary(
         "!=" => Ok(left != right),
         "<" => Ok(left < right),
         ">" => Ok(left > right),
-        "-eq" => Ok(parse_int(left)? == parse_int(right)?),
-        "-ne" => Ok(parse_int(left)? != parse_int(right)?),
-        "-lt" => Ok(parse_int(left)? < parse_int(right)?),
-        "-le" => Ok(parse_int(left)? <= parse_int(right)?),
-        "-gt" => Ok(parse_int(left)? > parse_int(right)?),
-        "-ge" => Ok(parse_int(left)? >= parse_int(right)?),
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            // Same whitelist as the `eval_expr_with_bracket` 3-arg fast
+            // path, applied at the operator level so longer expressions
+            // (`-a`/`-o` chains, `!`, parens via `term`) skip the double
+            // `valid_number` re-parse too. Falls back to `parse_int` for
+            // any non-canonical side (GNU semantics unchanged).
+            if let (Some(l), Some(r)) = (fast_decimal(left), fast_decimal(right)) {
+                return Ok(apply_arith_op(op, l, r));
+            }
+            let l = parse_int(left)?;
+            let r = parse_int(right)?;
+            Ok(apply_arith_op(op, l, r))
+        }
         "-nt" => Ok(modified(left, env_vars) > modified(right, env_vars)),
         "-ot" => Ok(modified(left, env_vars) < modified(right, env_vars)),
         "-ef" => Ok(same_file(left, right, env_vars)),
@@ -655,6 +678,76 @@ fn eval_binary(
 
 fn parse_int(value: &str) -> Result<i64, String> {
     valid_number(value).ok_or_else(|| format!("{}: integer expected", value))
+}
+
+/// Whitelist fast path for pure-decimal integer operands (GNU test.c
+/// `arithcomp`, test.c:340-396, via `valid_number`, general.c:248-281).
+///
+/// Accepts only the canonical form: an optional `-` followed by 1..=18
+/// ASCII digits with no leading zero (a lone `0`/`-0` is allowed).
+/// Everything else — empty, whitespace, `+`, leading zeros (`007`),
+/// non-digits, or >=19-digit strings that could overflow i64 — returns
+/// `None` so the caller falls back to `valid_number`, which implements
+/// the full GNU `strtoimax`-base-10 semantics. Allocation-free single
+/// byte pass: skips the `trim` + `String` collect + generic-radix
+/// `from_str_radix` that `valid_number` pays twice per comparison.
+/// All `Some` results agree with `valid_number` (<=18 digits always fit
+/// i64: max 999999999999999999 < 9223372036854775807), and `-0` maps to
+/// `0`, equal under every comparison.
+fn fast_decimal(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let (negative, digits) = match bytes[0] {
+        b'-' => (true, &bytes[1..]),
+        b'0'..=b'9' => (false, &bytes[..]),
+        _ => return None,
+    };
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + i64::from(b - b'0');
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// Integer comparison for the six arithmetic test operators (GNU test.c
+/// `arithcomp` switch, test.c:384-393).
+fn apply_arith_op(op: &str, left: i64, right: i64) -> bool {
+    match op {
+        "-eq" => left == right,
+        "-ne" => left != right,
+        "-lt" => left < right,
+        "-le" => left <= right,
+        "-gt" => left > right,
+        // Callers only pass the six whitelisted operators; the remainder
+        // is `-ge`.
+        _ => left >= right,
+    }
+}
+
+/// Three-argument arithmetic fast path used by `eval_expr_with_bracket`:
+/// `Some` only when `op` is an integer comparison and both sides are
+/// canonical pure decimals; `None` (unknown op or non-canonical side)
+/// falls through to the full parser with identical semantics.
+fn fast_arith_three(left: &str, op: &str, right: &str) -> Option<bool> {
+    if !matches!(op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") {
+        return None;
+    }
+    Some(apply_arith_op(
+        op,
+        fast_decimal(left)?,
+        fast_decimal(right)?,
+    ))
 }
 
 /// GNU `valid_number()` (general.c:248-281): base-10 `strtoimax` with
