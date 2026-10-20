@@ -2799,6 +2799,22 @@ impl Executor {
                             "__RUBASH_ARRAY_VARS",
                             &bind_name,
                         );
+                        // Keep the structured cell in lockstep so typed
+                        // reads trust it (verified against the mirror by
+                        // debug_assert in the read path). The two coproc
+                        // fds occupy indexes 0 and 1.
+                        {
+                            use std::collections::BTreeMap;
+                            let mut entries = BTreeMap::new();
+                            entries.insert(0usize, coproc_read_fd.to_string());
+                            entries.insert(1usize, coproc_write_fd.to_string());
+                            crate::executor::arrays::sync_typed_indexed_array(
+                                &mut self.shell_state.variables,
+                                &bind_name,
+                                &entries,
+                            );
+                        }
+                        self.shell_state.env_vars.clear_array_cells_dirty();
                         // bind_variable (execute_cmd.c:2441) is nameref-aware:
                         // `coproc ref` with ref_PID a nameref assigns through
                         // it and hits the resolved target's readonly check.

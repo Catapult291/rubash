@@ -136,6 +136,11 @@ pub(crate) const ATTR_KEYS: [&str; 10] = [
 pub struct VarTable {
     values: HashMap<String, String>,
     attrs: HashMap<String, VarAttrs>,
+    /// Set when a mirror write bypassed the typed-cell sync (declare-family
+    /// builtins write through this table but cannot reach the executor's
+    /// structured store). Readers consult it before trusting a typed cell;
+    /// see `take_array_cells_dirty`.
+    array_cells_dirty: bool,
 }
 
 impl<'a> IntoIterator for &'a VarTable {
@@ -164,6 +169,7 @@ impl From<HashMap<String, String>> for VarTable {
         let mut table = VarTable {
             values,
             attrs: HashMap::new(),
+            array_cells_dirty: false,
         };
         table.import_attr_strings();
         table
@@ -200,6 +206,27 @@ impl VarTable {
     /// word). Absent name = no attributes.
     pub(crate) fn attr_of(&self, name: &str) -> VarAttrs {
         self.attrs.get(name).copied().unwrap_or_default()
+    }
+
+    /// Mark typed indexed-array cells potentially stale: a mirror write
+    /// happened outside the executor's syncing paths (declare-family
+    /// builtins write through VarTable and cannot reach the structured
+    /// store). Readers check the flag before trusting a typed cell;
+    /// executor sync points clear it again.
+    pub(crate) fn mark_array_cells_dirty(&mut self) {
+        self.array_cells_dirty = true;
+    }
+
+    /// Whether an unsynced mirror write happened since the last executor
+    /// sync. Read-only; only `clear_array_cells_dirty` resets it.
+    pub(crate) fn array_cells_dirty(&self) -> bool {
+        self.array_cells_dirty
+    }
+
+    /// Clear the dirty bit: the caller just re-synced every typed cell
+    /// with the mirror (or dropped the stale ones).
+    pub(crate) fn clear_array_cells_dirty(&mut self) {
+        self.array_cells_dirty = false;
     }
 
     /// Membership query for any marker key. The ten attribute keys read
