@@ -30,15 +30,16 @@ Rubash 是对 GNU Bash **语义**的从零重写，兼容性以 GNU Bash 5.3.0 �
 
 本仓的契约是“行为与 GNU Bash 5.3.0 一致”。下述六条是评审的硬门槛，违反会直接 REQUEST-CHANGES。面向 agent 的操作细则见 `AGENTS.md`，此处只收录对所有贡献者生效的规则。
 
-#### 1. Oracle 只能是 GNU Bash 5.3.0
+#### 1. Oracle：最新稳定版（现为 GNU Bash 5.3.0）
 
 - 权威 oracle：WSL `/usr/local/bin/bash`（owner 编译，5.3.0）。对比必须用脚本文件同时跑两侧（`target/debug/rubash.exe case.sh` vs `wsl bash /mnt/.../case.sh`）；禁止用 `wsl bash -c` 传带双层引号或双反斜杠的用例（wsl.exe 命令行透传会把 `\\` 压成 `\`，基线作废）。
 - 以下都不是 oracle：WSL `/usr/bin/bash`（5.2.21）、Git Bash（5.2.x）、winuxsh 垫片（版本更旧，行为不同）。在 5.2 下验证过的行为主张一律视为未验证。
 - 语义分歧以 `third_party/bash/` 的 C 源码为准：改行为前先找到 owning C 函数，把 `文件:行 函数名` 与 WSL 5.3.0 脚本实测输出写进任务/PR 描述，再动手。C 源码没有定论时如实标注 unverified，不许猜。
+- 版本升级走 #895（submodule bump + 坐标表重录 + 83 套重跑）；升级落地前，所有语义主张仍以 5.3.0 为准。
 
 #### 2. 无窗口探针
 
-- 本机探针/测试禁止逐形态起 `wsl.exe` 或可见控制台进程：单个脚本批量跑完全部形态，输出重定向到文件；长构建/长测试同样落文件。
+- 本机探针/测试禁止逐形态起 `wsl.exe` 或可见控制台进程：单个脚本批量跑完全部形态，输出重定向到文件（Python 探针起子进程必须带 `subprocess.CREATE_NO_WINDOW (0x08000000)`，不弹可见控制台）；长构建/长测试同样落文件。
 - 与他人共享机器：不留常驻进程，探针沙盒自建自清；收尾前确认没有残留的 `rubash.exe`/`bash.exe`/suite runner 进程。
 
 #### 3. 共享环境零变更
@@ -61,7 +62,7 @@ Rubash 是对 GNU Bash **语义**的从零重写，兼容性以 GNU Bash 5.3.0 �
 - 一个 issue 一个主题分支，WIP 及时 commit + push（pre-commit 有 fmt 钩子）。
 - PR 描述带 oracle 证据（5.3.0 脚本实测输出 + owning C 函数）；CI 全绿是合入门槛，合并由维护者执行，作者不自合并。
 - 多 PR 并行时 `scripts/regression-catalog/manifest.tsv` 冲突由后合并者重解，双方行都保留。
-- 兼容性修复经实测后同步更新 `docs/COMPATIBILITY-STATUS.md`（唯一权威状态源，只认实测）。
+- 兼容性修复经实测后同步更新 README「Compatibility at a Glance」台账（点-in-time 快照已归档至 issue #477，状态以 issue tracker 为准，只认实测）。
 
 ### 提交代码
 
