@@ -750,6 +750,10 @@ impl ConditionalArithParser<'_> {
             }
         }
         mark_env_name(self.env_vars, ASSOC_VARS, name);
+        // No structured store here (parser context): mark typed cells
+        // dirty so assoc reads re-parse instead of trusting a stale cell
+        // (same discipline as the indexed element store above).
+        self.env_vars.mark_array_cells_dirty();
     }
 }
 

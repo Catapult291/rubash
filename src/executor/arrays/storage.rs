@@ -429,6 +429,98 @@ pub(crate) fn drop_typed_indexed_array(store: &mut crate::shell::VariableStore, 
     }
 }
 
+/// Assoc analogue of `sync_typed_indexed_array`: structured-cell
+/// synchronization for associative arrays. `shell_state.variables`
+/// (`ShellValue::AssociativeArray`) is the O(1) `${A[k]}` truth — GNU reads
+/// it with `assoc_reference` (assoc.c:120, a single `hash_search`, never a
+/// table walk) — while the rendered `env_vars` string stays the projection
+/// every storage reader sees. `entries` always comes from the same parse the
+/// mirror render folds (`dedupe_assoc_entries`), so the structured key set
+/// equals the mirror-derived key set by construction. A readonly refusal
+/// would leave the structured cell older than the mirror — drop it so reads
+/// fall back to the mirror projection.
+pub(crate) fn sync_typed_assoc_array(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    entries: &[(String, String)],
+) {
+    if store
+        .replace_associative_array(
+            name,
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .is_err()
+    {
+        drop_typed_assoc_array(store, name);
+    }
+}
+
+/// Fast-append assoc write path (the rubash#618 budget scheme): the mirror
+/// grows by one `[k]=v` segment without a re-parse, so there is no canonical
+/// entry list to sync from. Upsert in place when the cell is already an assoc
+/// cell (the same O(1) `assoc_insert` shape GNU uses); leave a missing or
+/// wrong-shape cell alone — the next canonical write re-syncs it. A readonly
+/// cell would go stale behind the mirror write, so drop it instead.
+pub(crate) fn upsert_typed_assoc_element(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    key: &str,
+    value: &str,
+) {
+    let Some(variable) = store.get_mut(name) else {
+        return;
+    };
+    if variable.readonly {
+        drop_typed_assoc_array(store, name);
+        return;
+    }
+    if matches!(
+        variable.value,
+        crate::shell::ShellValue::AssociativeArray(_)
+    ) {
+        let _ = store.set_associative_element(name, key, value);
+    }
+}
+
+/// Remove only an assoc structured cell (indexed/scalar cells keep their
+/// behavior untouched). Used whenever a mirror write bypasses the assoc
+/// sync paths; reads then fall back to the mirror projection.
+pub(crate) fn drop_typed_assoc_array(store: &mut crate::shell::VariableStore, name: &str) {
+    if matches!(
+        store.get(name).map(|variable| &variable.value),
+        Some(crate::shell::ShellValue::AssociativeArray(_))
+    ) {
+        store.remove(name);
+    }
+}
+
+/// Assoc analogue of `sync_typed_indexed_storage`: sync (or invalidate) the
+/// structured assoc cell from a rendered mirror value. The caller gates on
+/// the ASSOC mark; any shape that is not an assoc render drops the cell so
+/// the mirror stays authoritative. Reuses the memoised assoc parse, so the
+/// compound-write path hits the previous write's render instead of
+/// re-scanning it.
+pub(crate) fn sync_typed_assoc_storage(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    storage: &str,
+) {
+    if storage.starts_with(STORAGE_WORD_PREFIX) {
+        // Indexed render — not an assoc cell's shape; drop so the mirror
+        // stays authoritative.
+        drop_typed_assoc_array(store, name);
+        return;
+    }
+    if storage.starts_with('(') && storage.ends_with(')') {
+        let parsed = crate::executor::assignment_helpers::assoc_entries(storage);
+        sync_typed_assoc_array(store, name, &parsed);
+    } else {
+        drop_typed_assoc_array(store, name);
+    }
+}
+
 /// rubash#616 (1a): dense typed replace for writers that render their own
 /// values (read -a, declare sync). A refused write — a readonly typed cell
 /// while the mirror write still lands (read -a on a readonly array) — must

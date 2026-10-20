@@ -214,6 +214,34 @@ impl VariableStore {
         entries.len() == expected_len
     }
 
+    /// Assoc analogue of `extend_indexed_element` for the single-element
+    /// assoc read fast path: extend an ALREADY-structured assoc cell by one
+    /// binding without rebuilding the map. Returns `false` when the cell is
+    /// absent, of another shape, readonly, or when the resulting size
+    /// disagrees with `expected_len` (the caller's own unique-key count);
+    /// the caller then performs the full structured sync, which drops a
+    /// refused cell. GNU assoc.c `assoc_insert` overwrites the binding in
+    /// place — an O(1) hash op, never a table re-serialisation.
+    pub fn extend_associative_element(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: &str,
+        expected_len: usize,
+    ) -> bool {
+        let Some(variable) = self.variables.get_mut(name) else {
+            return false;
+        };
+        if variable.readonly {
+            return false;
+        }
+        let ShellValue::AssociativeArray(entries) = &mut variable.value else {
+            return false;
+        };
+        entries.insert(key.to_string(), value.to_string());
+        entries.len() == expected_len
+    }
+
     /// rubash#616 (plan Phase 1a): refresh a complete indexed cell from a
     /// freshly parsed mirror WITHOUT rebuilding it, when the new map is an
     /// extension of the current one. This is the append-shaped case the

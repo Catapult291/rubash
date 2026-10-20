@@ -93,7 +93,7 @@ impl Executor {
         let mut stdout = Vec::new();
         // rubash#704 R6.2: same GNU any-found rule as the direct path
         // (builtins/command.def:111-121): one resolved operand suffices for
-        // status 0, and the command.def:95-96 no-operand early return makes
+        // status 0, and the command.def:96-97 no-operand early return makes
         // `$(command -v)` succeed with empty output.
         let mut any_found = false;
         let names = &words[1 + first_name..];

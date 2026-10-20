@@ -789,6 +789,15 @@ impl Executor {
                     // carries a structured cell drops it — the mirror is
                     // authoritative for this shape.
                     sync_typed_indexed_storage(&mut self.shell_state.variables, base_name, &value);
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
+                        sync_typed_assoc_storage(
+                            &mut self.shell_state.variables,
+                            base_name,
+                            &value,
+                        );
+                    } else {
+                        drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
+                    }
                     self.exit_code = 0;
                     return true;
                 }
@@ -1215,6 +1224,9 @@ impl Executor {
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 &self.shell_state.env_vars,
             );
+            // Partial store before the error report — keep the structured
+            // cell in lockstep from the same render.
+            sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &stored);
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), stored.clone());
@@ -1355,6 +1367,7 @@ impl Executor {
             // lingering structured cell (marker/typed divergence) must not
             // shadow it.
             drop_typed_indexed_array(&mut self.shell_state.variables, base_name);
+            drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
         }
         // GNU variables.c:3139-3140: for an assoc array, a scalar assignment
         // stores the value at key "0" via assign_func. Without this, a value
@@ -1367,6 +1380,9 @@ impl Executor {
             && !value.starts_with(STORAGE_WORD_PREFIX)
         {
             let storage = format!("([\"0\"]={})", quote_assoc_storage_value(&value));
+            // Assoc scalar bind stores at key "0" — keep the structured cell
+            // in lockstep from the same render.
+            sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &storage);
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), storage);
@@ -1384,6 +1400,14 @@ impl Executor {
         // process-env projection (exported / special names) still runs.
         if !mirror_written_in_place {
             sync_typed_indexed_storage(&mut self.shell_state.variables, base_name, &value);
+            // Assoc leg of the same discipline: a compound `A=(...)` render
+            // syncs the structured assoc cell, any other shape drops it so
+            // `${A[k]}` falls back to the mirror projection.
+            if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
+                sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &value);
+            } else {
+                drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
+            }
             if let Some(current) = self.shell_state.env_vars.get_mut(base_name) {
                 current.clone_from(&value);
             } else {
