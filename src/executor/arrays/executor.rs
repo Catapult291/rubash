@@ -168,7 +168,8 @@ impl Executor {
         } else {
             self.parameter_array_storage(array_name)
         };
-        let storage = storage_opt.clone().unwrap_or_default();
+        let storage_is_none = storage_opt.is_none();
+        let storage = storage_opt.unwrap_or_default();
         if assoc_marked {
             // GNU parameters.c assoc_reference: a literal * subscript means
             // all elements, not the key "*"; a quoted * joins with IFS[0]
@@ -372,7 +373,7 @@ impl Executor {
                 if let Some(dynamic) = self.dynamic_parameter_value(&storage_name) {
                     return Some(dynamic);
                 }
-                if storage_opt.is_none() {
+                if storage_is_none {
                     return None;
                 }
                 return Some(crate::executor::shell_safe_value(&storage));
