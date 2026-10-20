@@ -353,6 +353,17 @@ impl Executor {
                     if appended {
                         // Same bookkeeping as the canonical path: an element
                         // assignment binds the variable (rubash#371).
+                        // Typed-cell sync (assoc read fast path): the mirror
+                        // grew by one segment without a re-parse, so upsert
+                        // the binding in place — GNU assoc.c `assoc_insert`
+                        // is itself an O(1) hash op. A missing cell stays
+                        // missing; the canonical path below re-syncs it.
+                        upsert_typed_assoc_element(
+                            &mut self.shell_state.variables,
+                            name,
+                            &key,
+                            &stored,
+                        );
                         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
                         self.exit_code = 0;
                         return true;
@@ -419,6 +430,12 @@ impl Executor {
             // next O(entries) appends for free and keeps the storage string
             // within twice its canonical length, so reads stay O(entries).
             let compact_budget = entries.len().max(1) as u32;
+            // Typed-cell sync (assoc read fast path): the entries above are
+            // the post-write unique-key list the mirror render folds from,
+            // so sync the structured cell from the same list — GNU keeps one
+            // assoc table (assoc.c `assoc_insert`), and the "complete or
+            // absent" invariant is what lets `${A[k]}` trust the cell.
+            sync_typed_assoc_array(&mut self.shell_state.variables, name, &entries);
             let new_value = super::assignment_helpers::format_assoc_storage(entries);
             self.shell_state
                 .env_vars

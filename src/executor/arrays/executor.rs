@@ -163,7 +163,6 @@ impl Executor {
             self.dynamic_stack_array_values(array_name)
         };
         if assoc_marked {
-            let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             // GNU parameters.c assoc_reference: a literal * subscript means
             // all elements, not the key "*"; a quoted * joins with IFS[0]
             // (string_list_pos_params). Expanded subscripts such as
@@ -171,13 +170,53 @@ impl Executor {
             if key == "*" {
                 return Some(
                     assoc_hash_ordered_values(
-                        &storage_assoc,
+                        &self.parameter_array_storage(array_name).unwrap_or_default(),
                         assoc_nbuckets(&self.shell_state.env_vars, &storage_name),
                     )
                     .join(&self.ifs_first_char_separator()),
                 );
             }
             let key = self.assoc_subscript_key(key);
+            // Typed-cell fast path, mirroring the indexed leg below: GNU
+            // assoc.c:120 assoc_reference is a single hash_search over the
+            // assoc table — O(1), never a walk of the whole table. The
+            // mirror fetch clones the whole storage string and
+            // assoc_value_at linear-scans it, so take the structured-cell
+            // hit first under the same dirty gate (executor writes keep
+            // the cell in sync with the mirror, while builtin-side writes
+            // only set the dirty flag). Miss or dirty falls through to the
+            // mirror path; assoc/dynamic/scalar bases never reach a typed
+            // cell. The key expansion above already ran its subscript pass
+            // with side effects (`$(...)`, RNG), and the mirror fetch below
+            // is a pure read, so probing the cell first preserves GNU's
+            // observable order while skipping the per-read O(n) clone+scan
+            // on a typed hit.
+            if !self.shell_state.env_vars.array_cells_dirty() {
+                if let Some(cell_value) = self
+                    .shell_state
+                    .variables
+                    .associative_element(&storage_name, &key)
+                {
+                    let typed = cell_value.to_string();
+                    // Safety net (debug builds = the test suite): the cell
+                    // must agree with the mirror. A mismatch means a mirror
+                    // write path missed its sync-or-dirty handling. The
+                    // mirror is re-fetched on demand here so release builds
+                    // (where debug_assert_eq! compiles out) skip the O(n)
+                    // clone entirely on this fast path.
+                    debug_assert_eq!(
+                        Some(typed.clone()),
+                        {
+                            let mirror =
+                                self.parameter_array_storage(array_name).unwrap_or_default();
+                            assoc_value_at(&mirror, &key)
+                        },
+                        "typed assoc cell disagrees with mirror for {storage_name}[{key}]"
+                    );
+                    return Some(typed);
+                }
+            }
+            let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             return assoc_value_at(&storage_assoc, &key);
         }
         // Use expand_arithmetic_special_parameters for array subscripts so that
