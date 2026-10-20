@@ -366,6 +366,48 @@ fn c_command_retires_finished_coproc_endpoints_before_later_redirects() {
 }
 
 #[test]
+fn unset_scalar_base_index_zero_is_unset_for_operators() {
+    // An unset variable has no element 0: `-`/`=`/`+` must see an unset
+    // parameter (like any other missing element), while a set-but-empty
+    // scalar keeps its empty element 0. A dynamic scalar (RANDOM) reads
+    // live through element 0. Probed against GNU bash 5.3.
+    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg("--")
+        .arg("-c")
+        .arg(
+            "unset Z; printf 'minus0=[%s] minus5=[%s] plus=[%s] colonminus=[%s] plain=[%s]\\n' \
+             \"${Z[0]-d}\" \"${Z[5]-d}\" \"${Z[0]+a}\" \"${Z[0]:-d}\" \"${Z[0]}\"; \
+             Z=''; printf 'empty-minus=[%s] empty-plus=[%s] empty-colonminus=[%s]\\n' \
+             \"${Z[0]-d}\" \"${Z[0]+a}\" \"${Z[0]:-d}\"; \
+             unset Q; : \"${Q[0]=dd}\"; printf 'assigned=[%s:%s]\\n' \"$Q\" \"${Q[0]}\"; \
+             printf 'random=[%s]\\n' \"${RANDOM[0]-d}\"",
+        )
+        .output()
+        .expect("run unset scalar index-zero probe");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "minus0=[d] minus5=[d] plus=[] colonminus=[d] plain=[]"
+    );
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "empty-minus=[] empty-plus=[a] empty-colonminus=[d]"
+    );
+    assert_eq!(lines.next().unwrap_or_default(), "assigned=[dd:dd]");
+    let random = lines.next().unwrap_or_default();
+    let value = random
+        .strip_prefix("random=[")
+        .and_then(|s| s.strip_suffix(']'));
+    assert!(
+        value.is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())),
+        "RANDOM[0] must read the live dynamic value, got {random:?}"
+    );
+}
+
+#[test]
 fn c_command_materializes_persistent_stderr_to_stdout_for_external_children() {
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .arg("--")
