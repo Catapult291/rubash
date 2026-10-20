@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 mod paths;
 
-use crate::executor::markers::DATA_DOLLAR;
 use paths::{
     current_logical_pwd, filesystem_path_for_display, logical_destination,
     logical_destination_display, logical_pwd_var_display, set_shell_env, shell_display_path,
@@ -53,7 +52,10 @@ struct Target {
 }
 
 /// Execute `cd` with arguments after the command name.
-pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(
+    args: &[String],
+    env_vars: &mut crate::shell::var_table::VarTable,
+) -> io::Result<i32> {
     let mut stdout = crate::executor::WriteFileStdout;
     let mut stderr = crate::executor::WriteFileStderr;
     execute_with_io(
@@ -66,7 +68,7 @@ pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::R
 
 pub(crate) fn execute_with_io<'a, I, W, E>(
     args: I,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -117,14 +119,8 @@ where
         // Bash upstream tests that use POSIX system directories. A complete
         // shell should keep logical and physical directory state separately.
         // GNU cd.def:136-175 bindpwd: check readonly for OLDPWD and PWD.
-        let pwd_readonly = env_vars
-            .get("__RUBASH_READONLY_VARS")
-            .map(|v| v.split(DATA_DOLLAR).any(|name| name == "PWD"))
-            .unwrap_or(false);
-        let oldpwd_readonly = env_vars
-            .get("__RUBASH_READONLY_VARS")
-            .map(|v| v.split(DATA_DOLLAR).any(|name| name == "OLDPWD"))
-            .unwrap_or(false);
+        let pwd_readonly = env_vars.is_marked(crate::executor::types::READONLY_VARS, "PWD");
+        let oldpwd_readonly = env_vars.is_marked(crate::executor::types::READONLY_VARS, "OLDPWD");
         let mut failed = false;
         if oldpwd_readonly {
             writeln!(
@@ -212,14 +208,8 @@ where
     // bind_variable/setpwd fails and cd returns EXECUTION_FAILURE.
     // The error is emitted by err_readonly (error.c:455) via report_error,
     // which uses the error_prolog format: "shell: line N: VAR: readonly variable".
-    let pwd_readonly = env_vars
-        .get("__RUBASH_READONLY_VARS")
-        .map(|v| v.split(DATA_DOLLAR).any(|name| name == "PWD"))
-        .unwrap_or(false);
-    let oldpwd_readonly = env_vars
-        .get("__RUBASH_READONLY_VARS")
-        .map(|v| v.split(DATA_DOLLAR).any(|name| name == "OLDPWD"))
-        .unwrap_or(false);
+    let pwd_readonly = env_vars.is_marked(crate::executor::types::READONLY_VARS, "PWD");
+    let oldpwd_readonly = env_vars.is_marked(crate::executor::types::READONLY_VARS, "OLDPWD");
     let mut failed = false;
     if oldpwd_readonly {
         writeln!(

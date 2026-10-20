@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
+use crate::executor::markers::STORAGE_WORD_PREFIX;
 use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
-use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::executor::{mark_env_name, split_storage_words, unquote_storage_value, ARRAY_VARS};
 
 pub(in crate::executor) fn normalize_array_expanded_value(value: String) -> String {
@@ -770,17 +770,14 @@ pub(in crate::executor) fn is_array_storage(value: &str) -> bool {
 }
 
 pub(in crate::executor) fn is_marked_array_var(
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     name: &str,
 ) -> bool {
-    const ARRAY_VARS: &str = "__RUBASH_ARRAY_VARS";
-    const ASSOC_VARS: &str = "__RUBASH_ASSOC_VARS";
-    [ARRAY_VARS, ASSOC_VARS].iter().any(|key| {
-        env_vars
-            .get(*key)
-            .map(|value| value.split(DATA_DOLLAR).any(|marked| marked == name))
-            .unwrap_or(false)
-    })
+    // Structured flags, not the serialized string: writers stopped
+    // maintaining the string per mark (#916 follow-up). ASSOC counts as
+    // array-like here (same contract as before).
+    use crate::executor::types::{ARRAY_VARS, ASSOC_VARS};
+    env_vars.is_marked(ARRAY_VARS, name) || env_vars.is_marked(ASSOC_VARS, name)
 }
 
 fn rendered_array_values(value: &str) -> Vec<String> {

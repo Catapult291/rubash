@@ -1,14 +1,12 @@
 use std::collections::HashSet;
 
 use super::{ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, EXPORTED_VARS};
-use crate::executor::markers::DATA_DOLLAR;
 use crate::shell::var_table::VarTable;
 
 /// GNU variables.h:124-133: attributes are att_* bits on the SHELL_VAR.
-/// The writers below delegate to `VarTable`, which keeps the structured
-/// attribute map authoritative and the `__RUBASH_*_VARS` marker strings
-/// (the serialization child shells and list consumers read) synchronized
-/// bit-for-bit.
+/// The writers below delegate to `VarTable`, whose structured attribute
+/// map is authoritative; serialized marker strings are rendered on demand
+/// (`VarTable::marked_names`) instead of rewritten per mark (#916).
 pub(super) fn mark_exported(variables: &mut VarTable, name: &str) {
     variables.mark_name(EXPORTED_VARS, name);
 }
@@ -35,19 +33,11 @@ pub(super) fn unmark_typed(variables: &mut VarTable, key: &str, name: &str) {
 }
 
 /// Full list of one marker key (list-shaped consumers: `declare -p`
-/// rendering, set membership across a whole list). Reads the serialized
-/// string so insertion order is preserved.
+/// rendering, set membership across a whole list). Rendered on demand
+/// from the structured flags; writers no longer maintain the serialized
+/// string per mark (#916).
 pub(super) fn marked_vars(variables: &VarTable, key: &str) -> HashSet<String> {
-    variables
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    variables.marked_names(key).into_iter().collect()
 }
 
 pub(super) fn exported_vars(variables: &VarTable) -> HashSet<String> {

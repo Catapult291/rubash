@@ -212,14 +212,15 @@ impl VarTable {
     }
 
     /// Append `name` to a marker list. For the ten attribute keys the
-    /// structured map is authoritative; the serialized string is
-    /// rewritten only when the bit actually flips (GNU: setting an
-    /// already-set att_* bit touches nothing).
+    /// structured map is authoritative AND the whole store: no serialized
+    /// string is maintained (GNU keeps them as flag words on the SHELL_VAR;
+    /// serializing per mark cost O(n) and dominated export/unset loops).
+    /// Readers use `marked_names` (rendered on demand from the flags) or
+    /// `is_marked`, never the raw string.
     pub(crate) fn mark_name(&mut self, key: &str, name: &str) {
         let current = self.attr_of(name);
         if let Some(flag) = current.flag(key) {
             if !flag {
-                self.string_append(key, name);
                 self.write_flag(key, name, true);
             }
             return;
@@ -227,12 +228,12 @@ impl VarTable {
         self.string_append(key, name);
     }
 
-    /// Remove `name` from a marker list (same contract as `mark_name`).
+    /// Remove `name` from a marker list (same contract as `mark_name`:
+    /// attribute keys touch only the structured map).
     pub(crate) fn unmark_name(&mut self, key: &str, name: &str) {
         let current = self.attr_of(name);
         if let Some(flag) = current.flag(key) {
             if flag {
-                self.string_remove(key, name);
                 self.write_flag(key, name, false);
             }
             return;
@@ -241,25 +242,13 @@ impl VarTable {
     }
 
     /// Replace the whole attribute set of one variable (frame restore,
-    /// `declare -g` save/restore). Strings are rewritten only for the
-    /// bits that changed; an identical set is a no-op bit compare.
+    /// `declare -g` save/restore). Structured flags are the store; the
+    /// serialized string is not maintained (see `mark_name`). An
+    /// identical set is a no-op bit compare.
     pub(crate) fn set_attrs(&mut self, name: &str, new: VarAttrs) {
         let old = self.attr_of(name);
         if new == old {
             return;
-        }
-        for key in ATTR_KEYS {
-            let (Some(old_flag), Some(new_flag)) = (old.flag(key), new.flag(key)) else {
-                continue;
-            };
-            if old_flag == new_flag {
-                continue;
-            }
-            if new_flag {
-                self.string_append(key, name);
-            } else {
-                self.string_remove(key, name);
-            }
         }
         if new.is_empty() {
             self.attrs.remove(name);
@@ -317,10 +306,42 @@ impl VarTable {
     }
 
     /// Full marker-list enumeration (list-shaped consumers: child-env
-    /// export lists, `declare -p` renderers). Reads the serialized
-    /// string so insertion order is preserved.
+    /// export lists, `declare -p` renderers). Attribute keys render on
+    /// demand from the structured flags (sorted for determinism);
+    /// non-attribute keys read their maintained string.
     pub(crate) fn marked_names(&self, key: &str) -> Vec<String> {
+        if VarAttrs::default().flag(key).is_some() {
+            return self.render_attr_names(key);
+        }
         self.string_marked_names(key)
+    }
+
+    /// Render one attribute list from the structured flags. The ten
+    /// attribute keys never consult the serialized string here: writers
+    /// stopped maintaining it (see `mark_name`), so a parse would be
+    /// stale. Sorted: `export -p` sorts anyway and every other consumer
+    /// is order-insensitive.
+    fn render_attr_names(&self, key: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .attrs
+            .iter()
+            .filter(|(_, attrs)| attrs.flag(key) == Some(true))
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Serialized form of one attribute list, for snapshots that persist
+    /// the string (tempenv save/restore). Rendered from the structured
+    /// flags so a write-behind list still round-trips; None when empty,
+    /// matching the "emptied list drops the key" storage rule.
+    pub(crate) fn rendered_attr_list(&self, key: &str) -> Option<String> {
+        let names = self.marked_names(key);
+        if names.is_empty() {
+            return None;
+        }
+        Some(names.join(crate::executor::markers::DATA_DOLLAR_STR))
     }
 
     /// Restore a whole serialized marker list from a snapshot (tempenv
@@ -431,39 +452,40 @@ mod tests {
         let mut t = table();
         t.mark_name(EXPORTED_VARS, "a");
         assert!(t.is_marked(EXPORTED_VARS, "a"));
-        assert!(t.string_is_marked(EXPORTED_VARS, "a"));
-        // No-op mark leaves both forms alone.
-        let before = t.values.get(EXPORTED_VARS).cloned();
+        // Write-behind: the serialized string is not maintained per mark;
+        // readers use is_marked/marked_names instead.
+        assert!(t.values.get(EXPORTED_VARS).is_none());
+        assert!(t.marked_names(EXPORTED_VARS).contains(&"a".to_string()));
+        // No-op mark leaves everything alone.
         t.mark_name(EXPORTED_VARS, "a");
-        assert_eq!(
-            before.as_deref(),
-            t.values.get(EXPORTED_VARS).map(String::as_str)
-        );
+        assert!(t.values.get(EXPORTED_VARS).is_none());
         t.unmark_name(EXPORTED_VARS, "a");
         assert!(!t.is_marked(EXPORTED_VARS, "a"));
-        assert!(!t.string_is_marked(EXPORTED_VARS, "a"));
+        assert!(t.marked_names(EXPORTED_VARS).is_empty());
         assert!(t.attr_of("a").is_empty());
     }
 
     #[test]
-    fn set_attrs_only_rewrites_flipped_strings() {
+    fn set_attrs_updates_flags_not_strings() {
         let mut t = table();
         t.mark_name(EXPORTED_VARS, "a");
         t.mark_name(READONLY_VARS, "a");
         let mut attrs = t.attr_of("a");
         attrs.integer = true;
         t.set_attrs("a", attrs);
-        assert!(t.string_is_marked(INTEGER_VARS, "a"));
-        assert!(t.string_is_marked(EXPORTED_VARS, "a"));
-        assert!(t.string_is_marked(READONLY_VARS, "a"));
+        assert!(t.is_marked(INTEGER_VARS, "a"));
+        assert!(t.is_marked(EXPORTED_VARS, "a"));
+        assert!(t.is_marked(READONLY_VARS, "a"));
+        // No serialized strings are written for attribute keys.
+        assert!(t.values.get(INTEGER_VARS).is_none());
         // Restoring the previous set is a pure no-op.
         attrs.integer = false;
         t.set_attrs("a", attrs);
-        assert!(!t.string_is_marked(INTEGER_VARS, "a"));
+        assert!(!t.is_marked(INTEGER_VARS, "a"));
         assert_eq!(
-            t.values.get(EXPORTED_VARS).map(String::as_str),
-            Some("a"),
-            "exported string untouched by integer flip"
+            t.values.get(EXPORTED_VARS),
+            None,
+            "no exported string maintained"
         );
     }
 

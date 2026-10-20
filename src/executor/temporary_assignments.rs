@@ -123,15 +123,20 @@ impl Executor {
         self.tempenv_promoted_names.clear();
         let mut previous = Vec::new();
         if !assignments.is_empty() {
+            // Materialize the write-behind marker lists: restore replays
+            // the string, so the snapshot must reflect current flags,
+            // not a stale serialized copy.
+            let exported = self.shell_state.env_vars.rendered_attr_list(EXPORTED_VARS);
+            let nameref = self.shell_state.env_vars.rendered_attr_list(NAMEREF_VARS);
             previous.push((
                 EXPORTED_VARS.to_string(),
-                self.shell_state.env_vars.get(EXPORTED_VARS).cloned(),
+                exported,
                 self.shell_state.variables.get(EXPORTED_VARS).cloned(),
                 None,
             ));
             previous.push((
                 NAMEREF_VARS.to_string(),
-                self.shell_state.env_vars.get(NAMEREF_VARS).cloned(),
+                nameref,
                 self.shell_state.variables.get(NAMEREF_VARS).cloned(),
                 None,
             ));

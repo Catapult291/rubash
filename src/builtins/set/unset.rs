@@ -3,7 +3,6 @@ use super::{
     EXECUTION_SUCCESS, EXPORTED_VARS, INTEGER_VARS, LOWERCASE_VARS, NAMEREF_VARS, READONLY_VARS,
     UPPERCASE_VARS,
 };
-use crate::executor::markers::DATA_DOLLAR;
 use std::io::{self, Write};
 
 /// GNU shell.h:76 `EX_UTILERROR = 263` — a Posix special builtin utility error
@@ -254,10 +253,10 @@ pub(super) fn is_marked_variable(
     key: &str,
     name: &str,
 ) -> bool {
-    env_vars
-        .get(key)
-        .map(|value| value.split(DATA_DOLLAR).any(|marked| marked == name))
-        .unwrap_or(false)
+    // Structured flags are authoritative (lazy strings are not maintained);
+    // is_marked falls back to the string only for names with no flag entry,
+    // which a lazy write can never leave behind.
+    env_vars.is_marked(key, name)
 }
 
 fn unmark_variable(env_vars: &mut crate::shell::var_table::VarTable, key: &str, name: &str) {
