@@ -40,8 +40,17 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 libc = "0.2"
 signal-hook = "0.3"
 
+# rubash#827: build.rs stamps a `-dirty-<8 hex>` digest of the uncommitted
+# diff into the version banner (#488: a bare HEAD hash does not guarantee
+# content). The #[path]-included unit test (tests/build_rs_dirty.rs)
+# compiles build.rs into a test target, so sha2 must be a dev-dependency as
+# well as a build-dependency.
+[build-dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 pretty_assertions = "1.4"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3
