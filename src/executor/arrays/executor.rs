@@ -219,6 +219,62 @@ impl Executor {
             let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
             return assoc_value_at(&storage_assoc, &key);
         }
+        // Negative-literal fast lane: a clean `-N` subscript normalizes to
+        // `max_index + 1 - N` (GNU arrayfunc.c:1581 array_value_internal ->
+        // `ind = array_max_index (array_cell (var)) + 1 + ind`, INDEX_ERROR
+        // at :1582-1583 when still negative) without running evalexp, and
+        // the element comes straight from the structured cell — no mirror
+        // clone + full re-parse. Admission is a whitelist: `-` followed by
+        // `[1-9][0-9]*` only (a leading zero would be octal in shell
+        // arithmetic, so `-08` is an evalexp error, not -8). A clean
+        // literal has no names, expansions, RNG draws or writes, so
+        // skipping the expand+eval pipeline is observably identical when
+        // it HITS. Every other shape — assoc bases (where `-1` is a literal
+        // KEY, arrayfunc.c:1604-1625 assoc arm, never evalexp'd), dynamic
+        // views, dirty cells, empty arrays, still-negative results, holes —
+        // falls through to the slow path below, which owns all diagnostics
+        // byte-for-byte.
+        if dynamic_values.is_none() && !self.shell_state.env_vars.array_cells_dirty() {
+            if let Some(negative) = clean_negative_literal_subscript(key) {
+                if let Some((_, Some(max_index))) = self
+                    .shell_state
+                    .variables
+                    .indexed_array_shape(&storage_name)
+                {
+                    let normalized = max_index
+                        .checked_add(1)
+                        .and_then(|base| base.checked_add(negative));
+                    if let Some(normalized) = normalized {
+                        if normalized >= 0 {
+                            if let Some(cell_value) = self
+                                .shell_state
+                                .variables
+                                .indexed_element(&storage_name, normalized)
+                            {
+                                let typed = crate::executor::arrays::normalize_array_expanded_value(
+                                    cell_value.to_string(),
+                                );
+                                // Same safety net as the non-negative typed probe below: the
+                                // cell must agree with the mirror; release builds compile this
+                                // re-fetch out and skip the O(n) clone entirely.
+                                debug_assert_eq!(
+                                    Some(typed.clone()),
+                                    {
+                                        let mirror = self
+                                            .parameter_array_storage(array_name)
+                                            .unwrap_or_default();
+                                        resolve_indexed_array_subscript(&mirror, normalized as i128)
+                                            .and_then(|resolved| array_value_at(&mirror, resolved))
+                                    },
+                                    "typed cell disagrees with mirror for {storage_name}[{normalized}]"
+                                );
+                                return Some(typed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Use expand_arithmetic_special_parameters for array subscripts so that
         // $- expands to 0 (not shell flags) in arithmetic contexts. See array.tests line 60.
         // For $((...)) subscripts, expand_arithmetic_special_parameters would

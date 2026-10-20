@@ -142,6 +142,28 @@ pub(in crate::executor) fn parse_array_numeric_subscript(name: &str) -> Option<(
     Some((array_name, index))
 }
 
+/// A clean negative-literal subscript (`-N`, nothing else): the raw text is
+/// exactly `-` followed by `[1-9][0-9]*` and parses as `i64`.
+///
+/// GNU arrayfunc.c:1581 normalizes a negative indexed subscript as
+/// `array_max_index + 1 + ind`, so a literal needs no evalexp — but only a
+/// literal with this exact shape is value-identical to its parse. A leading
+/// zero would be octal under shell arithmetic (`-08` is an evalexp operand
+/// error, not -8; `-0` is element 0, not `max + 1`), and any whitespace,
+/// quote, sign repetition or expansion (`- 1`, `'-1'`, `--1`, `-$i`) must
+/// keep the full expand+evalexp pipeline with its diagnostics. Whitelist
+/// admission: anything rejected here rides the slow path unchanged.
+pub(in crate::executor) fn clean_negative_literal_subscript(key: &str) -> Option<i64> {
+    let digits = key.strip_prefix('-')?;
+    if !matches!(digits.as_bytes().first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    key.parse::<i64>().ok()
+}
+
 /// Split a bare array reference `name[subscript]` into its parts.
 ///
 /// GNU arrayfunc.c:1290-1333 tokenize_array_reference (via valid_array_reference):
@@ -1073,5 +1095,34 @@ mod tests {
         );
         let mirror = format_indexed_array_values(vec!["new0".to_string()]);
         assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+    }
+
+    #[test]
+    fn clean_negative_literal_admits_only_dash_nonzero_digits() {
+        // The negative-subscript fast lane (executor.rs) must admit exactly
+        // the spellings whose shell-arithmetic value equals the literal:
+        // `-[1-9][0-9]*`. A leading zero is octal (`-08` is an evalexp
+        // error, `-0` is element 0), and whitespace/quotes/signs/expansions
+        // keep the full expand+evalexp pipeline with its diagnostics.
+        assert_eq!(clean_negative_literal_subscript("-1"), Some(-1));
+        assert_eq!(clean_negative_literal_subscript("-10"), Some(-10));
+        assert_eq!(clean_negative_literal_subscript("-0"), None);
+        assert_eq!(clean_negative_literal_subscript("-08"), None);
+        assert_eq!(clean_negative_literal_subscript("-01"), None);
+        assert_eq!(clean_negative_literal_subscript("1"), None);
+        assert_eq!(clean_negative_literal_subscript("-"), None);
+        assert_eq!(clean_negative_literal_subscript("--1"), None);
+        assert_eq!(clean_negative_literal_subscript("- 1"), None);
+        assert_eq!(clean_negative_literal_subscript("-1 "), None);
+        assert_eq!(clean_negative_literal_subscript(" -1"), None);
+        assert_eq!(clean_negative_literal_subscript("'-1'"), None);
+        assert_eq!(clean_negative_literal_subscript("-$i"), None);
+        assert_eq!(clean_negative_literal_subscript(""), None);
+        // i64 overflow rides the slow path (whose i128 evalexp owns the
+        // diagnostic), exactly like any other rejected spelling.
+        assert_eq!(
+            clean_negative_literal_subscript("-99999999999999999999"),
+            None
+        );
     }
 }
