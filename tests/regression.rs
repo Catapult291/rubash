@@ -1852,7 +1852,7 @@ mod issue_704 {
         );
     }
 
-    /// 704.2b — builtins/command.def:96-99 `if (list == 0) return
+    /// 704.2b — builtins/command.def:96-97 `if (list == 0) return
     /// (EXECUTION_SUCCESS);`: the no-operand early return comes BEFORE the
     /// describe loop, so `command -v`/`-V` with no names succeeds with no
     /// output instead of falling through to the any_found accumulator's

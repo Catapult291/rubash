@@ -48,7 +48,7 @@ impl Executor {
             return Ok(false);
         };
         let saved_path = self.use_standard_path_for_lookup(use_standard_path);
-        // builtins/command.def:96-99 command_builtin(): `if (list == 0)
+        // builtins/command.def:96-97 command_builtin(): `if (list == 0)
         // return (EXECUTION_SUCCESS);` -- the no-operand early return comes
         // BEFORE the describe loop, so `command -v`/`-V` with no names
         // succeeds with no output (GNU probe rc=0) even though the

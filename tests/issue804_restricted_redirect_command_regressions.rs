@@ -10,10 +10,12 @@
 //! command-name scan execute_cmd.c:5789 that `command`'s operand lands in
 //! (command.def builds a bare simple command from the operand list and
 //! execute_command dispatches it; -p is refused earlier at
-//! command.def:98-104, -v/-V return from the describe path before any
-//! execution). The pre-fix rubash inverted cells 11/12 (allowed every
-//! write form whose target had no slash, refused `cat < slashed-file` with
-//! the output diagnostic) and skipped `command` operands entirely.
+//! command.def:100-104 (the use_standard_path && restricted if-block;
+//! the enclosing #if/#endif guard spans 99-105), and -v/-V return
+//! from the describe path before any execution). The pre-fix rubash
+//! inverted cells 11/12 (allowed every write form whose target had no
+//! slash, refused `cat < slashed-file` with the output diagnostic) and
+//! skipped `command` operands entirely.
 
 use std::fs;
 use std::io::Write;
