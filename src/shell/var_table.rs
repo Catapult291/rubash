@@ -579,4 +579,40 @@ mod tests {
         t.remove("PATH");
         assert!(t.get("PATH").is_none());
     }
+
+    #[test]
+    fn dirty_flag_mark_clear_cycle() {
+        let mut t = table();
+        assert!(!t.array_cells_dirty());
+        t.mark_array_cells_dirty();
+        assert!(t.array_cells_dirty());
+        t.clear_array_cells_dirty();
+        assert!(!t.array_cells_dirty());
+    }
+
+    #[test]
+    fn attr_flag_ops_do_not_touch_dirty_bit() {
+        let mut t = table();
+        // Attribute writes on a clean table leave it clean.
+        t.mark_name(EXPORTED_VARS, "a");
+        t.unmark_name(EXPORTED_VARS, "a");
+        t.set_attrs("a", t.attr_of("a"));
+        t.remove_unset_marks("a");
+        assert!(!t.is_marked(EXPORTED_VARS, "a"));
+        assert!(!t.array_cells_dirty());
+        // The same writes on a dirty table leave it dirty.
+        t.mark_name(READONLY_VARS, "b");
+        t.mark_array_cells_dirty();
+        let mut attrs = t.attr_of("b");
+        attrs.integer = true;
+        t.set_attrs("b", attrs);
+        assert!(t.is_marked(INTEGER_VARS, "b"));
+        t.unmark_name(READONLY_VARS, "b");
+        assert!(!t.is_marked(READONLY_VARS, "b"));
+        t.remove_unset_marks("b");
+        assert!(!t.is_marked(INTEGER_VARS, "b"));
+        assert!(t.array_cells_dirty());
+        t.clear_array_cells_dirty();
+        assert!(!t.array_cells_dirty());
+    }
 }
