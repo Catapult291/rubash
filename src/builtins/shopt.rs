@@ -396,7 +396,18 @@ pub(crate) fn set_option(
     } else {
         state.remove(name);
     }
-    env_vars.insert(SHOPT_STATE.to_string(), serialize_state(&state));
+    // Normalization (perf): a state equal to the defaults is stored as
+    // ABSENT, keeping every option_enabled lookup on the allocation-free
+    // static path (state_contains's None arm). A single redundant startup
+    // write — e.g. a host pinning expand_aliases off — used to flip ALL
+    // lookups to the serialized split-scan for the whole session, a
+    // measured ~1us per simple command. Reads treat absent as default, so
+    // nothing observable changes (same shopt -p/BASHOPTS rendering).
+    if state == default_state() {
+        env_vars.remove(SHOPT_STATE);
+    } else {
+        env_vars.insert(SHOPT_STATE.to_string(), serialize_state(&state));
+    }
     // GNU shopt.def toggle_shopts -> set_bashopts: every shopt change
     // rebinds the BASHOPTS variable, so an export of BASHOPTS carries the
     // live state to child shells (invocation1.sub:28-31).
@@ -460,6 +471,33 @@ mod tests {
 
         assert!(!option_enabled(&env_vars, "assoc_expand_once"));
         assert!(!option_enabled(&env_vars, "array_expand_once"));
+    }
+
+    #[test]
+    fn redundant_writes_normalize_to_absent_state() {
+        // Perf: a state equal to the defaults must not materialize the
+        // serialized entry — its presence flips every option_enabled
+        // lookup from the static path to the split-scan. A host pinning
+        // expand_aliases off at startup (its default) must leave the
+        // fast path intact.
+        let mut env_vars = fresh_env();
+        assert!(env_vars.get(SHOPT_STATE).is_none());
+
+        set_option(&mut env_vars, "expand_aliases", false);
+        assert!(env_vars.get(SHOPT_STATE).is_none());
+        assert!(!option_enabled(&env_vars, "expand_aliases"));
+        // BASHOPTS still renders (from the default state, identically).
+        assert!(!bashopts_value(&env_vars).contains("expand_aliases"));
+
+        // A real deviation still materializes, and clearing it removes
+        // the entry again.
+        set_option(&mut env_vars, "expand_aliases", true);
+        assert!(option_enabled(&env_vars, "expand_aliases"));
+        assert!(env_vars.get(SHOPT_STATE).is_some());
+
+        set_option(&mut env_vars, "expand_aliases", false);
+        assert!(!option_enabled(&env_vars, "expand_aliases"));
+        assert!(env_vars.get(SHOPT_STATE).is_none());
     }
 
     #[test]
