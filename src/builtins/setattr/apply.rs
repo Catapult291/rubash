@@ -9,9 +9,7 @@ use super::value::{
     array_attribute_assignment_value, diagnostic_prefix, readonly_error_subject, split_assignment,
     valid_identifier,
 };
-use super::{
-    ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS,
-};
+use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
 use crate::executor::local_helpers::sync_shell_assignment_process_env;
 
 pub(super) fn apply_export_arg<W>(
