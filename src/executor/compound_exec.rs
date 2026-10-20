@@ -3007,6 +3007,13 @@ impl Executor {
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
         let mut fall_through = false;
         let mut matched_any = false;
+        // GNU execute_cmd.c:3644 execute_case_command builds `word` once
+        // (expand_word_leave_quoted + dequote_string, 3695-3699) and reuses
+        // it for every arm's strmatch at 3736. Stage its `Vec<char>` once
+        // here so the N-arm loop below does not re-collect it per candidate;
+        // the pattern side still stages per arm (it differs per arm) while
+        // the literal / simple-glob fast paths stay borrow-only.
+        let word_chars: Vec<char> = word.chars().collect();
         let mut index = 0;
         while let Some(clause) = case_command.clauses.get(index) {
             let matched = fall_through
@@ -3019,18 +3026,18 @@ impl Executor {
                     }
                     if case_pattern_has_extglob(&stripped) {
                         if nocasematch {
-                            crate::executor::conditional::extglob_case_pattern_matches_nocase(
-                                &stripped, &word,
+                            crate::executor::conditional::extglob_case_pattern_matches_nocase_with_word_chars(
+                                &stripped, &word_chars,
                             )
                         } else {
-                            crate::executor::conditional::extglob_case_pattern_matches(
-                                &stripped, &word,
+                            crate::executor::conditional::extglob_case_pattern_matches_with_word_chars(
+                                &stripped, &word_chars,
                             )
                         }
                     } else if nocasematch {
-                        case_pattern_matches_nocase(&stripped, &word)
+                        case_pattern_matches_nocase_with_word_chars(&stripped, &word, &word_chars)
                     } else {
-                        case_pattern_matches(&stripped, &word)
+                        case_pattern_matches_with_word_chars(&stripped, &word, &word_chars)
                     }
                 });
             self.abandon_on_arithmetic_expansion_error()?;
@@ -3500,14 +3507,17 @@ fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
 }
 
 fn case_pattern_has_extglob(pattern: &str) -> bool {
-    let chars = pattern.chars().collect::<Vec<_>>();
+    // Zero-alloc scan (no `Vec<char>` staging): extglob operators and the
+    // backslash escape are single-byte ASCII, so a byte scan is equivalent
+    // to the char scan — multibyte continuation bytes never equal them.
+    let bytes = pattern.as_bytes();
     let mut index = 0usize;
-    while index + 1 < chars.len() {
-        if chars[index] == '\\' {
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
             index += 2;
             continue;
         }
-        if matches!(chars[index], '@' | '*' | '+' | '?' | '!') && chars[index + 1] == '(' {
+        if matches!(bytes[index], b'@' | b'*' | b'+' | b'?' | b'!') && bytes[index + 1] == b'(' {
             return true;
         }
         index += 1;

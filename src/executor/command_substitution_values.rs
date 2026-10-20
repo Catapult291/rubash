@@ -613,23 +613,41 @@ impl Executor {
         // `expression` is the already-stripped parameter name (`foo[@]`,
         // `foo[*]`, or a transform expression), so the `[@]`/`[*]` suffix is
         // present directly - there is no leading `${` to remove first.
+        //
+        // Perf: the indexed branch borrows the content-addressed memo
+        // (`indexed_array_entries_cached`, same discipline as the assoc parse
+        // memo) instead of re-scanning the storage string per join; the
+        // storage decode already yields final element text, so the
+        // `normalize_array_expanded_value` pass is the identity and is
+        // skipped rather than cloned through a second `Vec`. The `[*]`
+        // separator (`subst.c:2902 string_list_dollar_star` over
+        // `subst.c:2864 ifs_firstchar`) is looked up once, outside any
+        // per-element loop.
         let array_name = expression
             .strip_suffix("[@]")
             .or_else(|| expression.strip_suffix("[*]"))
             .unwrap_or_default();
-        let ordered = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, array_name) {
-            assoc_hash_ordered_values(
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, array_name) {
+            // Assoc: hash-slot order (assoc.c/hashlib.c hash_search buckets);
+            // `assoc_hash_ordered_values` already borrows its parse memo, and
+            // its elements are final text — no normalize clone.
+            let ordered = assoc_hash_ordered_values(
                 value,
                 assoc_nbuckets(&self.shell_state.env_vars, array_name),
-            )
+            );
+            return self.join_expanded_array_values(ordered, expression);
+        }
+        // Indexed: memoised index-order entries (GNU array.c array_max_index
+        // order); borrow the values, no intermediate `Vec<String>` clone.
+        let entries = indexed_array_entries_cached(value);
+        if expression.ends_with("[*]") {
+            let separator = self.ifs_first_char_separator();
+            let parts: Vec<&str> = entries.values().map(String::as_str).collect();
+            parts.join(&separator)
         } else {
-            array_values(value)
-        };
-        let values = ordered
-            .into_iter()
-            .map(normalize_array_expanded_value)
-            .collect::<Vec<_>>();
-        self.join_expanded_array_values(values, expression)
+            let parts: Vec<&str> = entries.values().map(String::as_str).collect();
+            parts.join(" ")
+        }
     }
 
     pub(in crate::executor) fn join_expanded_array_values(
@@ -638,8 +656,9 @@ impl Executor {
         expression: &str,
     ) -> String {
         if expression.ends_with("[*]") {
-            // GNU dollar_star (subst.c string_list_dollar_star): IFS[0], the
-            // empty string when IFS is set empty, a space when IFS is unset.
+            // GNU dollar_star (subst.c:2902 string_list_dollar_star): IFS[0], the
+            // empty string when IFS is set empty, a space when IFS is unset
+            // (subst.c:2864 ifs_firstchar).
             return values.join(&self.ifs_first_char_separator());
         }
         values.join(" ")

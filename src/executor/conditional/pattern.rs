@@ -32,6 +32,52 @@ pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str
     case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true)
 }
 
+/// Word-hoisted twin of [`case_pattern_matches`]: the `case` subject word is
+/// identical for every arm, so `execute_case_command`
+/// (GNU `execute_cmd.c:3644 execute_case_command`, word built once via
+/// `expand_word_leave_quoted` + `dequote_string` at 3695-3699, then matched
+/// per arm with `strmatch` at 3736) stages its `Vec<char>` once outside the
+/// arm loop and reuses it here. The pattern side still stages per arm — it
+/// differs per candidate — while the literal / simple-glob fast paths stay
+/// borrow-only. The raw-byte-marker path is rare; it delegates to the
+/// allocating form rather than duplicating the flatten logic.
+pub(in crate::executor) fn case_pattern_matches_with_word_chars(
+    pattern: &str,
+    word: &str,
+    word_chars: &[char],
+) -> bool {
+    if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
+        return verdict;
+    }
+    if let Some(verdict) = simple_glob_matches(pattern, word, false) {
+        return verdict;
+    }
+    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
+        return case_pattern_matches(pattern, word);
+    }
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, false)
+}
+
+/// Nocase twin of [`case_pattern_matches_with_word_chars`].
+pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
+    pattern: &str,
+    word: &str,
+    word_chars: &[char],
+) -> bool {
+    if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
+        return verdict;
+    }
+    if let Some(verdict) = simple_glob_matches(pattern, word, true) {
+        return verdict;
+    }
+    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
+        return case_pattern_matches_nocase(pattern, word);
+    }
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, true)
+}
+
 /// Direct char-wise match for the simple-glob class: a pattern whose every
 /// byte is printable ASCII (or space) with no byte in `[ ] \ + @ ! ( )` —
 /// only literals, `*` and `?` remain. GNU gnulib strmatch.c `gmatch` walks

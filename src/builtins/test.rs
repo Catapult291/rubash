@@ -44,37 +44,36 @@ pub fn execute(
     env_vars: &crate::shell::var_table::VarTable,
 ) -> io::Result<i32> {
     let mut stderr = io::stderr().lock();
-    execute_with_stderr(
-        args.iter().map(String::as_str),
-        bracket,
-        env_vars,
-        &mut stderr,
-    )
+    // Single borrow-only view for the non-hot direct entry; the hot
+    // `execute_test_words` path passes its already-merged `&[&str]` straight
+    // through so this layer adds no third `Vec` collect (GNU `test.c`
+    // `test_command` works on `argv` in place, no copy).
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    execute_with_stderr(&borrowed, bracket, env_vars, &mut stderr)
 }
 
-pub(crate) fn execute_with_stderr<'a, I, W>(
-    args: I,
+pub(crate) fn execute_with_stderr<W>(
+    args: &[&str],
     bracket: bool,
     env_vars: &crate::shell::var_table::VarTable,
     stderr: &mut W,
 ) -> io::Result<i32>
 where
-    I: IntoIterator<Item = &'a str>,
     W: Write,
 {
-    let mut args: Vec<&str> = args.into_iter().collect();
-
-    if bracket {
+    // Borrow-only bracket trim (no `Vec` pop-alloc): GNU `test.c`
+    // `test_command` just requires `argv[argc-1] == "]"` for `[`.
+    let args: &[&str] = if bracket {
         match args.last() {
-            Some(&"]") => {
-                args.pop();
-            }
+            Some(&"]") => &args[..args.len() - 1],
             _ => {
                 writeln!(stderr, "{}[: missing `]'", diagnostic_prefix(env_vars))?;
                 return Ok(EX_BADUSAGE);
             }
         }
-    }
+    } else {
+        args
+    };
 
     if args.is_empty() {
         return Ok(EXECUTION_FAILURE);

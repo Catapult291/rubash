@@ -12,6 +12,27 @@ pub(in crate::executor) fn extglob_case_pattern_matches_nocase(pattern: &str, wo
     extglob_matches_at_with_case(&pattern, 0, &word, 0, true)
 }
 
+/// Word-hoisted twin of [`extglob_case_pattern_matches`]: stages only the
+/// per-arm pattern side per call and reuses the caller-staged `word_chars`
+/// (see `case_pattern_matches_with_word_chars`; GNU `execute_cmd.c:3736`
+/// `strmatch` reuses the single expanded `word` for every arm).
+pub(crate) fn extglob_case_pattern_matches_with_word_chars(
+    pattern: &str,
+    word_chars: &[char],
+) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    extglob_matches_at(&pattern_chars, 0, word_chars, 0)
+}
+
+/// Nocase twin of [`extglob_case_pattern_matches_with_word_chars`].
+pub(in crate::executor) fn extglob_case_pattern_matches_nocase_with_word_chars(
+    pattern: &str,
+    word_chars: &[char],
+) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    extglob_matches_at_with_case(&pattern_chars, 0, word_chars, 0, true)
+}
+
 pub(in crate::executor) fn extglob_group_end(pattern: &[char], open_idx: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open_idx;
