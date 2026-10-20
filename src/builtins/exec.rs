@@ -323,7 +323,11 @@ where
     // endpoint 0.
     process.stdin(child_stdin);
 
-    match process.output() {
+    match process
+        .spawn()
+        .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
+        .and_then(|child| child.wait_with_output())
+    {
         Ok(output) => {
             stdout.write_all(&output.stdout)?;
             stderr.write_all(&output.stderr)?;
@@ -365,7 +369,11 @@ where
     // never the std default (rubash#575).
     process.stdin(child_stdin);
 
-    match process.status() {
+    match process
+        .spawn()
+        .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
+        .and_then(|mut child| child.wait())
+    {
         Ok(status) => Ok(crate::executor::wait_status::process_exit_status(&status)),
         Err(error) => {
             writeln!(

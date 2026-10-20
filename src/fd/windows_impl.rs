@@ -1381,6 +1381,7 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
     si.attr = attr_buf as _;
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let orphan_flags = crate::executor::path::orphan_console_creation_flags();
     let ok = unsafe {
         CreateProcessW(
             program_w.as_ptr(),
@@ -1388,7 +1389,7 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
             std::ptr::null(),
             std::ptr::null(),
             1,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | orphan_flags,
             env_block.as_ptr() as _,
             std::ptr::null(),
             &si.si,
@@ -1405,6 +1406,7 @@ pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChil
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    crate::executor::path::adopt_orphan_console(pi.dwProcessId);
     unsafe {
         CloseHandle(pi.hThread);
     }

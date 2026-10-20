@@ -467,6 +467,7 @@ impl Executor {
             match process.spawn() {
                 Ok(child) => {
                     let pid = child.id();
+                    adopt_orphan_console(pid);
                     self.background_children
                         .insert(pid, crate::fd::SpawnedChild::from(child));
                     self.shell_state
@@ -2582,6 +2583,7 @@ impl Executor {
                     // but keep the parent ends until after spawn so stdio uses
                     // the correct pipe direction on all hosts.
                     let pid = child_proc.id();
+                    adopt_orphan_console(pid);
                     if let Some(target) = coproc_stderr_target {
                         if let Some(stderr) = child_proc.stderr.take() {
                             let forwarder =

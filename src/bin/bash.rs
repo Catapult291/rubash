@@ -88,14 +88,18 @@ fn main() {
 fn suppress_child_console_window(command: &mut Command) {
     #[cfg(windows)]
     {
-        use std::io::IsTerminal as _;
         use std::os::windows::process::CommandExt;
+        extern "system" {
+            fn GetConsoleCP() -> u32;
+        }
         // DETACHED_PROCESS = 0x00000008, CREATE_NO_WINDOW = 0x08000000
-        // (WinBase.h). Deliberately gated on all-three-redirected, not just
-        // "stdout is piped": a child with no console can still use inherited
-        // console handles for plain I/O, but console APIs (ReadConsole/
-        // SetConsoleMode) fail in it, so an interactive niu session must keep
-        // inheriting the real console.
+        // (WinBase.h). Gated on `GetConsoleCP() == 0` (run after
+        // `release_orphan_console`): when the shim inherited a real terminal,
+        // ConPTY, or a caller-supplied hidden console (`AllocConsoleWithOptions`
+        // / `CREATE_NO_WINDOW`), `GetConsoleCP()` is non-zero and `niu.exe`
+        // inherits that console for free even when stdio is piped (#451/#462).
+        // Only when the shim has no console at all does it allocate one hidden
+        // console via CREATE_NO_WINDOW so the whole subtree shares it.
         //
         // Flag history: niubash#379 picked CREATE_NO_WINDOW to stop the
         // visible flash; #751 switched to DETACHED_PROCESS to skip the ~22 ms
@@ -105,10 +109,9 @@ fn suppress_child_console_window(command: &mut Command) {
         // down). CREATE_NO_WINDOW is back deliberately: niu's hidden console
         // is inherited by every grandchild, so the whole tree pays ~22 ms
         // ONCE here instead of per child spawn. Paired with
-        // release_orphan_console's GetConsoleWindow() rail, which keeps this
-        // hidden console alive (it owns no window).
-        if !io::stdin().is_terminal() && !io::stdout().is_terminal() && !io::stderr().is_terminal()
-        {
+        // release_orphan_console's IsWindowVisible rail, which keeps this
+        // hidden console alive.
+        if unsafe { GetConsoleCP() } == 0 {
             command.creation_flags(0x0800_0000);
         }
     }
@@ -165,8 +168,16 @@ fn release_orphan_console() {
         fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
         fn FreeConsole() -> i32;
     }
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
+    }
     unsafe {
-        if GetConsoleCP() == 0 || GetConsoleWindow().is_null() {
+        if GetConsoleCP() == 0 {
+            return;
+        }
+        let window = GetConsoleWindow();
+        if window.is_null() || IsWindowVisible(window) == 0 {
             return;
         }
         let mut pids = [0u32; 64];

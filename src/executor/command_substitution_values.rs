@@ -775,6 +775,7 @@ impl Executor {
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
         suppress_orphan_console(&mut process);
         let mut spawned = process.spawn().ok()?;
+        adopt_orphan_console(spawned.id());
         if let Some(input) = piped_stdin.as_deref() {
             if let Some(mut child_stdin) = spawned.stdin.take() {
                 use std::io::Write;

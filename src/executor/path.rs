@@ -1194,12 +1194,174 @@ pub(crate) fn suppress_orphan_console(command: &mut Command) {
             fn GetConsoleCP() -> u32;
         }
         // CREATE_NO_WINDOW = 0x08000000 (WinBase.h)
-        if unsafe { GetConsoleCP() } == 0 {
+        if unsafe { GetConsoleCP() } == 0 && !try_alloc_hidden_console() {
             command.creation_flags(0x0800_0000);
         }
     }
     #[cfg(not(windows))]
     let _ = command;
+}
+
+#[cfg(windows)]
+pub(crate) fn orphan_console_creation_flags() -> u32 {
+    extern "system" {
+        fn GetConsoleCP() -> u32;
+    }
+    if unsafe { GetConsoleCP() } == 0 && !try_alloc_hidden_console() {
+        0x0800_0000
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+unsafe fn preserve_std_handles<F: FnOnce() -> bool>(f: F) -> bool {
+    type Handle = *mut core::ffi::c_void;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const INVALID_HANDLE_VALUE: Handle = (-1isize) as Handle;
+
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> Handle;
+        fn SetStdHandle(n_std_handle: u32, h_handle: Handle) -> i32;
+        fn GetFileType(h_file: Handle) -> u32;
+        fn GetLastError() -> u32;
+        fn SetLastError(dw_err_code: u32);
+    }
+
+    unsafe fn live_std_handle(id: u32) -> Option<Handle> {
+        let h = GetStdHandle(id);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        SetLastError(0);
+        if GetFileType(h) == 0 && GetLastError() != 0 {
+            return None;
+        }
+        Some(h)
+    }
+
+    let stdin = live_std_handle(STD_INPUT_HANDLE);
+    let stdout = live_std_handle(STD_OUTPUT_HANDLE);
+    let stderr = live_std_handle(STD_ERROR_HANDLE);
+    let ok = f();
+    if ok {
+        if let Some(h) = stdin {
+            let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+        }
+        if let Some(h) = stdout {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+        }
+        if let Some(h) = stderr {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+        }
+    }
+    ok
+}
+
+/// Fast path on Windows 11 24H2+ / Server 2025: allocate a windowless console
+/// in-process via `AllocConsoleWithOptions(ALLOC_CONSOLE_MODE_NO_WINDOW)` so
+/// the shell owns the hidden console before the first child even spawns.
+#[cfg(windows)]
+fn try_alloc_hidden_console() -> bool {
+    #[repr(C)]
+    struct AllocConsoleOptions {
+        mode: i32,
+        use_show_window: i32,
+        show_window: u16,
+    }
+    type AllocConsoleWithOptionsFn =
+        unsafe extern "system" fn(*const AllocConsoleOptions, *mut i32) -> i32;
+
+    extern "system" {
+        fn GetModuleHandleA(module_name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            proc_name: *const u8,
+        ) -> *mut core::ffi::c_void;
+        fn GetConsoleCP() -> u32;
+    }
+
+    const ALLOC_CONSOLE_MODE_NO_WINDOW: i32 = 2;
+
+    unsafe {
+        let module = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        let proc = GetProcAddress(module, b"AllocConsoleWithOptions\0".as_ptr());
+        if proc.is_null() {
+            return false;
+        }
+        let func: AllocConsoleWithOptionsFn = core::mem::transmute(proc);
+        preserve_std_handles(|| {
+            let options = AllocConsoleOptions {
+                mode: ALLOC_CONSOLE_MODE_NO_WINDOW,
+                use_show_window: 0,
+                show_window: 0,
+            };
+            let mut result = 0i32;
+            func(&options, &mut result) >= 0 && GetConsoleCP() != 0
+        })
+    }
+}
+
+/// niubash#462: claim the first child's hidden CREATE_NO_WINDOW console for
+/// the shell session on Windows builds without `AllocConsoleWithOptions`, so
+/// subsequent external spawns inherit it for free instead of paying ~22 ms
+/// per child spawn.
+pub(crate) fn adopt_orphan_console(child_pid: u32) {
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn GetConsoleCP() -> u32;
+            fn AttachConsole(dw_process_id: u32) -> i32;
+            fn GetLastError() -> u32;
+            fn SwitchToThread() -> i32;
+        }
+
+        if GetConsoleCP() != 0 {
+            return;
+        }
+        // On Windows 8+ (ConDrv), a CREATE_NO_WINDOW child connects its
+        // hidden conhost.exe inside kernelbase.dll!DllMain during loader
+        // startup (~15-25 ms after CreateProcessW returns). Before that point
+        // AttachConsole fails with ERROR_INVALID_HANDLE (6) or
+        // ERROR_GEN_FAILURE (31); if the child already exited it fails with
+        // ERROR_INVALID_PARAMETER (87). Yield without hitting the 15.6 ms OS
+        // timer tick so even a fast-exiting child (`hostname.exe`) is caught
+        // the instant its console commits.
+        const ERROR_INVALID_HANDLE: u32 = 6;
+        const ERROR_GEN_FAILURE: u32 = 31;
+        preserve_std_handles(|| {
+            let start = std::time::Instant::now();
+            let spin_limit = std::time::Duration::from_millis(30);
+            let gen_failure_limit = std::time::Duration::from_millis(250);
+            let invalid_handle_limit = std::time::Duration::from_millis(500);
+            loop {
+                if AttachConsole(child_pid) != 0 {
+                    return true;
+                }
+                let err = GetLastError();
+                let elapsed = start.elapsed();
+                let keep_waiting = (err == ERROR_INVALID_HANDLE && elapsed < invalid_handle_limit)
+                    || (err == ERROR_GEN_FAILURE && elapsed < gen_failure_limit);
+                if !keep_waiting {
+                    return false;
+                }
+                if elapsed < spin_limit {
+                    if SwitchToThread() == 0 {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = child_pid;
 }
 
 /// The script argument a shell-wrapped child reports as `$0`.
@@ -1601,7 +1763,14 @@ fn winuxcmd_has_command(dispatcher: &Path, name: &str, env_vars: &HashMap<String
         }
     }
     suppress_orphan_console(&mut command);
-    command.output().is_ok_and(|output| output.status.success())
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .inspect(|child| adopt_orphan_console(child.id()))
+        .and_then(|child| child.wait_with_output())
+        .is_ok_and(|output| output.status.success())
 }
 
 /// rubash#159: `winuxcmd help NAME` probe memo. Each uncached probe is a
