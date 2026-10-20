@@ -18,10 +18,12 @@ pub(super) use storage::{
     normalize_array_expanded_value, parse_array_integer_subscript, parse_array_numeric_subscript,
     parse_array_subscript, parse_expanded_array_subscript, quote_array_value,
     resolve_indexed_array_subscript, store_indexed_array, store_indexed_array_state,
-    sync_typed_indexed_array, sync_typed_indexed_element,
+    sync_typed_assoc_array, sync_typed_indexed_array, sync_typed_indexed_element,
+    upsert_typed_assoc_element,
 };
 pub(crate) use storage::{
-    drop_typed_indexed_array, replace_typed_indexed_array, sync_typed_indexed_storage,
+    drop_typed_assoc_array, drop_typed_indexed_array, replace_typed_indexed_array,
+    sync_typed_assoc_storage, sync_typed_indexed_storage,
 };
 
 use std::collections::{BTreeMap, HashMap};

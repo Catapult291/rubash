@@ -718,6 +718,11 @@ impl Executor {
             let mut entries = assoc_entries(&current);
             let before = entries.len();
             entries.retain(|(entry_key, _)| *entry_key != key);
+            // Typed-cell sync (assoc read fast path): the retained entries
+            // are the post-unset unique-key list, so sync the structured
+            // cell from the same list instead of leaving it shadowing the
+            // removed binding.
+            sync_typed_assoc_array(&mut self.shell_state.variables, array_name, &entries);
             if entries.len() != before
                 || !is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, array_name)
             {
