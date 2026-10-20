@@ -838,6 +838,33 @@ pub(crate) fn push_literal_char(output: &mut String, c: char) {
     output.push(c);
 }
 
+/// Inverse of [`push_literal_char`] for SOURCE-DISPLAY boundaries only
+/// (ast_print / `--pretty-print` / `declare -f` — rubash#856): script-entry
+/// escaping (substitution_metadata::bytes_to_script_text) leaves `E400` +
+/// zone-char pairs inside raw word text, and printing that spelling would
+/// leak the transport escape. `E400` + marker-zone char renders as the
+/// char alone; a bare `E400` or `E400` + non-zone char passes through
+/// (push_literal_char only ever prefixes zone chars). This is NOT a
+/// transport decoder — everything else (C0 carriers, raw-byte pairs,
+/// named markers) stays encoded; only the inert literal-char escape is
+/// folded so the printed text shows the user's original source chars.
+pub(crate) fn fold_literal_char_escapes(text: &str) -> String {
+    if !text.contains(LITERAL_CHAR_ESCAPE) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE && chars.peek().is_some_and(|next| is_marker_zone_char(*next))
+        {
+            out.push(chars.next().expect("peeked char exists"));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// E400-aware ANSI_C_IFS_GUARD handling (rubash#735).
 ///
 /// The guard (U+E401) marks lexer-decoded `$'...'` blanks. User data U+E401
