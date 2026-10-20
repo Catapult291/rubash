@@ -525,28 +525,67 @@ pub(crate) fn bytes_to_shell_text(bytes: &[u8]) -> String {
 /// meaning they already have) and rides each byte of an invalid sequence
 /// as a raw-byte marker pair, so the output boundary
 /// (`decode_raw_byte_markers`, e.g. echo) restores the original byte.
+///
+/// One entry-side escape DOES apply to valid UTF-8 spans (rubash#856): a
+/// literal marker-zone char (U+E000..=U+E401 — RAW_BYTE_MARKER_ESCAPE,
+/// raw-byte payloads, the E301.. registry block, LITERAL_CHAR_ESCAPE
+/// itself) is user data per the #296 ownership contract but is
+/// indistinguishable from a stray marker introducer at every later decode
+/// boundary — `v="a<U+E000>b"` stored `ab` and `${v//a/ZZ}` emitted `ZZb`
+/// where GNU 5.3.0 keeps the PUA glyph verbatim. Those chars can only be
+/// told apart from live markers at THIS boundary (script bytes are fresh
+/// source — transport text never enters through file reads), so they are
+/// E400-escaped here exactly like `push_escaped_text_with_carriers` does
+/// for the stdin path (`read_unbuffered_line`).
+///
+/// The `-c` operand is deliberately NOT escaped here or at its call site:
+/// respawned `&` children receive serialized AST source over that same
+/// argv channel (compound_exec `bash_command_source_text`), whose words
+/// already carry transport spelling (E400 pairs and raw-byte markers), so
+/// re-escaping `-c` text would double-escape them. A literal marker-zone
+/// char typed into `-c` text is the protocol's documented ambiguous seam.
 pub(crate) fn bytes_to_script_text(bytes: &[u8]) -> String {
-    if std::str::from_utf8(bytes).is_ok() {
-        // Zero-change fast path: every currently-runnable script decodes to
-        // exactly the String String::from_utf8 produced.
-        return String::from_utf8_lossy(bytes).into_owned();
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains(crate::executor::markers::is_marker_zone_char) {
+            // Zero-change fast path: every currently-runnable script decodes
+            // to exactly the String String::from_utf8 produced.
+            return text.to_string();
+        }
+        return escape_marker_zone_chars(text);
     }
     let mut output = String::new();
     let mut remaining = bytes;
     while !remaining.is_empty() {
         match std::str::from_utf8(remaining) {
             Ok(text) => {
-                output.push_str(text);
+                push_marker_zone_escaped(&mut output, text);
                 break;
             }
             Err(error) => {
                 let valid = error.valid_up_to();
-                output.push_str(std::str::from_utf8(&remaining[..valid]).unwrap_or_default());
+                push_marker_zone_escaped(
+                    &mut output,
+                    std::str::from_utf8(&remaining[..valid]).unwrap_or_default(),
+                );
                 push_raw_byte_marker(&mut output, remaining[valid]);
                 remaining = &remaining[valid + 1..];
             }
         }
     }
+    output
+}
+
+/// E400-escape every marker-zone char in `text` (script-source literal
+/// boundary — see `bytes_to_script_text`).
+fn push_marker_zone_escaped(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        crate::executor::markers::push_literal_char(output, ch);
+    }
+}
+
+fn escape_marker_zone_chars(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    push_marker_zone_escaped(&mut output, text);
     output
 }
 
