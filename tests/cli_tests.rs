@@ -350,29 +350,64 @@ fn typed_cell_stays_consistent_across_builtin_writes() {
     let cases = [
         // plain executor writes (hot loop shape)
         ("a=(1 2 3); echo \"${a[1]}:${#a[@]}\"", "2:3\n"),
-        ("a=(); a[5]=x; a[2]=y; echo \"${a[5]}:${a[2]}:${#a[@]}\"", "x:y:2\n"),
+        (
+            "a=(); a[5]=x; a[2]=y; echo \"${a[5]}:${a[2]}:${#a[@]}\"",
+            "x:y:2\n",
+        ),
         // declare / typeset / local forms
         ("declare -a d=(p q); echo \"${d[1]}:${#d[@]}\"", "q:2\n"),
         ("declare -a e; e[0]=z; echo \"${e[0]}:${#e[@]}\"", "z:1\n"),
-        ("f() { local g=(m n); echo \"${g[0]}:${#g[@]}\"; }; f", "m:2\n"),
+        (
+            "f() { local g=(m n); echo \"${g[0]}:${#g[@]}\"; }; f",
+            "m:2\n",
+        ),
         // export / readonly / unset
         ("export h=(u v); echo \"${h[1]}\"", "v\n"),
         ("declare -r k=(w); echo \"${k[0]}\"", "w\n"),
-        ("u=(1 2 3); unset 'u[1]'; echo \"${u[0]}:${u[2]}:${#u[@]}\"", "1:3:2\n"),
+        (
+            "u=(1 2 3); unset 'u[1]'; echo \"${u[0]}:${u[2]}:${#u[@]}\"",
+            "1:3:2\n",
+        ),
         ("v=(1 2); unset v; echo \"${v[0]-gone}\"", "gone\n"),
         // compound append
         ("w=(a); w+=(b c); echo \"${w[2]}:${#w[@]}\"", "c:3\n"),
         // arithmetic element write
-        ("declare -ai n; n[0]=4; (( n[0] += 2 )); echo \"${n[0]}\"", "6\n"),
+        (
+            "declare -ai n; n[0]=4; (( n[0] += 2 )); echo \"${n[0]}\"",
+            "6\n",
+        ),
         // tempassign does not leak into the cell
         ("t=orig; T=$t command true; echo \"$t\"", "orig\n"),
         // interleaved: establish cell via executor write, then builtin
         // write, then read — catches stale typed cells.
-        ("a=(1 2 3); x=${a[0]}; declare -a a=(9 8); echo \"${a[0]}:${a[1]}\"", "9:8\n"),
-        ("a=(1 2 3); x=${a[0]}; export a=(7 8); echo \"${a[0]}:${#a[@]}\"", "7:2\n"),
-        ("a=(1 2 3); x=${a[0]}; readonly r=(q); echo \"${r[0]}:${a[0]}\"", "q:1\n"),
-        ("a=(1 2 3); x=${a[0]}; unset 'a[1]'; echo \"${a[0]}:${a[2]-gone}:${#a[@]}\"", "1:3:2\n"),
-        ("a=(1 2); x=${a[0]}; read -a a <<< \"m n\"; echo \"${a[0]}:${a[1]}\"", "m:n\n"),
+        (
+            "a=(1 2 3); x=${a[0]}; declare -a a=(9 8); echo \"${a[0]}:${a[1]}\"",
+            "9:8\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; export a=(7 8); echo \"${a[0]}:${#a[@]}\"",
+            "7:2\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; readonly r=(q); echo \"${r[0]}:${a[0]}\"",
+            "q:1\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; unset 'a[1]'; echo \"${a[0]}:${a[2]-gone}:${#a[@]}\"",
+            "1:3:2\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; read -a a <<< \"m n\"; echo \"${a[0]}:${a[1]}\"",
+            "m:n\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; printf -v \"a[1]\" \"%s\" \"ZZ\"; echo \"${a[0]}:${a[1]}\"",
+            "1:ZZ\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; a+=(4 5); echo \"${a[3]}:${#a[@]}\"",
+            "4:5\n",
+        ),
     ];
     for (script, expected) in cases {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
