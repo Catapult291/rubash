@@ -1033,6 +1033,21 @@ fn run_command_string_with_init(
     command: &str,
     init_file: Option<&str>,
 ) -> i32 {
+    // rubash#948: -c operand entry escaping — the boundary documented on
+    // substitution_metadata::command_string_entry_text. The respawn
+    // exclusion is a DOUBLE-ESCAPE exclusion only, not an all-`-c`
+    // exclusion: a respawned `&`/coproc child's operand is serialized AST
+    // already in transport spelling (E400 pairs, raw-byte markers) and must
+    // not be re-escaped, while a user-supplied -c string is fresh source —
+    // the same class as a script file or stdin — and gets marker-zone
+    // entry escaping so a literal marker-zone char stays user data instead
+    // of live protocol. The escaping preserves existing E400 pairs so
+    // transport-spelled argv from a rubash parent is not double-encoded.
+    let command = if rubash::executor::RESPAWNED_CHILD.load(std::sync::atomic::Ordering::Relaxed) {
+        std::borrow::Cow::Borrowed(command)
+    } else {
+        std::borrow::Cow::Owned(rubash::script_driver::command_string_entry_text(command))
+    };
     executor.inherit_process_stdin();
     // GNU shell.c:1969 initialize_job_control runs inside
     // initialize_shell_basics, long before the -c string is parsed, so the
@@ -1090,10 +1105,10 @@ fn run_command_string_with_init(
     // driver; GNU's reader is always command-by-command.
     let alias_live_at_start = executor.alias_expansion_enabled();
     let status =
-        if script_uses_history(command) || script_uses_aliases(command, alias_live_at_start) {
-            run_script_with_history(executor, command, None)
+        if script_uses_history(&command) || script_uses_aliases(&command, alias_live_at_start) {
+            run_script_with_history(executor, &command, None)
         } else {
-            run_source_with_line_offset(executor, command, interactive, line_offset, None, None)
+            run_source_with_line_offset(executor, &command, interactive, line_offset, None, None)
         };
     executor.set_command_string_mode(false);
     finish_shell(executor, status, interactive)
