@@ -1527,40 +1527,27 @@ impl Executor {
         // never sees an expansion result — so `vec![word]` is byte-for-byte
         // what the full pipeline below produces for this class.
         //
-        // The excluded classes, each mapped to the branch below that owns
-        // it: `$` and `` ` `` (every substitution/parameter arm, incl. the
-        // embedded walker's `$` dispatch and its recursive
-        // expand_word_mut_with_context call), `'` `"` `\` (quote removal /
-        // DATA_* carriers / escape handling / raw_word_is_fully_single_
-        // quoted), `{` `}` (brace expansion incl. raw_has_braces), `~`
-        // (tilde), `*` `?` `[` (pathname expansion), `(` `)` `<` `>` and any
-        // byte outside printable ASCII (process substitutions, storage/PUA
-        // and C0 carrier prefixes — QUOTED_WORD_PREFIX \x1b, STORAGE \x1d,
-        // CTLESC \x11, IFS_GLUE \x1c, DATA_DOLLAR \x1f are all non-printing
-        // and fail the set test on the first byte), `=` (assignment-shaped
-        // word arms: eval compound flattening, array-element assignment
-        // re-splitting, declaration-builtin operands), and whitespace (a
-        // token equal to its raw text cannot contain any). With raw == word
-        // the optional-raw arms (`"$((...))"` / `"$(...)"` fast paths,
-        // simple-substitution fragments) cannot engage because their
-        // admissions all require one of the excluded bytes in `raw`.
+        // The shape class itself lives in
+        // assignment_helpers::is_expand_fast_literal_word, shared with the
+        // expand_word_mut fast path so the two admissions can never
+        // diverge: the single-byte test operators `[`/`]`/`=` are admitted
+        // exactly (`[` alone opens no glob class or subscript, `]` alone
+        // closes nothing, `=` alone names no assignment), while longer
+        // words carrying those bytes (`[a]`, `a=b`) keep the slow path
+        // (rubash#117 discipline: doubt falls through). With raw == word
+        // the optional-raw arms (`"$((...))"` / `"$(...)"`
+        // fast paths, simple-substitution fragments) cannot engage because
+        // their admissions all require one of the excluded bytes in `raw`.
         // A false admission is impossible (the class is closed under the
         // exclusions); a word outside the class simply falls through to the
         // full pipeline unchanged.
         if raw == Some(word)
-            && !word.is_empty()
             && cmd.process_substitutions.is_empty()
             && cmd
                 .word_metadata
                 .get(index)
                 .is_none_or(|metadata| metadata.process_substitutions.is_empty())
-            && word.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || matches!(
-                        b,
-                        b'_' | b'.' | b'/' | b':' | b',' | b'-' | b'+' | b'%' | b'@'
-                    )
-            })
+            && crate::executor::assignment_helpers::is_expand_fast_literal_word(word)
         {
             return vec![word.to_string()];
         }
@@ -5127,6 +5114,108 @@ mod command_word_materialization_tests {
             assert!(
                 Executor::try_expand_literal_command(node).is_none(),
                 "{src:?} should fall through"
+            );
+        }
+    }
+
+    /// Literal-word fast-path admission contract (fix/literal-word-expand):
+    /// every admitted shape must expand to itself through both entries
+    /// (expand_word_mut in both quote contexts, and the full
+    /// expand_command_words pipeline on `[ 1 -eq 2 ]`-shaped commands),
+    /// and every excluded shape must fall through. Anti-rot pin:
+    /// widening the whitelist without updating this test ships a silent
+    /// divergence (behavioral equivalence across the suite is also covered
+    /// by the serial failure-set gate).
+    #[test]
+    fn literal_word_fast_path_admission() {
+        use crate::executor::assignment_helpers::is_expand_fast_literal_word;
+        // Admitted: the single-byte test operators plus the pre-existing
+        // alnum/punctuation class.
+        for word in [
+            "[",
+            "]",
+            "=",
+            "1",
+            "2",
+            "-eq",
+            "-n",
+            "--",
+            "true",
+            ":",
+            "a-b_c.d,e:f@g%h+i/j",
+        ] {
+            assert!(is_expand_fast_literal_word(word), "{word:?} should admit");
+        }
+        // Excluded: empty, and any byte with expansion meaning. Longer
+        // words carrying `[`/`]`/`=` keep the slow path (glob, subscript,
+        // and assignment arms own those shapes).
+        for word in [
+            "", "$x", "$@", "${x}", "`x`", "$(x)", "$((1+1))", "'a'", "\"a\"", "a\\b", "a b",
+            "a=b", "[a]", "a]", "~", "~/x", "*", "?", "{a,b}", "a(b)", "a<b", "a|b", "a;b", "a&b",
+            "a#b", "a!b", "\u{00e9}",
+        ] {
+            assert!(
+                !is_expand_fast_literal_word(word),
+                "{word:?} should fall through"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_word_fast_path_expands_to_itself() {
+        use super::Executor;
+        use crate::executor::substitution_metadata::SubstitutionQuoteContext;
+        let mut executor = Executor::new();
+        for word in ["[", "]", "=", "1", "-eq", "2", "-n", "--", "true"] {
+            assert_eq!(executor.expand_word_mut(word), word);
+            assert_eq!(
+                executor.expand_word_mut_with_context(word, SubstitutionQuoteContext::Unquoted),
+                word,
+                "{word:?} unquoted"
+            );
+            assert_eq!(
+                executor.expand_word_mut_with_context(word, SubstitutionQuoteContext::DoubleQuoted),
+                word,
+                "{word:?} double-quoted"
+            );
+        }
+        // The `[ ... ]` hot shape goes through the full per-word pipeline
+        // and comes out byte-identical.
+        for src in ["[ 1 -eq 2 ]", "[ x = y ]", "[ -n foo ]", "[ 1 = 1 ]"] {
+            let tokens = crate::lexer::tokenize(src);
+            let ast = crate::parser::parse(&tokens);
+            let expanded = executor
+                .expand_command_words(&ast.commands[0])
+                .expect("pipeline failed");
+            let expected: Vec<String> = src.split_whitespace().map(str::to_string).collect();
+            assert_eq!(expanded.words, expected, "pipeline changed {src:?}");
+        }
+    }
+
+    /// The `[ 1 -eq 2 ]` hot shape must actually REACH the per-word fast
+    /// path: admission needs raw == word, no quotes, and no process
+    /// substitutions alongside the predicate. A future lexer/parser change
+    /// that decorates these tokens would silently reroute them to the slow
+    /// path with no behavioral test failing — pin the routing here.
+    #[test]
+    fn test_hot_shape_takes_literal_fast_path() {
+        use crate::executor::assignment_helpers::is_expand_fast_literal_word;
+        let src = "[ 1 -eq 2 ]";
+        let tokens = crate::lexer::tokenize(src);
+        let ast = crate::parser::parse(&tokens);
+        let cmd = &ast.commands[0];
+        assert_eq!(cmd.words, vec!["[", "1", "-eq", "2", "]"]);
+        assert!(cmd.word_quotes.is_empty());
+        assert!(cmd.process_substitutions.is_empty());
+        for (index, word) in cmd.words.iter().enumerate() {
+            let raw = cmd
+                .word_metadata
+                .get(index)
+                .map(|metadata| metadata.raw.as_str());
+            assert_eq!(raw, Some(word.as_str()), "word {word:?} raw changed");
+            assert!(
+                is_expand_fast_literal_word(word),
+                "hot-shape word {word:?} no longer admitted"
             );
         }
     }

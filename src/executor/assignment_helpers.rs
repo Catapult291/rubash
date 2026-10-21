@@ -11,6 +11,48 @@ pub(in crate::executor) fn split_assignment_word(word: &str) -> Option<(&str, &s
     }
 }
 
+/// Whitelist admission for the literal-word fast paths in
+/// `expand_word_mut_with_context` and `expand_command_word` (rubash#117
+/// discipline: doubt falls through to the full pipeline). When this
+/// returns true the cooked token carries no expansion syntax at all, so
+/// GNU subst.c:11229 expand_word_internal pushes every character
+/// unchanged — no CTLESC is produced without quoting/expansion
+/// introducers, braces.c find_first_valid_brace finds no brace,
+/// pathexp.c unquoted_glob_pattern_p finds no metacharacter, and field
+/// splitting never sees an expansion result.
+///
+/// The excluded classes, each mapped to the pipeline branch that owns it:
+/// `$` and `` ` `` (every substitution/parameter arm), `'` `"` `\`
+/// (quote removal / DATA_* carriers / escape handling), `{` `}` (brace
+/// expansion), `~` (tilde), `*` `?` `[` (pathname expansion), `(` `)`
+/// `<` `>` (process substitutions / comsub bodies), any byte outside
+/// printable ASCII (QUOTED_WORD_PREFIX, STORAGE_WORD_PREFIX, CTLESC,
+/// IFS_GLUE and every other C0/PUA carrier ride non-printing and fail
+/// the set test on the first byte), whitespace (a token equal to its raw
+/// text cannot contain any), and `=` inside a longer word
+/// (assignment-shaped word arms: `a=b` must reach split_assignment_word).
+/// The single-byte test operators `[`, `]`, `=` are admitted exactly:
+/// `[` alone never opens a glob class or a subscript, `]` alone closes
+/// nothing, and `=` alone names no assignment (split_assignment_word
+/// needs a shell name before it), so the full pipeline returns them
+/// unchanged. Longer words carrying those bytes (`[a]`, `a=b`) keep the
+/// slow path.
+pub(in crate::executor) fn is_expand_fast_literal_word(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    if word == "[" || word == "]" || word == "=" {
+        return true;
+    }
+    word.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'.' | b'/' | b':' | b',' | b'-' | b'+' | b'%' | b'@'
+            )
+    })
+}
+
 pub(in crate::executor) fn assignment_name_and_append(name: &str) -> (&str, bool) {
     name.strip_suffix('+')
         .map(|base| (base, true))
