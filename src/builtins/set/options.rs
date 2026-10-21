@@ -271,11 +271,23 @@ pub(crate) fn shell_option_enabled(env_vars: &HashMap<String, String>, name: &st
 }
 
 fn shell_option_default(name: &str) -> bool {
-    SHELL_OPTIONS
-        .iter()
-        .find(|option| option.name == name)
-        .map(|option| option.default_enabled)
-        .unwrap_or(false)
+    // Hot path: `shell_option_enabled` is consulted per command (verbose in
+    // set_current_command, errexit/xtrace in the dispatch preambles) and per
+    // expansion (nounset/braceexpand), and the option key is ABSENT from
+    // env_vars whenever the option still holds its default, so this fallback
+    // ran on every such probe. A linear scan of SHELL_OPTIONS with a `str`
+    // compare per entry was the leaf cost (xtrace is the last of ~28 entries).
+    // Match on the name instead: the compiler switches on length first, so a
+    // hit is a couple of memcmps, and the arms are exactly the table above
+    // (a name outside it is not a shell option — default off, same as before).
+    match name {
+        "allexport" | "emacs" | "errexit" | "errtrace" | "functrace" | "histexpand" | "history"
+        | "ignoreeof" | "keyword" | "monitor" | "noclobber" | "noexec" | "noglob" | "nolog"
+        | "notify" | "nounset" | "onecmd" | "physical" | "pipefail" | "posix" | "privileged"
+        | "verbose" | "vi" | "xtrace" => false,
+        "braceexpand" | "hashall" | "interactive-comments" => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn shellopts_value(env_vars: &HashMap<String, String>) -> String {
