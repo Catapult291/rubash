@@ -154,7 +154,12 @@ impl Executor {
             }
         }
 
-        if let Some(fd) = read_fd {
+        // GNU read.def `-u N` selects the descriptor builtin_read zreads;
+        // `-u 0` names fd 0 itself, so it is the ordinary fd-0 read below,
+        // not a numbered-fd serve — the fd-table-only transports would
+        // report EOF where a pipeline stage parks its input on the
+        // FUNCTION_STDIN mirror (rubash#938).
+        if let Some(fd) = read_fd.filter(|fd| *fd != 0) {
             if let Some(line) =
                 self.read_redirected_fd(cmd, fd, delimiter, char_limit, exact_char_limit)
             {
@@ -194,7 +199,24 @@ impl Executor {
                 });
         }
 
-        if let Some(redirect) = &cmd.redirect_in {
+        // GNU redir.c:1128 do_redirection_internal gates a descriptor
+        // dup's whole action — the dup2 AND the r_move_input close — on
+        // `redir_fd != redirector`: `read x <&0`, `read x <&0-`,
+        // `read x </dev/stdin` and the `/dev/fd/0` / `/proc/self/fd/0`
+        // aliases all leave fd 0 bound exactly as it was. The builtin
+        // must therefore read the ordinary fd-0 transports below like a
+        // bare `read`; the descriptor serve only consults the fd table
+        // and reports EOF where the pipeline stage's FUNCTION_STDIN
+        // mirror holds the pipe data (rubash#938).
+        let fd0_self_dup = cmd.redirect_in.as_ref().is_some_and(|redirect| {
+            redirect.fd_var.is_none()
+                && redirect.fd.unwrap_or(0) == 0
+                && matches!(
+                    redirect_target_fd_and_move(&self.expand_redirect_target(redirect)),
+                    Some((0, _))
+                )
+        });
+        if let Some(redirect) = cmd.redirect_in.as_ref().filter(|_| !fd0_self_dup) {
             if redirect.fd.unwrap_or(0) != 0 {
                 return None;
             }

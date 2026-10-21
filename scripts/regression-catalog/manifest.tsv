@@ -1,6 +1,6 @@
 case	issue	expected	note
 issue-699	699	must-match	redirection/fd family: 2>&1 order, builtin write-error routing, closed-stderr rc, subshell cd diag, bare-cat self-redirect — fixed, closed
-issue-700	700	diverges	read /dev/stdin hang fixed; residual: /dev/stdin & <&0 read empty in pipeline context — tracked as rubash#938
+issue-700	700	must-match	read /dev/stdin hang fixed; pipeline-context /dev/stdin & <&0 empty read fixed by #938
 issue-701	701	must-match	read /dev/fd/N + EOF-without-newline rc family (while-read off-by-one) — fixed, closed
 issue-702	702	must-match	errexit in until/break — fixed, closed 2026-10-17
 issue-703	703	must-match	heredoc + pipeline in quoted $() — fixed by the 703 batch, closed 2026-10-18
