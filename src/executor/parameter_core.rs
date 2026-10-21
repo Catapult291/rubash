@@ -33,6 +33,19 @@ impl Executor {
         word: &str,
         context: SubstitutionQuoteContext,
     ) -> String {
+        // Literal fast path (GNU subst.c:11229 expand_word_internal): a
+        // whitelisted word carries no expansion syntax, so the whole
+        // pipeline below — the SubXpassFrame/WordCtxGuard scopes, the
+        // `:=` pre-scan, split_assignment_word, and every whole-word
+        // substitution arm — is provably inert on it and expand_word
+        // returns it unchanged. The whitelist is closed under its
+        // exclusions (see is_expand_fast_literal_word); any other shape
+        // falls through unchanged. Quote context is irrelevant: the word
+        // holds no quote, substitution, or marker byte for the context
+        // to reinterpret.
+        if crate::executor::assignment_helpers::is_expand_fast_literal_word(word) {
+            return word.to_string();
+        }
         // One cross-pass subscript-eval memo scope per word expansion:
         // the `:=` pre-scan, assignment apply, and real expansion of the
         // same `${}` fragment share its single GNU evaluation. `${}` body
