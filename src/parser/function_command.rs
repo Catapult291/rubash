@@ -260,7 +260,12 @@ pub(super) fn parse_function_command_with_diagnostic(
         let Some((mut body, close_i)) =
             parse_parenthesized_function_body(tokens, i, diagnostic_text, source_line_offset)
         else {
-            let command = unclosed_paren_eof_node(tokens, i);
+            let command = unclosed_paren_eof_node(
+                tokens,
+                i,
+                diagnostic_text.map(|s| &**s),
+                source_line_offset,
+            );
             return Some((command, tokens.len()));
         };
         let mut command = CommandNode::new();
@@ -325,7 +330,12 @@ pub(super) fn parse_function_command_with_diagnostic(
             && body_token.value.starts_with('{')
             && !body_token.value.trim_end().ends_with('}')
         {
-            let command = unclosed_brace_eof_node(tokens, i);
+            let command = unclosed_brace_eof_node(
+                tokens,
+                i,
+                diagnostic_text.map(|s| &**s),
+                source_line_offset,
+            );
             return Some((command, tokens.len()));
         }
         // parse.y:1054-1061 function_def: after `function WORD' (with or
@@ -392,7 +402,12 @@ pub(super) fn parse_function_command_with_diagnostic(
         // GNU parse.y:6890-6901: the `{` body never closed — report the
         // compound-EOF error naming the innermost unclosed compound rather
         // than falling back to a `(`-unexpected simple command.
-        let command = unclosed_brace_eof_node(tokens, open_brace);
+        let command = unclosed_brace_eof_node(
+            tokens,
+            open_brace,
+            diagnostic_text.map(|s| &**s),
+            source_line_offset,
+        );
         return Some((command, tokens.len()));
     };
 

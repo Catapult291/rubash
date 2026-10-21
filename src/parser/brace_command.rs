@@ -130,7 +130,8 @@ pub(super) fn parse_brace_group_command(
         && token.value.trim() != "{"
         && !token.value.trim_end().ends_with('}')
     {
-        let command = unclosed_brace_eof_node(tokens, start);
+        let command =
+            unclosed_brace_eof_node(tokens, start, source.map(|s| &**s), source_line_offset);
         return Some((command, tokens.len()));
     }
 
@@ -139,7 +140,8 @@ pub(super) fn parse_brace_group_command(
     }
 
     let Some(i) = matching_brace_group_end(tokens, start) else {
-        let command = unclosed_brace_eof_node(tokens, start);
+        let command =
+            unclosed_brace_eof_node(tokens, start, source.map(|s| &**s), source_line_offset);
         return Some((command, tokens.len()));
     };
 
