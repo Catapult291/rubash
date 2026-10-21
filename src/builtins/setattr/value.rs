@@ -4,8 +4,8 @@ use super::COMPOUND_ASSIGNMENT_MARKER;
 use super::{ARRAY_VARS, ASSOC_VARS, INTEGER_VARS};
 use crate::builtins::declare::storage::{append_array_value, append_assoc_value};
 use crate::builtins::declare::storage::{
-    fold_indexed_storage_dupes, format_assoc_storage, format_indexed_array_storage,
-    indexed_array_entries, parse_assoc_words,
+    append_baseline_mirror, fold_indexed_storage_dupes, format_assoc_storage,
+    format_indexed_array_storage, indexed_array_entries, parse_assoc_words,
 };
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
@@ -41,10 +41,13 @@ pub(super) fn array_attribute_assignment_value(
     let compound_shape = is_array_value(compound);
     if compound_shape && (tagged || array || assoc) {
         let current = if append {
-            env_vars
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| "()".to_string())
+            // GNU arrayfunc.c:710-743: an append continues the live ARRAY
+            // object. A declared-but-unset array is empty; an existing scalar
+            // (even "") keeps element 0. See append_baseline_mirror.
+            append_baseline_mirror(
+                env_vars.get(name).map(String::as_str),
+                env_vars.is_marked(crate::builtins::set::DECLARED_UNSET_VARS, name),
+            )
         } else {
             "()".to_string()
         };
