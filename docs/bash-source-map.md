@@ -12,7 +12,7 @@ The canonical migration map is `docs/semantic-ownership.tsv`. It records
 semantic ownership rather than pretending that one GNU C file has one Rust
 translation — each entry maps an *observable behavior contract* to its Rust
 owner, established and verified by black-box differential testing against
-GNU Bash 5.3.0 (see [`PROVENANCE.md`](PROVENANCE.md)). Its columns are:
+GNU Bash 5.3.20 (see [`PROVENANCE.md`](PROVENANCE.md)). Its columns are:
 
 | Column | Meaning |
 |---|---|

@@ -4563,7 +4563,7 @@ fn version_appends_build_metadata_after_the_gnu_block_rubash_488() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
-        lines[0].starts_with("GNU bash, version 5.3.0(1)-release ("),
+        lines[0].starts_with("GNU bash, version 5.3.20(1)-release ("),
         "GNU banner line 1 changed: {:?}",
         lines[0]
     );

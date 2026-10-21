@@ -52,6 +52,6 @@ The engine also runs the [bashdb](https://github.com/Trepan-Debuggers/bashdb) co
 - Fix by root cause subsystem, not by individual expected-output lines.
 - Keep bashdb external and clean; temporary instrumentation is for diagnosis only.
 - Every failing bashdb command is an opportunity to find and fix a Rubash compatibility gap.
-- Compatibility baseline is GNU Bash 5.3.0 (owner-compiled at `/usr/local/bin/bash`).
+- Compatibility baseline is GNU Bash 5.3.20 (owner-compiled at `/usr/local/bin/bash`).
 
 Methodology rules for compatibility work: [`AGENTS.md`](../AGENTS.md) and [`docs/PROVENANCE.md`](PROVENANCE.md).

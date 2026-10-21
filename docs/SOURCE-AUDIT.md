@@ -13,7 +13,7 @@ owner; (c) classify IMPLEMENTED / MISSING / DIVERGENT / N-A(platform);
 (d) every MISSING/DIVERGENT verified with a both-shell probe before filing.
 
 Citations are `file:line func` in `third_party/bash/` (vendored
-Bash-5.3 patch 15 tree; re-verify with grep before relying on them).
+Bash-5.3 patch 20 tree; re-verify with grep before relying on them).
 
 ---
 

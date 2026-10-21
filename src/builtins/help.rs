@@ -346,7 +346,8 @@ where
     writeln!(stdout, "IMPLEMENTATION")?;
     writeln!(
         stdout,
-        "    GNU bash, version 5.3.0(1)-release ({})",
+        "    GNU bash, version {} ({})",
+        crate::executor::bash_version_value(),
         crate::executor::machtype_value()
     )?;
     writeln!(
@@ -417,7 +418,8 @@ where
     // version string) followed by the configure-time MACHTYPE in parens.
     writeln!(
         stdout,
-        "GNU bash, version 5.3.0(1)-release ({})",
+        "GNU bash, version {} ({})",
+        crate::executor::bash_version_value(),
         crate::executor::machtype_value()
     )?;
     // TODO(builtins/help.def/builtins/gen-helpfiles.c): Generate this from the

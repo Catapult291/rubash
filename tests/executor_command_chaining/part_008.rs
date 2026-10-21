@@ -83,13 +83,13 @@ fn test_bash_version_and_versinfo_are_initialized() {
     let output = fs::read_to_string(output_path).unwrap();
     let lines: Vec<&str> = output.lines().collect();
     assert!(!lines[0].is_empty());
-    // wt33 (#374): the compat target is GNU Bash 5.3.0 — both shells report
-    // `5.3.0(1)-release` and `5 3 0 1 release <mach>` (WSL GNU 5.3.0 probe,
+    // wt33 (#374): the compat target is GNU Bash 5.3.20 — both shells report
+    // `5.3.20(1)-release` and `5 3 20 1 release <mach>` (WSL GNU 5.3.20 probe,
     // /usr/local/bin/bash). Match the 5.3.x line by pattern instead of the
     // retired 5.2.37 pin.
     assert!(lines[1].starts_with("5.3."));
     assert!(lines[1].ends_with("(1)-release"));
-    let version_words = "5.3.0".replace('.', " ");
+    let version_words = "5.3.20".replace('.', " ");
     assert!(lines[2].starts_with(&format!("{version_words} 1 release ")));
     assert_eq!(lines[2].split_whitespace().count(), 6);
     assert!(!lines[3].is_empty());
@@ -116,7 +116,7 @@ fn test_quoted_bash_versinfo_at_expands_to_words() {
     assert_eq!(executor.last_exit_code(), 0);
     let output = fs::read_to_string(output_path).unwrap();
     let lines: Vec<&str> = output.lines().collect();
-    let parts: Vec<&str> = "5.3.0".split('.').collect();
+    let parts: Vec<&str> = "5.3.20".split('.').collect();
     assert_eq!(lines.len(), 7);
     assert_eq!(
         lines[0],
@@ -158,7 +158,7 @@ fn test_bash_versinfo_assignment_reports_readonly() {
 
     let result = executor.execute_ast(&ast);
 
-    // wt33 (#374): GNU 5.3.0 ABORTS the rest of the command list after a
+    // wt33 (#374): GNU 5.3.20 ABORTS the rest of the command list after a
     // standalone readonly assignment (probe wt33-373/run/H01_readonly_abort,
     // byte-identical to rubash: the `echo` on the same line is skipped, the
     // script resumes on the NEXT line, and the aborted list leaves rc 1) —

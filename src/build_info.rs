@@ -1,6 +1,6 @@
 //! Build provenance for `--version` (rubash#488).
 //!
-//! The GNU-compat banner (`GNU bash, version 5.3.0(1)-release (...)`) is the
+//! The GNU-compat banner (`GNU bash, version 5.3.20(1)-release (...)`) is the
 //! rubash#154 persona contract and must stay byte-stable for the ecosystem;
 //! the build fingerprint is appended AFTER that block so any rubash binary
 //! traces to the exact commit and profile it was built from. Dev builds can
