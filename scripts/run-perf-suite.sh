@@ -3,7 +3,7 @@
 #
 # Runs every numbered probe under benchmarks/ against BOTH:
 #   - rubash:  $ROOT/target/debug/rubash.exe (override with RUBASH=...)
-#   - GNU:     WSL GNU Bash 5.3.0 (/usr/local/bin/bash, owner-compiled)
+#   - GNU:     WSL GNU Bash 5.3.x (/usr/local/bin/bash, owner-compiled)
 # and emits a Markdown ratio table.
 #
 # Usage (from the repo root, any bash >= 4; Git Bash recommended on Windows):
@@ -41,7 +41,7 @@ unset -f rm rmdir unlink 2>/dev/null || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH="$ROOT/benchmarks"
 RESULTS="$ROOT/target/perf-results"
-GNU_BASH=/usr/local/bin/bash   # WSL owner-compiled 5.3.0 (AGENTS.md oracle)
+GNU_BASH=/usr/local/bin/bash   # WSL owner-compiled 5.3.x (AGENTS.md oracle)
 
 FILTER=""
 RUNS_CAP=""

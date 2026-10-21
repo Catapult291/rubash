@@ -41,15 +41,19 @@ TESTS_SRC="$REPO/third_party/bash/tests"
 # which typically resolves to Git's coreutils 8.32. This is a known harness
 # limitation; od/expr output format differences from this are NOT rubash bugs.
 
-# ---- GNU baseline is CONTRACTUAL: GNU bash 5.3.0 (owner directive) ---------
-# The owner compiled and installed GNU bash 5.3.0 into /usr/local/bin
-
-# (2026-09-09) and directed the compat target to 5.3. Resolve the GNU side
+# ---- GNU baseline is CONTRACTUAL: GNU bash 5.3 at the vendored patchlevel ---
+# The owner compiled and installed GNU bash 5.3.x into /usr/local/bin
+# (2026-09-09) and directed the compat target to 5.3. The oracle is rebuilt
+# from the vendored tree, so the required patchlevel is read back out of
+# third_party/bash/patchlevel.h and the gate follows the mirror (currently
+# Bash-5.3 patch 20, bash.git @9c465866, rubash#895). Resolve the GNU side
 # explicitly and refuse any other version. Legacy 5.2.21 reference ledger:
 # scripts/true-baseline-521.sh.
 GNU_BASH=/usr/local/bin/bash
 GNU_VER=$("$GNU_BASH" --version | head -1)
-case "$GNU_VER" in *"version 5.3.0"*) ;; *) echo "FATAL: GNU baseline must be 5.3.0, got: $GNU_VER" >&2; exit 9 ;; esac
+VENDORED_PL=$(sed -n 's/^#define[[:space:]]*PATCHLEVEL[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$REPO/third_party/bash/patchlevel.h" 2>/dev/null | head -1)
+case "$VENDORED_PL" in ''|*[!0-9]*) echo "FATAL: cannot read vendored PATCHLEVEL (submodule initialized?)" >&2; exit 9 ;; esac
+case "$GNU_VER" in *"version 5.3.$VENDORED_PL("*) ;; *) echo "FATAL: GNU baseline must be 5.3.$VENDORED_PL (vendored patchlevel), got: $GNU_VER" >&2; exit 9 ;; esac
 
 # ---- locale: ensure en_US.UTF-8 is available --------------------------------
 # intl.tests/unicode*.sub require en_US.UTF-8 for proper multibyte char counting.

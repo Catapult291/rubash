@@ -10,7 +10,7 @@ An embeddable GNU Bash-compatible shell engine, written from scratch in Rust.
 
 ## What Is Rubash
 
-Rubash is a from-scratch reimplementation of GNU Bash semantics in Rust, packaged as an **embeddable, headless engine** — lexer, parser, expansion engine, executor, builtins, and all. It targets byte-level compatibility with GNU Bash 5.3.0 and runs on Windows natively.
+Rubash is a from-scratch reimplementation of GNU Bash semantics in Rust, packaged as an **embeddable, headless engine** — lexer, parser, expansion engine, executor, builtins, and all. It targets byte-level compatibility with GNU Bash 5.3.x and runs on Windows natively.
 
 Rubash itself is not a shell product. It ships with a reference CLI used by the compatibility harness and tooling, while interactive shells are built *on top of* the engine: niubash embeds Rubash for all bash semantics and owns line editing, prompt rendering, and completions itself.
 
@@ -78,7 +78,7 @@ they work even when PATH carries no `uname.exe` at all.
 ## Compatibility at a Glance
 
 ```
-GNU Bash 5.3.0 test suite — 83 files, true-baseline measurement
+GNU Bash 5.3.x test suite — 83 files, true-baseline measurement
 (ledger: 2026-10-12 full re-run on master 764b9dde, host WINUXSH_ROOT
 pin scrubbed — no upstream-script stubs, niu-mounted /bin/sh fixture,
 per-suite TMPDIR, foreground timeout; environment-bound diffs counted
@@ -118,7 +118,7 @@ account for all 83.
 
 ### Beyond the GNU suite — mixed evaluation suites and the real-world ecosystem
 
-The same true-baseline method (script files, byte-level diff vs GNU 5.3.0)
+The same true-baseline method (script files, byte-level diff vs GNU 5.3.x)
 applied to dedicated evaluation suites and real-world corpora
 (full inventory + verdicts archived in issue #477):
 
@@ -192,7 +192,7 @@ target/debug/rubash -c 'echo hello from rubash'
 ### Run the Compatibility Suite
 
 ```bash
-# Full 83-suite measurement (requires WSL + GNU Bash 5.3.0)
+# Full 83-suite measurement (requires WSL + GNU Bash 5.3.x)
 MSYS_NO_PATHCONV=1 wsl bash scripts/true-baseline.sh
 
 # Single suite
@@ -227,11 +227,11 @@ The engine also runs the [bashdb](https://github.com/Trepan-Debuggers/bashdb) co
 - Fix by root cause subsystem, not by individual expected-output lines.
 - Keep bashdb external and clean; temporary instrumentation is for diagnosis only.
 - Every failing bashdb command is an opportunity to find and fix a Rubash compatibility gap.
-- Compatibility baseline is GNU Bash 5.3.0 (owner-compiled at `/usr/local/bin/bash`).
+- Compatibility baseline is GNU Bash 5.3.x (owner-compiled at `/usr/local/bin/bash`).
 
 ## Provenance
 
-Rubash is a **from-scratch rewrite of GNU Bash semantics in Rust** — not a port or translation of the GNU Bash C code. No GNU Bash source is compiled into, linked with, or copied into Rubash's own code. Compatibility is defined against the *observable behavior* of GNU Bash 5.3.0 and verified by black-box differential testing. The vendored GNU Bash source lives in the separate `third_party/bash` submodule under its original GPL-3.0-or-later license and serves only as a semantic reference and test oracle. Full statement and contributor rules in [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
+Rubash is a **from-scratch rewrite of GNU Bash semantics in Rust** — not a port or translation of the GNU Bash C code. No GNU Bash source is compiled into, linked with, or copied into Rubash's own code. Compatibility is defined against the *observable behavior* of GNU Bash 5.3.x and verified by black-box differential testing. The vendored GNU Bash source lives in the separate `third_party/bash` submodule under its original GPL-3.0-or-later license and serves only as a semantic reference and test oracle. Full statement and contributor rules in [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
 
 ## License
 
