@@ -2,7 +2,9 @@
 
 用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎。
 
-[English](README.md)
+[English](README.md) · [unixwin.dev](https://unixwin.dev)
+
+文档与下载：[unixwin.dev](https://unixwin.dev)
 
 [![CI](https://github.com/unixwin/rubash/actions/workflows/ci.yml/badge.svg)](https://github.com/unixwin/rubash/actions/workflows/ci.yml)
 [![Rust Version](https://img.shields.io/badge/rust-1.70+-blue)](https://www.rust-lang.org)

@@ -2,7 +2,9 @@
 
 An embeddable GNU Bash-compatible shell engine, written from scratch in Rust.
 
-[中文](README.zh-CN.md)
+[中文](README.zh-CN.md) · [unixwin.dev](https://unixwin.dev)
+
+Docs & downloads: [unixwin.dev](https://unixwin.dev)
 
 [![CI](https://github.com/unixwin/rubash/actions/workflows/ci.yml/badge.svg)](https://github.com/unixwin/rubash/actions/workflows/ci.yml)
 [![Rust Version](https://img.shields.io/badge/rust-1.70+-blue)](https://www.rust-lang.org)

@@ -445,5 +445,6 @@ GNU Bash 5.3.0 兼容性大幅推进。83 套件 true-baseline 总差异从 3427
 
 ## 链接
 
+- [unixwin.dev](https://unixwin.dev) — 产品门户（文档与下载统一入口）
 - [GitHub Releases](https://github.com/unixwin/rubash/releases)
 - [问题跟踪器](https://github.com/unixwin/rubash/issues)
