@@ -9,7 +9,7 @@ Before making compatibility changes, read:
 
 Key rules:
 
-- **CRITICAL: Always use WSL GNU Bash (`wsl bash`, **5.3.0** at /usr/local/bin/bash — owner-compiled, baseline directive 2026-09-09; legacy 5.2.21 reference via scripts/true-baseline-521.sh) for semantic comparisons — NOT the winuxsh shim, and NOT Git Bash.** The winuxsh shim at PATH `bash` is an older version with different behavior. Git Bash (`D:/Git/bin/bash.exe`) is below rubash in some areas (notably quoting/escaping/braces) and produces wrong baselines there. Compare with a script FILE passed to both shells (see Bash Test Suite below).
+- **CRITICAL: Always use WSL GNU Bash (`wsl bash`, **5.3.x** at /usr/local/bin/bash — owner-compiled from the vendored tree, currently Bash-5.3 patch 20 / `9c465866`; baseline directive 2026-09-09; legacy 5.2.21 reference via scripts/true-baseline-521.sh) for semantic comparisons — NOT the winuxsh shim, and NOT Git Bash.** The winuxsh shim at PATH `bash` is an older version with different behavior. Git Bash (`D:/Git/bin/bash.exe`) is below rubash in some areas (notably quoting/escaping/braces) and produces wrong baselines there. Compare with a script FILE passed to both shells (see Bash Test Suite below).
 - **GNU C source is the specification.** Every semantic change must cite the
   owning C function (`file:line func`) in `third_party/bash/` before editing.
   Do NOT derive behavior from a suite's diff count, from a local pass/fail
@@ -38,7 +38,7 @@ Key rules:
 
 ### GNU C source is the specification — never guess
 
-Rubash's contract is "behave like GNU bash 5.3.0". That contract is defined by
+Rubash's contract is "behave like GNU bash 5.3.x". That contract is defined by
 the C source in `third_party/bash/`, so **the C source is the specification** —
 not the test output, not a diff count, and not what "looks symmetric".
 
@@ -47,7 +47,7 @@ Before changing any semantic behavior:
 1. **Cite it.** Find the C function that owns the behavior and record
    `file:line function_name` in the task report and the commit message.
    Example: `parse.y:5366 read_token_word()` backslash / `PST_NOEXPAND` branch.
-2. **Probe it.** Run the minimal case through WSL GNU Bash 5.3.0 *from a script
+2. **Probe it.** Run the minimal case through WSL GNU Bash 5.3.x *from a script
    file* (see Bash Test Suite) and paste the raw output.
 3. **Then edit**, naming the Rust semantic owner and the changed invariant.
 
@@ -86,7 +86,7 @@ printed `"` instead of `\`). A green local matrix is not evidence.
 
 ### Verified GNU entry points
 
-Line numbers are for the vendored tree (`bash.git @b4608166`, Bash-5.3 patch 15).
+Line numbers are for the vendored tree (`bash.git @9c465866`, Bash-5.3 patch 20).
 Re-verify with `grep -n` before citing; treat this table as a starting point, not
 gospel.
 
@@ -97,13 +97,13 @@ gospel.
 | Where `CTLESC`/`CTLNUL` get protected | `parse.y:5694-5706` (`got_character` vs `got_escaped_character`) |
 | `PST_NOEXPAND` meaning and scope | `parser.h:51`; cleared at `parse.y:7048`, `parse.y:7127` |
 | `${...}` text matching | `parse.y:3877 parse_matched_pair()` |
-| Command substitution body parse / reprint | `parse.y:4451 parse_comsub()`, `parse.y:4632 print_comsub()` |
+| Command substitution body parse / reprint | `parse.y:4451 parse_comsub()`, `print_cmd.c:164 print_comsub()` (call site `parse.y:4632`) |
 | Word expansion driver | `subst.c:11229 expand_word_internal()` |
 | `${parameter...}` expansion | `subst.c:9777 parameter_brace_expand()`, `subst.c:7663 parameter_brace_expand_word()` |
 | Command substitution execution | `subst.c:7143 command_substitute()` |
 | Verbatim extraction | `subst.c:1148 string_extract_verbatim()` |
 | `CTLESC` dequote only | `subst.c:4692 dequote_escapes()`, `subst.c:4901 remove_quoted_escapes()` |
-| Final dequote | `subst.c:4807 dequote_string()`, `subst.c:4865 dequote_word()` |
+| Final dequote | `subst.c:4807 dequote_string()`, `subst.c:4866 dequote_word()` |
 | Expanding a word list | `subst.c:13219 expand_word_list_internal()` |
 | Redirection word expansion | `redir.c:298 redirection_expand()` |
 | Command execution dispatch | `execute_cmd.c:624 execute_command_internal()` |
@@ -155,7 +155,7 @@ short-circuit is `parse_string_to_command`'s empty-command check. If a rubash
 shortcut exists anyway, its comment must name which GNU behavior it preserves
 and which inputs disqualify it.
 
-**Verification bar:** a diff matrix against WSL GNU Bash 5.3.0 covering the
+**Verification bar:** a diff matrix against WSL GNU Bash 5.3.x covering the
 whole class — assignment RHS / argument position × literal / variable /
 substitution / arithmetic × with-and-without spaces — not just the new
 reproducer. A green 19/20 matrix has already shipped wrong "fixes" here
@@ -208,7 +208,7 @@ source line breakpoints, because optimized/incremental Windows builds may move
 or omit lines. Capture LLDB stdout/stderr under
 `target/issue-suites/results/`; remove temporary instrumentation before
 finishing. LLDB evidence complements, but does not replace, the required WSL
-GNU Bash 5.3.0 script-file comparison. Do not claim a fix from an LLDB-only
+GNU Bash 5.3.x script-file comparison. Do not claim a fix from an LLDB-only
 run.
 
 Do not repeatedly rebuild entire suites while locating a root cause. First use
@@ -256,7 +256,7 @@ baselines are archived in issue #477. Re-measure with
 - **Upstream test files**: `third_party/bash/tests/<name>.tests`, run per-file
   with bounded timeouts; keep raw artifacts under
   `target/issue-suites/results/`.
-- **Comparison baseline**: WSL GNU Bash 5.3.0 (`/usr/local/bin/bash`; legacy 5.2.21 via `scripts/true-baseline-521.sh`). Run the same case file through
+- **Comparison baseline**: WSL GNU Bash 5.3.x (`/usr/local/bin/bash`; legacy 5.2.21 via `scripts/true-baseline-521.sh`). Run the same case file through
   both shells, e.g. `target/debug/rubash.exe case.sh` vs
   `MSYS_NO_PATHCONV=1 wsl bash /mnt/d/repo/rubash/case.sh`.
 - **Never use `wsl bash -c "$c"` for cases with doubled backslashes or
@@ -309,7 +309,7 @@ kills WSL-side test runs, and inflated PASS claims from wrong baselines.
   harness suddenly reports that error, do NOT patch the script; run
   git add --renormalize . and re-run. The attribute is the only durable fix.
 
-- One verification baseline only: WSL GNU Bash 5.3.0 via scripts/true-baseline.sh (suite slices: `MSYS_NO_PATHCONV=1 wsl bash /mnt/d/repo/rubash/scripts/true-baseline.sh NAME`; the older run-83.sh check remains usable for non-baseline spot checks).
+- One verification baseline only: WSL GNU Bash 5.3.x via scripts/true-baseline.sh (suite slices: `MSYS_NO_PATHCONV=1 wsl bash /mnt/d/repo/rubash/scripts/true-baseline.sh NAME`; the older run-83.sh check remains usable for non-baseline spot checks).
   Do NOT certify a fix by diffing third_party/bash/tests/*.tests against recho/
   zecho output, by comparing raw stdout, or by any other harness. A PASS claim
   is only valid if run-83.sh check prints PASS NAME.
@@ -381,7 +381,7 @@ binaries is not a rubash bug and must not be fixed by patching rubash.
    suite numbers split into rubash-caused vs WinuxCmd-caused, and say which
    issue number covers the environment-bound lines.
 
-**Verified examples (WSL GNU Bash 5.3.0 as sole baseline, single
+**Verified examples (WSL GNU Bash 5.3.x as sole baseline, single
 `scripts/true-baseline.sh` harness):**
 
 - `posixexp`: 169 diff lines — 145 from WinuxCmd `sed` rejecting brace `{ }

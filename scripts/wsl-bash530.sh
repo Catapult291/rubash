@@ -1,5 +1,5 @@
 #!/bin/bash
-# wsl-bash530.sh — 固定的 WSL GNU Bash 5.3.0 baseline 调用入口
+# wsl-bash530.sh — 固定的 WSL GNU Bash 5.3.x baseline 调用入口
 #
 # 解决两个反复出现的坑：
 #   1. Git Bash 的 MSYS 路径转换会把 /mnt/d/... 和 --flags 弄坏
@@ -10,7 +10,8 @@
 #   scripts/wsl-bash530.sh --strip <script.sh>  # 先去 CRLF 再运行（原目录旁临时副本）
 #   scripts/wsl-bash530.sh -c '<command>'        # 运行内联命令（简单场景）
 #
-# 底层固定调用 /usr/local/bin/bash（5.3.0），不依赖 PATH 顺序。
+# 底层固定调用 /usr/local/bin/bash（5.3.x，跟随 vendored patchlevel 重建，
+# 当前 Bash-5.3 patch 20 / rubash#895），不依赖 PATH 顺序。
 
 set -euo pipefail
 
