@@ -155,6 +155,49 @@ impl Executor {
         result
     }
 
+    /// Report an IoError escaping a command's execution. When it is the
+    /// command's own redirect OPEN failure — the `{target}: ` head names a
+    /// redirect-list entry, possibly through `!`/`time`/`&` wrappers — GNU
+    /// redir.c:135 redirection_error routes the message through the fd-2
+    /// binding the list's earlier entries already applied
+    /// (`( :; ) 2>cap.txt > /missing` lands in cap.txt, rubash#940 R1).
+    /// Any other IoError (body write errors, rubash#440 closed-output)
+    /// keeps the direct stderr write so the reported bytes are identical.
+    fn report_io_error_routed(
+        &mut self,
+        command: &CommandNode,
+        error: &std::io::Error,
+    ) -> Result<(), ExecuteError> {
+        let mut stderr = Vec::new();
+        writeln!(
+            &mut stderr,
+            "{}{}",
+            self.diagnostic_prefix(),
+            crate::posix_errors::message(error)
+        )?;
+        let mut owner = command;
+        loop {
+            if let Some(inner) = &owner.inverted_command {
+                owner = &inner.command;
+            } else if let Some(inner) = &owner.time_command {
+                owner = &inner.command;
+            } else if let Some(inner) = &owner.background_command {
+                owner = &inner.command;
+            } else {
+                break;
+            }
+        }
+        if self.failing_open_redirect_index(owner, &stderr).is_some() {
+            // A routed write that itself fails (closed fd 2) is lost like
+            // GNU's builtin_error — never a second diagnostic (rubash#699).
+            let _ = self.write_redirect_diagnostic_routed(owner, &stderr);
+        } else {
+            let _ = self.write_default_stderr(&stderr);
+        }
+        self.exit_code = 1;
+        Ok(())
+    }
+
     fn execute_ast_inner_body(&mut self, commands: &[CommandNode]) -> Result<(), ExecuteError> {
         let mut index = 0;
         // GNU execute_cmd.c:1576 execute_in_subshell: the forked child's
@@ -953,12 +996,7 @@ impl Executor {
                         self.exit_code = code;
                     }
                     Err(ExecuteError::IoError(error)) => {
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1029,12 +1067,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1090,12 +1123,7 @@ impl Executor {
                         self.exit_code = code;
                     }
                     Err(ExecuteError::IoError(error)) => {
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1156,12 +1184,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1238,12 +1261,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1337,12 +1355,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1412,12 +1425,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                 }
                 Err(ExecuteError::ExitCode(code)) => {
                     handle_exit_code!(code, command)
@@ -1478,12 +1486,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                 }
                 Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
                     // GNU: `return N` inside a `( )` subshell ends the child
@@ -1574,12 +1577,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list; only errexit promotes it.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                     // A compound's own failed redirection (the wrapper's
                     // open() -> ExecuteError::IoError) is THIS level's
                     // failure, not a body-inherited aggregate: GNU fires

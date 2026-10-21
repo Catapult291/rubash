@@ -717,6 +717,28 @@ impl<'a> Lexer<'a> {
                             scan.close_word.clear();
                             scan.function_chain = 0;
                         }
+                        // GNU parse.y:2378 alist `{"!", BANG}` +
+                        // reserved_word_acceptable (parse.y:5913 BANG): a
+                        // STANDALONE `!` at a command boundary is the
+                        // pipeline-negation token, and the boundary stays
+                        // open after it (`! { :; }` opens a nested group,
+                        // rubash#940 R2). Everywhere else `!` is ordinary
+                        // word text — `a ! b` arguments, glued `!{`/`!x`
+                        // words — so the admission requires both the
+                        // boundary state and a break-set (or end) next
+                        // byte, mirroring the `{`/`}` standalone gates.
+                        '!' if scan.word_start
+                            && scan.prev_accepts_close
+                            && self
+                                .peek()
+                                .is_none_or(|next| "()<>;&| \t\n\r".contains(next)) =>
+                        {
+                            scan.prev_accepts_close = true;
+                            scan.word_start = true;
+                            scan.word_plain = true;
+                            scan.close_word.clear();
+                            scan.function_chain = 0;
+                        }
                         // Quotes, substitutions, backslash and the rest of
                         // the word's own characters keep the word in
                         // progress; such a word is never a reserved word.
