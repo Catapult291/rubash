@@ -205,7 +205,7 @@ fn bare_help_overview_is_unchanged() {
     let (stdout, _, rc) = run(&["-c", "help"]);
     assert_eq!(rc, 0);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert!(lines[0].starts_with("GNU bash, version 5.3.0(1)-release ("));
+    assert!(lines[0].starts_with("GNU bash, version 5.3.20(1)-release ("));
     assert_eq!(
         lines[1],
         "These shell commands are defined internally.  Type `help' to see this list."

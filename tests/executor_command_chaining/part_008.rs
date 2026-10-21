@@ -84,12 +84,12 @@ fn test_bash_version_and_versinfo_are_initialized() {
     let lines: Vec<&str> = output.lines().collect();
     assert!(!lines[0].is_empty());
     // wt33 (#374): the compat target is GNU Bash 5.3.0 — both shells report
-    // `5.3.0(1)-release` and `5 3 0 1 release <mach>` (WSL GNU 5.3.0 probe,
+    // `5.3.20(1)-release` and `5 3 20 1 release <mach>` (WSL GNU 5.3.20 probe,
     // /usr/local/bin/bash). Match the 5.3.x line by pattern instead of the
     // retired 5.2.37 pin.
     assert!(lines[1].starts_with("5.3."));
     assert!(lines[1].ends_with("(1)-release"));
-    let version_words = "5.3.0".replace('.', " ");
+    let version_words = "5.3.20".replace('.', " ");
     assert!(lines[2].starts_with(&format!("{version_words} 1 release ")));
     assert_eq!(lines[2].split_whitespace().count(), 6);
     assert!(!lines[3].is_empty());

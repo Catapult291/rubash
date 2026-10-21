@@ -23,10 +23,9 @@ pub(in crate::executor) fn is_special_parameter_name(name: &str) -> bool {
 }
 
 /// Bash compatibility version advertised through BASH_VERSION / BASH_VERSINFO.
-/// Rubash targets GNU Bash 5.3 semantics (owner directive 2026-09-09, the
-/// compiled /usr/local/bin/bash 5.3.0 baseline); scripts that feature-detect on
-/// the version must see a compatible value, like other Bash-compatible shells.
-const BASH_COMPAT_VERSION: &str = "5.3.0";
+/// GNU patchlevel.h:28 PATCHLEVEL 20 (vendored tree @9c46586, oracle bash
+/// 5.3.20); $BASH_VERSION is `5.3.20(1)-release`, VERSINFO[2] is 20.
+const BASH_COMPAT_VERSION: &str = "5.3.20";
 
 /// GNU variables.c sv_bashcompat / set_compatibility_level: assigning
 /// BASH_COMPAT sets shell_compatibility_level (default 53 for bash-5.3);
@@ -48,7 +47,7 @@ pub(in crate::executor) fn shell_compatibility_level_value(
     level.parse::<u32>().unwrap_or(53)
 }
 
-/// The `$BASH_VERSION` value the executor seeds (`5.3.0(1)-release` — the
+/// The `$BASH_VERSION` value the executor seeds (`5.3.20(1)-release` — the
 /// `-release` suffix is part of it, version.c's shell_version_string). Pub
 /// so `usage::show_shell_help`/`show_shell_version` fall back to the same
 /// literal when a caller has no executor (the #585 host-half embedders).
