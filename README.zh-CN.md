@@ -22,7 +22,7 @@ Rubash 本身不是 shell 产品。它自带一个参考 CLI（供兼容性 harn
 
 **路径是一等公民，一个子进程一种方言**：MSYS 的模型是*猜*哪些参数像路径然后改写——这就是为什么每个 AI agent 和脚本都得设置 `MSYS_NO_PATHCONV=1`，防止 `/flags` 被改成 `C:/Program Files/Git/flags`。Rubash 用**逐子进程方言契约**把模型反过来（与 GNU 画的是同一条线：`shell_execve` 把原始词字节原样交给 `execve`，从不改写 argv）。自带 POSIX 层的子进程——凡是从 WinuxCmd 安装解析出来的、或经 `winuxcmd` 分发器解析的——拿到的 argv **逐字原样**，`/d/...`、`/tmp`、`/dev/*` 由它自己解析。原生 Windows 程序则拿到路径形参数的真实 Win32 拼写，翻译**整体一致**（绝不半个 argv 被翻译、另一半留在 POSIX 形），原生工具的每个操作数——包括它即将创建的尚不存在目标——都拿到合法 Win32 路径。紧急回退：导出 `__RUBASH_ARGV_DIALECT=legacy` 可恢复 Option-B 之前的翻译行为。
 
-**平台状态——跨平台、Windows 优先**：Windows 是主战场，拥有完整技术栈：单一自包含二进制直面 Windows 用户的 bash 痛点（无 POSIX 模拟层、无路径转换猜测、无需 MSYS_NO_PATHCONV、原生 Win32 路径为通货、为 bash 生态提供 MSYS2 兼容身份）。Linux 原生构建并运行（x86_64-unknown-linux-gnu）——真 getrlimit/chmod/faccessat/uname(2) 语义与信号投递——CI 在 Ubuntu 上跑引擎测试车道（库测试、兼容性 `cli_tests`、marker goldens），并且每次推送都回放 GNU 上游语料（`Bash upstream test progress` job，`scripts/run-bash-upstream-tests.sh`）；更早在 Linux 二进制上人工跑同一语料的成绩为 19/24 套字节一致（2026-09-26，#500），剩余差距在 issue tracker 跟踪。macOS 在 CI 跑库测试套件（`macos-latest`），另有 cross-target check。引擎语义模型刻意平台中立，账本随行。
+**平台状态——跨平台、Windows 优先**：Windows 是主战场，拥有完整技术栈：单一自包含二进制直面 Windows 用户的 bash 痛点（无 POSIX 模拟层、无路径转换猜测、无需 MSYS_NO_PATHCONV、原生 Win32 路径为通货、为 bash 生态提供 MSYS2 兼容身份）。Linux 原生构建并运行（x86_64-unknown-linux-gnu）——真 getrlimit/chmod/faccessat/uname(2) 语义与信号投递——CI 在 Ubuntu 上跑引擎测试车道（库测试、兼容性 `cli_tests`、marker goldens），并且每次推送都回放 GNU 上游语料（`Bash upstream test progress` job，`scripts/run-bash-upstream-tests.sh`）；更早在 Linux 二进制上人工跑同一语料的成绩为 17/24 套字节一致（2026-09-27 wt4/linuxrun 车道，台账存档于 #477/#581），剩余差距在 issue tracker 跟踪。macOS 在 CI 跑库测试套件（`macos-latest`），另有 cross-target check。引擎语义模型刻意平台中立，账本随行。
 
 ## 身份与兼容性（rubash#154）
 
@@ -93,7 +93,7 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
 | **nvm.sh**（v0.40.x loader） | 加载逐字节干净，含 Windows 原生空 `NVM_DIR` 自动使用（`$PWD` POSIX 人设，#537）；自有测试切片的引擎侧失败已修 |
 | **FFmpeg / OpenSSH / PHP / ltmain / cmake configure 脚本** | `--help`/错误路径输出**逐字节一致** |
 | **git 自家测试框架**（t/test-lib.sh） | 在引擎下端到端运行 |
-| **GNU 83 套件 · Linux 原生二进制** | 19/24 套字节一致（2026-09-26 那一轮，#500）；该语料现由 CI 每次推送回放（`Bash upstream test progress`，Ubuntu） |
+| **GNU 83 套件 · Linux 原生二进制** | 17/24 套字节一致（2026-09-27 wt4/linuxrun 车道，台账存档于 #477/#581）；该语料现由 CI 每次推送回放（`Bash upstream test progress`，Ubuntu） |
 
 以上全部钉为回归夹具（`tests/` 下 335 个集成测试文件，含 `tests/regression.rs`——GNU golden 矩阵、套件切片快照、perf 金丝雀），CI 每次推送都跑——外加一道 C 源码逐行审计（`docs/SOURCE-AUDIT.md`，已盘点 336 个行为），总在套件踩到之前把缺口找到并关掉。
 

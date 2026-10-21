@@ -33,8 +33,9 @@ the engine's test lanes on Ubuntu (library tests, compatibility
 `cli_tests`, marker goldens) and replays the GNU upstream corpus on every
 push (the `Bash upstream test progress` job, `scripts/run-bash-upstream-tests.sh`);
 the earlier manual pass of the same corpus on the Linux binary scored
-19/24 suites byte-identical (2026-09-26, #500) and the remaining gap is
-tracked in the issue tracker. macOS runs the library test suite in CI
+17/24 suites byte-identical (2026-09-27 wt4/linuxrun lane, ledger
+archived in #477/#581) and the remaining gap is tracked in the issue
+tracker. macOS runs the library test suite in CI
 (`macos-latest`) alongside the cross-target check. The engine's
 semantic model (in-process subshells, fd-table semantics, process
 boundaries) is deliberately platform-neutral, so the same ledger travels.
@@ -139,7 +140,7 @@ applied to dedicated evaluation suites and real-world corpora
 | **nvm.sh** (v0.40.x loader) | loads byte-clean incl. empty-`NVM_DIR` auto-use on Windows native (`$PWD` POSIX persona, #537); own test slice engine-caused failures fixed |
 | **FFmpeg / OpenSSH / PHP / ltmain / cmake configure scripts** | `--help`/error-path output **byte-identical** |
 | **git's own test framework** (t/test-lib.sh) | runs end-to-end under the engine |
-| **GNU 83-suite on Linux native binary** | 19/24 byte-identical (2026-09-26 pass, #500); the corpus is now replayed in CI on every push (`Bash upstream test progress`, Ubuntu) |
+| **GNU 83-suite on Linux native binary** | 17/24 byte-identical (2026-09-27 wt4/linuxrun lane, ledger archived in #477/#581); the corpus is now replayed in CI on every push (`Bash upstream test progress`, Ubuntu) |
 
 Everything above is pinned as regression fixtures under `tests/` (335
 integration test files, incl. `tests/regression.rs` — GNU-golden matrices,
