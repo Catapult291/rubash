@@ -1090,28 +1090,50 @@ impl Executor {
         // text cannot recover.
         || cmd.words.first().is_some_and(|word| word == "read" || word == "printf")
         || !cmd.process_substitutions.is_empty()
-        || cmd.word_metadata.iter().any(|metadata| {
-            !metadata.process_substitutions.is_empty()
-                || metadata.raw.contains("<(")
-                || metadata.raw.contains(">(")
-                // GNU parse.y: an escaped `\<(...)` word is NOT a process
-                // substitution, but after quote removal the expanded value
-                // looks like one. Preserve the metadata so the executor
-                // can consult the raw form and avoid mis-materializing
-                // the expanded word as a process substitution (func5.sub
-                // line 45 `\<\(:\)` must report "command not found").
-                // The expanded value carries CTLESC markers between the
-                // metacharacters (`<` CTLESC `(`), so compare against the
-                // dequoted form.
-                || metadata
-                    .value
-                    .replace(crate::executor::markers::CTLESC, "")
-                    .contains("<(")
-                || metadata
-                    .value
-                    .replace(crate::executor::markers::CTLESC, "")
-                    .contains(">(")
-        })
+        || {
+            // Whitelist short-circuit for the all-literal shape (same shared
+            // predicate as the expand fast paths, never a second copy): a
+            // fast-literal raw/value carries none of `<`, `>`, `(`, quotes,
+            // `$`, backtick, or non-printable carriers, so it cannot contain
+            // `<(`/`>(` and the CTLESC-stripped value cannot either;
+            // process-substitution syntax needs exactly those bytes. The
+            // per-metadata `process_substitutions` emptiness is still checked
+            // (cheap) — any doubt (empty/non-literal raw/value, non-empty
+            // procsub list) falls through to the slow scan below with
+            // identical semantics.
+            use crate::executor::assignment_helpers::is_expand_fast_literal_word;
+            let all_literal = cmd.word_metadata.iter().all(|metadata| {
+                metadata.process_substitutions.is_empty()
+                    && is_expand_fast_literal_word(&metadata.raw)
+                    && is_expand_fast_literal_word(&metadata.value)
+            });
+            if all_literal {
+                false
+            } else {
+                cmd.word_metadata.iter().any(|metadata| {
+                    !metadata.process_substitutions.is_empty()
+                        || metadata.raw.contains("<(")
+                        || metadata.raw.contains(">(")
+                        // GNU parse.y: an escaped `\<(...)` word is NOT a process
+                        // substitution, but after quote removal the expanded value
+                        // looks like one. Preserve the metadata so the executor
+                        // can consult the raw form and avoid mis-materializing
+                        // the expanded word as a process substitution (func5.sub
+                        // line 45 `\<\(:\)` must report "command not found").
+                        // The expanded value carries CTLESC markers between the
+                        // metacharacters (`<` CTLESC `(`), so compare against the
+                        // dequoted form.
+                        || metadata
+                            .value
+                            .replace(crate::executor::markers::CTLESC, "")
+                            .contains("<(")
+                        || metadata
+                            .value
+                            .replace(crate::executor::markers::CTLESC, "")
+                            .contains(">(")
+                })
+            }
+        }
     }
 
     pub(in crate::executor) fn expand_command_words(
