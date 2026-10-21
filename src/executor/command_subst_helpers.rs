@@ -16,6 +16,19 @@ pub(in crate::executor) fn collect_braced_parameter_body(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> (String, bool) {
     let mut name = String::new();
+    let terminated = collect_braced_parameter_body_into(chars, &mut name);
+    (name, terminated)
+}
+
+/// Appending form of [`collect_braced_parameter_body`]: the caller supplies
+/// the buffer so hot walkers can collect straight into a pooled synthetic
+/// `${...}` word instead of staging a per-fragment `String` (GNU
+/// subst.c:9777 parameter_brace_expand scans the same body inline — the
+/// intermediate is a port artifact, not GNU state).
+pub(in crate::executor) fn collect_braced_parameter_body_into(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    body: &mut String,
+) -> bool {
     let mut nested = 0usize;
     let mut single = false;
     let mut double = false;
@@ -27,7 +40,7 @@ pub(in crate::executor) fn collect_braced_parameter_body(
             if ch == '\'' {
                 single = false;
             }
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         // Inside a $'...' ANSI-C span a backslash escapes the following
@@ -36,10 +49,10 @@ pub(in crate::executor) fn collect_braced_parameter_body(
         // early and the trailing '}' is swallowed, leaving a heredoc body
         // such as 7: ${x%'$'a\t\\'b'}' unexpanded.
         if ansi_c {
-            name.push(ch);
+            body.push(ch);
             if ch == '\\' {
                 if let Some(escaped) = chars.next() {
-                    name.push(escaped);
+                    body.push(escaped);
                 }
             } else if ch == '\'' {
                 ansi_c = false;
@@ -49,17 +62,17 @@ pub(in crate::executor) fn collect_braced_parameter_body(
         if double {
             if ch == '"' {
                 double = false;
-                name.push(ch);
+                body.push(ch);
                 continue;
             }
             if ch == '\\' {
-                name.push(ch);
+                body.push(ch);
                 if let Some(escaped) = chars.next() {
-                    name.push(escaped);
+                    body.push(escaped);
                 }
                 continue;
             }
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         // GNU Bash scans `\` plus the following character as one unit
@@ -67,10 +80,10 @@ pub(in crate::executor) fn collect_braced_parameter_body(
         // backslash, `\}` a literal closing brace; neither closes the name.
         if ch == '\\' {
             if let Some(escaped) = chars.next() {
-                name.push('\\');
-                name.push(escaped);
+                body.push('\\');
+                body.push(escaped);
             } else {
-                name.push('\\');
+                body.push('\\');
             }
             continue;
         }
@@ -79,46 +92,46 @@ pub(in crate::executor) fn collect_braced_parameter_body(
             // from a plain single quote: backslashes inside it escape data.
             chars.next();
             ansi_c = true;
-            name.push('$');
-            name.push('\'');
+            body.push('$');
+            body.push('\'');
             continue;
         }
         if ch == '\'' {
             single = true;
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         if ch == '"' {
             double = true;
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         if ch == '[' {
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         if ch == ']' {
-            name.push(ch);
+            body.push(ch);
             continue;
         }
         if ch == '$' && chars.peek().copied() == Some('{') {
             chars.next();
             nested += 1;
-            name.push('$');
-            name.push('{');
+            body.push('$');
+            body.push('{');
             continue;
         }
         if ch == '}' {
             if nested == 0 {
-                return (name, true);
+                return true;
             }
             nested -= 1;
-            name.push(ch);
+            body.push(ch);
             continue;
         }
-        name.push(ch);
+        body.push(ch);
     }
-    (name, false)
+    false
 }
 
 pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> String {

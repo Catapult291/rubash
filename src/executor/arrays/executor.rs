@@ -129,6 +129,17 @@ impl Executor {
         &self,
         expression: &str,
     ) -> Option<String> {
+        // A name with no `[` is not an array-element reference:
+        // `parse_array_subscript` (arrays/storage.rs:182) splits on `[`, so
+        // the uncached body below returns None for it. Bail BEFORE touching
+        // the memo — every scalar parameter read (`${s}`, `${s#p}`, `$s`)
+        // reaches here through shell_variable_value, and memoizing a scalar
+        // miss allocated a `String` key + hash bucket per read for a result
+        // that is never a subscript side-effect. Array-element expressions
+        // (`name[sub]`) keep the exact memo path below.
+        if !expression.contains('[') {
+            return None;
+        }
         // GNU param_expand resolves the subscript once per `${}` expansion;
         // the memo frame pushed by the embedded-parameter walkers dedups the
         // repeated identical fetches the `&self` helper layers make, so

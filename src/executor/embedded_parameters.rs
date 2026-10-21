@@ -576,10 +576,22 @@ impl Executor {
                     let _site_guard = (!whole_braced).then(|| {
                         crate::executor::expand_braced_indices::SubSiteGuard::new(this_frag)
                     });
-                    let (name, terminated) =
-                        crate::executor::command_subst_helpers::collect_braced_parameter_body(
+                    // Collect straight into a pooled synthetic `${...}` word:
+                    // GNU subst.c:9777 parameter_brace_expand scans the body
+                    // inline with no intermediate; the historical `(name,
+                    // format!)` pair staged two `String`s per fragment.
+                    // Byte-identical content: `${` + body + `}`.
+                    let mut synthetic =
+                        crate::executor::parameter_words::pop_synthetic_fragment_word();
+                    synthetic.clear();
+                    synthetic.push_str("${");
+                    let terminated =
+                        crate::executor::command_subst_helpers::collect_braced_parameter_body_into(
                             &mut chars,
+                            &mut synthetic,
                         );
+                    synthetic.push('}');
+                    let name = synthetic[2..synthetic.len() - 1].to_string();
                     if double_quoted {
                         // Prompt-pass verdicts (GNU expand_prompt_string runs
                         // under no_longjmp_on_fatal_error, subst.c:4407, and
