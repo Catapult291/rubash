@@ -915,9 +915,8 @@ impl Executor {
                     // evaluated (a `${name}` body re-walked inside the
                     // enclosing fragment's site), it inherits that site
                     // instead of re-keying on the synthetic string.
-                    let whole_braced =
-                        crate::executor::parameter_ops::braced_parameter_spans_whole_word(word)
-                            && crate::executor::expand_braced_indices::sub_site_active();
+                    let whole_braced = crate::executor::expand_braced_indices::sub_site_active()
+                        && crate::executor::parameter_ops::braced_parameter_spans_whole_word(word);
                     let this_frag = frag_index;
                     frag_index += 1;
                     let _site_guard = (!whole_braced).then(|| {
