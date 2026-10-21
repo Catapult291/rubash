@@ -1,14 +1,17 @@
 pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bool {
+    // Byte-spelling gate runs BEFORE the pattern-only fast paths below:
+    // they verdict on raw chars and cannot see marker spellings (a `?`
+    // must match a carried byte, not fail on its two-char spelling).
+    if either_side_needs_byte_char_matching(pattern, word) && !pattern.contains('[') {
+        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
+        let word: Vec<char> = flatten_word_to_byte_chars(word);
+        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, false) {
         return verdict;
-    }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
-        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
     }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
@@ -16,16 +19,17 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
 }
 
 pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
+    // Byte-spelling gate runs BEFORE the pattern-only fast paths (see above).
+    if either_side_needs_byte_char_matching(pattern, word) && !pattern.contains('[') {
+        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
+        let word: Vec<char> = flatten_word_to_byte_chars(word);
+        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, true) {
         return verdict;
-    }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
-        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
     }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
@@ -53,14 +57,18 @@ pub(in crate::executor) fn case_pattern_matches_with_word_chars(
     word: &str,
     word_chars: &mut Option<Vec<char>>,
 ) -> bool {
+    // Byte-spelling gate runs BEFORE the pattern-only fast paths (see
+    // above): the fast paths verdict on raw chars and cannot see marker
+    // spellings, so a marked word must go through the flattening base
+    // function instead of the staged raw-char path below.
+    if either_side_needs_byte_char_matching(pattern, word) && !pattern.contains('[') {
+        return case_pattern_matches(pattern, word);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, false) {
         return verdict;
-    }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
-        return case_pattern_matches(pattern, word);
     }
     let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
     let pattern_chars: Vec<char> = pattern.chars().collect();
@@ -73,14 +81,15 @@ pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
     word: &str,
     word_chars: &mut Option<Vec<char>>,
 ) -> bool {
+    // Byte-spelling gate first (see base function above).
+    if either_side_needs_byte_char_matching(pattern, word) && !pattern.contains('[') {
+        return case_pattern_matches_nocase(pattern, word);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, true) {
         return verdict;
-    }
-    if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
-        return case_pattern_matches_nocase(pattern, word);
     }
     let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
     let pattern_chars: Vec<char> = pattern.chars().collect();
@@ -205,15 +214,22 @@ fn literal_pattern_equality(pattern: &str, word: &str, nocase: bool) -> Option<b
         })
 }
 
-/// Check if the pattern contains raw-byte marker sentinels (U+E000).
-/// When present, GNU's byte-level pattern matching (subst.c glob_pattern_patscan)
-/// matches raw bytes against the word's byte representation, so we flatten
-/// both sides to byte-chars for the char-level matcher.
-fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
-    pattern.contains(
-        char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-            .expect("raw-byte sentinel is a valid char"),
-    )
+/// Check if either side carries raw-byte marker sentinels (U+E000 range).
+/// When present, GNU's byte-level pattern matching (subst.c
+/// glob_pattern_patscan) matches raw bytes against the word's byte
+/// representation, so we flatten both sides to byte-chars for the
+/// char-level matcher. The word side must be checked too: an expansion
+/// can store a byte as a two-char marker pair (e.g. `[[ $x == ? ]]`
+/// where the word carries a quoted 0x11), and a plain `?` must still
+/// match the single byte.
+fn either_side_needs_byte_char_matching(pattern: &str, word: &str) -> bool {
+    fn has_markers(text: &str) -> bool {
+        text.contains(
+            char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
+                .expect("raw-byte sentinel is a valid char"),
+        )
+    }
+    has_markers(pattern) || has_markers(word)
 }
 
 /// Base for byte-char representation: U+E100 + byte value. This PUA range is
@@ -415,6 +431,30 @@ mod tests {
     fn wildcard_matching_backtracks_after_a_partial_literal_match() {
         assert!(case_pattern_matches("*ab", "aab"));
         assert!(case_pattern_matches_nocase("*foo*", "PATH_FOO_VALUE"));
+    }
+
+    /// GNU matches bytes, not chars (subst.c glob_pattern_patscan walks
+    /// unsigned char buffers): a word carrying a raw-byte marker pair for
+    /// a single byte must match a single-char pattern. Regression test
+    /// for the word-side blind spot in the byte-spelling gate: previously
+    /// only the pattern side was checked, so `[[ $x == ? ]]` with a
+    /// carried 0x11 byte fell through to the plain char-wise matcher and
+    /// wrongly failed (the two-char marker spelling never equals one `?`).
+    #[test]
+    fn carried_byte_matches_single_char_pattern() {
+        // \u{e000}\u{e012} is the stored spelling of byte 0x11
+        // (RAW_BYTE_MARKER_ESCAPE + FIRST + byte).
+        let carried = "\u{e000}\u{e012}";
+        assert!(case_pattern_matches("?", carried));
+        assert!(case_pattern_matches_nocase("?", carried));
+        assert!(case_pattern_matches("*", carried));
+        assert!(!case_pattern_matches("??", carried));
+        assert!(!case_pattern_matches("x", carried));
+        // Plain words without marker spellings keep the old behavior.
+        assert!(case_pattern_matches("?", "q"));
+        assert!(!case_pattern_matches("??", "q"));
+        assert!(case_pattern_matches("a", "a"));
+        assert!(!case_pattern_matches("a", "b"));
     }
 }
 
