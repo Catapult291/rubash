@@ -976,20 +976,30 @@ impl Executor {
             "literal words must never carry ARRAYREF marks: {:?}",
             cmd.words
         );
-        // Same minimal construction as the single-word path (see it for
-        // the per-field rationale): clone the words, keep metadata exactly
-        // per the shared predicate, carry the routing fields.
+        // Constructed field-for-field like the slow pipeline's
+        // `variable_expanded` node (never a private copy of it): words
+        // cloned, metadata exactly per the shared predicate, assignments
+        // and every expandable list empty by the admission above (so
+        // `new()` defaults equal the slow path's empty clones), routing
+        // fields carried, and the three compound slots cloned (always
+        // `None` here — their syntax needs bytes the whitelist rejects —
+        // but cloned rather than assumed, so a future shape that reaches
+        // this point with one set still matches). Like the slow path,
+        // `logical_line`/`end_line`/kinds stay at their defaults: the
+        // line stamps read the pre-expansion node.
         let mut expanded = CommandNode::new();
         expanded.words = cmd.words.clone();
         if Self::preserves_word_metadata(cmd) {
             expanded.word_metadata = cmd.word_metadata.clone();
         }
-        expanded.line = cmd.line;
-        expanded.logical_line = cmd.logical_line;
         expanded.pipe = cmd.pipe;
         expanded.background = cmd.background;
         expanded.and_or = cmd.and_or;
         expanded.inverted = cmd.inverted;
+        expanded.arithmetic_command = cmd.arithmetic_command.clone();
+        expanded.conditional_command = cmd.conditional_command.clone();
+        expanded.brace_group = cmd.brace_group.clone();
+        expanded.line = cmd.line;
         Some(expanded)
     }
     pub(in crate::executor) fn try_expand_literal_command(
@@ -5497,15 +5507,15 @@ mod command_word_materialization_tests {
                     "{src:?} metadata handling changed"
                 );
                 assert_eq!(expanded.line, cmd.line, "{src:?} line dropped");
-                // The live pipeline must agree byte-for-byte.
+                // The live pipeline must agree field-for-field (words,
+                // metadata, routing, compound slots, line info) — a
+                // future CommandNode field with expansion semantics fails
+                // here instead of shipping a divergence.
                 let piped = executor.expand_command_words(cmd).expect("pipeline failed");
                 assert_eq!(
-                    piped.words, expanded.words,
-                    "{src:?} fast != pipeline words"
-                );
-                assert_eq!(
-                    piped.word_metadata, expanded.word_metadata,
-                    "{src:?} fast != pipeline metadata"
+                    format!("{expanded:?}"),
+                    format!("{piped:?}"),
+                    "{src:?} fast != pipeline node"
                 );
             }
         }
