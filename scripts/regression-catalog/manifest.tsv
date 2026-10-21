@@ -40,7 +40,7 @@ issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed;
 issue-830	830	must-match	popd default pop must chdir into the popped dir — fixed, closed
 issue-832	832	must-match	$(echo 's') fast-path detour must not consult CWD contents — fixed, closed
 issue-840	840	diverges	marker output-boundary residuals: declare -p E400-prefix leak + typed __RUBASH_CSB1_ re-decode (face3 \uE30D assign already matches) — open
-issue-846	846	diverges	top-level !{}>bad rc fixed; residuals (diagnostic bypass on ()/simple faces + nested-! abort) — tracked as rubash#940
+issue-846	846	must-match	top-level !{}>bad rc + diagnostic routing + nested-! abort all match GNU (rubash#940 fixed)
 issue-847	847	must-match	#822 span scanner dquote state (E3b: dq-wrapped $'...' spelling stays raw on assign/read/arith) + unset deferred operand quote-removes $'...' (u1/u2/u3 keep the cell; bare/variable rows still delete) - fixed
 issue-856	856	diverges	isolated literal U+E000 at the output boundary — literal-PUA spelling still eaten (escape-spelling f0 control matches); issue open
 issue-860	860	must-match	unset empty-span/mask pseudo-diagnostic family — fixed by PR #883 (manifest row landed late under #746)

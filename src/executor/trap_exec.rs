@@ -1612,6 +1612,46 @@ impl Executor {
         // `3>&1`/`2>&1` also land in `redirect_out`. Only an fd-1 (or
         // default) entry is a stdout redirect; numbered entries propagate
         // through splice_numbered_output_redirects_in_order below instead.
+        //
+        // rubash#940: the stdio arms run in PARSE ORDER (their position in
+        // `command.redirects`), matching GNU do_redirection_internal
+        // (redir.c:767-955) and the brace path's apply_brace_group_redirects
+        // — `( :; ) 2>cap.txt > /missing` must perform the `2>` open
+        // (truncate/create side effect) BEFORE the `>` open fails, and the
+        // failure report must see the binding it established. The old
+        // field-order arms ran `>` first, so the earlier `2>` side effects
+        // never happened.
+        for arm in compound_stdio_arms_in_parse_order(cmd) {
+            match arm {
+                CompoundStdioArm::Out => self.apply_compound_out_arm(cmd, ast, prepare_targets)?,
+                CompoundStdioArm::Append => {
+                    self.apply_compound_append_arm(cmd, ast, prepare_targets)?
+                }
+                CompoundStdioArm::Err => self.apply_compound_err_arm(cmd, ast, prepare_targets)?,
+                CompoundStdioArm::ErrAppend => {
+                    self.apply_compound_err_append_arm(cmd, ast, prepare_targets)?
+                }
+            }
+        }
+
+        // Numbered (fd-prefixed) output redirects — `3>&1`, `10>f` — bind
+        // real fd-table entries for the body's duration through
+        // open_compound_output_redirects (with_command_input_redirects /
+        // with_compound_output_redirects), matching GNU
+        // do_redirection_internal which dups/opens the group's descriptors
+        // before the body runs (redir.c:767-955). Leaves then resolve
+        // `1>&3` against the group's binding rather than a spliced-in
+        // re-dup of their own fd 1 (which mis-binds inside pipelines).
+
+        Ok(())
+    }
+
+    fn apply_compound_out_arm(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+        prepare_targets: bool,
+    ) -> Result<(), ExecuteError> {
         if let Some(redirect) = cmd.redirect_out.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
             // GNU do_redirections opens the expanded word once, relative to
             // the cwd in force when the compound command starts; the
@@ -1656,7 +1696,17 @@ impl Executor {
                 };
                 apply_stdout_append_redirect(&mut ast.commands, &append_redirect);
             }
-        } else if let Some(redirect) = cmd.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
+        }
+        Ok(())
+    }
+
+    fn apply_compound_append_arm(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+        _prepare_targets: bool,
+    ) -> Result<(), ExecuteError> {
+        if let Some(redirect) = cmd.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
             let expanded = self.expand_redirect_target(redirect);
             // subst.c:12663-12668 failglob: abort before anchoring.
             if self.redirect_failglob_aborted() {
@@ -1680,7 +1730,15 @@ impl Executor {
             };
             apply_stdout_append_redirect(&mut ast.commands, &append_redirect);
         }
+        Ok(())
+    }
 
+    fn apply_compound_err_arm(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+        prepare_targets: bool,
+    ) -> Result<(), ExecuteError> {
         if let Some(redirect) = cmd.redirect_err.as_ref().filter(|r| r.fd.unwrap_or(2) == 2) {
             let expanded = self.expand_redirect_target(redirect);
             // subst.c:12663-12668 failglob: abort before the target is
@@ -1726,7 +1784,17 @@ impl Executor {
                 };
                 apply_stderr_append_redirect(&mut ast.commands, &append_redirect);
             }
-        } else if let Some(redirect) = cmd
+        }
+        Ok(())
+    }
+
+    fn apply_compound_err_append_arm(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+        _prepare_targets: bool,
+    ) -> Result<(), ExecuteError> {
+        if let Some(redirect) = cmd
             .redirect_err_append
             .as_ref()
             .filter(|r| r.fd.unwrap_or(2) == 2)
@@ -1759,16 +1827,6 @@ impl Executor {
                 apply_stderr_append_redirect(&mut ast.commands, &append_redirect);
             }
         }
-
-        // Numbered (fd-prefixed) output redirects — `3>&1`, `10>f` — bind
-        // real fd-table entries for the body's duration through
-        // open_compound_output_redirects (with_command_input_redirects /
-        // with_compound_output_redirects), matching GNU
-        // do_redirection_internal which dups/opens the group's descriptors
-        // before the body runs (redir.c:767-955). Leaves then resolve
-        // `1>&3` against the group's binding rather than a spliced-in
-        // re-dup of their own fd 1 (which mis-binds inside pipelines).
-
         Ok(())
     }
 
@@ -3795,4 +3853,64 @@ fn exec_has_only_redirects(cmd: &CommandNode) -> bool {
                     .iter()
                     .any(|redirect| redirect.fd.is_some_and(|fd| fd.to_string() == *fd_word))
     )
+}
+
+/// The four stdio-slot redirect arms of a compound command, ordered by
+/// their position in the command's parse-order redirect list (rubash#940 —
+/// the same contract apply_brace_group_redirects follows for `{ }`,
+/// rubash#826). An arm whose mirror entry cannot be found in the list (a
+/// synthesized desugar) keeps its field order after every matched arm, so
+/// the sort is total and stable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompoundStdioArm {
+    Out,
+    Append,
+    Err,
+    ErrAppend,
+}
+
+fn compound_stdio_arms_in_parse_order(command: &CommandNode) -> Vec<CompoundStdioArm> {
+    let candidates = [
+        (
+            command
+                .redirect_out
+                .as_ref()
+                .filter(|r| r.fd.unwrap_or(1) == 1),
+            CompoundStdioArm::Out,
+        ),
+        (
+            command.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1),
+            CompoundStdioArm::Append,
+        ),
+        (
+            command
+                .redirect_err
+                .as_ref()
+                .filter(|r| r.fd.unwrap_or(2) == 2),
+            CompoundStdioArm::Err,
+        ),
+        (
+            command
+                .redirect_err_append
+                .as_ref()
+                .filter(|r| r.fd.unwrap_or(2) == 2),
+            CompoundStdioArm::ErrAppend,
+        ),
+    ];
+    let fallback = command.redirects.len();
+    let mut order: Vec<(usize, CompoundStdioArm)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(field_index, (redirect, arm))| {
+            let redirect = (*redirect)?;
+            let position = command
+                .redirects
+                .iter()
+                .position(|entry| entry == redirect)
+                .unwrap_or(fallback + field_index);
+            Some((position, *arm))
+        })
+        .collect();
+    order.sort_by_key(|(position, _)| *position);
+    order.into_iter().map(|(_, arm)| arm).collect()
 }

@@ -2195,6 +2195,15 @@ impl Executor {
                 if matches!(error, ExecuteError::IoError(_)) {
                     self.note_compound_redirect_failure();
                 }
+                // rubash#940: the subshell boundary owns its saved state on
+                // every exit path — GNU's forked child dies with its own
+                // copy and nothing leaks back (execute_cmd.c:1576). The
+                // early apply-failure return skipped the restore below and
+                // leaked subshell_depth + the child trap reset into the
+                // parent.
+                self.restore_flat_subshell(saved_state, saved_cwd);
+                self.fd_table = saved_fd_table;
+                self.command_expansion_failed.set(saved_expansion_failed);
                 return Err(error);
             }
             body_owned = Some(body_ast.commands);
