@@ -795,12 +795,15 @@ fn decode_ansi_c_span_cursor<'a>(out: &mut String, rest: &'a str) -> &'a str {
 }
 
 /// Cursor form of `copy_braced_parameter_unquoted` (rest at the `$`).
-fn copy_braced_parameter_unquoted_cursor<'a>(out: &mut String, rest: &'a str) -> &'a str {
+pub(crate) fn copy_braced_parameter_unquoted_cursor<'a>(
+    out: &mut String,
+    rest: &'a str,
+) -> &'a str {
     copy_braced_parameter_inner_cursor(out, rest, false, false)
 }
 
 /// Cursor form of `copy_braced_parameter_after_dollar` (rest at the `$`).
-fn copy_braced_parameter_after_dollar_cursor<'a>(
+pub(crate) fn copy_braced_parameter_after_dollar_cursor<'a>(
     out: &mut String,
     rest: &'a str,
     posix: bool,
