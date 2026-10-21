@@ -405,6 +405,19 @@ impl Executor {
     fn fast_plain_scalar_rhs(&self, value: &str, raw: Option<&str>) -> Option<String> {
         let raw = raw?;
         if value == raw {
+            // Whole-word braced simple parameter `NAME=${name}`: GNU
+            // subst.c:9777 parameter_brace_expand takes the same
+            // parameter_brace_expand_word/param_expand path as `$name` when
+            // the body is a bare identifier with no operator, so it reuses
+            // the `$name` shortcut below (fast_plain_copy already refuses
+            // dynamics, RANDOM/SRANDOM, and `set -u`). A body that is not a
+            // plain shell name (`${a[0]}`, `${!r}`, `${s:-w}`, `${#s}`)
+            // fails fast_plain_copy and falls through unchanged.
+            if let Some(inner) = raw.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+                if let Some(copied) = self.fast_plain_copy(inner) {
+                    return Some(copied);
+                }
+            }
             let mut bytes = raw.bytes();
             if bytes.all(|b| b.is_ascii_alphanumeric() || FAST_RHS_LITERAL.contains(&b)) {
                 return Some(raw.to_string());

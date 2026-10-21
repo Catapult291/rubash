@@ -195,6 +195,37 @@ pub(in crate::executor) fn matching_parameter_brace(input: &str) -> Option<usize
     matching_parameter_brace_in_context(input, false, false)
 }
 
+/// Bytes that, before the closing `}` of a `${...}` body, can make GNU's
+/// `extract_dollar_brace_string` (subst.c:1825) skip or nest PAST a `}`:
+/// a `\`/CTLESC escape (`pass_character`), a backtick or `$(`/`<(`/`>(`
+/// substitution span, a `"`/`'` quote span, an `[...]` subscript
+/// (`skipsubscript`), or a nested `${`. A prefix free of every one of them
+/// cannot hide or nest the terminator, so the FIRST `}` is the close in
+/// every quote/POSIX context — the state machine's `dolbrace_state` only
+/// gates quote handling, never the `RBRACE` nesting decrement. This is a
+/// closed whitelist of inert bytes: anything else (including C0 carriers
+/// and non-ASCII) falls through to the full scanner.
+fn brace_prefix_byte_is_inert(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r')
+        || (b' '..=b'~').contains(&b)
+            && !matches!(
+                b,
+                b'\\'
+                    | b'$'
+                    | b'{'
+                    | b'}'
+                    | b'`'
+                    | b'('
+                    | b')'
+                    | b'<'
+                    | b'>'
+                    | b'"'
+                    | b'\''
+                    | b'['
+                    | b']'
+            )
+}
+
 /// Locate the `}` closing a `${` body, honoring the outer quote context and
 /// POSIX mode. GNU parse.y's dolbrace state machine (Austin Group Interp 221)
 /// treats single quotes inside a double-quoted `${...}` as literal in POSIX
@@ -204,6 +235,21 @@ pub(in crate::executor) fn matching_parameter_brace_in_context(
     outer_double_quote: bool,
     posix: bool,
 ) -> Option<usize> {
+    // Shared brace-scan fast path: when no byte before the first `}` can
+    // open a construct that skips or nests it (`brace_prefix_byte_is_inert`),
+    // the first `}` is the terminator under every quote/POSIX setting, so
+    // skip the allocating lexer scan (`scan_braced_parameter_body` collects
+    // the whole input plus a byte-translation table). `${x}`, `${x:-w}`,
+    // `${x:1:2}`, `${x//a/b}`, `${x#p}` … all take this arm; anything with
+    // a quote, backslash, `$`, `[`, or substitution falls through unchanged.
+    if let Some(close) = input.as_bytes().iter().position(|&b| b == b'}') {
+        if input.as_bytes()[..close]
+            .iter()
+            .all(|&b| brace_prefix_byte_is_inert(b))
+        {
+            return Some(close);
+        }
+    }
     let replacement_context = input.find('/').is_some_and(|slash| {
         !input[..slash].contains(':')
             && input[..slash]
@@ -999,6 +1045,28 @@ mod tests {
     #[test]
     fn matching_parameter_brace_accepts_nested_array_subscript() {
         assert_eq!(matching_parameter_brace("A[${i}]}"), Some(7));
+    }
+
+    #[test]
+    fn matching_parameter_brace_plain_body_fast_arm_matches_scanner() {
+        // The inert-prefix fast arm returns the first `}`; every one of
+        // these has no byte that GNU's extract_dollar_brace_string
+        // (subst.c:1825) reacts to before the closer, so the first `}` is
+        // the terminator under all quote/POSIX settings.
+        assert_eq!(matching_parameter_brace("s}"), Some(1));
+        assert_eq!(matching_parameter_brace("s:5:10}"), Some(6));
+        assert_eq!(matching_parameter_brace("s//a/X}"), Some(6));
+        assert_eq!(matching_parameter_brace("s#abc}"), Some(5));
+        assert_eq!(matching_parameter_brace("s%%x*z}"), Some(6));
+        assert_eq!(matching_parameter_brace("#s}"), Some(2));
+        assert_eq!(matching_parameter_brace("s^^}"), Some(3));
+        assert_eq!(matching_parameter_brace("u:-dflt}"), Some(7));
+        assert_eq!(matching_parameter_brace("s: -5}"), Some(5));
+        // A `}` that a special byte could hide/nest stays on the slow arm.
+        assert_eq!(matching_parameter_brace("s:-'a'}"), Some(6));
+        assert_eq!(matching_parameter_brace("s:-${x}}"), Some(7));
+        // An escaped `}` is not a terminator (slow arm keeps the escape).
+        assert_eq!(matching_parameter_brace(r"s:-a\}"), None);
     }
 
     #[test]

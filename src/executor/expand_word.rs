@@ -9,6 +9,9 @@ use crate::executor::markers::STORAGE_WORD_PREFIX;
 /// operator form (${$'x1'%t}, ${$'x1'-fallback}). Returns the rewritten
 /// body, or None when the name is not a decodable dollar-quoted span.
 pub(in crate::executor) fn resolve_dollar_quoted_parameter_name(name: &str) -> Option<String> {
+    if !name.starts_with("$'") {
+        return None;
+    }
     let chars: Vec<char> = name.chars().collect();
     if chars.len() < 3 || chars[0] != '$' || chars[1] != '\'' {
         return None;
