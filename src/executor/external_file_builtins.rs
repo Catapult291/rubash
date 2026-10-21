@@ -1,5 +1,6 @@
 use super::*;
 use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR};
+use crate::shell::var_table::VarTable;
 use std::io::IsTerminal;
 
 impl Executor {
@@ -2151,7 +2152,7 @@ fn apply_chmod_mode(base: u32, mode: &str) -> Option<u32> {
 /// Windows-port-only emulated mode store: unix chmod writes the real inode
 /// mode instead (PermissionsExt::set_mode above).
 #[cfg_attr(unix, allow(dead_code))]
-fn store_emulated_file_mode(env_vars: &mut HashMap<String, String>, windows: &str, mode: u32) {
+fn store_emulated_file_mode(env_vars: &mut VarTable, windows: &str, mode: u32) {
     let key = crate::builtins::test::EMULATED_FILE_MODES;
     let entries = env_vars.get(key).cloned().unwrap_or_default();
     let mut kept: Vec<String> = entries

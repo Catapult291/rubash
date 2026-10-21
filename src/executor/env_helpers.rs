@@ -1,5 +1,6 @@
 use super::*;
 use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR};
+use crate::shell::var_table::VarTable;
 
 /// Exact-case bare-name fallback into the process environment.
 ///
@@ -31,7 +32,7 @@ pub(in crate::executor) fn mark_initial_exported_vars(
     env_vars.replace_attr_list(EXPORTED_VARS, names);
 }
 
-pub(in crate::executor) fn initialize_shell_level(env_vars: &mut HashMap<String, String>) {
+pub(in crate::executor) fn initialize_shell_level(env_vars: &mut VarTable) {
     let next_level = env_vars
         .get("SHLVL")
         .and_then(|value| value.parse::<i64>().ok())
@@ -138,7 +139,7 @@ pub(in crate::executor) fn local_export_env_values(
 }
 
 pub(in crate::executor) fn set_local_export_env_value(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     name: &str,
     value: String,
 ) {
@@ -154,10 +155,7 @@ pub(in crate::executor) fn set_local_export_env_value(
     write_local_export_env_values(env_vars, entries);
 }
 
-pub(in crate::executor) fn remove_local_export_env_value(
-    env_vars: &mut HashMap<String, String>,
-    name: &str,
-) {
+pub(in crate::executor) fn remove_local_export_env_value(env_vars: &mut VarTable, name: &str) {
     let entries = local_export_env_values(env_vars)
         .into_iter()
         .filter(|(entry_name, _)| entry_name != name)
@@ -166,7 +164,7 @@ pub(in crate::executor) fn remove_local_export_env_value(
 }
 
 pub(in crate::executor) fn write_local_export_env_values(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     entries: Vec<(String, String)>,
 ) {
     if entries.is_empty() {

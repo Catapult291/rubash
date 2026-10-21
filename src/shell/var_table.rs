@@ -41,8 +41,8 @@
 //! attribute mutation goes through `mark_name` / `unmark_name` /
 //! `set_attrs` / `replace_attr_list`.
 
-use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
 use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR};
 use crate::executor::{
@@ -129,9 +129,12 @@ pub(crate) const ATTR_KEYS: [&str; 10] = [
 
 /// The value map plus the structured attribute map.
 ///
-/// `Deref`/`DerefMut` expose the value map so the hundreds of existing
-/// value-only call sites (plain `get`/`insert`/`remove`/iteration)
-/// compile unchanged; attribute operations MUST use the methods below.
+/// `Deref` exposes the value map for the hundreds of existing read-only
+/// call sites (plain `get`/`contains_key`/iteration). There is deliberately
+/// NO `DerefMut`: every mirror write must pass through the inherent
+/// choke-point methods below (`insert`/`remove`/`get_mut`/`entry`/`retain`),
+/// which call `note_mirror_write` so a write to a tracked name marks its
+/// typed cell stale. Attribute operations MUST use the methods below.
 #[derive(Debug, Default, Clone)]
 pub struct VarTable {
     values: HashMap<String, String>,
@@ -141,6 +144,22 @@ pub struct VarTable {
     /// structured store). Readers consult it before trusting a typed cell;
     /// see `take_array_cells_dirty`.
     array_cells_dirty: bool,
+    /// Names with a live typed cell in the executor's structured store
+    /// (`shell_state.variables`). Only tracked names participate in the
+    /// per-name freshness protocol; untracked writes skip the stale set
+    /// entirely so marker/housekeeping keys never pollute it.
+    tracked: HashSet<String>,
+    /// Tracked names with an unsynced mirror write pending. A name is
+    /// fresh when it is tracked and absent here (plus epoch equality, see
+    /// below). Cleared per name by `mark_cell_synced`.
+    stale: HashSet<String>,
+    /// Per-name mirror-write epoch, bumped by every choked write to a
+    /// tracked name. Lets read gates compare versions instead of only set
+    /// membership (P1b/P1c).
+    mirror_epoch: HashMap<String, u64>,
+    /// Epoch the typed cell was last synced at (P1b sync helpers record
+    /// here via `mark_cell_synced`).
+    synced_epoch: HashMap<String, u64>,
 }
 
 impl<'a> IntoIterator for &'a VarTable {
@@ -158,11 +177,8 @@ impl Deref for VarTable {
     }
 }
 
-impl DerefMut for VarTable {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
-    }
-}
+// NOTE: no `DerefMut` by design (P1a dirty choke-point). Mutable access
+// goes through the inherent methods below so every write is observed.
 
 impl From<HashMap<String, String>> for VarTable {
     fn from(values: HashMap<String, String>) -> Self {
@@ -170,6 +186,10 @@ impl From<HashMap<String, String>> for VarTable {
             values,
             attrs: HashMap::new(),
             array_cells_dirty: false,
+            tracked: HashSet::new(),
+            stale: HashSet::new(),
+            mirror_epoch: HashMap::new(),
+            synced_epoch: HashMap::new(),
         };
         table.import_attr_strings();
         table
@@ -182,6 +202,127 @@ impl VarTable {
     /// The strings stay in `values` — they are the transport encoding.
     pub(crate) fn from_values(values: HashMap<String, String>) -> Self {
         VarTable::from(values)
+    }
+
+    // ---- P1a dirty choke-point: every mirror write observes here. ----
+
+    /// Record a mirror write to `name`: when the name has a live typed
+    /// cell, mark it stale and bump its mirror epoch. Untracked names are
+    /// a no-op beyond this call (the global `array_cells_dirty` bit keeps
+    /// its existing owners and semantics; P1b wires the sync helpers to
+    /// the per-name protocol).
+    pub(crate) fn note_mirror_write(&mut self, name: &str) {
+        if !self.tracked.contains(name) {
+            return;
+        }
+        self.stale.insert(name.to_string());
+        self.mirror_epoch
+            .entry(name.to_string())
+            .and_modify(|epoch| *epoch = epoch.wrapping_add(1))
+            .or_insert(1);
+    }
+
+    /// Mirror `HashMap::insert` through the choke-point.
+    pub(crate) fn insert(&mut self, key: String, value: String) -> Option<String> {
+        self.note_mirror_write(&key);
+        self.values.insert(key, value)
+    }
+
+    /// Mirror `HashMap::remove` through the choke-point. A mirror removal
+    /// also invalidates the typed cell (the verifier skips absent mirrors,
+    /// but the read gates must not trust a cell with no mirror behind it).
+    pub(crate) fn remove(&mut self, key: &str) -> Option<String> {
+        self.note_mirror_write(key);
+        self.values.remove(key)
+    }
+
+    /// Mirror `HashMap::get_mut` through the choke-point. Conservative:
+    /// the returned reference can mutate without further observation, so
+    /// the name is marked at call time (all current call sites mutate).
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut String> {
+        self.note_mirror_write(key);
+        self.values.get_mut(key)
+    }
+
+    /// Mirror `HashMap::entry` through the choke-point. Conservative like
+    /// `get_mut`: a tracked key is marked at call time, so any subsequent
+    /// `or_insert`/`and_modify` mutation is already observed. Returns the
+    /// plain `HashMap` entry so all existing combinators keep working.
+    pub(crate) fn entry(
+        &mut self,
+        key: String,
+    ) -> std::collections::hash_map::Entry<'_, String, String> {
+        self.note_mirror_write(&key);
+        self.values.entry(key)
+    }
+
+    /// Mirror `HashMap::retain` through the choke-point. The predicate
+    /// receives `(&String, &mut String)` exactly as before and may mutate
+    /// values in place, so every tracked name present before the call is
+    /// marked afterwards (current call sites only touch `__RUBASH_*`
+    /// housekeeping keys, which are never tracked, so this stays a no-op
+    /// in practice).
+    pub(crate) fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&String, &mut String) -> bool,
+    {
+        if self.tracked.is_empty() {
+            self.values.retain(f);
+            return;
+        }
+        let maybe_touched: Vec<String> = self
+            .tracked
+            .iter()
+            .filter(|name| self.values.contains_key(*name))
+            .cloned()
+            .collect();
+        self.values.retain(f);
+        for name in maybe_touched {
+            self.note_mirror_write(&name);
+        }
+    }
+
+    // ---- Per-name freshness protocol (read gates consume this in P1c). ----
+
+    /// Register a live typed cell for `name`. Starts fresh at the current
+    /// mirror epoch (a just-created cell agrees with the mirror by
+    /// construction; the writer synced it).
+    pub(crate) fn track_cell(&mut self, name: &str) {
+        self.tracked.insert(name.to_string());
+        self.stale.remove(name);
+        let mirror = self.mirror_epoch.get(name).copied().unwrap_or(0);
+        self.synced_epoch.insert(name.to_string(), mirror);
+    }
+
+    /// Drop all per-name state for `name` (typed cell destroyed).
+    pub(crate) fn untrack_cell(&mut self, name: &str) {
+        self.tracked.remove(name);
+        self.stale.remove(name);
+        self.mirror_epoch.remove(name);
+        self.synced_epoch.remove(name);
+    }
+
+    /// Record that the typed cell was (re)synced with the mirror: clears
+    /// the stale mark and pins the synced epoch to the current mirror
+    /// epoch. No-op for untracked names.
+    pub(crate) fn mark_cell_synced(&mut self, name: &str) {
+        if !self.tracked.contains(name) {
+            return;
+        }
+        self.stale.remove(name);
+        let mirror = self.mirror_epoch.get(name).copied().unwrap_or(0);
+        self.synced_epoch.insert(name.to_string(), mirror);
+    }
+
+    /// Whether the typed cell for `name` may be trusted: tracked, not
+    /// stale, and epochs equal. Untracked names report stale (`false`) so
+    /// read gates fall through to the mirror path.
+    pub(crate) fn cell_is_fresh(&self, name: &str) -> bool {
+        if !self.tracked.contains(name) || self.stale.contains(name) {
+            return false;
+        }
+        self.mirror_epoch.get(name).copied().unwrap_or(0)
+            == self.synced_epoch.get(name).copied().unwrap_or(0)
     }
 
     fn import_attr_strings(&mut self) {
@@ -307,6 +448,7 @@ impl VarTable {
             .map(|name| name.as_ref().to_string())
             .filter(|name| !name.is_empty())
             .collect();
+        self.note_mirror_write(key);
         if names.is_empty() {
             self.values.remove(key);
         } else {
@@ -387,6 +529,7 @@ impl VarTable {
     /// the flags map cannot diverge; `None` means the key was absent.
     pub(crate) fn restore_attr_string(&mut self, key: &str, value: Option<String>) {
         let Some(value) = value else {
+            self.note_mirror_write(key);
             self.values.remove(key);
             if VarAttrs::default().flag(key).is_some() {
                 let flagged: Vec<String> = self
@@ -452,6 +595,7 @@ impl VarTable {
         }
         let mut names = self.string_marked_names(key);
         names.push(name.to_string());
+        self.note_mirror_write(key);
         self.values
             .insert(key.to_string(), names.join(DATA_DOLLAR_STR));
     }
@@ -467,6 +611,7 @@ impl VarTable {
             .collect();
         // An emptied list drops the key (unset.rs's whole-family unbind
         // removes the entry; no consumer distinguishes "" from absent).
+        self.note_mirror_write(key);
         if names.is_empty() {
             self.values.remove(key);
         } else {
@@ -614,5 +759,68 @@ mod tests {
         assert!(t.array_cells_dirty());
         t.clear_array_cells_dirty();
         assert!(!t.array_cells_dirty());
+    }
+
+    #[test]
+    fn untracked_writes_stay_out_of_stale_set() {
+        let mut t = table();
+        t.insert("PWD".to_string(), "/tmp".to_string());
+        t.remove("OLDPWD");
+        let _ = t.get_mut("PWD");
+        t.entry("HOME".to_string()).or_insert("/root".to_string());
+        t.retain(|_, _| true);
+        assert!(!t.cell_is_fresh("PWD"));
+        assert!(!t.cell_is_fresh("HOME"));
+    }
+
+    #[test]
+    fn tracked_write_marks_stale_and_sync_clears() {
+        let mut t = table();
+        t.insert("a".to_string(), "(1 2)".to_string());
+        // Untracked: no freshness either way.
+        assert!(!t.cell_is_fresh("a"));
+        t.track_cell("a");
+        assert!(t.cell_is_fresh("a"));
+        // Each choked write path marks stale + bumps the epoch.
+        t.insert("a".to_string(), "(1 2 3)".to_string());
+        assert!(!t.cell_is_fresh("a"));
+        t.mark_cell_synced("a");
+        assert!(t.cell_is_fresh("a"));
+        t.remove("a");
+        assert!(!t.cell_is_fresh("a"));
+        t.mark_cell_synced("a");
+        assert!(t.cell_is_fresh("a"));
+        t.untrack_cell("a");
+        assert!(!t.cell_is_fresh("a"));
+    }
+
+    #[test]
+    fn get_mut_entry_retain_mark_tracked_stale() {
+        let mut t = table();
+        t.insert("a".to_string(), "(1)".to_string());
+        t.insert("b".to_string(), "(2)".to_string());
+        t.track_cell("a");
+        t.track_cell("b");
+        assert!(t.cell_is_fresh("a"));
+        if let Some(slot) = t.get_mut("a") {
+            slot.push_str("x");
+        }
+        assert!(!t.cell_is_fresh("a"));
+        assert!(t.cell_is_fresh("b"));
+        t.mark_cell_synced("a");
+        t.entry("b".to_string()).or_insert("v".to_string());
+        assert!(!t.cell_is_fresh("b"));
+        assert!(t.cell_is_fresh("a"));
+        t.mark_cell_synced("b");
+        t.retain(|_, _| true);
+        assert!(!t.cell_is_fresh("a"));
+        assert!(!t.cell_is_fresh("b"));
+        // Epochs advance monotonically per write; sync pins them equal.
+        t.mark_cell_synced("a");
+        t.mark_cell_synced("b");
+        assert!(t.cell_is_fresh("a"));
+        assert!(t.cell_is_fresh("b"));
+        t.untrack_cell("a");
+        t.untrack_cell("b");
     }
 }

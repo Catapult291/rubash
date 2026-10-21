@@ -9,12 +9,12 @@ mod stack;
 pub(crate) use stack::{load_stack, save_stack, set_stack_value, stack_value, stack_words};
 
 use crate::executor::types::READONLY_VARS;
+use crate::shell::var_table::VarTable;
 use parse::{parse_popd_operand, parse_pushd_operand, PopdOperand, PushdOperand};
 use stack::{
     is_stack_index, logical_dir_exists, normalize_stack_dir, resolved_index, stack_index,
     strip_double_dash,
 };
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 const EXECUTION_SUCCESS: i32 = 0;
@@ -532,7 +532,7 @@ enum PopdChdir {
 /// failed (diagnostic already printed).
 fn popd_chdir<E: Write>(
     target: &str,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stderr: &mut E,
     diagnostic_prefix: &str,
 ) -> io::Result<Option<PopdChdir>> {

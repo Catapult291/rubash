@@ -3,6 +3,7 @@
 //! GNU Bash source ownership:
 //! - builtins/umask.def (`umask_builtin`)
 
+use crate::shell::var_table::VarTable;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -23,7 +24,7 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
     "rubash: ".to_string()
 }
 
-pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(args: &[String], env_vars: &mut VarTable) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     execute_with_io(args, env_vars, &mut stdout, &mut stderr)
@@ -31,7 +32,7 @@ pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::R
 
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -297,7 +298,10 @@ mod tests {
     use super::*;
 
     fn run(mode: &str, initial: &str) -> (i32, String, String) {
-        let mut env = HashMap::from([(String::from("__RUBASH_UMASK"), initial.to_string())]);
+        let mut env = VarTable::from(HashMap::from([(
+            String::from("__RUBASH_UMASK"),
+            initial.to_string(),
+        )]));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let status = execute_with_io(
@@ -389,7 +393,7 @@ mod tests {
 
     #[test]
     fn invalid_option_is_usage_error() {
-        let mut env = HashMap::new();
+        let mut env = VarTable::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let status =
@@ -403,7 +407,7 @@ mod tests {
 
     #[test]
     fn invalid_modes_keep_bash_error_categories() {
-        let mut env = HashMap::new();
+        let mut env = VarTable::default();
         for (mode, expected) in [
             ("09", "rubash: umask: 09: octal number out of range\n"),
             (
