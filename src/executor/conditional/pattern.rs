@@ -1,14 +1,21 @@
 pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bool {
+    // The byte-spelling gate runs BEFORE the pattern-only fast paths:
+    // literal_pattern_equality and simple_glob_matches admit on
+    // `pattern.bytes()` alone, and every byte of `__RUBASH_CSB1_xx;` is
+    // printable ASCII with no glob syntax, so a pattern carrying a comsub
+    // payload prefix (`[[ $v == *$(printf '\001')* ]]`, rubash#729 rework)
+    // would be verdicted against the word's raw spelling and never reach
+    // the normalization that decodes the payload.
+    if sides_need_byte_char_matching(pattern, word) {
+        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
+        let word: Vec<char> = flatten_word_to_byte_chars(word);
+        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, false) {
         return verdict;
-    }
-    if sides_need_byte_char_matching(pattern, word) {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
-        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, false);
     }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
@@ -16,16 +23,16 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
 }
 
 pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
+    if sides_need_byte_char_matching(pattern, word) {
+        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
+        let word: Vec<char> = flatten_word_to_byte_chars(word);
+        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
+    }
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
         return verdict;
     }
     if let Some(verdict) = simple_glob_matches(pattern, word, true) {
         return verdict;
-    }
-    if sides_need_byte_char_matching(pattern, word) {
-        let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
-        let word: Vec<char> = flatten_word_to_byte_chars(word);
-        return case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true);
     }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();

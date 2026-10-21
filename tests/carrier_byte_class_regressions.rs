@@ -187,3 +187,31 @@ fn user_e401_not_stripped_by_guard_paths() {
     let script = "x=$'\\uE401'; y=${x}; [ -n \"$y\" ] && echo kept";
     assert_eq!(rubash_stdout(script), "kept\n");
 }
+
+/// PR #821 rework: an UNQUOTED command substitution inside a `[[ == ]]`
+/// glob pattern arrives CSB1-protected (`*__RUBASH_CSB1_01;*`), which is
+/// all printable ASCII — literal_pattern_equality / simple_glob_matches
+/// admitted it on `pattern.bytes()` alone and verdicted before the
+/// byte-spelling normalization gate ran. sides_need_byte_char_matching
+/// must run first so the payload decodes to the byte-char the word side
+/// carries (GNU bash 5.3.0: the `==` forms below are matches).
+#[test]
+fn unquoted_comsub_byte_in_conditional_pattern() {
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; [[ $v == *$(printf '\\001')* ]]; echo $?"),
+        "0\n"
+    );
+    // Variable-carried spelling (the byte rides a word, not the pattern).
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; x=$(printf '\\001'); [[ $v == *$x* ]]; echo $?"),
+        "0\n"
+    );
+    // `?` measures one logical byte: a pair-encoded byte is two transport
+    // chars but one byte-char after normalization (GNU: match).
+    assert_eq!(rubash_stdout("x=$'\\x11'; [[ $x == ? ]]; echo $?"), "0\n");
+    // Inequality form sees the same gate ordering.
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; [[ $v != *$(printf '\\001')* ]]; echo $?"),
+        "1\n"
+    );
+}
