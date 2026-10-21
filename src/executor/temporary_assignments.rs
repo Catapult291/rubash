@@ -466,6 +466,22 @@ impl Executor {
             } else {
                 entries.push((key, element));
             }
+            // Typed-cell sync (assoc fast path), symmetric with the indexed
+            // leg below: `entries` is the post-write key list this render
+            // folds, so the structured assoc cell is synced from the same
+            // list. GNU keeps ONE assoc table — variables.c:3266-3267
+            // bind_variable (nameref cell -> assign_array_element) ->
+            // arrayfunc.c:262 bind_array_variable -> assoc.c:68 assoc_insert
+            // overwrites the key in place — so the cell can never hold a
+            // stale element. The complete-or-absent invariant is what lets
+            // the typed-cell read fast path (executor/arrays/executor.rs:194,
+            // GNU assoc.c:120 assoc_reference) trust the cell; without this
+            // sync a stale typed cell shadows the mirror (rubash#961).
+            crate::executor::arrays::sync_typed_assoc_array(
+                &mut self.shell_state.variables,
+                elem_base,
+                &entries,
+            );
             let new_value = format!(
                 "({})",
                 entries
@@ -483,6 +499,7 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .insert(elem_base.to_string(), new_value);
+            self.shell_state.env_vars.clear_array_cells_dirty();
             self.exit_code = 0;
             return true;
         }
