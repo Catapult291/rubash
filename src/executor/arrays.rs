@@ -20,6 +20,7 @@ pub(super) use storage::{
     parse_expanded_array_subscript, quote_array_value, resolve_indexed_array_subscript,
     store_indexed_array, store_indexed_array_state, sync_typed_assoc_array,
     sync_typed_indexed_array, sync_typed_indexed_element, upsert_typed_assoc_element,
+    AssocElementUpsert,
 };
 pub(crate) use storage::{
     drop_typed_assoc_array, drop_typed_indexed_array, replace_typed_indexed_array,

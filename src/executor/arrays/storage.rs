@@ -512,30 +512,58 @@ pub(crate) fn sync_typed_assoc_array(
     }
 }
 
+/// Outcome of a fast-append typed-cell upsert: the caller uses it to schedule
+/// the next canonical render without over-compacting a growing fill.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AssocElementUpsert {
+    /// The key was absent: the mirror gained a NEW canonical segment, so the
+    /// append produced no duplicate and the mirror is still compact.
+    NewKey,
+    /// The key already existed: the mirror now carries a duplicate segment
+    /// that a canonical render must eventually fold.
+    Overwrote,
+    /// No synced assoc cell to update (absent, wrong shape, or readonly): the
+    /// mirror grew but the cell did not, so the caller must force a canonical
+    /// re-sync.
+    NoCell,
+}
+
 /// Fast-append assoc write path (the rubash#618 budget scheme): the mirror
 /// grows by one `[k]=v` segment without a re-parse, so there is no canonical
 /// entry list to sync from. Upsert in place when the cell is already an assoc
-/// cell (the same O(1) `assoc_insert` shape GNU uses); leave a missing or
-/// wrong-shape cell alone — the next canonical write re-syncs it. A readonly
-/// cell would go stale behind the mirror write, so drop it instead.
+/// cell (the same O(1) `assoc_insert` shape GNU uses); report a missing or
+/// wrong-shape cell to the caller — the next canonical write re-syncs it. A
+/// readonly cell would go stale behind the mirror write, so drop it instead.
 pub(crate) fn upsert_typed_assoc_element(
     store: &mut crate::shell::VariableStore,
     name: &str,
     key: &str,
     value: &str,
-) {
+) -> AssocElementUpsert {
     let Some(variable) = store.get_mut(name) else {
-        return;
+        return AssocElementUpsert::NoCell;
     };
     if variable.readonly {
         drop_typed_assoc_array(store, name);
-        return;
+        return AssocElementUpsert::NoCell;
     }
-    if matches!(
-        variable.value,
-        crate::shell::ShellValue::AssociativeArray(_)
-    ) {
-        let _ = store.set_associative_element(name, key, value);
+    if let crate::shell::ShellValue::AssociativeArray(entries) = &mut variable.value {
+        // GNU assoc.c assoc_insert: overwrite an existing binding in place.
+        // Reusing the stored key's allocation on the overwrite arm keeps a
+        // same-key burst (the common `m[k]=v` hot shape) from allocating a
+        // fresh key String per write.
+        match entries.get_mut(key) {
+            Some(slot) => {
+                *slot = value.to_string();
+                AssocElementUpsert::Overwrote
+            }
+            None => {
+                entries.insert(key.to_string(), value.to_string());
+                AssocElementUpsert::NewKey
+            }
+        }
+    } else {
+        AssocElementUpsert::NoCell
     }
 }
 
@@ -1201,5 +1229,39 @@ mod tests {
         }
         let rendered = format_indexed_array_storage(entries);
         assert_eq!(table.get("m").map(String::as_str), Some(rendered.as_str()));
+    }
+
+    #[test]
+    fn assoc_upsert_reports_new_overwrite_and_missing_cell() {
+        // The fast-append budget spends only on an OVERWRITE (a new key adds no
+        // duplicate segment, so a fill stays compact), so the upsert outcome
+        // must distinguish the two. A cell the append cannot sync reports
+        // NoCell so the caller forces a canonical re-sync.
+        let mut store = VariableStore::default();
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NoCell,
+            "no cell yet"
+        );
+        store.set_scalar("A", "").unwrap();
+        store.get_mut("A").unwrap().value =
+            ShellValue::AssociativeArray(std::collections::HashMap::new());
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NewKey
+        );
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v2"),
+            AssocElementUpsert::Overwrote
+        );
+        assert_eq!(store.associative_element("A", "k"), Some("v2"));
+        // A readonly cell is dropped behind the mirror write and reports
+        // NoCell so reads fall back and the next canonical write re-syncs.
+        store.get_mut("A").unwrap().readonly = true;
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v3"),
+            AssocElementUpsert::NoCell
+        );
+        assert!(store.get("A").is_none(), "readonly cell dropped");
     }
 }

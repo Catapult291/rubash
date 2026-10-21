@@ -152,15 +152,31 @@ impl Executor {
         // produce. E400-aware: user data U+E401 rides the E400 pair and
         // survives (rubash#735; issue #734 item 2 — the marker leaked into
         // `declare -p` through the stored key).
-        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(
-            &crate::executor::markers::restore_bare_sentinels(
-                &expanded.replace(crate::executor::markers::IFS_GLUE, ""),
-                // E309 is registry-zone — a typed `$'\uE309'` arrives
-                // E400-escaped and is user data; strip only the BARE tag
-                // (rubash#840).
-                &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
-            ),
-        );
+        //
+        // rubash#618 fast lane: each pass is a marker strip whose only effect
+        // on a marker-free value is a fresh allocation (str::replace always
+        // copies; restore_bare_sentinels and strip_ansi_c_ifs_guard are
+        // identity when their sentinel is absent). A plain `k$i` key carries
+        // no marker, so test the three sentinels first and keep the expanded
+        // value in place — GNU's dequote walks a marker-free C string without
+        // copying (subst.c dequote_string). The passes never introduce one
+        // another's sentinel, so the guarded chain is byte-identical.
+        let expanded = if expanded.contains(crate::executor::markers::IFS_GLUE)
+            || expanded.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG)
+            || expanded.contains(crate::executor::markers::ANSI_C_IFS_GUARD)
+        {
+            crate::executor::markers::strip_ansi_c_ifs_guard(
+                &crate::executor::markers::restore_bare_sentinels(
+                    &expanded.replace(crate::executor::markers::IFS_GLUE, ""),
+                    // E309 is registry-zone — a typed `$'\uE309'` arrives
+                    // E400-escaped and is user data; strip only the BARE tag
+                    // (rubash#840).
+                    &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
+                ),
+            )
+        } else {
+            expanded
+        };
         // A leading unquoted `~` tilde-expands; `x~` and `a:~` stay literal
         // and `"~"` never reaches here (its first character is the quote).
         if raw.starts_with('~') {

@@ -26,6 +26,17 @@ impl Executor {
         if !associative {
             return None;
         }
+        // A subscript with no expansion syntax and no `[`/`]`/`=` — no `$`,
+        // backtick, tilde, quote, or backslash — is literal data, so
+        // expand_subscript_string (subst.c:11063) returns it unchanged and the
+        // equality check below (`key == raw_subscript &&
+        // !key.contains(['[', ']', '='])`) is provably true: the ordinary word
+        // expansion already carries it verbatim. Skip the side-effect-free pass
+        // (rubash#618 fast lane). Whitelist: any of those bytes falls through to
+        // the full path.
+        if !raw_subscript.contains(['$', '`', '~', '\'', '"', '\\', '[', ']', '=']) {
+            return None;
+        }
         // Expand only for the associative branch: expand_subscript_string
         // runs command substitutions, and an indexed subscript must see its
         // single expansion inside eval_indexed_subscript below — expanding
@@ -337,19 +348,25 @@ impl Executor {
                 } else {
                     value.to_string()
                 };
-                let mut fast = false;
-                if let Some(budget) = self.shell_state.array_compact_budget.get_mut(name) {
-                    if *budget > 0 {
-                        *budget -= 1;
-                        fast = true;
-                    }
-                }
+                // rubash#618 budget: a fast append is scheduled by the
+                // per-variable budget, but the budget is spent only by an
+                // OVERWRITE. A new key adds a segment the mirror did not
+                // already carry, so the mirror stays canonical and needs no
+                // compaction — a pure fill therefore never pays a canonical
+                // re-render, while an overwrite burst still folds through one
+                // every `budget` writes. A cell the append could not sync
+                // (absent / wrong shape / readonly) drops the budget so the
+                // very next write rebuilds it on the canonical path.
+                let fast = self
+                    .shell_state
+                    .array_compact_budget
+                    .get(name)
+                    .is_some_and(|budget| *budget > 0);
                 if fast {
-                    let segment = super::assignment_helpers::assoc_element_segment(&key, &stored);
                     let appended = match self.shell_state.env_vars.get_mut(name) {
-                        Some(storage) => {
-                            super::assignment_helpers::assoc_storage_append(storage, &segment)
-                        }
+                        Some(storage) => super::assignment_helpers::assoc_storage_append_element(
+                            storage, &key, &stored,
+                        ),
                         None => false,
                     };
                     if appended {
@@ -358,14 +375,27 @@ impl Executor {
                         // Typed-cell sync (assoc read fast path): the mirror
                         // grew by one segment without a re-parse, so upsert
                         // the binding in place — GNU assoc.c `assoc_insert`
-                        // is itself an O(1) hash op. A missing cell stays
-                        // missing; the canonical path below re-syncs it.
-                        upsert_typed_assoc_element(
+                        // is itself an O(1) hash op.
+                        match upsert_typed_assoc_element(
                             &mut self.shell_state.variables,
                             name,
                             &key,
                             &stored,
-                        );
+                        ) {
+                            AssocElementUpsert::NewKey => {}
+                            AssocElementUpsert::Overwrote => {
+                                if let Some(budget) =
+                                    self.shell_state.array_compact_budget.get_mut(name)
+                                {
+                                    *budget = budget.saturating_sub(1);
+                                }
+                            }
+                            AssocElementUpsert::NoCell => {
+                                // Mirror grew without a synced cell: force the
+                                // canonical path next time so it re-syncs.
+                                self.shell_state.array_compact_budget.remove(name);
+                            }
+                        }
                         unmark_env_name(&mut self.shell_state.env_vars, DECLARED_UNSET_VARS, name);
                         self.exit_code = 0;
                         return true;
