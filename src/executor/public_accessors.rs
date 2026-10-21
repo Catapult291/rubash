@@ -1267,7 +1267,16 @@ impl Executor {
         // (`'[[' '-n' '$unset' ']]'`); pipelines record the full
         // `a | b` text. bash_command_source_text is that renderer;
         // bash_command_text only knows simple commands.
-        let command = bash_command_source_text(cmd);
+        // GNU `case` is the exception: execute_cmd.c:3655 prints only the
+        // HEAD (`print_case_command_head` -> `case WORD in `), never the
+        // clause list, so `$BASH_COMMAND` during the case word expansion is
+        // the head. Rendering all N arms per execution here was also the
+        // dominant per-arm cost of a literal-arm `case` loop.
+        let command = if let Some(case_command) = &cmd.case_command {
+            crate::executor::command_text::case_command_head_source_text(case_command)
+        } else {
+            bash_command_source_text(cmd)
+        };
         // Same equality gate as the line stamps: GNU keeps
         // the_printed_command in a C global, so recording it is a pointer
         // store; inserting a byte-identical value into both env keys for

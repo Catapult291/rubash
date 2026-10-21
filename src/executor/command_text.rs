@@ -689,6 +689,27 @@ fn command_body_source_text(
     }
 }
 
+/// GNU print_cmd.c:731-739 `print_case_command_head`: the `case` command's
+/// printed form — `the_printed_command` / `the_printed_command_except_trap`,
+/// which is what `$BASH_COMMAND` exposes — is the HEAD ONLY:
+/// `case WORD in ` with WORD still carrying its source quote characters
+/// (print_cmd.c:735-738 prints `case_command->word->word`; execute_cmd.c:3655
+/// resets `command_string_index` and prints the head before expanding the
+/// word, so a `${BASH_COMMAND}` inside the case word sees exactly this text —
+/// probe: `case "${BASH_COMMAND}" in 'case "${BASH_COMMAND}" in '*)` matches
+/// under GNU bash 5.3). The clause list belongs to the JOB's `command` field
+/// (jobs.c make_job -> print_command), which rubash obtains separately via
+/// [`case_command_source_text`] at background registration — not to the
+/// per-execution printed command.
+pub(in crate::executor) fn case_command_head_source_text(case_command: &CaseCommand) -> String {
+    let raw_word = if case_command.word_metadata.raw.is_empty() {
+        case_command.word.as_str()
+    } else {
+        case_command.word_metadata.raw.as_str()
+    };
+    format!("case {raw_word} in ")
+}
+
 fn case_command_source_text(case_command: &CaseCommand) -> String {
     let mut text = format!("case {} in", case_command.word);
     for clause in &case_command.clauses {

@@ -3147,7 +3147,19 @@ impl Executor {
         // (print_case_command_head, print_cmd.c:731 -> `case WORD in `) and
         // run_debug_trap fires before the word is expanded, so the trap sees
         // the raw unexpanded word — `case "$v" in ` keeps the quotes.
-        if self.debug_trap_in_scope() {
+        // GNU's run_debug_trap (trap.c) is a no-op when no DEBUG action is
+        // armed; gate the head-text `format!` on that presence test so the
+        // common no-trap loop does not allocate a String per `case` (same
+        // folded admission as the ast_exec per-command DEBUG preamble,
+        // rubash#186).
+        if self.debug_trap_in_scope()
+            && !self.debug_trap_running
+            && crate::builtins::trap::has_active_trap_action(
+                &self.shell_state.env_vars,
+                "DEBUG",
+                "__RUBASH_TRAP_DEBUG",
+            )
+        {
             let raw_word = if case_command.word_metadata.raw.is_empty() {
                 case_command.word.as_str()
             } else {
@@ -3205,8 +3217,10 @@ impl Executor {
         // it for every arm's strmatch at 3736. Stage its `Vec<char>` once
         // here so the N-arm loop below does not re-collect it per candidate;
         // the pattern side still stages per arm (it differs per arm) while
-        // the literal / simple-glob fast paths stay borrow-only.
-        let word_chars: Vec<char> = word.chars().collect();
+        // the literal / simple-glob fast paths stay borrow-only. The cell is
+        // LAZY: a loop of static literal arms (GNU strmatch's no-staging
+        // path) never builds it.
+        let mut word_chars: Option<Vec<char>> = None;
         let mut index = 0;
         while let Some(clause) = case_command.clauses.get(index) {
             let matched = fall_through
@@ -3218,19 +3232,28 @@ impl Executor {
                         return false;
                     }
                     if case_pattern_has_extglob(&stripped) {
+                        // Extglob staging needs the word chars immediately
+                        // (no literal fast path in extglob_matches_at); seed
+                        // the lazy cell here.
+                        let word_chars =
+                            word_chars.get_or_insert_with(|| word.chars().collect());
                         if nocasematch {
                             crate::executor::conditional::extglob_case_pattern_matches_nocase_with_word_chars(
-                                &stripped, &word_chars,
+                                &stripped, word_chars,
                             )
                         } else {
                             crate::executor::conditional::extglob_case_pattern_matches_with_word_chars(
-                                &stripped, &word_chars,
+                                &stripped, word_chars,
                             )
                         }
                     } else if nocasematch {
-                        case_pattern_matches_nocase_with_word_chars(&stripped, &word, &word_chars)
+                        case_pattern_matches_nocase_with_word_chars(
+                            &stripped,
+                            &word,
+                            &mut word_chars,
+                        )
                     } else {
-                        case_pattern_matches_with_word_chars(&stripped, &word, &word_chars)
+                        case_pattern_matches_with_word_chars(&stripped, &word, &mut word_chars)
                     }
                 });
             self.abandon_on_arithmetic_expansion_error()?;
@@ -3314,14 +3337,15 @@ impl Executor {
         // application only add per-execution churn; keep the ambient line
         // binding (line_number = case_command->line) semantics intact.
         // RESTRICTED_SHELL (#804): refuse before any splice or creation.
-        if compound_command_has_redirects(cmd) {
+        let has_redirects = compound_command_has_redirects(cmd);
+        if has_redirects {
             if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
                 self.write_default_stderr(&message)?;
                 self.exit_code = 1;
                 return Ok(());
             }
         }
-        if !compound_command_has_redirects(cmd) {
+        if !has_redirects {
             let case_line = cmd.line;
             return self.with_ambient_line(case_line, |executor| {
                 executor.execute_case_command(case_command)
