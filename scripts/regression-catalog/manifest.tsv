@@ -51,3 +51,5 @@ issue-871	871	must-match	printf inf/nan prefix subclass (infin/nann/infx/nanx) p
 issue-876	876	must-match	mark_quoted_ifs_from_raw byte-offset vs char-count on multibyte leads — fixed (manifest row landed late under #746)
 issue-879	879	must-match	printf %f/%e/%g long-double expansion (1e999 -> inf on the arm) + %a/%A mantissa style — verified byte-identical to GNU; promoted from diverges per #949 (pinned also in tests/issue879_printf_longdouble_regressions.rs)
 issue-948	948	must-match	-c operand marker-zone entry escape (rubash#948): respawn double-escape exclusion only; typed __RUBASH_CSB1_/U+E319 literals pass verbatim via -c
+carrier-729-cntrl	729	must-match	byte-char classes + removal/patsub on carried bytes (746 case 729.1/729.2)
+carrier-735-escape	735	must-match	user E4xx data E400 round-trip vs #729 normalization (746 case 735.1/735.2)

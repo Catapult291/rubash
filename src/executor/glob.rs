@@ -1819,6 +1819,29 @@ fn alt_matches_slice(
 }
 
 fn chars_match(pattern: char, candidate: char, nocase: bool) -> bool {
+    // Byte-chars (U+E100+byte, a carried raw byte) compare as their byte
+    // value (rubash#729 — glob.c matches raw bytes; sm_loop.c GLOBCHAR is
+    // compared byte-wise). PUA marker codepoints exceed 0xFF and can never
+    // equal a carried byte, so #735 E400-escaped user data stays data.
+    let base = crate::executor::markers::BYTE_CHAR_BASE;
+    let pattern_byte = (pattern as u32)
+        .checked_sub(base)
+        .filter(|offset| *offset < 0x100);
+    let candidate_byte = (candidate as u32)
+        .checked_sub(base)
+        .filter(|offset| *offset < 0x100);
+    if let (Some(p), Some(c)) = (pattern_byte, candidate_byte) {
+        return p == c;
+    }
+    if let Some(p) = pattern_byte {
+        return p as u32 == candidate as u32;
+    }
+    if let Some(c) = candidate_byte {
+        // Only an ASCII literal can name the same byte (GNU compares
+        // bytes; a multibyte literal like U+00E9 is bytes C3 A9 in GNU and
+        // never equals a lone carried 0xE9).
+        return pattern.is_ascii() && pattern as u32 == c as u32;
+    }
     if nocase {
         pattern.eq_ignore_ascii_case(&candidate)
     } else {
