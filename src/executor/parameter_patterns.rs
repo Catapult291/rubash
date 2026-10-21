@@ -434,6 +434,16 @@ impl Executor {
             } else {
                 entries.push((key, value));
             }
+            // Typed-cell sync (rubash#616 follow-up): `entries` is the exact
+            // key list the render folds, so the structured assoc cell is
+            // synced from the same list before the render consumes it. GNU
+            // subst.c:7966 parameter_brace_expand_rhs runs the `${A[k]=v}`
+            // assignment through subst.c:8145 assign_array_element ->
+            // arrayfunc.c:262 bind_array_variable -> assoc.c:68 assoc_insert,
+            // one assoc table, so the O(1) `${A[k]}` / `${#A[@]}` cell
+            // (assoc.c:120 assoc_reference) can never stay stale behind the
+            // mirror.
+            sync_typed_assoc_array(&mut self.shell_state.variables, array_name, &entries);
             self.shell_state
                 .env_vars
                 .insert(array_name.to_string(), format_assoc_storage(entries));
@@ -482,6 +492,16 @@ impl Executor {
             .unwrap_or_default();
         let mut entries = indexed_array_entries(&current);
         entries.insert(index, value);
+        // Typed-cell sync (rubash#616 follow-up), symmetric with the assoc
+        // leg above: GNU subst.c:7966 parameter_brace_expand_rhs runs the
+        // `${a[i]=v}` assignment through subst.c:8145 assign_array_element ->
+        // arrayfunc.c:334 assign_array_element -> arrayfunc.c:262
+        // bind_array_variable -> array.c array_insert, so the ARRAY object
+        // the O(1) `${#a[@]}` / `${a[i]}` fast paths read (subst.c:7533
+        // array_num_elements, array.h:121 num_elements) is the same one this
+        // mirror render projects. Without the sync the structured cell kept
+        // the pre-assignment length and `${#a[@]}` reported the old count.
+        sync_typed_indexed_array(&mut self.shell_state.variables, array_name, &entries);
         self.shell_state.env_vars.insert(
             array_name.to_string(),
             format_indexed_array_storage(entries),

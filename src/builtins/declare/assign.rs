@@ -4,9 +4,9 @@ use super::diagnostic::diagnostic_prefix;
 use super::marks::{mark_typed, marked_vars, unmark_typed};
 use super::names::valid_nameref_value;
 use super::storage::{
-    append_array_value, append_assoc_value, eval_arith_value, format_assoc_storage,
-    format_indexed_array_storage, indexed_array_entries, is_noassign_bash_array,
-    parse_array_tokens, parse_assoc_words, quote_assoc_storage_value,
+    append_array_value, append_assoc_value, append_baseline_mirror, eval_arith_value,
+    format_assoc_storage, format_indexed_array_storage, indexed_array_entries,
+    is_noassign_bash_array, parse_array_tokens, parse_assoc_words, quote_assoc_storage_value,
 };
 use super::{
     ARRAY_VARS, ASSOC_128_VARS, ASSOC_VARS, COMPOUND_ASSIGNMENT_MARKER, DECLARED_UNSET_VARS,
@@ -533,7 +533,20 @@ where
                 || current.starts_with(STORAGE_WORD_PREFIX)
                 || current.starts_with('(') && current.ends_with(')')
             {
-                match append_array_value(&current, value, integer, variables, oob_word) {
+                // GNU arrayfunc.c:710-743 assign_compound_array_list seeds
+                // the append from the live ARRAY object; a declared-but-unset
+                // array is empty, while an existing scalar (even "") is an
+                // implicit array that keeps element 0. The branch condition
+                // above still sees the raw mirror, so the empty-object
+                // baseline is applied only to the element list handed to
+                // append_array_value. An ABSENT variable is the empty object
+                // too, so pass None rather than "". See append_baseline_mirror.
+                let present = variables.contains_key(var_name);
+                let baseline = append_baseline_mirror(
+                    present.then(|| current.as_str()),
+                    variables.is_marked(DECLARED_UNSET_VARS, var_name),
+                );
+                match append_array_value(&baseline, value, integer, variables, oob_word) {
                     Ok(storage) => storage,
                     Err(pattern) => {
                         writeln!(

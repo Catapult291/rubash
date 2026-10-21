@@ -51,7 +51,11 @@ impl Executor {
         // inside the pure builtin (setattr/apply.rs `env_vars.insert`), so
         // refresh the structured cell for assignment operands — a previously
         // typed array must not shadow the new storage (GNU keeps one owner,
-        // bind_variable variables.c:3286).
+        // bind_variable variables.c:3286). The mark-aware dispatch also
+        // covers `export -A A=(...)` / `export -A A+=(...)`: the assoc render
+        // would otherwise leave ShellValue::AssociativeArray stale (the
+        // indexed sync drops no assoc cell), which the command-boundary
+        // verify_typed_cells net catches.
         for arg in &args {
             if let Some((raw, _)) = arg.split_once('=') {
                 let base = raw.trim_end_matches('+');
@@ -60,7 +64,11 @@ impl Executor {
                     continue;
                 }
                 if let Some(mirror) = self.shell_state.env_vars.get(base).cloned() {
-                    sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, &mirror);
+                    } else {
+                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    }
                 }
             }
         }

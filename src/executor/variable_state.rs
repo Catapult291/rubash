@@ -685,4 +685,76 @@ impl Executor {
             let _ = self.shell_state.variables.set(name.to_string(), variable);
         }
     }
+
+    /// Debug-only systemic check of the typed-cell ↔ mirror invariant
+    /// (rubash#616 follow-up): while no unsynced mirror write is pending
+    /// (`VarTable::array_cells_dirty`), every structured `IndexedArray` /
+    /// `AssociativeArray` cell in `shell_state.variables` must equal the
+    /// parse of its rendered mirror projection in `shell_state.env_vars`.
+    ///
+    /// A mismatch means some mirror write path neither synced the typed
+    /// cell nor marked the table dirty — exactly the class of bug the
+    /// per-read `debug_assert_eq!` nets in `arrays/executor.rs` catch one
+    /// element at a time, here caught systemically after every command. A
+    /// dirty table is skipped wholesale: stale cells are legal there by
+    /// contract (the mirror is authoritative until the next sync point).
+    ///
+    /// Cells whose mirror entry is absent are skipped: that is a different
+    /// invariant (mirror removal), not the cell==mirror projection check.
+    ///
+    /// Called at every command boundary in debug builds
+    /// (`command_execute.rs`) and directly by
+    /// `tests/typed_cell_coherence_fuzz.rs`.
+    #[cfg(debug_assertions)]
+    pub fn verify_typed_cells(&self) {
+        if self.shell_state.env_vars.array_cells_dirty() {
+            return;
+        }
+        for (name, variable) in self.shell_state.variables.iter() {
+            match &variable.value {
+                // Most variables are scalars; skip them before the mirror
+                // hash lookup, which would otherwise dominate this
+                // per-command check (a 100k-iteration `while read` loop
+                // calls it 200k times).
+                crate::shell::ShellValue::Scalar(_) => {}
+                crate::shell::ShellValue::IndexedArray(cell) => {
+                    let Some(mirror) = self.shell_state.env_vars.get(name) else {
+                        continue;
+                    };
+                    let parsed = super::arrays::indexed_array_entries_cached(mirror);
+                    // Both maps are key-ascending, so a length check plus a
+                    // pairwise zip is an exact map comparison.
+                    let coherent = cell.len() == parsed.len()
+                        && cell.iter().zip(parsed.iter()).all(
+                            |((cell_index, cell_value), (parsed_index, parsed_value))| {
+                                i64::try_from(*parsed_index)
+                                    .map(|index| index == *cell_index)
+                                    .unwrap_or(false)
+                                    && cell_value == parsed_value
+                            },
+                        );
+                    assert!(
+                        coherent,
+                        "typed indexed cell `{name}` disagrees with its mirror: \
+                         cell={cell:?} mirror_parse={parsed:?} mirror={mirror:?}"
+                    );
+                }
+                crate::shell::ShellValue::AssociativeArray(cell) => {
+                    let Some(mirror) = self.shell_state.env_vars.get(name) else {
+                        continue;
+                    };
+                    let parsed = super::assignment_helpers::assoc_entries_cached(mirror);
+                    let coherent = cell.len() == parsed.len()
+                        && parsed
+                            .iter()
+                            .all(|(key, value)| cell.get(key).is_some_and(|v| v == value));
+                    assert!(
+                        coherent,
+                        "typed assoc cell `{name}` disagrees with its mirror: \
+                         cell={cell:?} mirror_parse={parsed:?} mirror={mirror:?}"
+                    );
+                }
+            }
+        }
+    }
 }

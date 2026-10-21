@@ -63,7 +63,8 @@ impl Executor {
         )?;
         // rubash#616 (1a): `readonly -a name=(...)` rewrites the array mirror
         // inside the pure builtin — refresh the structured cell for
-        // assignment operands (same rule as export above).
+        // assignment operands (same mark-aware rule as export above, so the
+        // assoc render of `readonly -A A=(...)` also re-syncs its cell).
         for arg in &args {
             if let Some((raw, _)) = arg.split_once('=') {
                 let base = raw.trim_end_matches('+');
@@ -72,7 +73,11 @@ impl Executor {
                     continue;
                 }
                 if let Some(mirror) = self.shell_state.env_vars.get(base).cloned() {
-                    sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, &mirror);
+                    } else {
+                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    }
                 }
             }
         }
