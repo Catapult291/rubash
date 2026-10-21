@@ -1272,6 +1272,22 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
     let tokens = tokenize(source);
     let mut stack = Vec::new();
     for token in &tokens {
+        // `=~` RHS fragments are word data, never grammar tokens.
+        if token.regexp_rhs_fragment {
+            continue;
+        }
+        // `;;`/`;&`/`;;;&` tokenize as Word: legal only inside a `case` or
+        // an arithmetic `( (` frame; anywhere else GNU's grammar rejects
+        // them at read time — same terminal verdict as the stray `)`.
+        if token.kind == TokenKind::Word
+            && token.raw == token.value
+            && matches!(token.value.as_str(), ";;" | ";&" | ";;&")
+        {
+            if !matches!(stack.last(), Some(&"esac") | Some(&")")) {
+                return false;
+            }
+            continue;
+        }
         if token.kind != TokenKind::Keyword {
             continue;
         }
@@ -1283,8 +1299,32 @@ pub fn stdin_source_needs_more_posix(source: &str, posix: bool) -> bool {
             // its `}` — GNU reads until the closing brace (parse.y
             // brace_group), so a multi-line `{ ... }` keeps the group open.
             "{" => stack.push("}"),
-            "esac" | "fi" | "done" | "}" if stack.last() == Some(&token.value.as_str()) => {
-                stack.pop();
+            "(" => stack.push(")"),
+            ")" => {
+                if stack.last() == Some(&")") {
+                    stack.pop();
+                } else if !token.case_pattern_close {
+                    // niubash#482: a `)` that closes no `(` and is not a
+                    // case-pattern terminator is GNU's `syntax error near
+                    // unexpected token `)'' at that token — the reader
+                    // abandons the whole group (yyerror), so gathering can
+                    // never produce a legal completion: the group ends here
+                    // and the parser reports the stray close.
+                    return false;
+                }
+            }
+            "esac" | "fi" | "done" | "}" => {
+                if stack.last() == Some(&token.value.as_str()) {
+                    stack.pop();
+                } else if matches!(stack.last(), Some(&"fi") | Some(&"done") | Some(&"}")) {
+                    // Same family as the stray `)`: a foreign keyword
+                    // closer under a keyword opener is GNU's read-time
+                    // syntax error, never a future completion. Under
+                    // `(`/case frames `done`/`fi`/`esac` are legal text
+                    // (arithmetic, patterns) — keep gathering
+                    // (niubash#482).
+                    return false;
+                }
             }
             _ => {}
         }

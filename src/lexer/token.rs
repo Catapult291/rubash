@@ -88,6 +88,16 @@ pub struct Token {
     /// this flag lets the parser's compound-boundary scanners treat those
     /// fragments as inert word data instead of grammar tokens.
     pub regexp_rhs_fragment: bool,
+    /// niubash#482: this `)` token was read while the lexer's case-state
+    /// tracker (scanner.rs record_token, the PST_CASEPAT port) had an open
+    /// case PATTERN region — i.e. it terminates a `case ... in` pattern
+    /// list, the one position where a `)` that does not pop a `(` is
+    /// legal. GNU parse.y consumes pattern closers inside the case
+    /// grammar, so a completeness reader can treat a flagged `)` as
+    /// in-case syntax instead of a stray close; an UNFLAGGED `)` reaching
+    /// the top level of an open group is GNU's `syntax error near
+    /// unexpected token `)''.
+    pub case_pattern_close: bool,
 }
 
 impl Token {
@@ -106,6 +116,7 @@ impl Token {
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
+            case_pattern_close: false,
         }
     }
 
@@ -138,6 +149,7 @@ impl Token {
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
+            case_pattern_close: false,
         }
     }
 
@@ -160,6 +172,7 @@ impl Token {
             compound_unclosed: false,
             heredoc_end_line: None,
             regexp_rhs_fragment: false,
+            case_pattern_close: false,
         }
     }
 }

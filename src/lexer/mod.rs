@@ -504,10 +504,17 @@ pub(crate) struct GroupScanFeeder {
     /// Tokens of the current open logical line already folded, and the
     /// (stack, last) state at that line's start for full-re-lex refolds.
     open_folded: usize,
-    open_snapshot: (Vec<&'static str>, Option<TokenKind>),
+    open_snapshot: (Vec<&'static str>, Option<TokenKind>, bool),
     /// Set when the original loop would `break` out of line processing
     /// (heredoc overflow): later pushes are inert, like the loop exit.
     overflowed: bool,
+    /// niubash#482: a `)` token that is neither a `(` group close nor a
+    /// case-pattern close reached the stream while a compound/group opener
+    /// was still unresolved — GNU's reader reports `syntax error near
+    /// unexpected token `)'' and abandons the whole group right there
+    /// (parse.y yyerror + jump to top level), so the gather must stop
+    /// instead of waiting for the opener forever (the PS2 wedge).
+    stray_close: bool,
     /// Set when this feeder's per-line shopt simulation EFFECTIVELY toggled
     /// the process-global `PARSE_EXTENDED_GLOB` gate (an Enable/Disable flip
     /// that actually changed the value). Consumers that want to reuse the
@@ -559,7 +566,7 @@ impl GroupScanFeeder {
         start_line: usize,
         in_comsub: bool,
     ) -> Self {
-        let open_snapshot = (Vec::new(), None);
+        let open_snapshot = (Vec::new(), None, false);
         Self {
             initial_posix,
             input_origin,
@@ -592,6 +599,7 @@ impl GroupScanFeeder {
             open_folded: 0,
             open_snapshot,
             overflowed: false,
+            stray_close: false,
             extglob_toggled: false,
             group_clean: true,
             gate_comsub_open: false,
@@ -608,7 +616,13 @@ impl GroupScanFeeder {
     /// still being awaited, a fresh scan at EOF pushes the unterminated-body
     /// marker token before its separator, so its last significant token is
     /// the HereDocBody — never a connector — exactly like this formula.
+    /// A stray `)` ends the group too (niubash#482): GNU abandons the
+    /// whole submission on the token, so "no more needed" is the answer
+    /// that hands the offending text to the parser's diagnostic.
     pub(crate) fn token_level_needs_more(&self) -> bool {
+        if self.stray_close {
+            return false;
+        }
         // rubash#463: an open word-attached procsub body holds the logical
         // line open (the keyword stack cannot see it — the body's tokens are
         // consumed by the word scanner of the still-unfinished word).
@@ -663,15 +677,45 @@ impl GroupScanFeeder {
     /// exactly the loop `stdin_source_needs_more_posix` runs over the fresh
     /// token list.
     fn fold_token(&mut self, token: &Token) {
-        if token.kind == TokenKind::Keyword {
+        // `=~` RHS fragments are word data (token.rs field doc), never
+        // grammar tokens — a `)` inside `[[ x =~ (a|b) ]]` is pattern text.
+        if token.kind == TokenKind::Word
+            && token.raw == token.value
+            && matches!(token.value.as_str(), ";;" | ";&" | ";;&")
+        {
+            if !matches!(self.keyword_stack.last(), Some(&"esac") | Some(&")")) {
+                self.stray_close = true;
+            }
+        } else if token.kind == TokenKind::Keyword && !token.regexp_rhs_fragment {
             match token.value.as_str() {
                 "case" => self.keyword_stack.push("esac"),
                 "if" => self.keyword_stack.push("fi"),
                 "for" | "select" | "while" | "until" => self.keyword_stack.push("done"),
                 "{" => self.keyword_stack.push("}"),
+                "(" => self.keyword_stack.push(")"),
+                ")" => {
+                    if self.keyword_stack.last() == Some(&")") {
+                        self.keyword_stack.pop();
+                    } else if !token.case_pattern_close {
+                        // niubash#482: a `)` that closes nothing legal is
+                        // GNU's `syntax error near unexpected token `)'' —
+                        // more input cannot cure it, so the group ends here.
+                        self.stray_close = true;
+                    }
+                }
                 "esac" | "fi" | "done" | "}" => {
                     if self.keyword_stack.last().copied() == Some(token.value.as_str()) {
                         self.keyword_stack.pop();
+                    } else if matches!(
+                        self.keyword_stack.last(),
+                        Some(&"fi") | Some(&"done") | Some(&"}")
+                    ) {
+                        // A foreign keyword closer under a keyword opener is
+                        // the same GNU syntax error as the stray `)` —
+                        // but under `(`/`case` frames (`done`/`fi` are legal
+                        // arithmetic text and case-body words) it stays a
+                        // word and must not end the gather (niubash#482).
+                        self.stray_close = true;
                     }
                 }
                 _ => {}
@@ -694,6 +738,7 @@ impl GroupScanFeeder {
             let snapshot = self.open_snapshot.clone();
             self.keyword_stack = snapshot.0;
             self.last_significant = snapshot.1;
+            self.stray_close = snapshot.2;
             for token in tokens {
                 self.fold_token(token);
             }
@@ -835,7 +880,11 @@ impl GroupScanFeeder {
         // The open logical line is fully committed: the next line starts a
         // fresh one, and a later full re-lex must refold from here.
         self.open_folded = 0;
-        self.open_snapshot = (self.keyword_stack.clone(), self.last_significant.clone());
+        self.open_snapshot = (
+            self.keyword_stack.clone(),
+            self.last_significant.clone(),
+            self.stray_close,
+        );
     }
 
     /// The parked main loop: the body of the original `while let

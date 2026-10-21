@@ -350,6 +350,9 @@ impl<'a> Lexer<'a> {
         if self.parse_state.case_pattern && keyword_is(")") {
             // parse.y:3787-3788: the `)` ending a pattern list leaves
             // PST_CASEPAT; `;;`/family below re-enter it for the next clause.
+            // Stamp the closer on the token (niubash#482): completeness
+            // readers must not report this `)` as a stray close.
+            token.case_pattern_close = true;
             self.parse_state.case_pattern = false;
         }
         if self.parse_state.case_stmt_depth > 0
