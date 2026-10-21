@@ -1,4 +1,5 @@
 use super::*;
+use crate::shell::var_table::VarTable;
 
 pub(in crate::executor) fn validate_local_options(args: &[String]) -> Result<(), char> {
     for arg in args {
@@ -90,7 +91,7 @@ pub(in crate::executor) fn local_stderr_from_declare(stderr: Vec<u8>) -> Vec<u8>
 }
 
 pub(in crate::executor) fn restore_optional_env_var(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     name: &str,
     value: Option<String>,
 ) {
@@ -105,7 +106,7 @@ pub(in crate::executor) fn restore_optional_env_var(
 }
 
 pub(in crate::executor) fn restore_optional_shell_var(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     name: &str,
     value: Option<String>,
 ) {

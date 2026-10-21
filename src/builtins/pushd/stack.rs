@@ -1,5 +1,6 @@
 use super::DIR_STACK;
 use crate::executor::path::shell_path_to_windows;
+use crate::shell::var_table::VarTable;
 use std::collections::HashMap;
 
 const SEP: char = crate::executor::markers::DIR_STACK_FIELD_SEP;
@@ -40,7 +41,7 @@ pub(crate) fn load_stack(env_vars: &HashMap<String, String>) -> Vec<String> {
         .unwrap_or_else(|| "/".to_string())]
 }
 
-pub(crate) fn save_stack(env_vars: &mut HashMap<String, String>, stack: &[String]) {
+pub(crate) fn save_stack(env_vars: &mut VarTable, stack: &[String]) {
     env_vars.insert(DIR_STACK.to_string(), stack.join(&SEP.to_string()));
 }
 
@@ -52,7 +53,7 @@ pub(crate) fn stack_words(env_vars: &HashMap<String, String>) -> String {
     load_stack(env_vars).join(" ")
 }
 
-pub(crate) fn set_stack_value(env_vars: &mut HashMap<String, String>, index: usize, value: String) {
+pub(crate) fn set_stack_value(env_vars: &mut VarTable, index: usize, value: String) {
     let mut stack = load_stack(env_vars);
     if index < stack.len() {
         stack[index] = value;

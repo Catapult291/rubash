@@ -52,6 +52,7 @@
 //!   The table shape mirrors the Linux glibc build of GNU bash 5.3.0 (the
 //!   WSL oracle) so scripts ported from Linux see the same 17 `-a` rows.
 
+use crate::shell::var_table::VarTable;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -221,7 +222,7 @@ mod plat {
         option: char,
         newlim: u64,
         mode: u8,
-        _env_vars: &mut HashMap<String, String>,
+        _env_vars: &mut VarTable,
     ) -> io::Result<()> {
         if option == 'p' {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -373,7 +374,7 @@ mod plat {
         option: char,
         newlim: u64,
         mode: u8,
-        env_vars: &mut HashMap<String, String>,
+        env_vars: &mut VarTable,
     ) -> io::Result<()> {
         // The pipe buffer is a kernel constant, not a limit: GNU fails the
         // set with EINVAL on every platform, and so does the emulation.
@@ -518,7 +519,7 @@ fn scan(args: &[String]) -> ScanOutcome {
 
 // ---- builtin body (ulimit_builtin, ulimit.def:336-448) ---------------------
 
-pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(args: &[String], env_vars: &mut VarTable) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     execute_with_io(args, env_vars, &mut stdout, &mut stderr)
@@ -526,7 +527,7 @@ pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::R
 
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -625,7 +626,7 @@ fn ulimit_internal<W, E>(
     cmdarg: Option<&str>,
     mode_in: u8,
     multiple: bool,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
     prefix: &str,

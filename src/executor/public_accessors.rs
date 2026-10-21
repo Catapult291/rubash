@@ -1,11 +1,12 @@
 use super::*;
+use crate::shell::var_table::VarTable;
 
 /// Stamp a line-number env key without allocating when the value is
 /// unchanged. Byte-identical inserts are idempotent, so the equality gate
 /// is behavior-neutral; it exists because a loop body re-stamps the same
 /// line once per command (GNU's line_number is a C int — execute_cmd.c
 /// SET_LINE_NUMBER — and costs nothing to re-assign).
-fn stamp_env_usize(env_vars: &mut HashMap<String, String>, key: &str, line: usize) -> bool {
+fn stamp_env_usize(env_vars: &mut VarTable, key: &str, line: usize) -> bool {
     let mut buffer = [0u8; 20];
     let mut value = line;
     let mut position = buffer.len();
