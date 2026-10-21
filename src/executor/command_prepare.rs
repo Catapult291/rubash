@@ -2294,7 +2294,7 @@ impl Executor {
             // simulating quote removal.
             let mut marked = mark_literal_ifs_chars(word, ifs);
             if let Some(raw) = raw {
-                marked = mark_quoted_ifs_from_raw(raw, &marked, ifs);
+                marked = mark_quoted_ifs_from_raw(raw, &marked, ifs, self.posix_mode_enabled());
             }
             marked_word = marked;
             &marked_word
@@ -4536,7 +4536,7 @@ fn copy_comsub_body_verbatim_for_ifs_marking(
             ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>');
     }
 }
-fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> String {
+fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str, posix: bool) -> String {
     use crate::executor::markers::{
         ANSI_C_IFS_GUARD, CTLESC, DATA_BACKSLASH, DATA_BACKTICK, DATA_DOLLAR, DATA_DQUOTE,
         DATA_SQUOTE, IFS_GLUE, PARAM_NAME_END_MARKER,
@@ -4700,23 +4700,38 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str) -> St
             pending_name = false;
             match raw_chars.get(index + 1) {
                 Some('{') => {
-                    // ${...} — copy span verbatim (quotes inside are syntax).
-                    let mut depth = 1usize;
-                    simulated.push(ch);
-                    simulated.push('{');
-                    index += 2;
-                    while index < raw_chars.len() && depth > 0 {
-                        if raw_chars[index] == '{' {
-                            depth += 1;
-                        } else if raw_chars[index] == '}' {
-                            depth -= 1;
-                        } else if raw_chars[index] == '\\' && index + 1 < raw_chars.len() {
-                            simulated.push(raw_chars[index]);
-                            index += 1;
-                        }
-                        simulated.push(raw_chars[index]);
-                        index += 1;
-                    }
+                    // ${...} — verbatim copy through the cook's own span
+                    // boundary. The walk routes `${` to
+                    // copy_braced_parameter_unquoted (outer) /
+                    // copy_braced_parameter_after_dollar (inside "..."):
+                    // the same cursor functions own the end here (GNU
+                    // parse.y:3877 parse_matched_pair P_FIRSTCLOSE|
+                    // P_DOLBRACE — '...'/"..."/`...`/$'...' spans, $(...)/
+                    // <(...)/>(...) units and nested ${...} are skipped
+                    // opaquely, and a bare `{` never nests). The previous
+                    // naive `{`/`}` depth scan counted a `}` inside those
+                    // opaque regions, closed the span early, re-walked the
+                    // tail as outer text, desynced `simulated` from
+                    // `cooked` and bailed the whole mark pass — the quoted
+                    // IFS char then split ("a b"${x:-'}'}$w → <a> <bVp>
+                    // <q>, rubash#977).
+                    let byte_index = raw_chars[..index]
+                        .iter()
+                        .map(|c| c.len_utf8())
+                        .sum::<usize>();
+                    let rest = if in_double {
+                        crate::lexer::quotes::copy_braced_parameter_after_dollar_cursor(
+                            &mut simulated,
+                            &raw[byte_index..],
+                            posix,
+                        )
+                    } else {
+                        crate::lexer::quotes::copy_braced_parameter_unquoted_cursor(
+                            &mut simulated,
+                            &raw[byte_index..],
+                        )
+                    };
+                    index += raw[byte_index..raw.len() - rest.len()].chars().count();
                     continue;
                 }
                 Some('(') => {
