@@ -31,6 +31,13 @@ pub(in crate::executor) fn is_conditional_file_binary(op: &str) -> bool {
     matches!(op, "-nt" | "-ot" | "-ef")
 }
 
+/// The arithmetic-comparison operators (`test.c:357 arithcomp`). One owner
+/// for the six spellings so the `[[ ]]` dispatch and the metadata pre-pass
+/// cannot drift apart.
+pub(in crate::executor) fn is_conditional_numeric_op(op: &str) -> bool {
+    matches!(op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
+}
+
 pub(in crate::executor) fn conditional_logical_index(args: &[String], op: &str) -> Option<usize> {
     let end = conditional_effective_len(args);
     let mut depth = 0usize;
@@ -78,6 +85,20 @@ pub(in crate::executor) fn conditional_regex_operands(args: &[String]) -> Option
     }
 
     Some((args[0].as_str(), args[op + 1..end].join("")))
+}
+
+/// True when [`reassemble_extglob_args`] would actually change the token
+/// list: some word ending in an extglob operator is immediately followed by
+/// a bare `(` token (the exact merge trigger in that function). When false
+/// the reassembly is a pure copy, so callers can borrow the original slice
+/// and skip the whole-Vec clone (`execute_conditional` runs per `[[ ]]`
+/// evaluation).
+pub(in crate::executor) fn needs_extglob_reassembly(args: &[String]) -> bool {
+    args.windows(2).any(|pair| {
+        pair[1] == "("
+            && pair[0] != "!"
+            && pair[0].ends_with(|c: char| matches!(c, '*' | '?' | '+' | '@' | '!'))
+    })
 }
 
 /// Reassemble extglob patterns that the lexer split into separate tokens.
