@@ -39,12 +39,19 @@ pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str
 /// per arm with `strmatch` at 3736) stages its `Vec<char>` once outside the
 /// arm loop and reuses it here. The pattern side still stages per arm — it
 /// differs per candidate — while the literal / simple-glob fast paths stay
-/// borrow-only. The raw-byte-marker path is rare; it delegates to the
-/// allocating form rather than duplicating the flatten logic.
+/// borrow-only.
+///
+/// `word_chars` is a LAZY cell: the literal / simple-glob fast paths never
+/// consult it, and GNU's `strmatch` for a literal arm does no char staging
+/// either, so the common 20-literal-arm loop must not pay a per-execution
+/// `Vec<char>` build for a cache that is never read. The caller seeds it on
+/// the first arm that actually reaches the staged matcher. The raw-byte-marker
+/// path is rare; it delegates to the allocating form rather than duplicating
+/// the flatten logic.
 pub(in crate::executor) fn case_pattern_matches_with_word_chars(
     pattern: &str,
     word: &str,
-    word_chars: &[char],
+    word_chars: &mut Option<Vec<char>>,
 ) -> bool {
     if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
         return verdict;
@@ -55,6 +62,7 @@ pub(in crate::executor) fn case_pattern_matches_with_word_chars(
     if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
         return case_pattern_matches(pattern, word);
     }
+    let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
     let pattern_chars: Vec<char> = pattern.chars().collect();
     case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, false)
 }
@@ -63,7 +71,7 @@ pub(in crate::executor) fn case_pattern_matches_with_word_chars(
 pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
     pattern: &str,
     word: &str,
-    word_chars: &[char],
+    word_chars: &mut Option<Vec<char>>,
 ) -> bool {
     if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
         return verdict;
@@ -74,6 +82,7 @@ pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
     if pattern_contains_raw_byte_markers(pattern) && !pattern.contains('[') {
         return case_pattern_matches_nocase(pattern, word);
     }
+    let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
     let pattern_chars: Vec<char> = pattern.chars().collect();
     case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, true)
 }
