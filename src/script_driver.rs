@@ -4357,6 +4357,14 @@ pub fn bytes_to_script_text(bytes: &[u8]) -> String {
     crate::executor::substitution_metadata::bytes_to_script_text(bytes)
 }
 
+/// `-c` operand entry escaping (rubash#948): literal marker-zone chars in
+/// user-supplied command strings are escaped like script source, while an
+/// existing `E400` + zone-char pair is protocol from a rubash parent and
+/// stays untouched. See substitution_metadata::command_string_entry_text.
+pub fn command_string_entry_text(command: &str) -> String {
+    crate::executor::substitution_metadata::command_string_entry_text(command)
+}
+
 /// Read a script-language file the way GNU shell.c does: raw bytes, then
 /// `check_binary_file`, then script-text decoding. Errors use the io error
 /// message (callers own their diagnostics).
