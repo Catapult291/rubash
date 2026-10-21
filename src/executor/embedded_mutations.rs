@@ -870,7 +870,7 @@ impl Executor {
                 }
                 Some('@') => {
                     chars.next();
-                    let value = self.shell_state.positional_params.join(" ");
+                    let value = self.shell_state.positional_window().join(" ");
                     let value = protect_rhs_value(&value, protect_rhs_data);
                     if expansion_ws_marked(alternate, preserve_quotes, in_double) {
                         output.push_str(&mark_expansion_whitespace(&value, preserve_quotes));
@@ -891,7 +891,7 @@ impl Executor {
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -915,9 +915,8 @@ impl Executor {
                     // evaluated (a `${name}` body re-walked inside the
                     // enclosing fragment's site), it inherits that site
                     // instead of re-keying on the synthetic string.
-                    let whole_braced =
-                        crate::executor::parameter_ops::braced_parameter_spans_whole_word(word)
-                            && crate::executor::expand_braced_indices::sub_site_active();
+                    let whole_braced = crate::executor::expand_braced_indices::sub_site_active()
+                        && crate::executor::parameter_ops::braced_parameter_spans_whole_word(word);
                     let this_frag = frag_index;
                     frag_index += 1;
                     let _site_guard = (!whole_braced).then(|| {
@@ -1227,7 +1226,7 @@ impl Executor {
                     } else {
                         let value = self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .get(index - 1)
                             .map(String::as_str)
                             .unwrap_or("");
@@ -1859,7 +1858,7 @@ impl Executor {
         // receive the raw source and splice for themselves at their own
         // parse boundary.
         let words = split_shell_words(&self.comsub_body_alias_splice_extracted(source));
-        let saved_positional_params = self.shell_state.positional_params.clone();
+        let saved_positional_params = self.shell_state.positional_window_cloned();
         // GNU subst.c:7143 command_substitute feeds the body to
         // parse_and_execute, so the real parser owns each word's quoting:
         // `"$x"` stays one field, `""` stays one empty argument, and `"*"`
@@ -2164,6 +2163,12 @@ impl Executor {
 
         self.restore_flat_subshell(saved_state, saved_dir);
         self.fd_table = saved_fd_table;
+        // rubash#846: the substitution body ran in a fork-equivalent child
+        // frame (GNU subst.c:7143 command_substitute has no :1831-style
+        // invert step), so an inner compound's own redirect failure arrives
+        // here as plain status — never flipped. Discard the mark; the
+        // parent judges the enclosing command by status only.
+        self.compound_redirect_failed.set(false);
         // rubash#485: GNU subst.c command_substitute reaps the substitution
         // child in the parent and its exit status becomes the shell's
         // last_command_exit_value BEFORE the enclosing command runs, so a

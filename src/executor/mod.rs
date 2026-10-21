@@ -128,6 +128,10 @@ mod readonly_functions;
 mod shell_options;
 #[cfg(windows)]
 mod sudo_builtin;
+// Windows-only stand-in (see the module header): unix builds never see it,
+// so no cross-target dead-code surface.
+#[cfg(windows)]
+mod tput_emulation;
 
 pub(crate) use shell_options::{write_stderr_bytes, write_stdout_bytes, GlobalStdout};
 
@@ -173,6 +177,7 @@ mod type_describe;
 mod type_functions;
 mod unset_arrays;
 mod variable_state;
+mod windows_drive;
 
 mod alias_helpers;
 pub(crate) mod assignment_helpers;
@@ -183,7 +188,7 @@ mod command_text;
 mod env_helpers;
 mod execution_misc;
 mod function_env;
-mod local_helpers;
+pub(crate) mod local_helpers;
 mod parameter_case;
 mod parameter_decode;
 mod parameter_ops;
@@ -239,7 +244,10 @@ use substitution_metadata::*;
 use support_names::*;
 
 pub(crate) mod conditional;
-use conditional::{case_pattern_matches, case_pattern_matches_nocase, simple_grep_pattern_matches};
+use conditional::{
+    case_pattern_matches, case_pattern_matches_nocase, case_pattern_matches_nocase_with_word_chars,
+    case_pattern_matches_with_word_chars, simple_grep_pattern_matches,
+};
 
 use crate::builtins::alias::Alias;
 use crate::expand::tilde::tilde as tilde_expand;
@@ -310,8 +318,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::path::{
-    apply_required_windows_child_environment, external_command_for_named_program, find_shell,
-    find_user_command, shell_path_to_process, shell_path_to_windows, standard_path,
+    adopt_orphan_console, apply_required_windows_child_environment,
+    external_command_for_named_program, find_shell, find_user_command, shell_path_to_process,
+    shell_path_to_windows, standard_path, suppress_orphan_console,
 };
 
 // version.c:90 show_shell_version(): the --version banner prints the same
@@ -934,6 +943,22 @@ pub struct Executor {
     /// last executed top-level command carried `!`; the drivers consult it
     /// before breaking (set-e1.sub `! true` under `set -o posix`).
     pub(crate) last_command_inverted: Cell<bool>,
+    /// GNU execute_cmd.c:854-883: a compound command's OWN redirect failure
+    /// abandons it with status 1 and returns BEFORE the :1204 invert step,
+    /// so `! { :; } > bad` stays 1 (no flip) while `! true > bad` (simple
+    /// command, flipped at :1204) is 0. Set at each compound's own
+    /// do_redirections-failure adjudication (IoError from the apply stage
+    /// only — never ExpansionFailure, never a body write error); simple
+    /// commands never set it. The `!` flip sites (compound_exec
+    /// execute_inverted_ast_command, ast_exec command dispatch) suppress
+    /// the flip while it is set and leave it set: nested `! ! C` wrappers
+    /// suppress in turn, and the innermost fork/call boundary that owns a
+    /// flip of its own (subshell-region single-inverted-body at
+    /// execute_cmd.c:1831, pipeline wait-side at :763) consumes it.
+    /// Comsub / function / eval boundaries consume it without flipping
+    /// (command_substitute has no :1831-equivalent); the flat-command loop
+    /// clears it between top-level commands as a backstop. rubash#846.
+    pub(crate) compound_redirect_failed: Cell<bool>,
     /// The group's execute_ast ended by unwinding (`exit`, errexit, POSIX
     /// special-builtin failure, fatal expansion — GNU's
     /// jump_to_top_level(EXITPROG/ERREXIT/FORCE_EOF)). run_source converts

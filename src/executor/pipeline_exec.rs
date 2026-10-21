@@ -465,6 +465,11 @@ impl Executor {
         &mut self,
         command: &CommandNode,
     ) -> Result<bool, ExecuteError> {
+        // rubash#846: GNU execute_cmd.c:854-883 — the compound's own
+        // redirect failure returns before the :1204 invert step, so an
+        // enclosing `!` must not flip this status. The dispatch flip sites
+        // consult the mark; boundaries consume it.
+        self.note_compound_redirect_failure();
         self.exit_code = 1;
         self.maybe_run_error_trap(command)?;
         if self.errexit_enabled()
@@ -1241,6 +1246,10 @@ impl Executor {
                 command.time_command.is_some()
                     || command.brace_group.is_some()
                     || command.subshell
+                    // #800A: a tput head answers inline on the sequential
+                    // path (the byte-exact whitelist stage arm); see
+                    // concurrent_external_stage_spec's matching clause.
+                    || (cfg!(windows) && tput_inline_stage(command))
                     || command_has_non_concurrent_pipeline_redirects(command, index, commands.len())
                     || command.redirect_in.is_some()
                     || command.redirect_err.is_some()
@@ -1564,6 +1573,7 @@ impl Executor {
                 process.stdout(Stdio::piped());
                 process.stderr(Stdio::piped());
             }
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -1577,6 +1587,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < consumer_count {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {
@@ -1739,6 +1750,14 @@ impl Executor {
         if command.time_command.is_some()
             || command.brace_group.is_some()
             || command.subshell
+            // #800A: a tput head answers inline on the sequential path (the
+            // byte-exact whitelist stage arm below); the concurrent paths
+            // spawn members directly and would bypass it. tput is a
+            // millisecond terminal query — never a long-running producer —
+            // so declining concurrency for it costs nothing, and a
+            // non-admitted shape still spawns the real binary on the
+            // sequential path exactly as this one would.
+            || (cfg!(windows) && tput_inline_stage(command))
             || command_has_non_concurrent_pipeline_redirects(
                 command,
                 index,
@@ -1998,6 +2017,7 @@ impl Executor {
             // niubash#141: keep the failed stage's resolved program in the
             // diagnostic — a bare `line 1: Unknown error` hid which stage's
             // CreateProcess failed (and with which binary).
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2011,6 +2031,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < commands.len() {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {
@@ -2225,6 +2246,7 @@ impl Executor {
             process.stdout(stdio_from_transferred_handle(
                 write.take().expect("producer writer already transferred"),
             ));
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2238,6 +2260,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             processes.push(child);
         }
 
@@ -2614,6 +2637,7 @@ impl Executor {
                 process.stderr(Stdio::piped());
             }
 
+            suppress_orphan_console(&mut process);
             let mut child = process.spawn().map_err(|error| {
                 ExecuteError::IoError(io::Error::new(
                     error.kind(),
@@ -2627,6 +2651,7 @@ impl Executor {
                     ),
                 ))
             })?;
+            adopt_orphan_console(child.id());
             if capture_intermediate_stderr && index + 1 < commands.len() {
                 if let Some(mut stderr) = child.stderr.take() {
                     intermediate_stderr.push(std::thread::spawn(move || {
@@ -3080,7 +3105,18 @@ impl Executor {
         // the external spawner with no diagnostic and a 127 status where GNU
         // reports `$(echo a b): ambiguous redirect` and the stage dies with
         // status 1 (rubash#525).
-        let stage_redirect_rejected = self.reject_invalid_redirects(command)?;
+        // rubash#846: both preflights can return Err (notably an
+        // unopenable `>file` open failure). The thread-local stdout
+        // capture above is active, so restore it before propagating —
+        // otherwise every later stdout write in the script is swallowed
+        // into the orphaned buffer while stderr keeps working.
+        let stage_redirect_rejected = match self.reject_invalid_redirects(command) {
+            Ok(rejected) => rejected,
+            Err(error) => {
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                return Err(error);
+            }
+        };
         if stage_redirect_rejected.is_some() {
             // The rejected stage already placed its diagnostic on the
             // element's fd 1 (the pipe) via the capture above — GNU's
@@ -3098,7 +3134,14 @@ impl Executor {
                 1,
             )));
         }
-        if self.command_output_redirect_fails(command)? {
+        let stage_output_redirect_failed = match self.command_output_redirect_fails(command) {
+            Ok(failed) => failed,
+            Err(error) => {
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                return Err(error);
+            }
+        };
+        if stage_output_redirect_failed {
             let captured = crate::executor::shell_options::take_stdout_capture();
             crate::executor::shell_options::restore_stdout_capture(saved_capture);
             return Ok(Some((
@@ -3652,6 +3695,37 @@ impl Executor {
                     // classes it does not know, `[x*n]` repeats, escapes)
                     // must run the real external `tr`; silently returning the
                     // input unchanged is never acceptable.
+                    self.execute_external_pipeline_stage(command, input, stdin_inherit)
+                }
+            }
+            // #800A: the same inline stand-in the simple-command path uses
+            // (external_file_builtins::external_tput). The harvest assets'
+            // `$(tput …)` bodies are single-command pipelines, so without
+            // this arm the stage spawner paid the full child spawn per call
+            // (~17ms host, ~300ms on the harvest runner). Admission stays
+            // the byte-exact whitelist; anything else falls through to the
+            // real binary exactly as before.
+            #[cfg(windows)]
+            "tput" => {
+                // Stage argv is pre-expansion here (the arms expand their
+                // own arguments), so resolve against the expanded operands
+                // — a non-admitted expansion falls through below.
+                let args = self.expand_pipeline_stage_arg_words(command, 1);
+                let mut probe = command.clone();
+                probe.words = vec![command.words[0].clone()];
+                probe.words.extend(args);
+                if let Some(outcome) = self.admitted_tput_outcome(&probe) {
+                    self.record_tput_resolution(&probe);
+                    let (output, status) = match outcome {
+                        crate::executor::tput_emulation::TputOutcome::Bytes(bytes) => {
+                            (bytes.into_owned(), 0)
+                        }
+                        // ncurses: an absent capability prints nothing,
+                        // exits 1 (verified `TERM=vt100 tput setaf 1`).
+                        crate::executor::tput_emulation::TputOutcome::Absent => (String::new(), 1),
+                    };
+                    Ok(Some((output, String::new(), status)))
+                } else {
                     self.execute_external_pipeline_stage(command, input, stdin_inherit)
                 }
             }
@@ -4387,4 +4461,28 @@ struct InlineGrepSpec {
     quiet: bool,
     line_numbers: bool,
     ignore_case: bool,
+}
+
+/// #800A: the raw head word of a pipeline stage that should answer through
+/// the inline tput arm instead of the direct-spawn concurrent paths. Raw
+/// word on purpose: a quoted or function-shadowed shape reaches the
+/// sequential dispatcher anyway, where function shadowing wins before the
+/// arm (GNU execute_cmd.c classify order), so over-matching here only
+/// costs concurrency, never correctness.
+#[cfg(windows)]
+fn tput_inline_stage(command: &CommandNode) -> bool {
+    matches!(
+        command.words.first().map(String::as_str),
+        Some("tput") | Some("/bin/tput") | Some("/usr/bin/tput")
+    )
+}
+
+/// Non-Windows stub so `cfg!(windows) && tput_inline_stage(command)` at the
+/// call sites compiles on Linux/macOS — the arm is Windows-only by design
+/// (the whitelist exists to dodge the ~300ms Windows spawn floor), and the
+/// predicate is always false off Windows.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn tput_inline_stage(_command: &CommandNode) -> bool {
+    false
 }

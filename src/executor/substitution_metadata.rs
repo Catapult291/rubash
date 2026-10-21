@@ -525,28 +525,115 @@ pub(crate) fn bytes_to_shell_text(bytes: &[u8]) -> String {
 /// meaning they already have) and rides each byte of an invalid sequence
 /// as a raw-byte marker pair, so the output boundary
 /// (`decode_raw_byte_markers`, e.g. echo) restores the original byte.
+///
+/// One entry-side escape DOES apply to valid UTF-8 spans (rubash#856): a
+/// literal marker-zone char (U+E000..=U+E401 — RAW_BYTE_MARKER_ESCAPE,
+/// raw-byte payloads, the E301.. registry block, LITERAL_CHAR_ESCAPE
+/// itself) is user data per the #296 ownership contract but is
+/// indistinguishable from a stray marker introducer at every later decode
+/// boundary — `v="a<U+E000>b"` stored `ab` and `${v//a/ZZ}` emitted `ZZb`
+/// where GNU 5.3.0 keeps the PUA glyph verbatim. Those chars can only be
+/// told apart from live markers at THIS boundary (script bytes are fresh
+/// source — transport text never enters through file reads), so they are
+/// E400-escaped here exactly like `push_escaped_text_with_carriers` does
+/// for the stdin path (`read_unbuffered_line`).
+///
+/// The `-c` operand has its own entry escaping — see
+/// `command_string_entry_text` below (rubash#948), applied in
+/// `run_command_string_with_init` (main.rs). The boundary, in words:
+/// the respawn exclusion is a DOUBLE-ESCAPE exclusion only, not an
+/// all-`-c` exclusion. A respawned `&`/coproc child (`RESPAWNED_CHILD`,
+/// the `__RUBASH_SHELL_PID` / `__RUBASH_COPROC_CHILD` env markers,
+/// including the `__RUBASH_CMD_FILE` file-transport variant) receives
+/// serialized AST source (compound_exec `bash_command_source_text`) whose
+/// words already carry transport spelling (E400 pairs and raw-byte
+/// markers); re-escaping that text would prefix already-escaped pairs
+/// again, so the respawned arm skips entry escaping entirely. Every other
+/// `-c` string is fresh source — the same class as a script file or
+/// stdin — and is escaped, with the one nuance that an existing
+/// `E400` + zone-char pair is protocol emitted by a rubash parent's argv
+/// materialization and is preserved rather than re-escaped.
 pub(crate) fn bytes_to_script_text(bytes: &[u8]) -> String {
-    if std::str::from_utf8(bytes).is_ok() {
-        // Zero-change fast path: every currently-runnable script decodes to
-        // exactly the String String::from_utf8 produced.
-        return String::from_utf8_lossy(bytes).into_owned();
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains(crate::executor::markers::is_marker_zone_char) {
+            // Zero-change fast path: every currently-runnable script decodes
+            // to exactly the String String::from_utf8 produced.
+            return text.to_string();
+        }
+        return escape_marker_zone_chars(text);
     }
     let mut output = String::new();
     let mut remaining = bytes;
     while !remaining.is_empty() {
         match std::str::from_utf8(remaining) {
             Ok(text) => {
-                output.push_str(text);
+                push_marker_zone_escaped(&mut output, text);
                 break;
             }
             Err(error) => {
                 let valid = error.valid_up_to();
-                output.push_str(std::str::from_utf8(&remaining[..valid]).unwrap_or_default());
+                push_marker_zone_escaped(
+                    &mut output,
+                    std::str::from_utf8(&remaining[..valid]).unwrap_or_default(),
+                );
                 push_raw_byte_marker(&mut output, remaining[valid]);
                 remaining = &remaining[valid + 1..];
             }
         }
     }
+    output
+}
+
+/// `-c` operand entry escaping (rubash#948). A user-supplied command string
+/// is fresh source — the same class as a script file or stdin — so literal
+/// marker-zone chars must be E400-escaped before the lexer sees them or they
+/// are read as live protocol (`rubash -c 'echo "x<U+E319>41;y"'` decoded the
+/// payload and printed `xAy`; stdin/script faces were already covered by
+/// `bytes_to_script_text`/`bytes_to_shell_text`).
+///
+/// Unlike script files, `-c` text can already be PARTIALLY transport-spelled:
+/// a rubash parent's argv materialization keeps `E400` + zone-char pairs
+/// verbatim when it launches another `rubash -c`, so an existing
+/// `LITERAL_CHAR_ESCAPE` + `is_marker_zone_char` pair here is protocol, not
+/// user data, and is copied unchanged. Re-escaping it would double-encode
+/// (E400+E400, E400+zone) and leak the pair into output. A lone typed
+/// `U+E400` still gets the literal escape — the `-c` channel's documented
+/// ambiguous seam, since transport text is indistinguishable from user data
+/// at this boundary. Whole-operand transport spelling (respawned `&`/coproc
+/// children, `RESPAWNED_CHILD`) is skipped entirely at the call site in
+/// `run_command_string_with_init` — this escaping is idempotent only within
+/// one text, it does not make already-spelled respawn source safe to
+/// re-escape.
+pub(crate) fn command_string_entry_text(command: &str) -> String {
+    use crate::executor::markers::{is_marker_zone_char, LITERAL_CHAR_ESCAPE};
+    if !command.chars().any(is_marker_zone_char) {
+        return command.to_string();
+    }
+    let mut output = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE && chars.peek().is_some_and(|next| is_marker_zone_char(*next))
+        {
+            output.push(ch);
+            output.push(chars.next().expect("peeked char exists"));
+        } else {
+            crate::executor::markers::push_literal_char(&mut output, ch);
+        }
+    }
+    output
+}
+
+/// E400-escape every marker-zone char in `text` (script-source literal
+/// boundary — see `bytes_to_script_text`).
+fn push_marker_zone_escaped(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        crate::executor::markers::push_literal_char(output, ch);
+    }
+}
+
+fn escape_marker_zone_chars(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    push_marker_zone_escaped(&mut output, text);
     output
 }
 
@@ -1112,7 +1199,7 @@ mod tests {
         ));
         assert!(!command_substitution_value_needs_payload_protection(
             "$x",
-            "__RUBASH_CSB1_1a;",
+            &format!("{}1a;", crate::executor::markers::COMSUB_PAYLOAD_SENTINEL),
         ));
         assert!(!command_substitution_value_needs_payload_protection(
             "literal",

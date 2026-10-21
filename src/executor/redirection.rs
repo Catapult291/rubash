@@ -836,6 +836,52 @@ impl Executor {
         Ok(state.redirect_failed)
     }
 
+    /// The redirect in `cmd`'s parse-order list whose open(2) failure
+    /// produced `message` — GNU redirection_error (redir.c:149-176)
+    /// reports the redirectee's word, so the diagnostic head `{target}: `
+    /// names the failing entry. Output-side opens match exactly like the
+    /// input side (rubash#940: `cmd 2>cap.txt > /missing` reports through
+    /// the fd-2 binding `2>cap.txt` already established). Pure fd-dup
+    /// (`>&N`), closed (`>&-`) and fd-var entries cannot be the failing
+    /// open and are skipped.
+    pub(in crate::executor) fn failing_open_redirect_index(
+        &mut self,
+        cmd: &CommandNode,
+        message: &[u8],
+    ) -> Option<usize> {
+        use crate::parser::RedirectKind;
+        cmd.redirects.iter().position(|redirect| {
+            let opens_path = match redirect.kind {
+                RedirectKind::Input | RedirectKind::DuplicateInput => {
+                    redirect.fd.is_none_or(|fd| fd == 0)
+                }
+                RedirectKind::ReadWrite
+                | RedirectKind::Output
+                | RedirectKind::Append
+                | RedirectKind::ClobberOutput
+                | RedirectKind::CombinedOutput
+                | RedirectKind::CombinedAppend
+                | RedirectKind::DuplicateOutput => true,
+                _ => false,
+            };
+            if !opens_path {
+                return false;
+            }
+            let target = self.expand_redirect_target(redirect);
+            if super::execution_misc::is_closed_redirect_target(&target)
+                || redirect_target_fd(&target).is_some()
+            {
+                return false;
+            }
+            let head = format!("{}: ", target.strip_prefix('&').unwrap_or(&target));
+            let prefix = self.diagnostic_prefix();
+            std::str::from_utf8(message).is_ok_and(|text| {
+                text.strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with(&head))
+            })
+        })
+    }
+
     /// GNU redir.c:135 redirection_error, reached from redir.c:260
     /// do_redirections: the redirection list applies left-to-right, and a
     /// failed open reports through the fd 2 binding the redirects BEFORE
@@ -855,27 +901,7 @@ impl Executor {
         cmd: &CommandNode,
         message: &[u8],
     ) -> Result<(), ExecuteError> {
-        let failed_index = cmd.redirects.iter().position(|redirect| {
-            if !matches!(
-                redirect.kind,
-                crate::parser::RedirectKind::Input | crate::parser::RedirectKind::DuplicateInput
-            ) || redirect.fd.is_some_and(|fd| fd != 0)
-            {
-                return false;
-            }
-            let target = self.expand_redirect_target(redirect);
-            if super::execution_misc::is_closed_redirect_target(&target)
-                || redirect_target_fd(&target).is_some()
-            {
-                return false;
-            }
-            let head = format!("{target}: ");
-            let prefix = self.diagnostic_prefix();
-            std::str::from_utf8(message).is_ok_and(|text| {
-                text.strip_prefix(prefix.as_str())
-                    .is_some_and(|rest| rest.starts_with(&head))
-            })
-        });
+        let failed_index = self.failing_open_redirect_index(cmd, message);
         let mut state = self.command_output_fd_state();
         match failed_index {
             Some(index) => {

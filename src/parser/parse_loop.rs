@@ -2117,7 +2117,12 @@ fn innermost_unclosed_compound(region: &[Token]) -> Option<(String, usize)> {
 /// following tokens) or a collapsed `{ ...` keyword token the lexer emitted
 /// when an unclosed group swallowed the rest of the input — the swallowed
 /// text is retokenized so inner compounds and heredocs are still seen.
-pub(super) fn unclosed_brace_eof_node(tokens: &[Token], brace_index: usize) -> CommandNode {
+pub(super) fn unclosed_brace_eof_node(
+    tokens: &[Token],
+    brace_index: usize,
+    diagnostic_text: Option<&str>,
+    line_offset: usize,
+) -> CommandNode {
     let brace = &tokens[brace_index];
     let brace_line = brace.position;
     let inner_text = brace
@@ -2157,6 +2162,13 @@ pub(super) fn unclosed_brace_eof_node(tokens: &[Token], brace_index: usize) -> C
     } else {
         inner_text.trim_end_matches([' ', '\t']).ends_with('\\')
     };
+    // niubash#482: a stray closer inside the never-closed `{` is GNU's
+    // `syntax error near unexpected token `X'' at that token — the same
+    // foreign-closer verdict the if/loop EOF arms already report — not
+    // the end-of-file diagnostic (`{ echo c\n)` names `)', not the EOF).
+    if let Some(rel) = first_mismatched_closer(region, "{") {
+        return mismatched_closer_node(region, rel, diagnostic_text, line_offset);
+    }
     compound_eof_error_node(
         "{",
         brace_line,
@@ -2167,9 +2179,19 @@ pub(super) fn unclosed_brace_eof_node(tokens: &[Token], brace_index: usize) -> C
 }
 
 /// `name() (` with no closing `)`: the same EOF reporting names the `(`.
-pub(super) fn unclosed_paren_eof_node(tokens: &[Token], paren_index: usize) -> CommandNode {
+pub(super) fn unclosed_paren_eof_node(
+    tokens: &[Token],
+    paren_index: usize,
+    diagnostic_text: Option<&str>,
+    line_offset: usize,
+) -> CommandNode {
     let paren_line = tokens[paren_index].position;
     let region = &tokens[paren_index + 1..];
+    // Same foreign-closer family as the `{` arm: `fi`/`}`/`;;` reaching an
+    // open `(` is a mismatched-closer diagnostic, not EOF (niubash#482).
+    if let Some(rel) = first_mismatched_closer(region, "(") {
+        return mismatched_closer_node(region, rel, diagnostic_text, line_offset);
+    }
     let last_line = region
         .iter()
         .map(|token| token.position)
@@ -2223,7 +2245,7 @@ pub(super) fn unclosed_keyword_eof_node(
 /// an EOF diagnostic (`if x; then y; done` reports `done`, not a missing
 /// `fi`). Seeded with the opener being reported; returns the first
 /// mismatched closer in `region`, or None when input truly ran out.
-fn first_mismatched_closer(region: &[Token], opener: &'static str) -> Option<usize> {
+pub(super) fn first_mismatched_closer(region: &[Token], opener: &'static str) -> Option<usize> {
     let mut stack: Vec<&'static str> = vec![opener];
     for (region_index, token) in region.iter().enumerate() {
         if token.kind != TokenKind::Keyword {
@@ -2250,8 +2272,12 @@ fn first_mismatched_closer(region: &[Token], opener: &'static str) -> Option<usi
             ")" => {
                 if matches!(stack.last(), Some(&"(")) {
                     stack.pop();
-                } else if !matches!(stack.last(), Some(&"case")) {
-                    // Inside `case`, `)` is legal pattern syntax.
+                } else if !token.case_pattern_close {
+                    // niubash#482: `)`s that closed a case pattern list
+                    // carry the lexer's case_pattern_close stamp (the
+                    // PST_CASEPAT region); an unflagged `)` is a stray
+                    // close — also inside a `case` BODY (GNU 5.3: `case x
+                    // in\na) e\n)` reports `unexpected token `)'').
                     return Some(region_index);
                 }
             }

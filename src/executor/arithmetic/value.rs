@@ -708,6 +708,9 @@ impl ConditionalArithParser<'_> {
         self.env_vars.insert(name.to_string(), value);
         super::super::record_arith_write(name, old_value);
         mark_env_name(self.env_vars, ARRAY_VARS, name);
+        // No structured store here (parser context): mark typed cells
+        // dirty so reads re-parse instead of trusting a stale cell.
+        self.env_vars.mark_array_cells_dirty();
     }
 
     pub(super) fn set_assoc_element(&mut self, name: &str, key: &str, value: i128) {
@@ -747,6 +750,10 @@ impl ConditionalArithParser<'_> {
             }
         }
         mark_env_name(self.env_vars, ASSOC_VARS, name);
+        // No structured store here (parser context): mark typed cells
+        // dirty so assoc reads re-parse instead of trusting a stale cell
+        // (same discipline as the indexed element store above).
+        self.env_vars.mark_array_cells_dirty();
     }
 }
 

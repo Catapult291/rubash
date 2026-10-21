@@ -8,12 +8,17 @@ foreign `sh -c` child, a background `&` job — which of the six audited propert
 **inherits** from the parent, which it **owns** privately, and where the contract is
 **undefined**.
 
-Version 1 (2026-10-13, #713 second pass). Method: the differential harness
-`scripts/audit/nested-context-probes.py` — now **45 cases** (24 original + 21 new)
-run byte-for-byte (stdout, stderr, exit status separately) against **WSL GNU bash
-5.3.0(1)-release** reading the same case file. Every verdict below names its probe
-label. Fork-defined observables a forkless engine cannot reproduce are recorded as
-**documented divergences**, not bugs (§5).
+Version 2 (2026-10-21, #713 third pass). Method: the differential harness
+`scripts/audit/nested-context-probes.py` — now **56 cases** (24 original + 21 second
+pass + 11 this pass) run byte-for-byte (stdout, stderr, exit status separately)
+against GNU bash reading the same case file. The canonical oracle is **WSL GNU bash
+5.3.0(1)-release**; this pass's leg ran against native **MSYS2 GNU bash
+5.2.37(1)-release** (`GNU_CMD="D:/Git/bin/bash.exe"`) because WSL was unavailable to
+the runner — all measured cells are fork-emulation semantics MSYS2 implements
+faithfully, and the `$0` path-spelling noise is normalized inside the harness since
+this pass (D1). Every verdict below names its probe label. Fork-defined observables
+a forkless engine cannot reproduce are recorded as **documented divergences**, not
+bugs (§5).
 
 ## 1. The invariant table
 
@@ -25,10 +30,10 @@ measured.
 |---|---|---|---|---|---|---|
 | **1. fd table** (open fds visible; `exec`-established; redirection scope) | G: `fd3-in-subshell`, `fd-exec-close-isolation`, `fd-offset-shared-paren` — the table is a value copy; `( exec 3<&- )` cannot close the parent's fd 3; Rc-shared endpoints share the file offset like `fork()` | G: `fd4-into-comsub` (#368 closed), `stderr-inside-comsub` | G: `fd3-into-pipeline-stage`, `pipe-stage-stderr` | G: `fd3-into-function` — the function is the *same* fd table, no copy | D*: foreign children receive only OS-inherited fds (`platform-fd-inheritance.md`; #378 fixed the numbered-fd pass-through) | G: `bg-…` probes — copy at spawn time |
 | **2. traps** (EXIT / ERR / DEBUG / RETURN × `set -E` / `set -T`) | G: `err-plain-subshell`, `err-with-E` (#702), `err-nested-subshell-count`, `err-three-level-count`, `err-flat-region-fire`, `err-return-in-until` (#720), `exit-trap-in-subshell`, `trap-visible-in-subshell`, `ignored-signal-inherit`, `return-in-funcsub` — `reset_for_subshell_child` (`builtins/trap.rs:958`) keeps ERR under `-E` and DEBUG/RETURN under `-T` (trap.c:1466-1474), resets everything else, arms in-child installs | G: `err-in-comsub-under-E`, `debug-into-comsub-functrace-off`, `exit-trap-armed-in-comsub` — the ordinary comsub reset stays unconditional (GNU's comsub child does not fire ERR/DEBUG even under `-E`/`-T`; only an install *inside* the substitution fires) | G: `err-in-pipeline-stage` — the stage resets like a subshell; the pipeline aggregate (execute_cmd.c:2909) fires once for a failing *last* stage | G: `return-trap-functrace-on`, `debug-into-comsub-functrace-off` — ERR inherits only under `-E` (execute_cmd.c:5281-5291), RETURN under `-T`/`-o functrace` (execute_cmd.c:5294+) | D*: signal dispositions only; language traps are not a foreign-child concept | G: `exit-trap-background-subshell`, `bg-var-isolation` |
-| **3. diagnostic ownership** (do messages route through the redirected fd table?) | **BUG** (see §3.2): a compound's *own* redirection-failure message inside `( … ) 2>file` still reaches the real stderr — probe `subshell-redirect-diag-route`; the plain-command faces match (`subshell-stderr-route`, `closed-stderr-subshell`, #271/#510 closed) | G: `comsub-stderr-passthru` | G: `pipe-stage-stderr` | G: routed — same table | D*: child's own stderr | G: routed at spawn |
-| **4. compound-redirect exit status** | G: `compound-redirect-fail-status` (status 1) — but the message **doubles** (§3.1) and the `2>file` capture drops (`brace-redirect-err-route`) | G (status) | G (status) | G | G | G |
-| **5. stdin / EOF ownership** (`read` status, shared offsets) | G: `read-offset-shared-paren`, `read-offset-paren-isolation`, `fd-offset-shared-paren` — an explicit `<&7`/`<file` binding shares the offset across the boundary; fd 0 consumption is scoped (#567 closed) | G: `read` cases in `conformance` | G: `stage-read-var-isolation` — a non-last stage cannot set parent variables (matches GNU without `lastpipe`) | G (same process) | D* | G: `#567` probes |
-| **6. fd duplication ordering** (`2>&1 >file`) | G: `dup2` shape probes — the ordered list is a sequence, left to right (#699/#725 fixed the order) | G | G | G | G | G |
+| **3. diagnostic ownership** (do messages route through the redirected fd table?) | **BUG #934** (§3.4): the `( )` command's *own* failing redirect list reports through the real stderr and never performs the earlier `2>` opens — probes `paren-redirect-err-route`, `paren-redirect-side-effect`; the plain faces match (`subshell-stderr-route`, `closed-stderr-subshell`, `subshell-redirect-diag-route` — the #826 face is fixed) | **BUG #934**: an open failure *inside* the substitution leaks to the real stderr instead of the in-force `2>` — `comsub-redirect-err-route`; pass-through itself is correct (`comsub-stderr-passthru`, `stderr-inside-comsub`) | G: `pipe-stage-stderr`; the stage's *own* open failure leaks like the simple path (#934) | **BUG #934**: `func-redirect-err-route`, `func-redirect-fail-status` — the function's own failing redirect list bypasses the table; body diagnostics route correctly (`func-stderr-route`). Simple commands share the defect (`simple-redirect-err-route`, `exec2-persist-err-route`, `simple-redirect-side-effect`) | D*: child's own stderr | G: routed at spawn |
+| **4. compound-redirect exit status** | G: `compound-redirect-fail-status` (status 1); the message is now captured correctly on `{ }` (`brace-redirect-err-route`, #826 closed) but still misroutes on every other shape (#934) | G (status) | G (status) | G (status; `func-redirect-fail-status` shows the diagnostic face) | G | G |
+| **5. stdin / EOF ownership** (`read` status, shared offsets) | G: `fd-offset-shared-paren`, `read-offset-paren-isolation` — an explicit `<&7`/`<file` binding shares the offset across the boundary; fd 0 consumption is scoped (#567 closed) | G: `read` cases in `conformance` | G: `stage-read-var-isolation` — a non-last stage cannot set parent variables (matches GNU without `lastpipe`) | G (same process) | D* | G: `#567` probes |
+| **6. fd duplication ordering** (`2>&1 >file`) | G on the success path (#699/#725 fixed the order); **BUG #934 face B** on failure — the compound apply paths skip the earlier `2>` open's side effects entirely (`paren-redirect-side-effect`, `if`-family) | G on success | G on success | G on success; the simple/function paths perform the earlier open but misroute the report (`simple-redirect-side-effect`) | G | G |
 
 Process identity is settled outside this table: `$BASHPID` increments per `( )` while
 `$$` stays the parent (recorded in #713), and `bash -c`/foreign children carry the
@@ -80,9 +85,9 @@ All anchors are the vendored bash 5.3 mirror (`third_party/bash`, submodule comm
   `debug-into-comsub-functrace-off`), while an install *inside* the substitution fires
   (#345) and the EXIT trap armed inside runs at its end (`exit-trap-armed-in-comsub`).
 
-## 3. Findings — real defects (filed, not fixed in the #720 PR)
+## 3. Findings — real defects
 
-### 3.1 NEW — `set -T` DEBUG trap is not inherited into `$( )`
+### 3.1 FIXED — `set -T` DEBUG trap is not inherited into `$( )`
 Probe `debug-into-comsub-functrace-on`:
 
     set -T; trap 'echo D:$BASH_COMMAND' DEBUG; x=$(true); echo got=$x
@@ -92,9 +97,9 @@ Probe `debug-into-comsub-functrace-on`:
 GNU keeps DEBUG in the comsub child when `function_trace_mode` is set
 (trap.c:1469-1471 clears DEBUG/RETURN only `if (function_trace_mode == 0)`); rubash's
 command-substitution path calls the unconditional `reset_for_subshell` and has no
-functrace-scoped variant. Filed as **#825**.
+functrace-scoped variant. Filed as **#825**, since closed.
 
-### 3.2 NEW — a compound's own redirection-failure diagnostic bypasses the ordered fd table
+### 3.2 FIXED — a compound's own redirection-failure diagnostic bypasses the ordered fd table
 Three probes, one mechanism (`brace-redirect-err-route`,
 `compound-redirect-fail-status`, `subshell-redirect-diag-route`):
 
@@ -113,15 +118,53 @@ later redirect fails. This is the "diagnostic destination" mirror of
 `state-ownership-invariants.md` row B (175 `eprintln!` outside entry points) — the
 compound wrapper's open-failure reporter does not consult the fd table the command
 established. Faces (b)-in-subshell and the `cd` variant are already tracked in #699;
-the doubled emission and the dropped `2>file` capture are new. Filed as **#826**.
+the doubled emission and the dropped `2>file` capture are new. Filed as **#826**,
+since closed — but only the `{ }` wrapper path got the fix; every other apply path
+still carried the defect (see §3.4).
 
-### 3.3 Known-open tickets mapped to cells (no new filing)
+### 3.3 Tickets previously mapped to cells — all closed as of this pass
 - #699 — `2>&1 >file` order residuals, builtin write-error routing, closed-stderr
-  status corruption (cells 3/6).
+  status corruption (cells 3/6). Closed.
 - #700 / #701 — `read` on `/dev/stdin`, `/dev/fd/N`, EOF-without-newline under
-  compound redirection (cell 5, Windows-origin faces).
-- #720 form 3 — `cat <(false)` process-substitution copy path (cell 1×2 seam, PR
-  #715's read/procsub area).
+  compound redirection (cell 5, Windows-origin faces). Closed.
+- #720 — ERR-trap nested-context faces incl. `cat <(false)` procsub (cells 1×2).
+  Closed.
+- The live cell-defect after this pass is **#934** (§3.4), the only open item.
+
+### 3.4 NEW — redirect open-failure diagnostic bypasses the fd table on all
+non-brace paths (#934, two faces)
+
+#826 fixed the invariant on the `{ }` wrapper only
+(`apply_brace_group_redirects`, `src/executor/source_type_state.rs`). GNU applies
+the whole redirect list left-to-right in `do_redirection_internal`
+(`redir.c:767-955`) and reports an open failure through the fd-2 binding *in force
+at that point* (`redirection_error`, `redir.c:135`). Every other apply path
+violates one or both halves:
+
+- **Face A — wrong destination.** The open-failure message goes to the process's
+  real stderr even when an earlier `2>file` (same command or persistent
+  `exec 2>file`) is bound. Status 1 and single emission are correct everywhere.
+  Faces: `simple-redirect-err-route`, `func-redirect-err-route`,
+  `paren-redirect-err-route`, `if-redirect-err-route`,
+  `comsub-redirect-err-route`, `exec2-persist-err-route`,
+  `func-redirect-fail-status` (the `2>/dev/null` suppression face).
+- **Face B — missing side effects.** On the `( )`/`if`-family compound paths the
+  earlier `2>cap.txt` open never even happens when a later `>` fails — a stale
+  cap.txt survives untouched (GNU truncates it). Faces:
+  `paren-redirect-side-effect` (and the `if`/while/for/case/until siblings share
+  `apply_redirects_to_commands`, `compound_exec.rs:3610`). The simple/function
+  paths do perform the open (`simple-redirect-side-effect`) — only their
+  reporter is wrong.
+
+Correct faces already held: `{ }` brace (all three #826 probes), `>`-before-`2>`
+ordering (both shells agree the message reaches real stderr), and dup-failure
+diagnostics (`N: Bad file descriptor` does route through the table). The defect
+is specific to the *open*-failure reporter and the parse-order application
+contract — one mechanism, like #826, generalized to the remaining apply paths
+(`apply_ordered_output_redirects` `redirection.rs:1108`,
+`apply_function_call_redirects` `function_calls.rs:835`,
+`apply_no_output_builtin_redirects` `builtin_redirects.rs:52`, pipeline-stage
+wiring).
 
 ## 4. Documented forkless divergences (by design, do not "fix")
 - **D1** diagnostic branding: `$0: line N:` prefix carries the engine's own argv[0]
@@ -147,10 +190,27 @@ the doubled emission and the dropped `2>file` capture are new. Filed as **#826**
 
 ## 6. Harness
 
-`scripts/audit/nested-context-probes.py` (45 cases, exit non-zero on any divergence)
+`scripts/audit/nested-context-probes.py` (56 cases, exit non-zero on any divergence)
 — run:
 
     RUBASH_BIN=<path>/rubash.exe python scripts/audit/nested-context-probes.py
 
-Last full run (this branch, 2026-10-13): `cases=45 divergences=4` — the four are
-§3.1 and §3.2 (three probes of one mechanism). Every #720-related trap cell passes.
+Since this pass the harness normalizes the `$0` case-file path spelling
+(`D:\...`, `/d/...`, `/mnt/d/...`, `/cygdrive/d/...` → `<CASE>`) on both streams
+before comparing — the D1 brand noise no longer masquerades as a divergence, so
+`divergences=N` is once again a clean regression signal. Line numbers, message
+text, routing and status are still byte-compared.
+
+Last full run (master `d4fc195c`, 2026-10-21): `cases=56 divergences=9` — all
+nine are §3.4 / #934 faces (`simple`/`func`/`paren`/`if`/`comsub`/`exec2`
+redirect-err-route, `func-redirect-fail-status`, and the two `*-side-effect`
+probes); zero regressions elsewhere — every #720/#825/#826 trap and brace cell
+still passes. Oracle leg this run: native MSYS2 GNU bash 5.2.37(1)
+(`GNU_CMD="D:/Git/bin/bash.exe"`); the canonical WSL 5.3.0 leg should be
+re-confirmed at merge time. Runner:
+`RUBASH_BIN=<exe> GNU_CMD='wsl /usr/local/bin/bash' python
+scripts/audit/nested-context-probes.py` from an empty scratch cwd (case
+artefacts land there); stdin is EOF by harness construction. On GBK consoles
+run with `PYTHONIOENCODING=utf-8`. On hosts whose `wsl.exe` prepends banner
+noise to guest stderr, strip that exact prefix outside the comparison — it is
+machine noise, not a leg.

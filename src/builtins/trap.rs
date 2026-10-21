@@ -3,11 +3,17 @@
 //! GNU Bash source ownership:
 //! - builtins/trap.def
 
+use crate::shell::var_table::VarTable;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
 const TRAP_LIST: &str = "__RUBASH_TRAPS";
-const TRAP_PREFIX: &str = "__RUBASH_TRAP_";
+/// Action-key prefix for installed traps (`__RUBASH_TRAP_<SIGNAL>`).
+/// `pub(crate)` for the arith-for counter fast driver's whitelist gate
+/// (`compound_exec.rs`): the fast loop runs no commands, so any installed
+/// action — including a reset-suppressed one, which the gate conservatively
+/// treats as doubt — disqualifies and the slow loop runs instead.
+pub(crate) const TRAP_PREFIX: &str = "__RUBASH_TRAP_";
 /// Signals whose disposition was SIG_IGN when this shell started (trap.c
 /// sigmodes SIG_HARD_IGNORE). They cannot be trapped or reset, and POSIX
 /// reports no error when attempted (trap.c set_signal/ignore_signal).
@@ -17,7 +23,9 @@ pub(crate) const TRAP_ORIG_IGNORES: &str = "__RUBASH_TRAP_ORIG_IGN";
 /// restores the original handler for trapped signals but deliberately does
 /// not free trap_list strings, so `trap` in a subshell still lists the
 /// parent's traps; the reset set records which entries may not fire.
-const TRAP_RESET: &str = "__RUBASH_TRAP_RESET";
+/// `pub(crate)` alongside [`TRAP_PREFIX`] for the same fast-driver gate,
+/// which skips exactly this metadata key (and [`TRAP_ORIG_IGNORES`]).
+pub(crate) const TRAP_RESET: &str = "__RUBASH_TRAP_RESET";
 const EX_USAGE: i32 = 2;
 /// GNU's internal EX_USAGE (builtins/common.h): what trap.def returns before
 /// execute_cmd.c:4886-4888 converts it for `$?`. It exceeds EX_SHERRBASE,
@@ -307,7 +315,7 @@ pub(crate) const SIGNALS: [&str; 31] = [
 ];
 
 pub fn execute(args: &[String]) -> io::Result<i32> {
-    let mut env_vars = HashMap::new();
+    let mut env_vars = VarTable::default();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     execute_with_io(args, &mut env_vars, &mut stdout, &mut stderr)
@@ -330,7 +338,7 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
 
 pub fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -473,7 +481,7 @@ pub fn list_first_signal_for_sed() -> &'static str {
     "SIGHUP"
 }
 
-pub(crate) fn take_exit_trap(env_vars: &mut HashMap<String, String>) -> Option<String> {
+pub(crate) fn take_exit_trap(env_vars: &mut VarTable) -> Option<String> {
     if reset_trap_signals(env_vars).contains("EXIT") {
         return None;
     }
@@ -645,7 +653,7 @@ fn normalize_signal(signal: &str) -> Option<&'static str> {
 /// source builtin's entry-trap restore (source.def:216's
 /// uw_maybe_set_debug_trap -> trap.c:737-743 trap_if_untrapped ->
 /// set_signal).
-pub(crate) fn set_trap(env_vars: &mut HashMap<String, String>, signal: &str, action: &str) {
+pub(crate) fn set_trap(env_vars: &mut VarTable, signal: &str, action: &str) {
     // GNU trap.c set_signal: "A signal ignored on entry to the shell cannot
     // be trapped or reset, but no error is reported" (SIG_HARD_IGNORE).
     // Only real signals are hard-ignored; the EXIT/DEBUG/ERROR/RETURN
@@ -668,7 +676,7 @@ pub(crate) fn set_trap(env_vars: &mut HashMap<String, String>, signal: &str, act
 
 /// GNU trap.c restore_default_signal for the special traps. `pub(crate)`
 /// for the source builtin's entry-trap save (source.def:214-215).
-pub(crate) fn remove_trap(env_vars: &mut HashMap<String, String>, signal: &str) {
+pub(crate) fn remove_trap(env_vars: &mut VarTable, signal: &str) {
     if is_hard_ignored(env_vars, signal) {
         return;
     }
@@ -727,7 +735,7 @@ pub(crate) fn transport_inherited_ignores(env_vars: &HashMap<String, String>) ->
     ignored.join(":")
 }
 
-fn store_orig_ignored_signals(env_vars: &mut HashMap<String, String>, mut signals: Vec<String>) {
+fn store_orig_ignored_signals(env_vars: &mut VarTable, mut signals: Vec<String>) {
     signals.sort();
     signals.dedup();
     if signals.is_empty() {
@@ -737,7 +745,7 @@ fn store_orig_ignored_signals(env_vars: &mut HashMap<String, String>, mut signal
     }
 }
 
-fn add_orig_ignored_signal(env_vars: &mut HashMap<String, String>, signal: &str) {
+fn add_orig_ignored_signal(env_vars: &mut VarTable, signal: &str) {
     let mut signals = orig_ignored_signals(env_vars);
     if signals.iter().any(|ignored| ignored == signal) {
         return;
@@ -753,7 +761,7 @@ fn add_orig_ignored_signal(env_vars: &mut HashMap<String, String>, signal: &str)
 /// environment (a parent shell's "trap '' SIG" reaching a fresh rubash
 /// child) become hard-ignored for this shell, matching trap.c's
 /// original_signals == SIG_IGN startup handling.
-pub(crate) fn seed_startup_traps(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
     // Rebuild the empty trap-table entries for ignores transported across a
     // process boundary (transport_inherited_ignores): the per-signal "" keys
     // cannot survive a Windows environment block, so the ORIG_IGN list is
@@ -794,7 +802,7 @@ pub(crate) fn seed_startup_traps(env_vars: &mut HashMap<String, String>) {
 /// disposition, and trap.c re-derives SIG_HARD_IGNORE from it). Runtime
 /// ignores of plain subshells stay mutable; only this shell-entry boundary
 /// freezes them.
-pub(crate) fn mark_startup_ignores(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn mark_startup_ignores(env_vars: &mut VarTable) {
     let ignored: Vec<String> = trap_list(env_vars)
         .into_iter()
         .filter(|signal| {
@@ -811,7 +819,7 @@ pub(crate) fn mark_startup_ignores(env_vars: &mut HashMap<String, String>) {
 
 /// GNU execute_cmd.c uw_maybe_set_debug_trap: restore a saved DEBUG trap at
 /// function exit only when the body did not set a new one.
-pub(crate) fn maybe_restore_debug_trap(env_vars: &mut HashMap<String, String>, action: String) {
+pub(crate) fn maybe_restore_debug_trap(env_vars: &mut VarTable, action: String) {
     if env_vars.contains_key(&trap_key("DEBUG")) {
         return;
     }
@@ -820,7 +828,7 @@ pub(crate) fn maybe_restore_debug_trap(env_vars: &mut HashMap<String, String>, a
 
 /// GNU execute_cmd.c uw_maybe_set_error_trap: at function exit the saved ERR
 /// action is restored only when the body did not set a new one.
-pub(crate) fn maybe_restore_error_trap(env_vars: &mut HashMap<String, String>, action: String) {
+pub(crate) fn maybe_restore_error_trap(env_vars: &mut VarTable, action: String) {
     if env_vars.contains_key(&trap_key("ERR")) {
         return;
     }
@@ -832,7 +840,7 @@ pub(crate) fn maybe_restore_error_trap(env_vars: &mut HashMap<String, String>, a
 /// function body unless error_trace_mode (set -E) makes functions inherit
 /// it — so `trap -p ERR` inside the body reports nothing and the trap table
 /// matches the effective (non-inherited) state.
-pub(crate) fn clear_error_trap(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn clear_error_trap(env_vars: &mut VarTable) {
     env_vars.remove(&trap_key("ERR"));
     let mut signals = trap_list(env_vars);
     signals.remove("ERR");
@@ -841,7 +849,7 @@ pub(crate) fn clear_error_trap(env_vars: &mut HashMap<String, String>) {
 
 /// GNU execute_cmd.c restore_default_signal(DEBUG_TRAP) at function entry:
 /// remove the inherited DEBUG trap for the function body.
-pub(crate) fn clear_debug_trap(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn clear_debug_trap(env_vars: &mut VarTable) {
     env_vars.remove(&trap_key("DEBUG"));
     let mut signals = trap_list(env_vars);
     signals.remove("DEBUG");
@@ -941,7 +949,7 @@ fn trap_key(signal: &str) -> String {
 /// entry). Ignored dispositions (`trap ''`) stay ignored. Keep every table
 /// entry and record the reset dispositions so get_trap_action/take_exit_trap
 /// skip firing them while the listing still shows them.
-pub(crate) fn reset_for_subshell(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn reset_for_subshell(env_vars: &mut VarTable) {
     reset_for_subshell_inner(env_vars, false);
 }
 
@@ -955,11 +963,11 @@ pub(crate) fn reset_for_subshell(env_vars: &mut HashMap<String, String>) {
 /// builtin copy paths keep the unconditional [`reset_for_subshell`]; their
 /// ERR inheritance is modeled at their own call sites, so this variant is
 /// used only by the true `( )` subshell paths.
-pub(crate) fn reset_for_subshell_child(env_vars: &mut HashMap<String, String>) {
+pub(crate) fn reset_for_subshell_child(env_vars: &mut VarTable) {
     reset_for_subshell_inner(env_vars, true);
 }
 
-fn reset_for_subshell_inner(env_vars: &mut HashMap<String, String>, inherit_errtrace: bool) {
+fn reset_for_subshell_inner(env_vars: &mut VarTable, inherit_errtrace: bool) {
     let mut reset = reset_trap_signals(env_vars);
     for signal in trap_list(env_vars) {
         // DEBUG and RETURN are tracing hooks, not OS signal dispositions;
@@ -1014,7 +1022,7 @@ fn reset_trap_signals(env_vars: &HashMap<String, String>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn store_reset_traps(env_vars: &mut HashMap<String, String>, signals: BTreeSet<String>) {
+fn store_reset_traps(env_vars: &mut VarTable, signals: BTreeSet<String>) {
     if signals.is_empty() {
         env_vars.remove(TRAP_RESET);
     } else {
@@ -1032,7 +1040,7 @@ fn trap_list(env_vars: &HashMap<String, String>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn store_trap_list(env_vars: &mut HashMap<String, String>, signals: BTreeSet<String>) {
+fn store_trap_list(env_vars: &mut VarTable, signals: BTreeSet<String>) {
     if signals.is_empty() {
         env_vars.remove(TRAP_LIST);
     } else {
@@ -1059,7 +1067,7 @@ mod tests {
     /// (it removes the USR1 trap and succeeds).
     #[test]
     fn posix_reset_by_name_returns_internal_usage() {
-        let mut env_vars = HashMap::new();
+        let mut env_vars = VarTable::default();
         env_vars.insert("__RUBASH_SETOPT_posix".to_string(), "1".to_string());
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1068,7 +1076,7 @@ mod tests {
         assert_eq!(status, EX_USAGE_INTERNAL);
         assert!(String::from_utf8(err).unwrap().contains("usage: trap"));
 
-        let mut env_vars = HashMap::new();
+        let mut env_vars = VarTable::default();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let status =
@@ -1076,7 +1084,7 @@ mod tests {
         assert_eq!(status, 0);
 
         // The all-digit reset form keeps working in POSIX mode.
-        let mut env_vars = HashMap::new();
+        let mut env_vars = VarTable::default();
         env_vars.insert("__RUBASH_SETOPT_posix".to_string(), "1".to_string());
         let mut out = Vec::new();
         let mut err = Vec::new();

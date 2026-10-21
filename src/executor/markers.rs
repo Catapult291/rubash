@@ -389,10 +389,23 @@ pub(crate) const ARRAYREF_FLAG_STR: &str = "\u{E318}";
 /// Prefix marking a quoted here-doc body token value (lexer/mod.rs).
 pub(crate) const QUOTED_HEREDOC_MARKER: &str = "__RUBASH_HD1__";
 
-/// Command-substitution payload prefix inside transport text
-/// (execution_misc.rs) — `__RUBASH_CSB1_<hex>;` encodes bytes that cannot
-/// ride as chars.
-pub(crate) const COMSUB_PAYLOAD_PREFIX: &str = "__RUBASH_CSB1_";
+/// Command-substitution payload introducer inside transport text
+/// (execution_misc.rs) — `U+E319` + two hex chars + `;` encodes a byte
+/// that cannot ride as a bare char (comsub output's C0 carriers).
+///
+/// The introducer is a registry-zone PUA char, NOT the former ASCII
+/// `__RUBASH_CSB1_` prefix: the ASCII form was plain typeable text, so a
+/// user-literal `__RUBASH_CSB1_41;` reaching the payload decode boundary
+/// (argv materialization, field-split decisions) was consumed into its
+/// payload byte where GNU prints it verbatim (rubash#840 divergence 2).
+/// A bare U+E319 in transport is always protocol — user zone chars ride
+/// the E400 literal-char escape at every entry (push_literal_char, the
+/// same contract as ANSI_C_IFS_GUARD), so the decode is E400-aware and
+/// typed `$'\uE319'` data is never claimed. Typed `__RUBASH_CSB1_<hex>;`
+/// is now pure user data everywhere and passes through verbatim.
+pub(crate) const COMSUB_PAYLOAD_SENTINEL: char = '\u{E319}';
+/// `&str` companion of COMSUB_PAYLOAD_SENTINEL.
+pub(crate) const COMSUB_PAYLOAD_SENTINEL_STR: &str = "\u{E319}";
 
 /// `( ... )` compound-assignment operand marker (types.rs).
 pub(crate) const COMPOUND_ASSIGNMENT_MARKER: &str = "__RUBASH_CA1__";
@@ -416,17 +429,24 @@ pub(crate) fn decode_word_position_carriers(value: &str) -> String {
     if !contains_word_marker_bytes(value) {
         return value.to_string();
     }
-    value
-        .replace(DATA_SQUOTE, "'")
-        .replace(DATA_DQUOTE, "\"")
-        .replace(DATA_BACKTICK, "`")
-        .replace(DATA_DOLLAR, "$")
-        // The heredoc-mode walker protects a `'`/`"` in unquoted herestring
-        // text with the ANSI-C markers (the same decode
-        // eval_source_for_reparse applies, execution_misc.rs) — a `\'`
-        // escape pair in the raw word reaches this decoder as marker + '.
-        .replace(ANSI_C_QUOTE_MARKER, "'")
-        .replace(ANSI_C_DQUOTE_MARKER, "\"")
+    // The heredoc-mode walker protects a `'`/`"` in unquoted herestring
+    // text with the ANSI-C markers (the same decode
+    // eval_source_for_reparse applies, execution_misc.rs) — a `\'`
+    // escape pair in the raw word reaches this decoder as marker + '.
+    // E400-aware restore (rubash#840 divergence 3): the PUA members of the
+    // rule set can arrive as the escaped member of an E400 literal-char
+    // pair — typed `$'\uE010'` is user data, not a live marker.
+    restore_bare_sentinels(
+        value,
+        &[
+            (DATA_SQUOTE, "'"),
+            (DATA_DQUOTE, "\""),
+            (DATA_BACKTICK, "`"),
+            (DATA_DOLLAR, "$"),
+            (ANSI_C_QUOTE_MARKER, "'"),
+            (ANSI_C_DQUOTE_MARKER, "\""),
+        ],
+    )
 }
 
 /// Whether `value` contains any byte of the in-band word-text carrier
@@ -766,6 +786,12 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
         user_reachable: false,
     },
     MarkerInfo {
+        name: "COMSUB_PAYLOAD_SENTINEL",
+        code: COMSUB_PAYLOAD_SENTINEL as u32,
+        boundaries: &[Boundary::Output, Boundary::Storage],
+        user_reachable: true,
+    },
+    MarkerInfo {
         name: "DIR_STACK_FIELD_SEP",
         code: DIR_STACK_FIELD_SEP as u32,
         boundaries: &[],
@@ -814,12 +840,6 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
         name: "QUOTED_HEREDOC_MARKER",
         code: 0x5F,
         boundaries: &[Boundary::Reparse, Boundary::Storage],
-        user_reachable: false,
-    },
-    MarkerInfo {
-        name: "COMSUB_PAYLOAD_PREFIX",
-        code: 0x5F,
-        boundaries: &[Boundary::Storage, Boundary::Reparse],
         user_reachable: false,
     },
     MarkerInfo {
@@ -957,6 +977,33 @@ pub(crate) fn push_literal_char(output: &mut String, c: char) {
     output.push(c);
 }
 
+/// Inverse of [`push_literal_char`] for SOURCE-DISPLAY boundaries only
+/// (ast_print / `--pretty-print` / `declare -f` — rubash#856): script-entry
+/// escaping (substitution_metadata::bytes_to_script_text) leaves `E400` +
+/// zone-char pairs inside raw word text, and printing that spelling would
+/// leak the transport escape. `E400` + marker-zone char renders as the
+/// char alone; a bare `E400` or `E400` + non-zone char passes through
+/// (push_literal_char only ever prefixes zone chars). This is NOT a
+/// transport decoder — everything else (C0 carriers, raw-byte pairs,
+/// named markers) stays encoded; only the inert literal-char escape is
+/// folded so the printed text shows the user's original source chars.
+pub(crate) fn fold_literal_char_escapes(text: &str) -> String {
+    if !text.contains(LITERAL_CHAR_ESCAPE) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE && chars.peek().is_some_and(|next| is_marker_zone_char(*next))
+        {
+            out.push(chars.next().expect("peeked char exists"));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// E400-aware ANSI_C_IFS_GUARD handling (rubash#735).
 ///
 /// The guard (U+E401) marks lexer-decoded `$'...'` blanks. User data U+E401
@@ -1023,6 +1070,134 @@ pub(crate) fn cow_replace<'a>(s: &'a str, from: &str, to: &str) -> std::borrow::
         return std::borrow::Cow::Borrowed(s);
     }
     std::borrow::Cow::Owned(s.replace(from, to))
+}
+
+/// E400-aware sentinel restore over registry-zone markers: `E400 + c`
+/// copies BOTH chars verbatim (the literal-char escape — user data riding
+/// transport), while a BARE `sentinel` is protocol and maps to its
+/// replacement. One left-to-right scan replaces a `.replace()` chain; the
+/// replacement text is appended, never re-scanned.
+///
+/// The blind `.replace(E30D, "\\")`-style chains this supersedes read the
+/// ESCAPED member of a user pair as live protocol: typed `$'\uE30D'`
+/// arrives `E400 + E30D` at entry (push_literal_char, rubash#735), so an
+/// unaware restore consumed the char and left a stray E400 introducer —
+/// `a=($'\uE30D')` stored `E400 + \` (rubash#840 divergence 3, the
+/// "assignment-tail unescape eats typed PUA" family). Only registry-zone
+/// targets need this treatment: typed C0 bytes never arrive as bare C0
+/// chars (they ride raw-byte marker pairs), so `.replace()` on C0
+/// carriers stays correct.
+pub(crate) fn restore_bare_sentinels(value: &str, rules: &[(char, &str)]) -> String {
+    if rules.iter().all(|(sentinel, _)| !value.contains(*sentinel)) {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            output.push(ch);
+            if let Some(next) = chars.next() {
+                output.push(next);
+            }
+            continue;
+        }
+        match rules.iter().find(|(sentinel, _)| *sentinel == ch) {
+            Some((_, replacement)) => output.push_str(replacement),
+            None => output.push(ch),
+        }
+    }
+    output
+}
+
+/// Decode-side sibling of [`restore_bare_sentinels`] for boundaries whose
+/// result is USER-VISIBLE text rather than transport (the array storage
+/// mirror's element render, eval's re-parse source): `E400 + c` emits
+/// `c` itself — the literal-char escape resolves to the restored user
+/// char — while a BARE `sentinel` maps to its replacement. Where the
+/// result stays transport text for a downstream decode, use
+/// `restore_bare_sentinels` instead (its pair-preserving contract keeps
+/// user chars escaped in flight).
+pub(crate) fn decode_bare_sentinels(value: &str, rules: &[(char, &str)]) -> String {
+    if !value.contains(LITERAL_CHAR_ESCAPE)
+        && rules.iter().all(|(sentinel, _)| !value.contains(*sentinel))
+    {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            output.push(chars.next().unwrap_or(ch));
+            continue;
+        }
+        match rules.iter().find(|(sentinel, _)| *sentinel == ch) {
+            Some((_, replacement)) => output.push_str(replacement),
+            None => output.push(ch),
+        }
+    }
+    output
+}
+
+/// E400-aware `str::trim_end_matches`: strips the trailing run of BARE
+/// `sentinel`s only. `trim_end_matches` (and `trim_matches`) reads the
+/// escaped member of a trailing `E400 + sentinel` pair as a bare sentinel
+/// and strips it, leaving a dangling E400 introducer where GNU keeps the
+/// user char (rubash#840). A leading pair can never collide (the head
+/// char is E400, not the sentinel), so `trim_start_matches` stays safe.
+pub(crate) fn trim_bare_sentinel_suffix<'a>(value: &'a str, sentinel: char) -> &'a str {
+    if !value.ends_with(sentinel) {
+        return value;
+    }
+    // Byte offset where the trailing run of BARE sentinels begins. An
+    // E400 pair is user data and breaks the run; a lone trailing E400 is
+    // malformed protocol and also breaks it (nothing to trim anyway).
+    let mut run_start = value.len();
+    let mut chars = value.char_indices();
+    while let Some((offset, ch)) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            run_start = value.len();
+            chars.next();
+            continue;
+        }
+        if ch == sentinel {
+            if run_start == value.len() {
+                run_start = offset;
+            }
+        } else {
+            run_start = value.len();
+        }
+    }
+    &value[..run_start]
+}
+
+/// Whether `value` ends with a BARE `sentinel` (live protocol at the
+/// edge). `str::ends_with` reads the escaped member of a trailing
+/// `E400 + sentinel` pair as a hit (rubash#840).
+pub(crate) fn ends_with_bare_sentinel(value: &str, sentinel: char) -> bool {
+    value.ends_with(sentinel) && trim_bare_sentinel_suffix(value, sentinel).len() < value.len()
+}
+
+/// E400-aware sentinel presence test: true only for a BARE `sentinel`
+/// (live protocol). The escaped member of an `E400 + sentinel` pair is
+/// user data riding transport and does not count — the check answers "is
+/// the protocol already present", the question admission gates such as
+/// `command_substitution_value_needs_payload_protection` actually ask.
+/// `value.contains(sentinel)` reads the pair's second char as a hit.
+pub(crate) fn contains_bare_sentinel(value: &str, sentinel: char) -> bool {
+    if !value.contains(sentinel) {
+        return false;
+    }
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            chars.next();
+            continue;
+        }
+        if ch == sentinel {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1311,7 +1486,7 @@ mod tests {
             "ARRAY_FIELD_SPLIT_MARKER", // declare/storage/array element split
             "QUOTED_HEREDOC_MARKER", // execution_misc.rs body strip (QUOTED_HEREDOC_MARKER replace)
             "COMPOUND_ASSIGNMENT_MARKER", // types.rs compound-operand strip
-            "COMSUB_PAYLOAD_PREFIX", // execution_misc decode_command_substitution_payload
+            "COMSUB_PAYLOAD_SENTINEL", // execution_misc decode_command_substitution_payload
             "CASE_PATTERN_EXPECT", // parser/support.rs boundary-stack sentinel
             "CASE_PATTERN_MAY_OPEN", // parser/support.rs boundary-stack sentinel
             "CASE_PATTERN_PAREN",  // parser/support.rs boundary-stack sentinel
@@ -1339,7 +1514,7 @@ mod tests {
         for (name, first) in [
             ("FAILED_SUBSCRIPT_SENTINEL", FAILED_SUBSCRIPT_SENTINEL),
             ("QUOTED_HEREDOC_MARKER", QUOTED_HEREDOC_MARKER),
-            ("COMSUB_PAYLOAD_PREFIX", COMSUB_PAYLOAD_PREFIX),
+            ("COMSUB_PAYLOAD_SENTINEL", COMSUB_PAYLOAD_SENTINEL_STR),
             ("COMPOUND_ASSIGNMENT_MARKER", COMPOUND_ASSIGNMENT_MARKER),
             ("GROUP_REDIRECT_INJECTED_MARK", GROUP_REDIRECT_INJECTED_MARK),
             ("CASE_PATTERN_EXPECT", CASE_PATTERN_EXPECT),

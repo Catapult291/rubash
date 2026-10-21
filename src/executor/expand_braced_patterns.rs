@@ -157,7 +157,7 @@ impl Executor {
             };
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|value| self.apply_parameter_transform_value(value, transform))
                     .collect::<Vec<_>>()
@@ -167,7 +167,7 @@ impl Executor {
         if let Ok(index) = var_name.parse::<usize>() {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index.saturating_sub(1))
                     .map(|value| self.apply_parameter_transform_value(value, transform))
                     .unwrap_or_default(),
@@ -215,7 +215,7 @@ impl Executor {
         if matches!(var_name, "@" | "*") {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|value| apply_parameter_case_mod(value, operation, &pattern))
                     .collect::<Vec<_>>()
@@ -225,7 +225,7 @@ impl Executor {
         if let Ok(index) = var_name.parse::<usize>() {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index.saturating_sub(1))
                     .map(|value| apply_parameter_case_mod(value, operation, &pattern))
                     .unwrap_or_default(),

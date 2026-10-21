@@ -12,7 +12,6 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
 
 use super::support_names::split_shell_path;
 use crate::executor::markers::DATA_DOLLAR;
@@ -36,13 +35,13 @@ struct CommandLookupCache {
     /// File-name listing per physical PATH directory. Replaces the PATH x
     /// PATHEXT per-candidate stat grid with one read_dir per directory
     /// (rubash#159); exact-case set + ASCII-lowercase fold map since #799.
+    /// A miss is never concluded from a listing alone: every candidate is
+    /// stat'ed directly first, and a probe hit re-reads that directory
+    /// (rubash#392). No filesystem timestamp on Windows (mtime
+    /// granularity, lazy directory timestamp flushes) can prove a
+    /// directory's entry set did not move — `wpm` replaces command links
+    /// by unlink+create inside the same timestamp tick.
     listings: HashMap<PathBuf, Arc<DirListing>>,
-    /// When each listing was read (the directory mtime). A listing whose
-    /// directory mtime moved is dropped before a miss is concluded
-    /// (rubash#392): `wpm` replaces command links by unlink+create, so a
-    /// directory listed while a link was missing would otherwise keep
-    /// answering "absent" for the life of the process.
-    listing_stamps: HashMap<PathBuf, SystemTime>,
     /// `winuxcmd help NAME` dispatcher probe outcomes keyed by dispatch
     /// name (rubash#159). Each uncached probe is a child process; GNU has
     /// no analogue because findcmd.c:623 find_user_command_in_path is a
@@ -69,7 +68,6 @@ impl CommandLookupCache {
         self.fingerprint = fingerprint;
         self.results.clear();
         self.listings.clear();
-        self.listing_stamps.clear();
         self.probes.clear();
         self.path_dirs = None;
         self.path_extensions = None;
@@ -84,7 +82,6 @@ fn command_lookup_cache() -> &'static Mutex<CommandLookupCache> {
             fingerprint: String::new(),
             results: HashMap::new(),
             listings: HashMap::new(),
-            listing_stamps: HashMap::new(),
             probes: HashMap::new(),
             path_dirs: None,
             path_extensions: None,
@@ -337,8 +334,8 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
         cache.results.clear();
     }
     // Only positive resolutions are memoized (rubash#392): a miss must stay
-    // re-checkable — the walk's directory listings validate themselves against
-    // the directory mtime, so a command that appears mid-session (the wpm
+    // re-checkable — before the walk concludes one, every candidate name is
+    // stat'ed directly, so a command that appears mid-session (the wpm
     // unlink+create window) is found on the next lookup.
     if result.is_some() {
         cache.results.insert(name.to_string(), result.clone());
@@ -399,21 +396,36 @@ struct DirListing {
 ///   resolves verbatim). The stem check stays byte-exact inside the fold
 ///   arm, and the RESOLVED spelling is always the on-disk one.
 ///
-/// The listing is a cache, not an oracle: rubash#392 validates it against
-/// the directory mtime before a miss is concluded (one stat per consulted
-/// directory, miss path only) and drops it when the directory's entry set
-/// moved -- `wpm` replaces command links by unlink+create (WinuxCmd#1188,
-/// #1206), so a listing read while a link was absent must not keep
-/// answering "absent". Inside a fingerprint, hits (`results`) stay
-/// memoized; misses do not. An unreadable directory (missing PATH entry,
-/// permission denial) yields an empty listing -- exactly the set of names
-/// the per-candidate stat walk would have found there: none. `cache` must
-/// already be verified against the current fingerprint by the caller.
+/// The listing is a cache, not an oracle: before a miss is concluded every
+/// candidate name is stat'ed directly, and a probe hit re-reads the
+/// directory it hit in (rubash#392, `confirm_listing_miss` below) -- `wpm`
+/// replaces command links by unlink+create (WinuxCmd#1188, #1206), so a
+/// listing read while a link was absent must not keep answering "absent".
+/// Inside a fingerprint, hits
+/// (`results`) stay memoized; misses do not. An unreadable directory
+/// (missing PATH entry, permission denial) yields an empty listing --
+/// exactly the set of names the per-candidate stat walk would have found
+/// there: none. `cache` must already be verified against the current
+/// fingerprint by the caller.
 #[cfg(not(unix))]
 fn cached_dir_listing(cache: &mut CommandLookupCache, directory: &Path) -> Arc<DirListing> {
     if let Some(listing) = cache.listings.get(directory) {
         return Arc::clone(listing);
     }
+    let listing = Arc::new(read_dir_listing(directory));
+    if cache.listings.len() >= 512 {
+        cache.listings.clear();
+    }
+    cache
+        .listings
+        .insert(directory.to_path_buf(), Arc::clone(&listing));
+    listing
+}
+
+/// Enumerate one directory into a `DirListing`. An unreadable directory
+/// yields an empty listing (see `cached_dir_listing`).
+#[cfg(not(unix))]
+fn read_dir_listing(directory: &Path) -> DirListing {
     let mut listing = DirListing {
         exact: HashSet::new(),
         fold: HashMap::new(),
@@ -428,17 +440,6 @@ fn cached_dir_listing(cache: &mut CommandLookupCache, directory: &Path) -> Arc<D
             }
         })
         .ok();
-    let listing = Arc::new(listing);
-    if cache.listings.len() >= 512 {
-        cache.listings.clear();
-        cache.listing_stamps.clear();
-    }
-    if let Some(stamp) = dir_mtime(directory) {
-        cache.listing_stamps.insert(directory.to_path_buf(), stamp);
-    }
-    cache
-        .listings
-        .insert(directory.to_path_buf(), Arc::clone(&listing));
     listing
 }
 
@@ -497,8 +498,10 @@ fn listed_candidates(name: &str, extensions: &[String]) -> Vec<ListedCandidate> 
 /// findcmd.c:623 find_user_command_in_path (first match wins, PATH order
 /// preserved, per-directory extension order from executable_candidate),
 /// but consults the per-fingerprint scan scaffold and the cached
-/// directory listings under one lock, so a warm miss performs no
-/// filesystem syscalls at all.
+/// directory listings under one lock. A hit is answered from the listing
+/// alone (plus the is_file confirm); a miss is never concluded from the
+/// listing — it is confirmed by direct candidate probes (rubash#392), so
+/// the only cost a warm lookup pays is the listing check itself.
 #[cfg(not(unix))]
 fn find_in_path_via_listings(
     name: &str,
@@ -562,11 +565,22 @@ fn find_in_path_via_listings(
                 }
             }
         }
-        // rubash#392: before concluding a miss, re-stat the consulted
-        // directories (one stat each, miss path only) and drop listings whose
-        // mtime moved — the wpm unlink+create window (WinuxCmd#1188/#1206) is
-        // exactly "the file appeared inside an already-listed directory".
-        if attempt == 0 && invalidate_stale_listings(&mut cache, &dirs) {
+        // rubash#392: before concluding a miss, stat every candidate name
+        // directly — a probe hit means that directory's listing is stale,
+        // so re-read it and re-walk once against fresh listings. The wpm
+        // unlink+create window (WinuxCmd#1188/#1206) is exactly "the file
+        // appeared inside an already-listed directory", and no Windows
+        // timestamp oracle can prove a directory's entry set did not move
+        // (directory mtime has coarse granularity and lazy flushes — the
+        // mtime-stamp version of this check kept answering "absent" for a
+        // file created inside the same timestamp tick). The probes are
+        // GNU's own miss semantics: findcmd.c:623-697
+        // find_user_command_in_path -> find_in_path_element -> file_status
+        // (findcmd.c:113) stats NAME under each PATH element on every
+        // unhashed lookup, so the negative answer always comes from the
+        // filesystem, never from a cache. Hits return from the listing
+        // scan above and never pay the probe grid.
+        if attempt == 0 && confirm_listing_miss(&mut cache, &dirs, &candidates) {
             continue;
         }
         break;
@@ -596,39 +610,52 @@ fn listing_stem_exact_extension_ci(disk: &str, candidate: &Path) -> bool {
     }
 }
 
-/// Directory mtime — the cheap "did the entry set change" probe (rubash#392).
+/// Ground-truth confirmation for a would-be miss (rubash#392): stat each
+/// candidate spelling under every consulted directory — the same probes
+/// GNU's find_in_path_element -> file_status walk performs — and re-read
+/// the listing of any directory where a probe hits. The probe is only a
+/// staleness signal, never a match: the filesystem folds case behind the
+/// command name's back (`dir/r.exe` stats true for on-disk `R.exe`), so the
+/// rescan re-imposes the rubash#799 byte-exact stem contract on the fresh
+/// listing. A probe hit on a listing that turns out identical costs the
+/// re-read but no rescan (the #799-rejected name stays rejected). When a
+/// listing actually moved, the dispatcher-probe outcomes ride the same
+/// directories — a `wpm` install that adds a link can also flip a
+/// `winuxcmd help NAME` answer — so they are cleared with it. Returns true
+/// when anything changed so the caller re-walks exactly once. Cost: PATH
+/// entries x PATHEXT candidates stats, miss path only; hits never reach
+/// this.
 #[cfg(not(unix))]
-fn dir_mtime(directory: &Path) -> Option<SystemTime> {
-    fs::metadata(directory)
-        .and_then(|meta| meta.modified())
-        .ok()
-}
-
-/// Drop every cached listing whose directory mtime moved since it was read,
-/// together with the dispatcher-probe outcomes (they ride the same
-/// directories). Returns true when anything was dropped so the caller
-/// re-walks exactly once. Cost: one stat per consulted directory, and only on
-/// the miss path (rubash#392).
-#[cfg(not(unix))]
-fn invalidate_stale_listings(cache: &mut CommandLookupCache, dirs: &[PathBuf]) -> bool {
-    let stale = dirs
-        .iter()
-        .filter(|dir| match cache.listing_stamps.get(*dir) {
-            Some(taken) => dir_mtime(dir).map(|now| now != *taken).unwrap_or(true),
-            // A listing without a stamp predates the stamp bookkeeping:
-            // treat it as stale so the first miss re-reads it.
-            None => cache.listings.contains_key(*dir),
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for dir in &stale {
-        cache.listings.remove(dir);
-        cache.listing_stamps.remove(dir);
+fn confirm_listing_miss(
+    cache: &mut CommandLookupCache,
+    dirs: &[PathBuf],
+    candidates: &[ListedCandidate],
+) -> bool {
+    let mut changed = false;
+    for dir in dirs {
+        if candidates
+            .iter()
+            .any(|candidate| dir.join(&candidate.file).is_file())
+        {
+            let fresh = read_dir_listing(dir);
+            // `fold` is derived from `exact` but its per-key winner follows
+            // enumeration order, so compare both — a case-distinct rename
+            // on a case-sensitive directory can move `fold` while `exact`
+            // stands.
+            let moved = match cache.listings.get(dir) {
+                Some(cached) => cached.exact != fresh.exact || cached.fold != fresh.fold,
+                None => true,
+            };
+            if moved {
+                changed = true;
+                cache.listings.insert(dir.clone(), Arc::new(fresh));
+            }
+        }
     }
-    if !stale.is_empty() {
+    if changed {
         cache.probes.clear();
     }
-    !stale.is_empty()
+    changed
 }
 
 #[cfg_attr(unix, allow(unused_variables))]
@@ -1172,6 +1199,198 @@ pub fn external_command_for_named_program(
     (command, false)
 }
 
+/// niubash#379, grandchild level: a console-less rubash (agent/CI/git-hook
+/// spawn — e.g. the `bash.exe` forwarder's DETACHED_PROCESS child) has no
+/// console for a console-subsystem child to inherit, so a plain
+/// CreateProcess makes Windows allocate a *visible* console window for that
+/// child — one flash per external command. CREATE_NO_WINDOW gives the child
+/// a hidden console instead: functionally identical to the inherited hidden
+/// console the pre-DETACHED layout delivered, and harmless for GUI children
+/// (the flag is ignored outside the console subsystem).
+///
+/// The gate is GetConsoleCP()==0 — "this process is attached to no console".
+/// GetConsoleWindow() is NOT a usable gate: it returns NULL under ConPTY,
+/// which would tax every Windows Terminal spawn with a needless hidden
+/// console and detach the child from the pseudoconsole. stdio is_terminal()
+/// is no gate either: `cmd > out` in a real terminal must still let the
+/// child inherit the real console.
+pub(crate) fn suppress_orphan_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetConsoleCP() -> u32;
+        }
+        // CREATE_NO_WINDOW = 0x08000000 (WinBase.h)
+        if unsafe { GetConsoleCP() } == 0 && !try_alloc_hidden_console() {
+            command.creation_flags(0x0800_0000);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+#[cfg(windows)]
+pub(crate) fn orphan_console_creation_flags() -> u32 {
+    extern "system" {
+        fn GetConsoleCP() -> u32;
+    }
+    if unsafe { GetConsoleCP() } == 0 && !try_alloc_hidden_console() {
+        0x0800_0000
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+unsafe fn preserve_std_handles<F: FnOnce() -> bool>(f: F) -> bool {
+    type Handle = *mut core::ffi::c_void;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const INVALID_HANDLE_VALUE: Handle = (-1isize) as Handle;
+
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> Handle;
+        fn SetStdHandle(n_std_handle: u32, h_handle: Handle) -> i32;
+        fn GetFileType(h_file: Handle) -> u32;
+        fn GetLastError() -> u32;
+        fn SetLastError(dw_err_code: u32);
+    }
+
+    unsafe fn live_std_handle(id: u32) -> Option<Handle> {
+        let h = GetStdHandle(id);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        SetLastError(0);
+        if GetFileType(h) == 0 && GetLastError() != 0 {
+            return None;
+        }
+        Some(h)
+    }
+
+    let stdin = live_std_handle(STD_INPUT_HANDLE);
+    let stdout = live_std_handle(STD_OUTPUT_HANDLE);
+    let stderr = live_std_handle(STD_ERROR_HANDLE);
+    let ok = f();
+    if ok {
+        if let Some(h) = stdin {
+            let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+        }
+        if let Some(h) = stdout {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+        }
+        if let Some(h) = stderr {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+        }
+    }
+    ok
+}
+
+/// Fast path on Windows 11 24H2+ / Server 2025: allocate a windowless console
+/// in-process via `AllocConsoleWithOptions(ALLOC_CONSOLE_MODE_NO_WINDOW)` so
+/// the shell owns the hidden console before the first child even spawns.
+#[cfg(windows)]
+fn try_alloc_hidden_console() -> bool {
+    #[repr(C)]
+    struct AllocConsoleOptions {
+        mode: i32,
+        use_show_window: i32,
+        show_window: u16,
+    }
+    type AllocConsoleWithOptionsFn =
+        unsafe extern "system" fn(*const AllocConsoleOptions, *mut i32) -> i32;
+
+    extern "system" {
+        fn GetModuleHandleA(module_name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            proc_name: *const u8,
+        ) -> *mut core::ffi::c_void;
+        fn GetConsoleCP() -> u32;
+    }
+
+    const ALLOC_CONSOLE_MODE_NO_WINDOW: i32 = 2;
+
+    unsafe {
+        let module = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        let proc = GetProcAddress(module, b"AllocConsoleWithOptions\0".as_ptr());
+        if proc.is_null() {
+            return false;
+        }
+        let func: AllocConsoleWithOptionsFn = core::mem::transmute(proc);
+        preserve_std_handles(|| {
+            let options = AllocConsoleOptions {
+                mode: ALLOC_CONSOLE_MODE_NO_WINDOW,
+                use_show_window: 0,
+                show_window: 0,
+            };
+            let mut result = 0i32;
+            func(&options, &mut result) >= 0 && GetConsoleCP() != 0
+        })
+    }
+}
+
+/// niubash#462: claim the first child's hidden CREATE_NO_WINDOW console for
+/// the shell session on Windows builds without `AllocConsoleWithOptions`, so
+/// subsequent external spawns inherit it for free instead of paying ~22 ms
+/// per child spawn.
+pub(crate) fn adopt_orphan_console(child_pid: u32) {
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn GetConsoleCP() -> u32;
+            fn AttachConsole(dw_process_id: u32) -> i32;
+            fn GetLastError() -> u32;
+            fn SwitchToThread() -> i32;
+        }
+
+        if GetConsoleCP() != 0 {
+            return;
+        }
+        // On Windows 8+ (ConDrv), a CREATE_NO_WINDOW child connects its
+        // hidden conhost.exe inside kernelbase.dll!DllMain during loader
+        // startup (~15-25 ms after CreateProcessW returns). Before that point
+        // AttachConsole fails with ERROR_INVALID_HANDLE (6) or
+        // ERROR_GEN_FAILURE (31); if the child already exited it fails with
+        // ERROR_INVALID_PARAMETER (87). Yield without hitting the 15.6 ms OS
+        // timer tick so even a fast-exiting child (`hostname.exe`) is caught
+        // the instant its console commits.
+        const ERROR_INVALID_HANDLE: u32 = 6;
+        const ERROR_GEN_FAILURE: u32 = 31;
+        preserve_std_handles(|| {
+            let start = std::time::Instant::now();
+            let spin_limit = std::time::Duration::from_millis(30);
+            let gen_failure_limit = std::time::Duration::from_millis(250);
+            let invalid_handle_limit = std::time::Duration::from_millis(500);
+            loop {
+                if AttachConsole(child_pid) != 0 {
+                    return true;
+                }
+                let err = GetLastError();
+                let elapsed = start.elapsed();
+                let keep_waiting = (err == ERROR_INVALID_HANDLE && elapsed < invalid_handle_limit)
+                    || (err == ERROR_GEN_FAILURE && elapsed < gen_failure_limit);
+                if !keep_waiting {
+                    return false;
+                }
+                if elapsed < spin_limit {
+                    if SwitchToThread() == 0 {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = child_pid;
+}
+
 /// The script argument a shell-wrapped child reports as `$0`.
 ///
 /// GNU search_for_command (findcmd.c:395-397) returns a slash-bearing word
@@ -1570,7 +1789,15 @@ fn winuxcmd_has_command(dispatcher: &Path, name: &str, env_vars: &HashMap<String
             command.env(key, value);
         }
     }
-    command.output().is_ok_and(|output| output.status.success())
+    suppress_orphan_console(&mut command);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .inspect(|child| adopt_orphan_console(child.id()))
+        .and_then(|child| child.wait_with_output())
+        .is_ok_and(|output| output.status.success())
 }
 
 /// rubash#159: `winuxcmd help NAME` probe memo. Each uncached probe is a
@@ -2524,6 +2751,35 @@ fn shell_path_to_windows_inner(path: &str, env_vars: &HashMap<String, String>) -
             let drive = bytes[5] as char;
             let rest = if normalized.len() > 6 {
                 normalized[7..].trim_start_matches('/')
+            } else {
+                ""
+            };
+            if rest.is_empty() {
+                return PathBuf::from(format!("{}:\\", drive.to_ascii_uppercase()));
+            } else {
+                return PathBuf::from(
+                    format!("{}:\\{}", drive.to_ascii_uppercase(), rest).replace('/', "\\"),
+                );
+            }
+        }
+    }
+
+    // Map /cygdrive/X drive paths to Windows drive letters (Cygwin-style
+    // convention), exactly parallel to the /mnt/ branch above.
+    // rubash#850: rubash's in-shell normalization had a /mnt arm but no
+    // /cygdrive arm, so `cd`/`test`/`[[ ]]`/`source`/redirects reported
+    // ENOENT for a path the bundled winuxcmd applets (ls/cat/cp, whose
+    // normalize_api_operand_w already folds /cygdrive/d/... into /d/...)
+    // resolved fine — the same path answered two ways depending on which
+    // layer handled it. `/cygdrive/d/repo` folds to `D:\repo`.
+    // Must be exactly /cygdrive/X or /cygdrive/X/... to avoid false
+    // matches like /cygdrive/cfoo.
+    if cfg!(windows) && normalized.starts_with("/cygdrive/") && normalized.len() >= 11 {
+        let bytes = normalized.as_bytes();
+        if bytes[10].is_ascii_alphabetic() && (normalized.len() == 11 || bytes[11] == b'/') {
+            let drive = bytes[10] as char;
+            let rest = if normalized.len() > 11 {
+                normalized[12..].trim_start_matches('/')
             } else {
                 ""
             };
@@ -5409,12 +5665,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_listing_cache_finds_files_that_appear_but_not_ghosts() {
-        // rubash#392: the per-directory listing is validated against the
-        // directory mtime before a miss is concluded, so a file created
-        // inside an already-listed PATH directory (the `wpm` unlink+create
-        // window, WinuxCmd#1188/#1206) is found on the next lookup instead
-        // of staying "command not found" for the life of the process. A
-        // name with no file behind it stays a miss, and `hash -r`
+        // rubash#392: before a miss is concluded every candidate name is
+        // stat'ed directly (GNU find_in_path_element -> file_status
+        // semantics — no timestamp oracle, which on Windows cannot prove
+        // an entry set did not move), so a file created inside an
+        // already-listed PATH directory (the `wpm` unlink+create window,
+        // WinuxCmd#1188/#1206) is found on the next lookup instead of
+        // staying "command not found" for the life of the process. A name
+        // with no file behind it stays a miss, and `hash -r`
         // (phash_flush, builtins/hash.def:150) still drops everything.
         let dir = std::env::temp_dir().join("rubash-listing-negative-boundary");
         let _ = fs::remove_dir_all(&dir);
@@ -5446,6 +5704,19 @@ mod tests {
         assert_eq!(
             find_user_command("late_tool3", &env_vars),
             Some(dir.join("late_tool3.exe"))
+        );
+
+        // A probe hit is a staleness signal, never a match: the
+        // filesystem folds case, so `ghost_tool` stats true against
+        // on-disk `GHOST_TOOL.exe`, but the rescan re-imposes the
+        // rubash#799 byte-exact stem contract — the miss must stand,
+        // while the exact-cased name still resolves through the
+        // extension-fold arm.
+        fs::write(dir.join("GHOST_TOOL.exe"), b"").unwrap();
+        assert_eq!(find_user_command("ghost_tool", &env_vars), None);
+        assert_eq!(
+            find_user_command("GHOST_TOOL", &env_vars),
+            Some(dir.join("GHOST_TOOL.exe"))
         );
 
         // `hash -r` drops everything; the fresh listing sees the files.
@@ -5513,9 +5784,7 @@ mod tests {
         assert_eq!(find_user_command("memo_tool", &env_vars), None);
 
         // Positives track a PATH reorder (fingerprint change resets the
-        // scan scaffold): the now-first directory wins. A file created
-        // inside an already-listed directory WITHOUT a fingerprint change
-        // stays invisible -- the sanctioned rubash#159 staleness below.
+        // scan scaffold): the now-first directory wins.
         fs::write(dir1.join("memo_hit.exe"), b"").unwrap();
         fs::write(dir0.join("memo_hit.exe"), b"").unwrap();
         env_vars.insert(
@@ -5593,6 +5862,19 @@ pub fn shell_pwd_display_path(path: &str) -> String {
     {
         let drive = (value.as_bytes()[0] as char).to_ascii_lowercase();
         return format!("/{drive}/{}", &value[3..]);
+    }
+    // unixwin/niubash#481: the bare drive-root display `D:` — produced by
+    // the display normalization of a `D:/` operand, which drops the
+    // trailing separator — is the same drive root the `D:/` arm above
+    // renders `/d/`; folding it here keeps the canonical persona form
+    // instead of leaking the designator into $PWD.
+    if cfg!(windows)
+        && value.len() == 2
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+    {
+        let drive = (value.as_bytes()[0] as char).to_ascii_lowercase();
+        return format!("/{drive}/");
     }
     if value.is_empty() {
         "/".to_string()

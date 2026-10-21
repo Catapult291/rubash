@@ -986,6 +986,19 @@ impl Executor {
                     // primitive, reused): eval absorbs it and continues.
                     self.evalerror_subscript_pending.set(true);
                     self.raise_evalerror_abort();
+                    // The abort above skips the success-gated typed-cell sync
+                    // below, but assign_compound_array_list has already
+                    // installed the PARTIAL store in the mirror (GNU
+                    // arrayfunc.c:913-932 returns NULL only after the elements
+                    // before the bad subscript were bound). GNU has ONE ARRAY
+                    // object, so the structured cell must be re-synced from
+                    // that partial mirror before the command boundary verifier
+                    // and the O(1) `${#a[@]}` read see it (rubash#635).
+                    crate::builtins::declare::sync_typed_assignments(
+                        &args,
+                        &self.shell_state.env_vars,
+                        &mut self.shell_state.variables,
+                    );
                     // Flush here: this early return skips the normal
                     // buffered-output flush below, which would swallow the
                     // diagnostic (rubash#635).

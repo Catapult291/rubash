@@ -43,6 +43,11 @@ A run reports:
   status is 1.
 * **PROMOTE** — a `diverges` case now matches.  The fix landed; flip that row to
   `must-match` so it can never regress.
+* **UNSCORED** — a case file with no manifest row.  It runs but is never
+  scored, so the ratchet cannot see it: the exit status is 2.  (Four files
+  shipped this way before the check existed.)
+* **DANGLING** — a manifest row with no case file (full runs only).  Also
+  exit 2.
 
 Adding a case for a new issue: drop `cases/<case>.sh` (self-contained, no
 positional arguments, no shared fixtures), add a manifest row with
@@ -68,7 +73,8 @@ exists to make that impossible to do by accident.
 * every arm is bounded and its whole process tree is killed on timeout, and an
   arm that does not reach the end of its own script is `INCOMPLETE` — never a
   pass (this is how `issue-738` and `issue-758` are detected at all);
-* each arm builds its fixtures in its own work dir; nothing is shared;
+* each arm gets its own staged work dir (`out/<case>/{arm,gnu}/`); fixtures
+  one arm leaves behind cannot contaminate the other;
 * no positional argument is ever passed to an arm — the host rewrites them, so
   everything a case needs lives in the case file;
 * line-ending normalisation **skips binaries**: rewriting CRLF inside a helper
@@ -123,6 +129,44 @@ to the pin, per the Scope rule.
 | #798 | `exit` inside source terminates | `issue-798` (case) |
 | #799 | command-name stem byte-exact | pointer: `tests/issue799_command_name_case_regressions.rs` (r/R cannot coexist on NTFS and WSL DrvFs is itself case-insensitive, so no differential case is expressible) |
 | #803 | nquote snapshot vs autocrlf | pointer: the snapshot runner's CRLF-normalizing copy predicate (`tests/regression.rs` `run_suite_snapshot`) — a harness face, not a behaviour |
+
+## The 2026-10-21 batch (rubash#746 continued)
+
+Second wave: the early-sweep rubash issues that predate the catalogue
+(#699/#700/#701), a set of still-open behavioural issues, the fixed faces of
+the #826-#846 wave, and the four case files that had landed without manifest
+rows.  Diagnostic wording is deliberately not pinned — cases that exercise a
+diagnostic route it to a file and assert only emptiness (the #756 precedent);
+where residual faces were found on closed issues they were filed separately so
+a `diverges` row points at live work.
+
+| issue | state | catalogue line |
+|---|---|---|
+| #699 | closed/fixed | `issue-699` (must-match): redirect order, write-error routing, closed-stderr rc, subshell cd diag, bare-cat self-redirect |
+| #700 | closed; residual #938 | `issue-700` (diverges): file-stdin form fixed, pipe-context `/dev/stdin` + `<&0` read empty |
+| #701 | closed/fixed | `issue-701` (must-match): `/dev/fd/N` + EOF-without-newline rc family |
+| #830 | closed/fixed | `issue-830` (must-match): `popd` chdir |
+| #832 | closed/fixed | `issue-832` (must-match): `$(echo 's')` CWD-independence |
+| #840 | open | `issue-840` (diverges): declare -p E400 leak, `__RUBASH_CSB1_` re-decode; `\uE30D` assign is the parity control |
+| #846 | closed; residual #940 | `issue-846` (diverges): top-level rc fixed, diagnostic-bypass + nested-`!` abort remain |
+| #856 | open | `issue-856` (diverges): literal-PUA spelling eaten at the output boundary; `$'\uE000'` escape control matches |
+| #860/#861 | closed/fixed (PR #883) | manifest rows added — the case files shipped unscored |
+| #868/#876 | closed/fixed | manifest rows added — the case files shipped unscored |
+| #871 | closed; residual matches | `issue-871` (must-match): `infin`/`nann`/`infx`/`nanx` print the value and emit `invalid number` + rc 1 — byte-identical to GNU (promoted from diverges per PR #944 review) |
+| #879 | open; case faces match | `issue-879` (must-match): `%f 1e999`/`%a 1e999` long-double expansion + glibc `%La` mantissa style — byte-identical to GNU (promoted from diverges per #949) |
+
+Residuals found while building this batch and filed for the record:
+#938 (read empty via `</dev/stdin` / `<&0` in pipeline context) and #940
+(redirect-failure diagnostic bypasses the ordered fd table on `()`/simple
+faces; `!`+compound+redirect failure inside a group aborts the script).
+#871's prefix-subclass residual is noted on its own row rather than
+reopened; that face has since been verified byte-identical to GNU and
+its row promoted to must-match (PR #944 rework).
+
+Not pinned by this batch: #705 (needs argv/stdin at the launcher — the runner
+deliberately passes a script file with fd 0 on /dev/null) and the static/
+inventory issues (#716, #727, #728, #729) stay non-cases per the Scope rule.
+The niubash and WinuxCmd tables of #746 live outside this repo's arm.
 
 ## Wiring with fast-path-differential.py (#706)
 

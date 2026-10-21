@@ -438,6 +438,57 @@ pub(in crate::executor) fn bash_command_sequence_text(commands: &[CommandNode]) 
     text
 }
 
+/// Whitelist fast render for BASH_COMMAND text (rubash#117 discipline):
+/// when every word is fast-literal with `raw == word`, no compound command
+/// shape is set, and no expandable structure exists, the full
+/// `bash_command_source_text` pipeline provably returns `words.join(" ")`:
+/// the simple-command arm renders assignments (absent here) plus
+/// per-word `metadata.raw` (equal to the word by admission, and
+/// `canonicalize_comsub_spans` is identity without `$(`), joined with
+/// single spaces, and there are no redirects to append. Any doubt falls
+/// through to the full renderer. Owned `String` in and out — no pointers,
+/// no lifetime tracking, no way to render a stale or freed node.
+pub(in crate::executor) fn try_render_literal_command(cmd: &CommandNode) -> Option<String> {
+    if cmd.for_command.is_some()
+        || cmd.pipeline_command.is_some()
+        || cmd.and_or_list.is_some()
+        || cmd.time_command.is_some()
+        || cmd.background_command.is_some()
+        || cmd.inverted_command.is_some()
+        || cmd.arithmetic_command.is_some()
+        || cmd.if_command.is_some()
+        || cmd.loop_command.is_some()
+        || cmd.conditional_command.is_some()
+        || cmd.subshell_command.is_some()
+        || cmd.select_command.is_some()
+        || cmd.case_command.is_some()
+        || cmd.coproc_command.is_some()
+        || cmd.function_command.is_some()
+        || cmd.brace_group.is_some()
+    {
+        return None;
+    }
+    if super::Executor::command_has_expandable_structure(cmd) {
+        return None;
+    }
+    if cmd.words.is_empty() {
+        return None;
+    }
+    for (index, word) in cmd.words.iter().enumerate() {
+        if !super::assignment_helpers::is_expand_fast_literal_word(word) {
+            return None;
+        }
+        let raw_matches = cmd
+            .word_metadata
+            .get(index)
+            .is_some_and(|metadata| metadata.raw == *word);
+        if !raw_matches {
+            return None;
+        }
+    }
+    Some(cmd.words.join(" "))
+}
+
 pub(in crate::executor) fn bash_command_source_text(cmd: &CommandNode) -> String {
     let mut text = if let Some(for_command) = &cmd.for_command {
         for_command_source_text(for_command)
@@ -689,6 +740,27 @@ fn command_body_source_text(
     }
 }
 
+/// GNU print_cmd.c:731-739 `print_case_command_head`: the `case` command's
+/// printed form — `the_printed_command` / `the_printed_command_except_trap`,
+/// which is what `$BASH_COMMAND` exposes — is the HEAD ONLY:
+/// `case WORD in ` with WORD still carrying its source quote characters
+/// (print_cmd.c:735-738 prints `case_command->word->word`; execute_cmd.c:3655
+/// resets `command_string_index` and prints the head before expanding the
+/// word, so a `${BASH_COMMAND}` inside the case word sees exactly this text —
+/// probe: `case "${BASH_COMMAND}" in 'case "${BASH_COMMAND}" in '*)` matches
+/// under GNU bash 5.3). The clause list belongs to the JOB's `command` field
+/// (jobs.c make_job -> print_command), which rubash obtains separately via
+/// [`case_command_source_text`] at background registration — not to the
+/// per-execution printed command.
+pub(in crate::executor) fn case_command_head_source_text(case_command: &CaseCommand) -> String {
+    let raw_word = if case_command.word_metadata.raw.is_empty() {
+        case_command.word.as_str()
+    } else {
+        case_command.word_metadata.raw.as_str()
+    };
+    format!("case {raw_word} in ")
+}
+
 fn case_command_source_text(case_command: &CaseCommand) -> String {
     let mut text = format!("case {} in", case_command.word);
     for clause in &case_command.clauses {
@@ -829,5 +901,78 @@ pub(in crate::executor) fn append_source_redirects(text: &mut String, cmd: &Comm
     if let Some(here_string) = &cmd.here_string {
         text.push_str(" <<< ");
         text.push_str(here_string);
+    }
+}
+
+#[cfg(test)]
+mod literal_render_tests {
+    use super::*;
+    use crate::executor::assignment_helpers::is_expand_fast_literal_word;
+
+    fn parse_one(src: &str) -> crate::parser::CommandNode {
+        let tokens = crate::lexer::tokenize(src);
+        let ast = crate::parser::parse(&tokens);
+        assert_eq!(ast.commands.len(), 1, "{src:?} should parse to one command");
+        ast.commands.into_iter().next().unwrap()
+    }
+
+    /// The fast render must agree byte-for-byte with the full renderer on
+    /// every admitted shape (including dispatch verbs whose expansion is
+    /// unaffected: `command`, `builtin`, `eval`, `declare`, `export`,
+    /// `unset`, `test`), and must decline every shape the full renderer
+    /// could treat specially (quotes, substitutions, assignments,
+    /// redirects, compound forms, case — the head special-case stays on
+    /// the slow path).
+    #[test]
+    fn literal_render_matches_full_renderer() {
+        let admitted = [
+            "[ 1 -eq 2 ]",
+            "test 1 -eq 2",
+            "true",
+            ":",
+            "true 1 2 3",
+            "echo a b c",
+            "command true",
+            "builtin echo hi",
+            "declare -a foo",
+            "export foo",
+            "unset foo",
+            "eval true",
+            "wait",
+            "echo -n x",
+            "printf %s x",
+        ];
+        for src in admitted {
+            let cmd = parse_one(src);
+            let fast =
+                try_render_literal_command(&cmd).unwrap_or_else(|| panic!("{src:?} should admit"));
+            assert_eq!(fast, bash_command_source_text(&cmd), "{src:?} fast != slow");
+        }
+        let declined = [
+            "[ $x -eq 2 ]",
+            "[ \"a\" = b ]",
+            "echo a$b",
+            "echo a b > out",
+            "A=1 true",
+            "echo $(date)",
+            "echo `date`",
+            "echo 'a b'",
+            "echo \"a b\"",
+            "for i in 1 2; do echo $i; done",
+            "echo a{b,c}",
+            "echo ~",
+            "echo *",
+        ];
+        for src in declined {
+            let cmd = parse_one(src);
+            assert!(
+                try_render_literal_command(&cmd).is_none(),
+                "{src:?} should fall through"
+            );
+        }
+        // Admission requires raw == word for every word.
+        for word in ["[", "1", "-eq", "2", "]", "true", "="] {
+            assert!(is_expand_fast_literal_word(word), "{word:?} should admit");
+        }
     }
 }

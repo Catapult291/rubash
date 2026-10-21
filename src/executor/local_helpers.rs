@@ -1,4 +1,5 @@
 use super::*;
+use crate::shell::var_table::VarTable;
 
 pub(in crate::executor) fn validate_local_options(args: &[String]) -> Result<(), char> {
     for arg in args {
@@ -90,7 +91,7 @@ pub(in crate::executor) fn local_stderr_from_declare(stderr: Vec<u8>) -> Vec<u8>
 }
 
 pub(in crate::executor) fn restore_optional_env_var(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     name: &str,
     value: Option<String>,
 ) {
@@ -105,7 +106,7 @@ pub(in crate::executor) fn restore_optional_env_var(
 }
 
 pub(in crate::executor) fn restore_optional_shell_var(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     name: &str,
     value: Option<String>,
 ) {
@@ -118,7 +119,7 @@ pub(in crate::executor) fn restore_optional_shell_var(
         }
         None => {
             env_vars.remove(name);
-            env::remove_var(name);
+            unset_process_env(name);
         }
     }
 }
@@ -145,24 +146,52 @@ pub(in crate::executor) fn is_valid_process_env(name: &str, value: &str) -> bool
     !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0')
 }
 
-pub(in crate::executor) fn set_process_env(name: &str, value: impl AsRef<str>) {
+pub(crate) fn set_process_env(name: &str, value: impl AsRef<str>) {
+    // #916: the process env mirrors exactly the special-name set below.
+    // Every other name reaches children through the explicit env built at
+    // spawn (env_clear + per-var env) and is read from the table everywhere
+    // else, so mirroring it here paid a locked O(n) environ scan per write
+    // for nothing. TMPDIR is never mirrored (safe_temp_dir_string reads
+    // the inherited value; writing it would shadow sandbox configuration).
     let value = value.as_ref();
-    if name != "TMPDIR" && is_valid_process_env(name, value) {
+    if name != "TMPDIR"
+        && shell_assignment_needs_process_env(name)
+        && is_valid_process_env(name, value)
+    {
         env::set_var(name, value);
     }
 }
 
-pub(in crate::executor) fn sync_shell_assignment_process_env(
-    env_vars: &crate::shell::var_table::VarTable,
-    name: &str,
-    value: impl AsRef<str>,
-) {
-    if is_marked_var(env_vars, EXPORTED_VARS, name) || shell_assignment_needs_process_env(name) {
-        set_process_env(name, value);
+/// Unbinding counterpart of `set_process_env`. The #916 mirror gate only
+/// governs WRITES: a name that entered the process env by inheritance
+/// predates the mirror, so the special-name gate can never see it, yet the
+/// stale copy is read back by every fallback that still consults the
+/// process env (exact_case_env_var bare-$NAME reads, the nounset
+/// existence checks, the fork+exec env_map base — the #182 revival class,
+/// rubash#917). GNU variables.c:3839 unbind_variable drops the name from
+/// the export environment unconditionally, so the mirror must too: the
+/// existence check is a single non-locking getenv that keeps the common
+/// "never mirrored" unset off the locked environ mutation path.
+pub(crate) fn unset_process_env(name: &str) {
+    if is_valid_process_env(name, "") && env::var_os(name).is_some() {
+        env::remove_var(name);
     }
 }
 
-pub(in crate::executor) fn shell_assignment_needs_process_env(name: &str) -> bool {
+pub(crate) fn sync_shell_assignment_process_env(
+    _env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+    value: impl AsRef<str>,
+) {
+    // #916: mirror iff the name needs the process env (special list
+    // below). Exported-but-ordinary names used to mirror too, at O(n) per
+    // op; they reach children through the explicit spawn env instead.
+    // (`_env_vars` is retained so every assignment-shaped call site keeps
+    // the same funnel.)
+    set_process_env(name, value);
+}
+
+pub(crate) fn shell_assignment_needs_process_env(name: &str) -> bool {
     matches!(
         name,
         "HOME" | "OLDPWD" | "PATH" | "PATHEXT" | "PWD" | "TEMP" | "TMP" | "TMPDIR" | "USERPROFILE"

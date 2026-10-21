@@ -132,9 +132,19 @@ impl Executor {
         let arith_nonfatal_before = self.shell_state.arithmetic_nonfatal_error.replace(false);
         // The parse.y:6684-6697 status bracket (see the doc comment).
         let comsub_status_before = self.last_command_substitution_status.replace(None);
+        // rubash#858: the `$?` read side consults word_expansion_comsub_exit
+        // FIRST (parameter_core.rs dollar_question_status — issue #485's
+        // word-internal comsub overlay). Restoring only the subst-status
+        // cell leaves an @P pass whose embedded `$(exit N)` latched onto
+        // the overlay visible to a later `$?` in the SAME command line:
+        // `echo ${PS1@P} $?` printed N under rubash where GNU prints the
+        // prior command's status. Snapshot and restore the overlay too so
+        // the prompt pass is transparent to both read paths.
+        let word_comsub_exit_before = self.word_expansion_comsub_exit.replace(None);
         let result = self.expand_embedded_parameters_inner(word, false, false, false, true);
         self.last_command_substitution_status
             .set(comsub_status_before);
+        self.word_expansion_comsub_exit.set(word_comsub_exit_before);
         let failed = self
             .shell_state
             .parameter_bad_substitution
@@ -486,7 +496,7 @@ impl Executor {
                 }
                 Some('@') => {
                     chars.next();
-                    let value = self.shell_state.positional_params.join(" ");
+                    let value = self.shell_state.positional_window().join(" ");
                     if preserve_quotes {
                         push_preserved_expansion_output(&mut output, &value, in_double);
                     } else {
@@ -504,7 +514,7 @@ impl Executor {
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -566,10 +576,22 @@ impl Executor {
                     let _site_guard = (!whole_braced).then(|| {
                         crate::executor::expand_braced_indices::SubSiteGuard::new(this_frag)
                     });
-                    let (name, terminated) =
-                        crate::executor::command_subst_helpers::collect_braced_parameter_body(
+                    // Collect straight into a pooled synthetic `${...}` word:
+                    // GNU subst.c:9777 parameter_brace_expand scans the body
+                    // inline with no intermediate; the historical `(name,
+                    // format!)` pair staged two `String`s per fragment.
+                    // Byte-identical content: `${` + body + `}`.
+                    let mut synthetic =
+                        crate::executor::parameter_words::pop_synthetic_fragment_word();
+                    synthetic.clear();
+                    synthetic.push_str("${");
+                    let terminated =
+                        crate::executor::command_subst_helpers::collect_braced_parameter_body_into(
                             &mut chars,
+                            &mut synthetic,
                         );
+                    synthetic.push('}');
+                    let name = synthetic[2..synthetic.len() - 1].to_string();
                     if double_quoted {
                         // Prompt-pass verdicts (GNU expand_prompt_string runs
                         // under no_longjmp_on_fatal_error, subst.c:4407, and
@@ -903,7 +925,7 @@ impl Executor {
                     } else {
                         let value = self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .get(index - 1)
                             .map(String::as_str)
                             .unwrap_or("");

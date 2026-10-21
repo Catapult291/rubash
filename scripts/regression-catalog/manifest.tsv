@@ -1,4 +1,7 @@
 case	issue	expected	note
+issue-699	699	must-match	redirection/fd family: 2>&1 order, builtin write-error routing, closed-stderr rc, subshell cd diag, bare-cat self-redirect — fixed, closed
+issue-700	700	must-match	read /dev/stdin hang fixed; pipeline-context /dev/stdin & <&0 empty read fixed by #938
+issue-701	701	must-match	read /dev/fd/N + EOF-without-newline rc family (while-read off-by-one) — fixed, closed
 issue-702	702	must-match	errexit in until/break — fixed, closed 2026-10-17
 issue-703	703	must-match	heredoc + pipeline in quoted $() — fixed by the 703 batch, closed 2026-10-18
 issue-704	704	diverges	printf numeric / command -v multi / ~+ assignment / BASH_ARGC (R7 faces fixed by PR #778; rest open)
@@ -30,11 +33,23 @@ issue-798	798	must-match	exit inside source terminates the shell — fixed in #8
 loc-l1-substring	772	must-match	${x:off:len} opaque bytes — fixed by PR #781
 loc-l2-comsub	772	diverges	$(cat) non-UTF-8 second shape still drops content + bogus UTF-8 diagnostic (residual of #781)
 loc-l5-read-cr	772	diverges	read -r still strips a trailing CR (#769-class byte-opacity face, still open)
-lim-f5-fd-cap	773	diverges	fd table caps at 1014 with 'cannot duplicate fd: Invalid argument'
+lim-f5-fd-cap	773	must-match	fd table no longer caps at 1014 — PROMOTE on the 2026-10-20 run (arm 62a30ab1)
 lim-f6-nul	773	diverges	read counts NUL bytes (8 vs 6); comsub does not warn
 lim-f7-closed-fd0	773	diverges	closed fd 0 then re-redirect -> Bad file descriptor
 issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (the CR Nit 2 unset-operand row landed as parity in #847, see tests/issue828)
+issue-830	830	must-match	popd default pop must chdir into the popped dir — fixed, closed
+issue-832	832	must-match	$(echo 's') fast-path detour must not consult CWD contents — fixed, closed
+issue-840	840	diverges	marker output-boundary residuals: declare -p E400-prefix leak + typed __RUBASH_CSB1_ re-decode (face3 \uE30D assign already matches) — open
+issue-846	846	must-match	top-level !{}>bad rc + diagnostic routing + nested-! abort all match GNU (rubash#940 fixed)
 issue-847	847	must-match	#822 span scanner dquote state (E3b: dq-wrapped $'...' spelling stays raw on assign/read/arith) + unset deferred operand quote-removes $'...' (u1/u2/u3 keep the cell; bare/variable rows still delete) - fixed
+issue-856	856	diverges	isolated literal U+E000 at the output boundary — literal-PUA spelling still eaten (escape-spelling f0 control matches); issue open
+issue-860	860	must-match	unset empty-span/mask pseudo-diagnostic family — fixed by PR #883 (manifest row landed late under #746)
+issue-861	861	must-match	assoc kvlist self-read miss — fixed by PR #883 (manifest row landed late under #746)
 issue-866	866	must-match	forged ambient __RUBASH_BACKGROUND_WRAPPER arms nothing (nonce handshake, rubash#866) - fixed
+issue-868	868	must-match	mark_quoted_ifs_from_raw carrier-blind — fixed (manifest row landed late under #746)
+issue-871	871	must-match	printf inf/nan prefix subclass (infin/nann/infx/nanx) prints the value but emits invalid number + rc 1 — verified byte-identical to GNU incl. rc 1 + diag; promoted from diverges per PR #944 review
+issue-876	876	must-match	mark_quoted_ifs_from_raw byte-offset vs char-count on multibyte leads — fixed (manifest row landed late under #746)
+issue-879	879	must-match	printf %f/%e/%g long-double expansion (1e999 -> inf on the arm) + %a/%A mantissa style — verified byte-identical to GNU; promoted from diverges per #949 (pinned also in tests/issue879_printf_longdouble_regressions.rs)
+issue-948	948	must-match	-c operand marker-zone entry escape (rubash#948): respawn double-escape exclusion only; typed __RUBASH_CSB1_/U+E319 literals pass verbatim via -c
 carrier-729-cntrl	729	must-match	byte-char classes + removal/patsub on carried bytes (746 case 729.1/729.2)
 carrier-735-escape	735	must-match	user E4xx data E400 round-trip vs #729 normalization (746 case 735.1/735.2)

@@ -56,7 +56,7 @@ impl Executor {
         let args: Vec<String> = if cmd.words.len() > word_index + 2 {
             cmd.words[word_index + 2..].to_vec()
         } else {
-            self.shell_state.positional_params.clone()
+            self.shell_state.positional_window_cloned()
         };
 
         let silent = optstring.starts_with(':');

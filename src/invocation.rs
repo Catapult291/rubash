@@ -344,9 +344,11 @@ impl ShellInvocation {
             executor.set_shopt_option("expand_aliases", true);
         }
         // shell.c:497-503: --login/-l flips LOGIN_SHELL so the `logout`
-        // builtin and exit path see a login shell.
+        // builtin and exit path see a login shell. GNU also reports the
+        // login_shell shopt as on (frameworks probe `shopt -q
+        // login_shell`); mark_login_shell keeps shopt and carrier together.
         if self.login {
-            executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+            executor.mark_login_shell();
         }
         for (name, enabled) in &self.shell_flags {
             if !executor.is_shell_option(name) {
@@ -709,6 +711,31 @@ mod tests {
         let interactive = ShellInvocation::parse(&["-ilc".into(), "env -0".into()]).unwrap();
         assert_eq!(interactive.command.as_deref(), Some("env -0"));
         assert!(interactive.login && interactive.interactive);
+    }
+
+    #[test]
+    fn login_invocation_reports_login_shell_shopt() {
+        // GNU: `bash -l -c 'shopt login_shell'` is on; frameworks probe
+        // `shopt -q login_shell`. A plain invocation must leave it off.
+        let login = ShellInvocation::parse(&["-l".into(), "-c".into(), "true".into()]).unwrap();
+        let mut executor = crate::executor::Executor::new();
+        login
+            .apply_to_executor_before_startup(&mut executor)
+            .unwrap();
+        assert!(crate::builtins::shopt::option_enabled(
+            &executor.shell_state.env_vars,
+            "login_shell"
+        ));
+
+        let plain = ShellInvocation::parse(&["-c".into(), "true".into()]).unwrap();
+        let mut plain_executor = crate::executor::Executor::new();
+        plain
+            .apply_to_executor_before_startup(&mut plain_executor)
+            .unwrap();
+        assert!(!crate::builtins::shopt::option_enabled(
+            &plain_executor.shell_state.env_vars,
+            "login_shell"
+        ));
     }
 
     // rubash#382: GNU shell.c parse_shell_options (shell.c:931-958) lets

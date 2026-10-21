@@ -129,6 +129,17 @@ impl Executor {
         &self,
         expression: &str,
     ) -> Option<String> {
+        // A name with no `[` is not an array-element reference:
+        // `parse_array_subscript` (arrays/storage.rs:182) splits on `[`, so
+        // the uncached body below returns None for it. Bail BEFORE touching
+        // the memo — every scalar parameter read (`${s}`, `${s#p}`, `$s`)
+        // reaches here through shell_variable_value, and memoizing a scalar
+        // miss allocated a `String` key + hash bucket per read for a result
+        // that is never a subscript side-effect. Array-element expressions
+        // (`name[sub]`) keep the exact memo path below.
+        if !expression.contains('[') {
+            return None;
+        }
         // GNU param_expand resolves the subscript once per `${}` expansion;
         // the memo frame pushed by the embedded-parameter walkers dedups the
         // repeated identical fetches the `&self` helper layers make, so
@@ -162,12 +173,6 @@ impl Executor {
         } else {
             self.dynamic_stack_array_values(array_name)
         };
-        let storage = if dynamic_values.is_some() {
-            // Never consumed on this path; the divert below returns first.
-            String::new()
-        } else {
-            self.parameter_array_storage(array_name).unwrap_or_default()
-        };
         if assoc_marked {
             // GNU parameters.c assoc_reference: a literal * subscript means
             // all elements, not the key "*"; a quoted * joins with IFS[0]
@@ -176,14 +181,110 @@ impl Executor {
             if key == "*" {
                 return Some(
                     assoc_hash_ordered_values(
-                        &storage,
+                        &self.parameter_array_storage(array_name).unwrap_or_default(),
                         assoc_nbuckets(&self.shell_state.env_vars, &storage_name),
                     )
                     .join(&self.ifs_first_char_separator()),
                 );
             }
             let key = self.assoc_subscript_key(key);
-            return assoc_value_at(&storage, &key);
+            // Typed-cell fast path, mirroring the indexed leg below: GNU
+            // assoc.c:120 assoc_reference is a single hash_search over the
+            // assoc table — O(1), never a walk of the whole table. The
+            // mirror fetch clones the whole storage string and
+            // assoc_value_at linear-scans it, so take the structured-cell
+            // hit first under the same dirty gate (executor writes keep
+            // the cell in sync with the mirror, while builtin-side writes
+            // only set the dirty flag). Miss or dirty falls through to the
+            // mirror path; assoc/dynamic/scalar bases never reach a typed
+            // cell. The key expansion above already ran its subscript pass
+            // with side effects (`$(...)`, RNG), and the mirror fetch below
+            // is a pure read, so probing the cell first preserves GNU's
+            // observable order while skipping the per-read O(n) clone+scan
+            // on a typed hit.
+            if !self.shell_state.env_vars.array_cells_dirty() {
+                if let Some(cell_value) = self
+                    .shell_state
+                    .variables
+                    .associative_element(&storage_name, &key)
+                {
+                    let typed = cell_value.to_string();
+                    // Safety net (debug builds = the test suite): the cell
+                    // must agree with the mirror. A mismatch means a mirror
+                    // write path missed its sync-or-dirty handling. The
+                    // mirror is re-fetched on demand here so release builds
+                    // (where debug_assert_eq! compiles out) skip the O(n)
+                    // clone entirely on this fast path.
+                    debug_assert_eq!(
+                        Some(typed.clone()),
+                        {
+                            let mirror =
+                                self.parameter_array_storage(array_name).unwrap_or_default();
+                            assoc_value_at(&mirror, &key)
+                        },
+                        "typed assoc cell disagrees with mirror for {storage_name}[{key}]"
+                    );
+                    return Some(typed);
+                }
+            }
+            let storage_assoc = self.parameter_array_storage(array_name).unwrap_or_default();
+            return assoc_value_at(&storage_assoc, &key);
+        }
+        // Negative-literal fast lane: a clean `-N` subscript normalizes to
+        // `max_index + 1 - N` (GNU arrayfunc.c:1581 array_value_internal ->
+        // `ind = array_max_index (array_cell (var)) + 1 + ind`, INDEX_ERROR
+        // at :1582-1583 when still negative) without running evalexp, and
+        // the element comes straight from the structured cell — no mirror
+        // clone + full re-parse. Admission is a whitelist: `-` followed by
+        // `[1-9][0-9]*` only (a leading zero would be octal in shell
+        // arithmetic, so `-08` is an evalexp error, not -8). A clean
+        // literal has no names, expansions, RNG draws or writes, so
+        // skipping the expand+eval pipeline is observably identical when
+        // it HITS. Every other shape — assoc bases (where `-1` is a literal
+        // KEY, arrayfunc.c:1604-1625 assoc arm, never evalexp'd), dynamic
+        // views, dirty cells, empty arrays, still-negative results, holes —
+        // falls through to the slow path below, which owns all diagnostics
+        // byte-for-byte.
+        if dynamic_values.is_none() && !self.shell_state.env_vars.array_cells_dirty() {
+            if let Some(negative) = clean_negative_literal_subscript(key) {
+                if let Some((_, Some(max_index))) = self
+                    .shell_state
+                    .variables
+                    .indexed_array_shape(&storage_name)
+                {
+                    let normalized = max_index
+                        .checked_add(1)
+                        .and_then(|base| base.checked_add(negative));
+                    if let Some(normalized) = normalized {
+                        if normalized >= 0 {
+                            if let Some(cell_value) = self
+                                .shell_state
+                                .variables
+                                .indexed_element(&storage_name, normalized)
+                            {
+                                let typed = crate::executor::arrays::normalize_array_expanded_value(
+                                    cell_value.to_string(),
+                                );
+                                // Same safety net as the non-negative typed probe below: the
+                                // cell must agree with the mirror; release builds compile this
+                                // re-fetch out and skip the O(n) clone entirely.
+                                debug_assert_eq!(
+                                    Some(typed.clone()),
+                                    {
+                                        let mirror = self
+                                            .parameter_array_storage(array_name)
+                                            .unwrap_or_default();
+                                        resolve_indexed_array_subscript(&mirror, normalized as i128)
+                                            .and_then(|resolved| array_value_at(&mirror, resolved))
+                                    },
+                                    "typed cell disagrees with mirror for {storage_name}[{normalized}]"
+                                );
+                                return Some(typed);
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Use expand_arithmetic_special_parameters for array subscripts so that
         // $- expands to 0 (not shell flags) in arithmetic contexts. See array.tests line 60.
@@ -213,7 +314,10 @@ impl Executor {
                     .trim();
                 // Still expand special parameters ($#, $-) inside the expression.
                 let expr = expr
-                    .replace("$#", &self.shell_state.positional_params.len().to_string())
+                    .replace(
+                        "$#",
+                        &self.shell_state.positional_window().len().to_string(),
+                    )
                     .replace("$-", "0");
                 let overlaid =
                     crate::executor::expand_braced_indices::env_vars_with_pending_subscript_writes(
@@ -347,6 +451,63 @@ impl Executor {
                 }
             }
         }
+        // Typed-cell fast path, hoisted BEFORE the mirror clone (#916
+        // follow-up): executor writes keep the structured cell in sync
+        // with the mirror, while builtin-side writes only set the dirty
+        // flag (VarTable has no access to the structured store). Trust
+        // the cell only when clean; otherwise fall through to the mirror
+        // parse below. assoc/dynamic/scalar bases returned above or miss
+        // the cell lookup and never return from here.
+        //
+        // GNU arrayfunc.c:1492 array_value_internal orders the read as
+        // array_variable_part (variable lookup) -> array_expand_index
+        // (arrayfunc.c:1356 expand_arith_string + evalexp, expr.c:1183
+        // expr_streval) -> array_reference (element fetch): the subscript
+        // above already ran its expand+evalexp pass with side effects
+        // (`$((i++))`, RNG, PENDING_SUBSCRIPT_WRITES), and the mirror
+        // fetch below is a pure read, so deferring it until after the
+        // index is resolved preserves GNU's observable order while
+        // skipping the per-read O(n) mirror clone on a typed hit.
+        if !self.shell_state.env_vars.array_cells_dirty() {
+            if let Ok(typed_index) = i64::try_from(index) {
+                if let Some(cell_value) = self
+                    .shell_state
+                    .variables
+                    .indexed_element(&storage_name, typed_index)
+                {
+                    let typed = crate::executor::arrays::normalize_array_expanded_value(
+                        cell_value.to_string(),
+                    );
+                    // Safety net (debug builds = the test suite): the cell
+                    // must agree with the mirror. A mismatch means a mirror
+                    // write path missed its sync-or-dirty handling. The
+                    // mirror is re-fetched on demand here so release builds
+                    // (where debug_assert_eq! compiles out) skip the O(n)
+                    // clone entirely on this fast path.
+                    debug_assert_eq!(
+                        Some(typed.clone()),
+                        {
+                            let mirror =
+                                self.parameter_array_storage(array_name).unwrap_or_default();
+                            resolve_indexed_array_subscript(&mirror, index)
+                                .and_then(|resolved| array_value_at(&mirror, resolved))
+                        },
+                        "typed cell disagrees with mirror for {storage_name}[{index}]"
+                    );
+                    return Some(typed);
+                }
+            }
+        }
+        // Mirror fetch for the remaining scalar/mirror legs only. The
+        // assoc leg fetched its own mirror above (before subscript eval);
+        // the dynamic leg never consumes a mirror (divert returned).
+        let storage_opt = if dynamic_values.is_some() {
+            None
+        } else {
+            self.parameter_array_storage(array_name)
+        };
+        let storage_is_none = storage_opt.is_none();
+        let storage = storage_opt.unwrap_or_default();
         if !assoc_marked
             && dynamic_values.is_none()
             && !self.parameter_is_array_variable(&storage_name)
@@ -359,8 +520,21 @@ impl Executor {
             // that owns this reference (expand_braced_ops), so this
             // lower-level fetcher stays silent to avoid a double report.
             // The scalar text must never be re-parsed as a list
-            // (rubash#755).
+            // (rubash#755). A dynamic scalar (RANDOM/SECONDS/...) reads
+            // live: element 0 is the current dynamic value, shadowing
+            // any stored seed text — the same dynamic-first precedence
+            // plain `$name` expansion uses. An UNSET base has no
+            // element 0 at all: report the reference as unset (None)
+            // so `-`/`=`/`+`/`?` see an unset parameter, exactly like
+            // any other missing element. A set-but-empty scalar keeps
+            // its empty element 0.
             if index == 0 {
+                if let Some(dynamic) = self.dynamic_parameter_value(&storage_name) {
+                    return Some(dynamic);
+                }
+                if storage_is_none {
+                    return None;
+                }
                 return Some(crate::executor::shell_safe_value(&storage));
             }
             return None;
@@ -394,8 +568,12 @@ impl Executor {
         // skips the fast path: its mirror resolves through
         // resolved_variable_name inside parameter_array_storage, and the
         // structured cell is keyed by the raw name. RUBASH_ARRAY_STORE=0
-        // bypasses the read entirely (Q4 escape hatch).
-        if array_store_enabled(&self.shell_state.env_vars) {
+        // bypasses the read entirely (Q4 escape hatch). Like the element
+        // read path, the cell is only trusted when no unsynced builtin
+        // write happened since the last executor sync.
+        if array_store_enabled(&self.shell_state.env_vars)
+            && !self.shell_state.env_vars.array_cells_dirty()
+        {
             if let Some(crate::shell::ShellValue::IndexedArray(entries)) = self
                 .shell_state
                 .variables
@@ -1051,7 +1229,7 @@ impl Executor {
         if let Ok(index) = indirect_name.parse::<usize>() {
             return self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .get(index.saturating_sub(1))
                 .cloned();
         }
@@ -1081,10 +1259,10 @@ impl Executor {
                 // `b c` parameter under the default IFS); quoted "$@" keeps
                 // one word per parameter verbatim.
                 return Some(if quoted_array_word {
-                    self.shell_state.positional_params.clone()
+                    self.shell_state.positional_window_cloned()
                 } else {
                     field_split_positional_values_with_ifs(
-                        self.shell_state.positional_params.clone(),
+                        self.shell_state.positional_window_cloned(),
                         self.shell_state.env_vars.get("IFS").map(String::as_str),
                     )
                 });
@@ -1093,11 +1271,11 @@ impl Executor {
                 return Some(if quoted_array_word {
                     vec![self
                         .shell_state
-                        .positional_params
+                        .positional_window()
                         .join(&self.ifs_first_char_separator())]
                 } else {
                     field_split_positional_values_with_ifs(
-                        self.shell_state.positional_params.clone(),
+                        self.shell_state.positional_window_cloned(),
                         self.shell_state.env_vars.get("IFS").map(String::as_str),
                     )
                 });

@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{self, Write};
 
 use super::marks::{
@@ -9,9 +8,8 @@ use super::value::{
     array_attribute_assignment_value, diagnostic_prefix, readonly_error_subject, split_assignment,
     valid_identifier,
 };
-use super::{
-    ExportMode, ARRAY_VARS, ASSOC_VARS, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS,
-};
+use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
+use crate::executor::local_helpers::sync_shell_assignment_process_env;
 
 pub(super) fn apply_export_arg<W>(
     arg: &str,
@@ -61,7 +59,12 @@ where
                 return Ok(EXECUTION_FAILURE);
             }
 
-            if value.is_none() && !env_vars.contains_key(name) && env::var(name).is_err() {
+            // #916: fresh names short-circuit on contains_key; env_vars is seeded
+            // from the process env at startup, so a preset name is always present
+            // here and never reaches the fallback. The old env::var probe paid a
+            // locked O(n) environ scan per fresh export and resurrected stale
+            // process values after unset (bash leaves them empty).
+            if value.is_none() && !env_vars.contains_key(name) {
                 mark_exported(env_vars, name);
                 return Ok(EXECUTION_SUCCESS);
             }
@@ -71,7 +74,7 @@ where
             // attribute is applied only for an explicit assignment word;
             // `export -a name` alone just marks att_exported.
             let has_assign = value.is_some();
-            let converted = env_vars.contains_key(name) || env::var(name).is_ok();
+            let converted = env_vars.contains_key(name);
             let (value, bound_array) = value
                 .map(|value| {
                     array_attribute_assignment_value(
@@ -80,11 +83,7 @@ where
                 })
                 .unwrap_or_else(|| {
                     (
-                        env_vars
-                            .get(name)
-                            .cloned()
-                            .or_else(|| env::var(name).ok())
-                            .unwrap_or_default(),
+                        env_vars.get(name).cloned().unwrap_or_default(),
                         array || assoc,
                     )
                 });
@@ -107,15 +106,18 @@ where
             // associative variables never cross the child env boundary
             // (ARRAY_EXPORT off), so `export A` / `export -a A=(x y)` on an
             // array keeps the exported attribute (declare -p shows -a -x)
-            // while the storage-encoded value stays out of the process env
-            // (rubash#534: printenv A must print nothing).
-            if !env_vars.is_marked(ARRAY_VARS, name) && !env_vars.is_marked(ASSOC_VARS, name) {
-                env::set_var(name, value);
-            }
+            // while the storage-encoded value stays out of the child env
+            // (rubash#534: printenv A must print nothing). Scalar values
+            // cross via the explicit child env; mirror to the process env
+            // only when exported-or-special, like plain assignments (#916).
+            sync_shell_assignment_process_env(env_vars, name, &value);
             mark_exported(env_vars, name);
         }
         ExportMode::Unset => {
-            env::remove_var(name);
+            // Existence-gated process-env removal (#916/#917): the name
+            // gate only applies to writes; an inherited copy must be
+            // dropped so table-miss fallbacks do not resurrect it.
+            crate::executor::local_helpers::unset_process_env(name);
             unmark_exported(env_vars, name);
         }
     }
@@ -194,7 +196,8 @@ where
         return Ok(EXECUTION_FAILURE);
     }
 
-    if value.is_none() && !env_vars.contains_key(name) && env::var(name).is_err() {
+    // #916: same fresh-name short-circuit as export above.
+    if value.is_none() && !env_vars.contains_key(name) {
         mark_readonly(env_vars, name);
         return Ok(EXECUTION_SUCCESS);
     }
@@ -203,18 +206,14 @@ where
     // `declare -gr{a,A} name=value`; without `=` the flags only filter the
     // printed list, so the marks below need the assignment word.
     let has_assign = value.is_some();
-    let converted = env_vars.contains_key(name) || env::var(name).is_ok();
+    let converted = env_vars.contains_key(name);
     let (value, bound_array) = value
         .map(|value| {
             array_attribute_assignment_value(value, array, assoc, append, env_vars, name, oob_word)
         })
         .unwrap_or_else(|| {
             (
-                env_vars
-                    .get(name)
-                    .cloned()
-                    .or_else(|| env::var(name).ok())
-                    .unwrap_or_default(),
+                env_vars.get(name).cloned().unwrap_or_default(),
                 array || assoc,
             )
         });
@@ -231,10 +230,9 @@ where
     }
     // Same array-export contract as apply_export_arg above (GNU variables.c
     // make_env_array_from_var_list, rubash#534): a readonly array keeps the
-    // attribute but its storage value never enters the process env.
-    if !env_vars.is_marked(ARRAY_VARS, name) && !env_vars.is_marked(ASSOC_VARS, name) {
-        env::set_var(name, value);
-    }
+    // attribute but its storage value never enters the child env. Mirrored
+    // through the same gate as every other write (#916).
+    sync_shell_assignment_process_env(env_vars, name, &value);
     mark_readonly(env_vars, name);
     Ok(EXECUTION_SUCCESS)
 }

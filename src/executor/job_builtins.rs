@@ -436,9 +436,15 @@ impl Executor {
             IndexedSubscript::Index(index) => {
                 let mut entries = indexed_array_entries(&current);
                 entries.insert(index as usize, value);
+                crate::executor::arrays::sync_typed_indexed_array(
+                    &mut self.shell_state.variables,
+                    base.as_str(),
+                    &entries,
+                );
                 self.shell_state
                     .env_vars
                     .insert(base.clone(), format_indexed_array_storage(entries));
+                self.shell_state.env_vars.clear_array_cells_dirty();
                 if !is_marked_array_var(&self.shell_state.env_vars, &base) {
                     mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, &base);
                 }
@@ -1931,7 +1937,14 @@ impl Executor {
                     &self.shell_state.env_vars,
                 )
                 .unwrap_or_else(|| std::path::PathBuf::from(&editor_name));
-                let edit_status = std::process::Command::new(&editor_path).arg(&path).status();
+                let mut edit_command = std::process::Command::new(&editor_path);
+                // The editor is an external child like any other: it gets
+                // the exported table vars explicitly (#916 — no process-env
+                // mirror to inherit from anymore).
+                self.apply_child_environment(&mut edit_command);
+                edit_command.arg(&path);
+                suppress_orphan_console(&mut edit_command);
+                let edit_status = edit_command.status();
                 match edit_status {
                     Ok(st) if st.success() => {}
                     Ok(st) => {

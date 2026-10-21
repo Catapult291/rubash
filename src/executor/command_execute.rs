@@ -13,6 +13,12 @@ impl Executor {
         let procsub_fd_base = self.command_scoped_procsub_input_fds.len();
         let result = self.execute_command_with_procsub_scope(cmd, procsub_fd_base);
         self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
+        // Debug-only systemic regression net for the typed-cell ↔ mirror
+        // invariant: after every command boundary every fresh (undirty)
+        // structured array cell must still equal its mirror projection.
+        // Release builds compile this out.
+        #[cfg(debug_assertions)]
+        self.verify_typed_cells();
         result
     }
 
@@ -78,6 +84,17 @@ impl Executor {
         drop(_t_heredoc);
         if self.command_parse_diagnostics(cmd)? {
             return Ok(());
+        }
+
+        // unixwin/niubash#481: the host REPL's bare-drive normalizer runs
+        // only on its fast path; the grouped reader (`D:; pwd`), the
+        // engine's own piped `-i` stdin driver (niubash#483), and nested
+        // contexts the host AST pass does not descend into all reach this
+        // dispatch with `D:` still a bare command word. Rewrite it to the
+        // same `cd D:/` node the host pass emits — one semantic owner at
+        // the funnel every route shares.
+        if let Some(drive_root) = windows_drive::bare_windows_drive_command_root(cmd) {
+            return self.execute_bare_windows_drive_command(cmd, drive_root);
         }
 
         let _t_dispatch = PhaseTimer::new(&super::exec_profile::P_DISPATCH);

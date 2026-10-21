@@ -1,19 +1,44 @@
 //! Build provenance for `--version` (rubash#488).
 //!
-//! The GNU-compat banner (`GNU bash, version 5.3.0(1)-release (...)`) is the
+//! The GNU-compat banner (`GNU bash, version 5.3.20(1)-release (...)`) is the
 //! rubash#154 persona contract and must stay byte-stable for the ecosystem;
 //! the build fingerprint is appended AFTER that block so any rubash binary
 //! traces to the exact commit and profile it was built from. Dev builds can
 //! no longer masquerade as the installed release — the fake-baseline class
 //! of incident behind rubash#488.
 
-/// Short git hash captured by `build.rs` (`git rev-parse --short HEAD`).
-/// "unknown" means git was unavailable at build time (tarball, sandboxed
-/// checkout); release pipelines pin the value via `RUBASH_BUILD_HASH`.
-pub fn build_hash() -> &'static str {
-    match option_env!("RUBASH_BUILD_HASH") {
-        Some(hash) => hash,
-        None => "unknown",
+/// The build stamp baked in at compile time. Two sources, in order:
+///
+/// 1. `RUBASH_BUILD_HASH` — an explicit pin read crate-side (release
+///    pipelines set it before a fresh build; rustc dep-info tracks
+///    `option_env!` reads, so a changed pin recompiles this module on its
+///    own — no build-script `rerun-if-env-changed` hook exists or is
+///    needed, and emitting one would break the stamp's freshness; see
+///    build.rs). The pin wins only the revision half: build.rs emits the
+///    worktree's dirty half separately as `RUBASH_GIT_DIRTY_SUFFIX`, and
+///    it is appended to a pinned hash too — a pin must not launder edits
+///    it did not name (#488/#827).
+/// 2. `RUBASH_GIT_STAMP` — build.rs's git-derived stamp (`git rev-parse
+///    --short HEAD` under the same `-dirty[-<digest>]` rule), emitted
+///    under its own name so it can never overwrite a pin.
+///
+/// "unknown" when neither exists (git-less source tarballs, non-cargo
+/// builds).
+///
+/// rubash#827: a tree carrying uncommitted changes stamps
+/// `<rev>-dirty-<8 hex>` where the digest covers `git diff HEAD` — a bare
+/// HEAD hash never guarantees content, and two different dirty trees can
+/// no longer print the same banner. The digest suffix may be absent when
+/// the diff could not be computed, leaving a plain `-dirty` marker.
+pub fn build_hash() -> String {
+    match option_env!("RUBASH_BUILD_HASH").map(str::trim) {
+        Some(pin) if !pin.is_empty() => format!(
+            "{pin}{}",
+            option_env!("RUBASH_GIT_DIRTY_SUFFIX").unwrap_or("")
+        ),
+        _ => option_env!("RUBASH_GIT_STAMP")
+            .unwrap_or("unknown")
+            .to_string(),
     }
 }
 
@@ -54,13 +79,21 @@ mod tests {
     #[test]
     fn build_hash_is_short_hex_or_unknown() {
         let hash = build_hash();
+        // `<rev>` optionally followed by `-dirty` or `-dirty-<8 hex>`
+        // (rubash#827: the stamp names WHICH dirty tree was compiled).
+        let (rev, dirty) = hash.split_once("-dirty").unwrap_or((hash.as_str(), ""));
+        let dirty_ok = dirty.is_empty()
+            || (dirty.starts_with('-')
+                && dirty.len() == 9
+                && dirty[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
         let valid = hash == "unknown"
-            || (!hash.is_empty()
-                && hash.len() >= 7
-                && hash.len() <= 40
-                && hash
+            || (!rev.is_empty()
+                && rev.len() >= 7
+                && rev.len() <= 40
+                && rev
                     .chars()
-                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+                && dirty_ok);
         assert!(
             valid,
             "build hash {hash:?} is not a short git hash or unknown"

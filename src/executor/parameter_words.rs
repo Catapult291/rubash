@@ -12,6 +12,32 @@ fn apfae_trace_enabled() -> bool {
     *TRACE.get_or_init(|| std::env::var_os("RUBASH_TRACE_APPAE").is_some())
 }
 
+thread_local! {
+    /// Depth pool of synthetic `${name}` words for
+    /// [`Executor::expand_braced_parameter_fragment_in_word`]. One buffer is
+    /// live per nesting level, so sibling fragments reuse the same allocation
+    /// and a nested fragment only allocates while an outer buffer is checked
+    /// out. See that function for the GNU anchor.
+    static SYNTHETIC_FRAGMENT_WORD: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Check out a synthetic-`${...}` buffer from the depth pool (see above).
+/// The caller fills it, expands through it, and returns it via
+/// [`recycle_synthetic_fragment_word`]; buffers are returned to the pool on
+/// every path so a nested fragment only allocates while an outer buffer is
+/// checked out.
+pub(in crate::executor) fn pop_synthetic_fragment_word() -> String {
+    SYNTHETIC_FRAGMENT_WORD
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+/// Return a buffer checked out via [`pop_synthetic_fragment_word`].
+pub(in crate::executor) fn recycle_synthetic_fragment_word(word: String) {
+    SYNTHETIC_FRAGMENT_WORD.with(|pool| pool.borrow_mut().push(word));
+}
+
 impl Executor {
     pub(in crate::executor) fn expand_parameter_word(&self, word: &str) -> String {
         // TODO(subst.c/parse.y): The `word` half of ${parameter:-word},
@@ -86,7 +112,7 @@ impl Executor {
         length: Option<isize>,
     ) -> String {
         let selected = positional_parameter_substring_with_zero(
-            &self.shell_state.positional_params,
+            self.shell_state.positional_window(),
             &self.script_name_value(),
             offset,
             length,
@@ -543,18 +569,36 @@ impl Executor {
         name: &str,
         context: SubstitutionQuoteContext,
     ) -> String {
-        let synthetic = format!("${{{name}}}");
+        // Fall-through shapes (a `=` assignment-operator candidate, or a
+        // funsub introducer `|`/whitespace) need the full pipeline; they
+        // keep the allocating form because they are the rare arm.
         if name.contains('=')
             || name
                 .chars()
                 .next()
                 .is_some_and(|first| first == '|' || first.is_whitespace())
-            || !braced_parameter_spans_whole_word(&synthetic)
         {
-            return self.expand_word_mut_with_context(&synthetic, context);
+            return self.expand_word_mut_with_context(&format!("${{{name}}}"), context);
         }
-        let _wctx = crate::executor::expand_braced_indices::WordCtxGuard::new_if_absent();
-        self.expand_quoted_parameter_word_mut(&synthetic, context)
+        // GNU subst.c:11229 expand_word_internal runs parameter_brace_expand
+        // inline on the SAME word buffer; the fragment re-entry needs a
+        // standalone `${...}` string, so reuse one from the depth pool
+        // instead of allocating per fragment. The buffer is returned to the
+        // pool after the expansion, so a nested fragment (which re-enters
+        // this function) only allocates while an outer buffer is live.
+        let mut synthetic = pop_synthetic_fragment_word();
+        synthetic.clear();
+        synthetic.push_str("${");
+        synthetic.push_str(name);
+        synthetic.push('}');
+        let result = if braced_parameter_spans_whole_word(&synthetic) {
+            let _wctx = crate::executor::expand_braced_indices::WordCtxGuard::new_if_absent();
+            self.expand_quoted_parameter_word_mut_routed(&synthetic, context, true)
+        } else {
+            self.expand_word_mut_with_context(&synthetic, context)
+        };
+        recycle_synthetic_fragment_word(synthetic);
+        result
     }
 
     pub(in crate::executor) fn expand_quoted_parameter_word_mut(
@@ -562,28 +606,10 @@ impl Executor {
         word: &str,
         context: SubstitutionQuoteContext,
     ) -> String {
-        // GNU param_expand resolves one `${}` expansion once: memoize
-        // array-element fetches for the duration of this word so repeated
-        // helper-layer reads (operator set-checks, error probes) do not
-        // re-run subscript side effects (AEPV_MEMO). Whole-word `\x1d`-marked
-        // `${}` forms reach here without passing a walker `${` arm, so a
-        // frame is needed at this entry — but only when the word is one
-        // `${}` span; a multi-`${}` word must keep per-`${}` scoping, which
-        // the walker's `${` arms provide (push-if-empty shares nested `${}`s
-        // with the outer scope).
-        let _memo_frame = if braced_parameter_spans_whole_word(word) {
-            Some(crate::executor::expand_braced_indices::AepvMemoFrame::new())
-        } else {
-            None
-        };
-        // Bash 5.3 (parser.h FUNSUB_CHAR): a whitespace-led `${ command; }` /
-        // `${|command;}` word is a nofork command substitution, not a
-        // parameter form. The operator split_once parsing below would treat
-        // the body's first `=` as ${name=word} assignment syntax and expand
-        // the rest of the body as literal text (comsub22.sub: a multi-line
-        // funsub in double quotes printed the body instead of executing it).
-        // Route the whole word through the embedded walker, which collects
-        // the funsub span and executes it in the current shell.
+        // Non-POSIX whole-word span, computed once here and threaded into
+        // the routed body so the per-`${}`-fragment re-entry below can skip
+        // its own scan (same string, same value).
+        let spans_nonposix = braced_parameter_spans_whole_word(word);
         // Bash 5.3 (parser.h FUNSUB_CHAR): a whitespace-led `${ command; }` /
         // `${|command;}` word is a nofork command substitution, not a
         // parameter form. The operator split_once parsing below would treat
@@ -596,8 +622,48 @@ impl Executor {
         if crate::executor::parameter_core::word_contains_current_shell_command_substitution(word)
             && crate::executor::parameter_core::funsub_span_is_top_level(word)
         {
+            // Frame placement mirrors the routed body below: the whole-word
+            // gate value decides, so a funsub word keeps the exact memo
+            // scope the pre-split code provided (push-if-empty shares nested
+            // `${}`s with the outer scope either way).
+            let _memo_frame =
+                spans_nonposix.then(crate::executor::expand_braced_indices::AepvMemoFrame::new);
             return self.expand_embedded_parameters_mut_with_context(word, context);
         }
+        self.expand_quoted_parameter_word_mut_routed(word, context, spans_nonposix)
+    }
+
+    /// Routed body of [`Executor::expand_quoted_parameter_word_mut`] after
+    /// the funsub scan. `spans_nonposix` MUST be
+    /// `braced_parameter_spans_whole_word(word)` for this exact `word` (the
+    /// outer entry just computed it; the fragment entry re-proved it on its
+    /// identical synthetic word) — it feeds both the memo-frame gate and the
+    /// non-POSIX span verdict below, so neither is re-scanned. Callers that
+    /// reach here have proven the word carries no TOP-LEVEL funsub span:
+    /// the outer entry ran the scan; the fragment entry's whitelist (see
+    /// `expand_braced_parameter_fragment_in_word`) admits only a synthetic
+    /// word whose sole top-level `${` is not a funsub introducer, and any
+    /// `${...}` nested inside its name is enclosed by that outer `${`, so
+    /// `funsub_span_is_top_level` is false either way and the routed arm
+    /// runs. GNU subst.c:11229 runs the same inline parameter_brace_expand
+    /// with no re-scan.
+    pub(in crate::executor) fn expand_quoted_parameter_word_mut_routed(
+        &mut self,
+        word: &str,
+        context: SubstitutionQuoteContext,
+        spans_nonposix: bool,
+    ) -> String {
+        // GNU param_expand resolves one `${}` expansion once: memoize
+        // array-element fetches for the duration of this word so repeated
+        // helper-layer reads (operator set-checks, error probes) do not
+        // re-run subscript side effects (AEPV_MEMO). Whole-word `\x1d`-marked
+        // `${}` forms reach here without passing a walker `${` arm, so a
+        // frame is needed at this entry — but only when the word is one
+        // `${}` span; a multi-`${}` word must keep per-`${}` scoping, which
+        // the walker's `${` arms provide (push-if-empty shares nested `${}`s
+        // with the outer scope).
+        let _memo_frame =
+            spans_nonposix.then(crate::executor::expand_braced_indices::AepvMemoFrame::new);
         // In POSIX mode, a double-quoted `${...}` may close at a `}` inside
         // the apparent word when a single quote is literal (Interp 221).
         // Expand that braced head separately, then continue with the suffix.
@@ -636,7 +702,7 @@ impl Executor {
         {
             braced_parameter_spans_whole_word_in_context(word, true, true)
         } else {
-            braced_parameter_spans_whole_word(word)
+            spans_nonposix
         };
         if !spans_whole_word {
             return self.expand_embedded_parameters_mut_with_context(word, context);

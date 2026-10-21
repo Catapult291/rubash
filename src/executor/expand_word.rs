@@ -9,6 +9,9 @@ use crate::executor::markers::STORAGE_WORD_PREFIX;
 /// operator form (${$'x1'%t}, ${$'x1'-fallback}). Returns the rewritten
 /// body, or None when the name is not a decodable dollar-quoted span.
 pub(in crate::executor) fn resolve_dollar_quoted_parameter_name(name: &str) -> Option<String> {
+    if !name.starts_with("$'") {
+        return None;
+    }
     let chars: Vec<char> = name.chars().collect();
     if chars.len() < 3 || chars[0] != '$' || chars[1] != '\'' {
         return None;
@@ -544,14 +547,14 @@ impl Executor {
             "$?" => Some(self.dollar_question_status().to_string()),
             "$$" => Some(self.shell_pid_value().to_string()),
             "$!" => Some(self.last_background_pid_value()),
-            "$@" => Some(self.shell_state.positional_params.join(" ")),
+            "$@" => Some(self.shell_state.positional_window().join(" ")),
             // Bash joins `$*` with the first character of IFS, not a space.
             "$*" => Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .join(&self.ifs_first_char_separator()),
             ),
-            "$#" => Some(self.shell_state.positional_params.len().to_string()),
+            "$#" => Some(self.shell_state.positional_window().len().to_string()),
             "$-" => Some(self.shell_option_flags()),
             _ => tilde_expand::expand_word_prefix(word, &self.shell_state.env_vars),
         }
@@ -831,8 +834,17 @@ thread_local! {
     /// `echo A${x[0]y}B` reports `A${x[0]y}B`, not the braced span
     /// (rubash#758). Consumed by the first gate evaluation so a NESTED
     /// fragment (`${x-${y[0]z}}`) keeps its own word.
-    static PENDING_DIAGNOSTIC_WORD: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+    ///
+    /// Stored as a raw `(ptr, len)` borrow rather than a `String`: the guard
+    /// is created once per walked `${}` fragment and the value is read only
+    /// on the bad-substitution path, so the historical `word.to_string()`
+    /// paid one allocation per fragment to describe an error that almost
+    /// never fires. The referent is the walker's `word: &str`, which the
+    /// guard's scope cannot outlive (the slot is restored on drop and the
+    /// one-shot `take` only runs inside that scope), so the pointer is valid
+    /// for every read — see the safety note on `take_pending_diagnostic_word`.
+    static PENDING_DIAGNOSTIC_WORD: std::cell::Cell<Option<(*const u8, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Run `f` with `word` recorded as the enclosing word for a walked `${}`
@@ -840,36 +852,52 @@ thread_local! {
 /// [`take_pending_diagnostic_word`]) and always cleared on return so it can
 /// never leak past the fragment.
 pub(in crate::executor) fn with_pending_diagnostic_word<T>(word: &str, f: impl FnOnce() -> T) -> T {
-    PENDING_DIAGNOSTIC_WORD.with(|slot| *slot.borrow_mut() = Some(word.to_string()));
+    let previous =
+        PENDING_DIAGNOSTIC_WORD.with(|slot| slot.replace(Some((word.as_ptr(), word.len()))));
     let result = f();
-    PENDING_DIAGNOSTIC_WORD.with(|slot| *slot.borrow_mut() = None);
+    PENDING_DIAGNOSTIC_WORD.with(|slot| slot.set(previous));
     result
 }
 
 /// Consume the pending enclosing word, if any. Evaluating a fragment that is
 /// itself valid consumes the record so a nested fragment cannot inherit the
 /// outer word.
+///
+/// # Safety
+/// The stored pointer was taken from a `&str` that is still borrowed by the
+/// enclosing guard/`with_pending_diagnostic_word` frame; the slot is restored
+/// (to the outer pointer or `None`) when that frame ends, and this take is
+/// only reachable while the frame is live. The referent therefore outlives
+/// the read and cannot have been moved (it is borrowed immutably for the
+/// whole frame).
 pub(in crate::executor) fn take_pending_diagnostic_word() -> Option<String> {
-    PENDING_DIAGNOSTIC_WORD.with(|slot| slot.borrow_mut().take())
+    PENDING_DIAGNOSTIC_WORD.with(|slot| {
+        slot.take().map(|(ptr, len)| {
+            // SAFETY: see the function-level safety note.
+            let word =
+                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+            word.to_string()
+        })
+    })
 }
 
 /// RAII scope arm: records `word` as the enclosing word for the duration of
 /// one `${}` fragment in a walker, restoring the previous record on drop.
 pub(in crate::executor) struct PendingDiagnosticWordGuard {
-    previous: Option<String>,
+    previous: Option<(*const u8, usize)>,
 }
 
 impl PendingDiagnosticWordGuard {
     pub(in crate::executor) fn new(word: &str) -> Self {
         let previous =
-            PENDING_DIAGNOSTIC_WORD.with(|slot| slot.borrow_mut().replace(word.to_string()));
+            PENDING_DIAGNOSTIC_WORD.with(|slot| slot.replace(Some((word.as_ptr(), word.len()))));
         Self { previous }
     }
 }
 
 impl Drop for PendingDiagnosticWordGuard {
     fn drop(&mut self) {
-        PENDING_DIAGNOSTIC_WORD.with(|slot| *slot.borrow_mut() = self.previous.take());
+        PENDING_DIAGNOSTIC_WORD.with(|slot| slot.set(self.previous));
     }
 }
 

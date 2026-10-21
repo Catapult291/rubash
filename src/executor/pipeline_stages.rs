@@ -184,6 +184,11 @@ impl Executor {
         // second time, and open the literal — propagate instead.
         if subshell.shell_state.redirect_failglob_seen.replace(false) {
             if let Err(error) = result {
+                // rubash#846: the thread-local stdout capture above is
+                // active — restore it before propagating so later stdout
+                // writes in the script are not swallowed into the
+                // orphaned buffer.
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
                 return Err(error);
             }
         }
@@ -403,7 +408,17 @@ impl Executor {
         // ordered redirect preflight the top-level builtin path uses, while the
         // stdout capture is active so a 2>&1-routed diagnostic lands in this
         // stage's stdout (the pipe) exactly like GNU's.
-        if self.command_output_redirect_fails(&call)? {
+        // rubash#846: the preflight can return Err (unopenable `>file`).
+        // Restore the active thread-local capture before propagating or
+        // every later stdout write is swallowed into the orphaned buffer.
+        let builtin_stage_output_redirect_failed = match self.command_output_redirect_fails(&call) {
+            Ok(failed) => failed,
+            Err(error) => {
+                crate::executor::shell_options::restore_stdout_capture(saved_capture);
+                return Err(error);
+            }
+        };
+        if builtin_stage_output_redirect_failed {
             let captured = crate::executor::shell_options::take_stdout_capture();
             crate::executor::shell_options::restore_stdout_capture(saved_capture);
             return Ok(Some((
@@ -909,7 +924,9 @@ impl Executor {
         // literal argv word resolves through the OS /dev/fd layer.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        suppress_orphan_console(&mut process);
         let mut child = process.spawn()?;
+        adopt_orphan_console(child.id());
         // Drop the Command NOW: std retains the `Stdio::from(PipeWriter)`
         // values set above, and a live Command keeps the merged pipe's
         // write end open in the parent — the drain below would never see

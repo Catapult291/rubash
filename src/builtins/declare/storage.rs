@@ -18,6 +18,33 @@ pub(super) fn parse_single_element_array(value: &str) -> Option<&str> {
     value.strip_prefix('(')?.strip_suffix(')')
 }
 
+/// GNU arrayfunc.c:710-743 `assign_compound_array_list` seeds a compound
+/// append from the target's live ARRAY object (`a = array_cell (var)` at
+/// :710, `last_ind = array_max_index (a) + 1` at :743), so `name+=(...)`
+/// continues the CURRENT element list. Two states both render the mirror as
+/// the empty string but are NOT the same array:
+///
+/// * a variable declared without a value (`declare -a a`, GNU
+///   att_invisible; rubash `DECLARED_UNSET_VARS`) or absent has an EMPTY
+///   array object, so the first appended element lands at index 0; and
+/// * a plain scalar, including `a=""`, is an implicit array whose element 0
+///   is that scalar (variables.c `convert_var_to_array` keeps it), so the
+///   append must start at index 1 and preserve `[0]=""`.
+///
+/// The mirror alone cannot tell them apart, so the caller passes the
+/// declared-unset state. With it clear, an empty mirror means "element 0 is
+/// the empty scalar" and is preserved; otherwise the baseline is the empty
+/// render `()`.
+pub(in crate::builtins) fn append_baseline_mirror(
+    current: Option<&str>,
+    declared_unset: bool,
+) -> String {
+    match current {
+        Some(value) if !value.is_empty() || !declared_unset => value.to_string(),
+        _ => "()".to_string(),
+    }
+}
+
 pub(super) fn format_array_value(value: &str) -> String {
     if let Some(rendered) = value.strip_prefix(STORAGE_WORD_PREFIX) {
         // rubash#616: fold transient duplicates from the append-updated

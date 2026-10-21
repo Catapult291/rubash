@@ -265,3 +265,90 @@ fn test_posix_function_typeset_plus_x_unsets_shell_value() {
     );
     let _ = fs::remove_file(&output_path);
 }
+
+#[test]
+fn test_export_minus_n_removes_export_mark() {
+    let _cwd_guard = CwdGuard::take();
+    let _lock = ENV_LOCK.lock().unwrap();
+    let output_path = target_test_path("rubash-export-minus-n-output.txt");
+    let _ = fs::remove_file(&output_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let input = format!(
+        "export RUBASH_EXPORT_UNMARK=hello; export -n RUBASH_EXPORT_UNMARK; \
+         printenv RUBASH_EXPORT_UNMARK > {shell_output_path}; echo rc=$? >> {shell_output_path}; \
+         declare -p RUBASH_EXPORT_UNMARK >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "rc=1\ndeclare -- RUBASH_EXPORT_UNMARK=\"hello\"\n"
+    );
+    std::env::remove_var("RUBASH_EXPORT_UNMARK");
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn test_declare_vs_export_child_visibility_contrast() {
+    let _cwd_guard = CwdGuard::take();
+    let _lock = ENV_LOCK.lock().unwrap();
+    let output_path = target_test_path("rubash-inherit-probe-output.txt");
+    let _ = fs::remove_file(&output_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let input = format!(
+        "declare RUBASH_INHERIT_PROBE=plain; \
+         printenv RUBASH_INHERIT_PROBE > {shell_output_path}; echo declare_rc=$? >> {shell_output_path}; \
+         declare -p RUBASH_INHERIT_PROBE >> {shell_output_path}; \
+         export RUBASH_INHERIT_PROBE; \
+         printenv RUBASH_INHERIT_PROBE >> {shell_output_path}; echo export_rc=$? >> {shell_output_path}; \
+         declare -p RUBASH_INHERIT_PROBE >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "declare_rc=1\ndeclare -- RUBASH_INHERIT_PROBE=\"plain\"\nplain\nexport_rc=0\ndeclare -x RUBASH_INHERIT_PROBE=\"plain\"\n"
+    );
+    std::env::remove_var("RUBASH_INHERIT_PROBE");
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn test_declare_trace_persists_across_export() {
+    let _cwd_guard = CwdGuard::take();
+    let _lock = ENV_LOCK.lock().unwrap();
+    let output_path = target_test_path("rubash-trace-pin-output.txt");
+    let _ = fs::remove_file(&output_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let input = format!(
+        "declare -t RUBASH_TRACE_PIN=tracked; declare -p RUBASH_TRACE_PIN > {shell_output_path}; \
+         export RUBASH_TRACE_PIN; declare -p RUBASH_TRACE_PIN >> {shell_output_path}; \
+         printenv RUBASH_TRACE_PIN >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "declare -t RUBASH_TRACE_PIN=\"tracked\"\ndeclare -tx RUBASH_TRACE_PIN=\"tracked\"\ntracked\n"
+    );
+    std::env::remove_var("RUBASH_TRACE_PIN");
+    let _ = fs::remove_file(&output_path);
+}

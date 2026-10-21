@@ -8,6 +8,13 @@ stderr and exit status compared separately. Do NOT run the GNU leg as
 quotes vanish, and `;` is then interpreted by the outer shell (it silently
 fabricates `$?`/`$x` divergences).
 
+The case-file path appears inside diagnostics as `$0` ("<case.sh>: line N:"),
+and each leg spells it differently (`D:/...` native, `/d/...` rubash-normalized,
+`/mnt/d/...` WSL) — machine noise, not a semantic leg (context-inheritance.md
+D1). Both streams are normalized through `_norm` before comparison so the
+verdict is semantic; line numbers, message text, routing and status are still
+compared byte-for-byte.
+
 Override the binaries with RUBASH_BIN / GNU_CMD:
     RUBASH_BIN=<path>/rubash.exe python scripts/audit/nested-context-probes.py
 """
@@ -69,9 +76,34 @@ cases = [
  ("subshell-var-isolation", "x=1; ( x=2 ); echo $x"),
  ("comsub-var-isolation",   "x=1; x=$(echo 2); echo $x"),
  ("bg-var-isolation",       "x=1; x=2 & wait; echo $x"),
+ # --- 2026-10-21 third pass (#713): the doc-cited function fd-table cell
+ # --- gets real probes, plus the #934 face set — every non-brace redirect-
+ # --- apply path reports an OPEN failure through the real stderr instead of
+ # --- the fd-2 binding in force (the brace group is correct since #826;
+ # --- `>`-before-`2>` and dup-failure faces already agree).
+ ("fd3-into-function",       "exec 3>f0.log; f(){ echo g >&3; }; f; exec 3>&-; echo fd3=$(cat f0.log)"),
+ ("func-stderr-route",       "f(){ echo E >&2; }; f 2>frr.txt; echo rc=$? ferr=[$(cat frr.txt)]"),
+ ("simple-redirect-err-route","true 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt 2>/dev/null)]"),
+ ("func-redirect-err-route", "f(){ :; }; f 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt 2>/dev/null)]"),
+ ("paren-redirect-err-route","( :; ) 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt 2>/dev/null)]"),
+ ("if-redirect-err-route",   "if true; then :; fi 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt 2>/dev/null)]"),
+ ("comsub-redirect-err-route","f(){ :; }; x=$( f 2>cap.txt > /nonexistent_dir_r720/f ); echo rc=$? cap=[$(cat cap.txt 2>/dev/null)]"),
+ ("exec2-persist-err-route", "exec 2>cap.txt; true > /nonexistent_dir_r720/f; rc=$?; exec 2>&1; echo rc=$rc cap=[$(cat cap.txt)]"),
+ ("func-redirect-fail-status","f(){ :; }; f 2>/dev/null > /nonexistent_dir_r720/f; echo rc=$?"),
+ # #934 face B: earlier redirects in a failing list must still perform their
+ # side effects in parse order (GNU do_redirection_internal, redir.c:767-955)
+ # — the simple path truncates cap.txt but reports to the real stderr; the
+ # `( )`/compound paths leave even a STALE cap.txt untouched.
+ ("simple-redirect-side-effect","printf 'STALE\\n' > cap.txt; true 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt)]"),
+ ("paren-redirect-side-effect","printf 'STALE\\n' > cap.txt; ( :; ) 2>cap.txt > /nonexistent_dir_r720/f; echo rc=$? cap=[$(cat cap.txt)]"),
 ]
 def _run(argv):
-    p = subprocess.run(argv, capture_output=True)
+    # stdin is EOF, never inherited: a case that dups fd 0 (fd9-in-subshell)
+    # must see EOF deterministically instead of blocking on whatever pipe
+    # the runner was launched with (rubash#713 rerun 2026-10-20 hung here
+    # under a held-open inherited stdin). Both legs share the same DEVNULL,
+    # so the differential comparison is unaffected.
+    p = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL)
     return (
         p.stdout.decode(errors="replace"),
         p.stderr.decode(errors="replace"),
@@ -83,6 +115,29 @@ def _case_file(script):
     f = here / "case.sh"
     f.write_text(script.replace("\r\n", "\n"), encoding="utf-8")
     return f
+
+
+def _norm(text):
+    """Fold the case-file path's per-leg spellings to one token.
+
+    Diagnostics embed `$0`; the rubash leg renders the same file `/d/...`,
+    a native GNU leg `D:\\...` or `D:/...`, and a WSL leg `/mnt/d/...`.
+    Everything else — line numbers, message text, routing, status — stays
+    byte-compared.
+    """
+    f = here / "case.sh"
+    posix = str(f).replace("\\", "/")
+    drive, tail = posix[0].lower(), posix[2:]
+    spellings = {
+        str(f),
+        posix,
+        f"/{drive}{tail}",
+        f"/mnt/{drive}{tail}",
+        f"/cygdrive/{drive}{tail}",
+    }
+    for spelled in sorted(spellings, key=len, reverse=True):
+        text = text.replace(spelled, "<CASE>")
+    return text
 
 
 def _as_guest_path(path):
@@ -113,6 +168,8 @@ if __name__ == "__main__":
     bad = 0
     for label, script in cases:
         rb, gn = run_rb(script), run_gnu(script)
+        rb = (_norm(rb[0]), _norm(rb[1]), rb[2])
+        gn = (_norm(gn[0]), _norm(gn[1]), gn[2])
         if rb != gn:
             bad += 1
             print(

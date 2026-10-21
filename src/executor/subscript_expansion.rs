@@ -152,11 +152,31 @@ impl Executor {
         // produce. E400-aware: user data U+E401 rides the E400 pair and
         // survives (rubash#735; issue #734 item 2 — the marker leaked into
         // `declare -p` through the stored key).
-        let expanded = crate::executor::markers::strip_ansi_c_ifs_guard(
-            &expanded
-                .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-                .replace(crate::executor::markers::IFS_GLUE, ""),
-        );
+        //
+        // rubash#618 fast lane: each pass is a marker strip whose only effect
+        // on a marker-free value is a fresh allocation (str::replace always
+        // copies; restore_bare_sentinels and strip_ansi_c_ifs_guard are
+        // identity when their sentinel is absent). A plain `k$i` key carries
+        // no marker, so test the three sentinels first and keep the expanded
+        // value in place — GNU's dequote walks a marker-free C string without
+        // copying (subst.c dequote_string). The passes never introduce one
+        // another's sentinel, so the guarded chain is byte-identical.
+        let expanded = if expanded.contains(crate::executor::markers::IFS_GLUE)
+            || expanded.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG)
+            || expanded.contains(crate::executor::markers::ANSI_C_IFS_GUARD)
+        {
+            crate::executor::markers::strip_ansi_c_ifs_guard(
+                &crate::executor::markers::restore_bare_sentinels(
+                    &expanded.replace(crate::executor::markers::IFS_GLUE, ""),
+                    // E309 is registry-zone — a typed `$'\uE309'` arrives
+                    // E400-escaped and is user data; strip only the BARE tag
+                    // (rubash#840).
+                    &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
+                ),
+            )
+        } else {
+            expanded
+        };
         // A leading unquoted `~` tilde-expands; `x~` and `a:~` stay literal
         // and `"~"` never reaches here (its first character is the quote).
         if raw.starts_with('~') {
@@ -1203,9 +1223,13 @@ impl Executor {
                     // foo) )` stored [0]=`foo" \x10"1`). Bare PUA-zone marker
                     // chars are never user data here (literal zone chars
                     // travel E400-escaped), so stripping them is safe.
-                    let field = field
-                        .replace(crate::executor::markers::IFS_GLUE, "")
-                        .replace(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "");
+                    let field = crate::executor::markers::restore_bare_sentinels(
+                        &field.replace(crate::executor::markers::IFS_GLUE, ""),
+                        // E309 is registry-zone — a typed `$'\uE309'`
+                        // arrives E400-escaped and is user data; strip
+                        // only the BARE tag (rubash#840).
+                        &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
+                    );
                     // A field still carrying CTLESC (\x11) protection is a
                     // QUOTED element product — expand_command_word
                     // CTLESC-protects every character of a quoted word's
@@ -1806,10 +1830,17 @@ fn dequote_compound_subscript(sub: &str) -> String {
     // reader resolved the plain spelling — the cell was unreachable by
     // direct read (rubash#861: write parity, read miss, count=2 after a
     // clean-spelling overwrite).
-    out.replace(crate::executor::markers::ANSI_C_QUOTE_MARKER, "'")
-        .replace(crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\"")
-        .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-        .replace(crate::executor::markers::IFS_GLUE, "")
+    crate::executor::markers::restore_bare_sentinels(
+        &out.replace(crate::executor::markers::IFS_GLUE, ""),
+        // Registry-zone sentinels — typed `$'\uE010'`/`$'\uE011'`/
+        // `$'\uE309'` arrive E400-escaped and are user data; only BARE
+        // carriers decode (rubash#840).
+        &[
+            (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+            (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+            (crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, ""),
+        ],
+    )
 }
 
 /// Encode a resolved associative compound-element key for the `[key]=value`

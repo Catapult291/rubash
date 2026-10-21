@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "printf_tests/float_numeric.rs"]
 mod float_numeric;
+#[path = "printf_tests/nonfinite_prefix_871.rs"]
+mod nonfinite_prefix_871;
 
 fn run(args: &[&str]) -> (i32, String, String, crate::shell::var_table::VarTable) {
     let mut env_vars = crate::shell::var_table::VarTable::default();
@@ -385,10 +387,10 @@ mod numeric_validation_704 {
         // chk_converror suffix. The pre-fix engine dropped the value to 0.
         let (status, stdout, stderr, _) = run(&["%f|%e|%g|%a", "5 ", "5 ", "5 ", "5 "]);
         assert_eq!(status, EXECUTION_FAILURE);
-        // The %a rendering keeps the engine's own mantissa style (a separate
-        // pre-existing divergence from glibc's "0xap-1"); what this facet
-        // owns is that the VALUE survives: it must not collapse to 0x0p+0.
-        assert_eq!(stdout, "5.000000|5.000000e+00|5|0x1.4p+2");
+        // What this facet owns is that the VALUE survives: it must not
+        // collapse to 0x0p+0. The nibble-style `%a` (`0xap-1`) is the
+        // glibc %La form owned by issue #879.
+        assert_eq!(stdout, "5.000000|5.000000e+00|5|0xap-1");
         assert_eq!(stderr.matches("printf: 5 : invalid number").count(), 4);
 
         let (status, stdout, stderr, _) = run(&["%f", "5.5 "]);
@@ -476,7 +478,7 @@ mod numeric_validation_704 {
 
     #[test]
     fn lone_quote_is_a_nul_character_constant_without_error() {
-        // printf.def:1519-1544 asciicode(): arg[1] of a quoted operand, with
+        // printf.def:1520-1543 asciicode(): arg[1] of a quoted operand, with
         // no chk_converror — a lone quote reads the NUL at arg[1] (0).
         let (status, stdout, stderr, _) = run(&["%d|%d|%d", "'a", "'a ", "'"]);
         assert_eq!(status, EXECUTION_SUCCESS);

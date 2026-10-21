@@ -591,6 +591,40 @@ mod windows_script_commands {
 #[path = "executor_command_chaining/mod.rs"]
 mod command_chaining;
 
+mod dirty_flag_semantics {
+    use super::*;
+
+    fn run(executor: &mut Executor, script: &str) {
+        let tokens = tokenize(script);
+        let ast = parse(&tokens);
+        executor.execute_ast(&ast).unwrap();
+    }
+
+    #[test]
+    fn element_read_keeps_dirty_clear_arith_write_sets_it() {
+        let _cwd_guard = CwdGuard::take();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut executor = Executor::new();
+        run(&mut executor, "RUBASH_DIRTY_F3=(zero one two)");
+        assert!(!executor.array_cells_dirty());
+        // A pure element read trusts the typed cell without dirtying it.
+        run(&mut executor, "RUBASH_DIRTY_F3_X=${RUBASH_DIRTY_F3[0]}");
+        assert!(!executor.array_cells_dirty());
+        assert_eq!(executor.get_env("RUBASH_DIRTY_F3_X"), Some("zero"));
+        // An arithmetic element store goes through the parser-context
+        // mirror path (`value.rs` `set_array_element`) and marks dirty.
+        run(&mut executor, "(( RUBASH_DIRTY_F3[1] = 99 ))");
+        assert!(executor.array_cells_dirty());
+        // Sync + clear: the typed cell follows the mirror again, so the
+        // fast path reads the fresh value back.
+        executor.sync_array_cells_from_mirror("RUBASH_DIRTY_F3");
+        assert!(!executor.array_cells_dirty());
+        run(&mut executor, "RUBASH_DIRTY_F3_Y=${RUBASH_DIRTY_F3[1]}");
+        assert_eq!(executor.get_env("RUBASH_DIRTY_F3_Y"), Some("99"));
+        assert!(!executor.array_cells_dirty());
+    }
+}
+
 mod builtin_commands {
     use super::*;
 

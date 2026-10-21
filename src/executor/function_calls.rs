@@ -280,7 +280,15 @@ impl Executor {
         // shapes land on the function boundary like GNU's unwind-protected
         // frame restore does. Off path: one relaxed AtomicBool load.
         let _profiler_frame = super::profiler::enter_function(name);
-        self.execute_function_dispatch(name, args, call_cmd)
+        let result = self.execute_function_dispatch(name, args, call_cmd);
+        // rubash#846: a function call is a call boundary (GNU
+        // execute_cmd.c:5200 execute_function runs the body as a fresh
+        // frame) — an inner compound's own redirect failure arrives here
+        // as plain status, never flipped. Discard the mark; the caller
+        // judges by status only (`! f` with a failing redirect inside f
+        // flips normally).
+        self.compound_redirect_failed.set(false);
+        result
     }
 
     /// The unprofiled body of [`Self::execute_function`] (seam wrapper above).
@@ -447,7 +455,7 @@ impl Executor {
                 .env_vars
                 .get(FUNCTION_STDIN_OFFSET)
                 .cloned();
-            let old_positional_params = self.shell_state.positional_params.clone();
+            let old_positional_params = self.shell_state.positional_window_cloned();
             self.shell_state
                 .env_vars
                 .insert("__RUBASH_CURRENT_FUNCTION".to_string(), name.to_string());

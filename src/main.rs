@@ -62,7 +62,10 @@ fn run_main() -> i32 {
     // `--internal-*` dispatch below sees it; the env key is scrubbed
     // unconditionally so a user-forged value can neither arm the wrapper
     // role nor leak into children. Also runs for plain invocations, where
-    // it is just the scrub.
+    // it is just the scrub — and (rubash#873) the run itself marks this
+    // process as a handshake consumer, which licenses the wrapper spawn
+    // site to attach the argv flag to respawns; host CLIs that never call
+    // this get env-only respawns and never see the niu-specific flag.
     rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
     let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());
     if let Some(name) = args
@@ -214,7 +217,7 @@ fn apply_invocation_shell_mode(executor: &mut Executor, argv0: Option<&str>) {
     // GNU shell.c set_shell_name: an argv[0] whose first character is '-'
     // (after the basename) marks a login shell, independent of --login/-l.
     if name.starts_with('-') {
-        executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+        executor.mark_login_shell();
     }
     // GNU shell.c shell_is_restricted/maybe_make_restricted
     // (shell.c:1258-1299, config-bot.h:96): a shell invoked under the name
@@ -444,7 +447,7 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 // GNU shell.c:497-503: --login/-l flips LOGIN_SHELL; a login
                 // shell accepts the logout builtin and runs ~/.bash_logout
                 // at exit.
-                executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+                executor.mark_login_shell();
                 index += 1;
             }
             "--noprofile" | "--norc" => {
@@ -809,7 +812,7 @@ fn parse_long_options(
                 return (index, Some(0));
             }
             "login" => {
-                executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+                executor.mark_login_shell();
             }
             "posix" => {
                 // GNU shell.c:566-572: --posix runs sv_strict_posix (the
@@ -1030,6 +1033,21 @@ fn run_command_string_with_init(
     command: &str,
     init_file: Option<&str>,
 ) -> i32 {
+    // rubash#948: -c operand entry escaping — the boundary documented on
+    // substitution_metadata::command_string_entry_text. The respawn
+    // exclusion is a DOUBLE-ESCAPE exclusion only, not an all-`-c`
+    // exclusion: a respawned `&`/coproc child's operand is serialized AST
+    // already in transport spelling (E400 pairs, raw-byte markers) and must
+    // not be re-escaped, while a user-supplied -c string is fresh source —
+    // the same class as a script file or stdin — and gets marker-zone
+    // entry escaping so a literal marker-zone char stays user data instead
+    // of live protocol. The escaping preserves existing E400 pairs so
+    // transport-spelled argv from a rubash parent is not double-encoded.
+    let command = if rubash::executor::RESPAWNED_CHILD.load(std::sync::atomic::Ordering::Relaxed) {
+        std::borrow::Cow::Borrowed(command)
+    } else {
+        std::borrow::Cow::Owned(rubash::script_driver::command_string_entry_text(command))
+    };
     executor.inherit_process_stdin();
     // GNU shell.c:1969 initialize_job_control runs inside
     // initialize_shell_basics, long before the -c string is parsed, so the
@@ -1087,10 +1105,10 @@ fn run_command_string_with_init(
     // driver; GNU's reader is always command-by-command.
     let alias_live_at_start = executor.alias_expansion_enabled();
     let status =
-        if script_uses_history(command) || script_uses_aliases(command, alias_live_at_start) {
-            run_script_with_history(executor, command, None)
+        if script_uses_history(&command) || script_uses_aliases(&command, alias_live_at_start) {
+            run_script_with_history(executor, &command, None)
         } else {
-            run_source_with_line_offset(executor, command, interactive, line_offset, None, None)
+            run_source_with_line_offset(executor, &command, interactive, line_offset, None, None)
         };
     executor.set_command_string_mode(false);
     finish_shell(executor, status, interactive)

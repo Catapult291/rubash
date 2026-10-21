@@ -4,6 +4,7 @@
 // - builtins/hash.def
 
 use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR};
+use crate::shell::var_table::VarTable;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -12,7 +13,7 @@ const EXECUTION_FAILURE: i32 = 1;
 const EX_USAGE: i32 = 2;
 const HASH_TABLE: &str = "__RUBASH_HASH_TABLE";
 
-pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(args: &[String], env_vars: &mut VarTable) -> io::Result<i32> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     execute_with_io(args, env_vars, &mut stdout, &mut stderr)
@@ -20,7 +21,7 @@ pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::R
 
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -279,7 +280,7 @@ where
     Ok(EXECUTION_SUCCESS)
 }
 
-pub(crate) fn set_hashed_path(env_vars: &mut HashMap<String, String>, name: &str, path: &str) {
+pub(crate) fn set_hashed_path(env_vars: &mut VarTable, name: &str, path: &str) {
     let mut table = hash_table(env_vars);
     table.insert(
         name.to_string(),
@@ -292,7 +293,7 @@ pub(crate) fn set_hashed_path(env_vars: &mut HashMap<String, String>, name: &str
     crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
 }
 
-pub(crate) fn remove_hashed_path(env_vars: &mut HashMap<String, String>, name: &str) {
+pub(crate) fn remove_hashed_path(env_vars: &mut VarTable, name: &str) {
     let mut table = hash_table(env_vars);
     table.remove(name);
     store_hash_table(env_vars, &table);
@@ -368,10 +369,7 @@ fn hash_table(env_vars: &HashMap<String, String>) -> HashMap<String, (String, u3
         .unwrap_or_default()
 }
 
-fn store_hash_table(
-    env_vars: &mut HashMap<String, String>,
-    table: &HashMap<String, (String, u32, u64)>,
-) {
+fn store_hash_table(env_vars: &mut VarTable, table: &HashMap<String, (String, u32, u64)>) {
     env_vars.insert(
         HASH_TABLE.to_string(),
         table
@@ -389,7 +387,7 @@ fn store_hash_table(
 
 /// GNU hashlib.c:254: a hash_search hit increments times_found — every
 /// phash_search (`type`, `command -v`, exec resolution, `hash -t`) counts.
-pub(crate) fn bump_hashed_path_hit(env_vars: &mut HashMap<String, String>, name: &str) {
+pub(crate) fn bump_hashed_path_hit(env_vars: &mut VarTable, name: &str) {
     let mut table = hash_table(env_vars);
     if let Some((_, hits, _)) = table.get_mut(name) {
         *hits += 1;
@@ -402,11 +400,7 @@ pub(crate) fn bump_hashed_path_hit(env_vars: &mut HashMap<String, String>, name:
 /// PATH enters the table with times_found=1 (phash_insert found=1).
 /// Called from the external-command dispatch once `find_user_command`
 /// resolved `name` to `shell_path`.
-pub(crate) fn record_command_resolution(
-    env_vars: &mut HashMap<String, String>,
-    name: &str,
-    shell_path: &str,
-) {
+pub(crate) fn record_command_resolution(env_vars: &mut VarTable, name: &str, shell_path: &str) {
     let mut table = hash_table(env_vars);
     if let Some((_, hits, _)) = table.get_mut(name) {
         *hits += 1;

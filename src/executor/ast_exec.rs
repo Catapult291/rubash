@@ -155,6 +155,49 @@ impl Executor {
         result
     }
 
+    /// Report an IoError escaping a command's execution. When it is the
+    /// command's own redirect OPEN failure — the `{target}: ` head names a
+    /// redirect-list entry, possibly through `!`/`time`/`&` wrappers — GNU
+    /// redir.c:135 redirection_error routes the message through the fd-2
+    /// binding the list's earlier entries already applied
+    /// (`( :; ) 2>cap.txt > /missing` lands in cap.txt, rubash#940 R1).
+    /// Any other IoError (body write errors, rubash#440 closed-output)
+    /// keeps the direct stderr write so the reported bytes are identical.
+    fn report_io_error_routed(
+        &mut self,
+        command: &CommandNode,
+        error: &std::io::Error,
+    ) -> Result<(), ExecuteError> {
+        let mut stderr = Vec::new();
+        writeln!(
+            &mut stderr,
+            "{}{}",
+            self.diagnostic_prefix(),
+            crate::posix_errors::message(error)
+        )?;
+        let mut owner = command;
+        loop {
+            if let Some(inner) = &owner.inverted_command {
+                owner = &inner.command;
+            } else if let Some(inner) = &owner.time_command {
+                owner = &inner.command;
+            } else if let Some(inner) = &owner.background_command {
+                owner = &inner.command;
+            } else {
+                break;
+            }
+        }
+        if self.failing_open_redirect_index(owner, &stderr).is_some() {
+            // A routed write that itself fails (closed fd 2) is lost like
+            // GNU's builtin_error — never a second diagnostic (rubash#699).
+            let _ = self.write_redirect_diagnostic_routed(owner, &stderr);
+        } else {
+            let _ = self.write_default_stderr(&stderr);
+        }
+        self.exit_code = 1;
+        Ok(())
+    }
+
     fn execute_ast_inner_body(&mut self, commands: &[CommandNode]) -> Result<(), ExecuteError> {
         let mut index = 0;
         // GNU execute_cmd.c:1576 execute_in_subshell: the forked child's
@@ -546,6 +589,12 @@ impl Executor {
                 // is cleared before each top-level command, so a redirected
                 // control structure's flag never leaks into the next command.
                 self.shell_state.stdin_redir.set(false);
+                // rubash#846: same per-command hygiene for the
+                // compound-redirect-failure mark — a stale mark (set by a
+                // previous command whose `!` consult never ran) must never
+                // suppress the next command's flip. Nested scopes clear at
+                // their own fork/call boundaries.
+                self.compound_redirect_failed.set(false);
             }
             {
                 let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_JOBS);
@@ -947,12 +996,7 @@ impl Executor {
                         self.exit_code = code;
                     }
                     Err(ExecuteError::IoError(error)) => {
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1023,12 +1067,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1084,12 +1123,7 @@ impl Executor {
                         self.exit_code = code;
                     }
                     Err(ExecuteError::IoError(error)) => {
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1150,12 +1184,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1232,12 +1261,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1266,6 +1290,12 @@ impl Executor {
                     }
                 }
                 if command.inverted {
+                    // rubash#846: pipeline-level `!` always flips (GNU
+                    // execute_cmd.c:763 wait-side — `! true | cat > bad` is
+                    // 0). A stage's own redirect failure may have marked
+                    // compound_redirect_failed; the pipeline owns the
+                    // adjudicated status from here, so consume the mark.
+                    self.take_compound_redirect_failed();
                     self.exit_code = invert_exit_status(self.exit_code);
                 }
                 // GNU order: the ERR trap for a failing pipeline
@@ -1325,12 +1355,7 @@ impl Executor {
                         // write error for this command — GNU's parent shell
                         // ignores SIGPIPE, reports the failed write and keeps
                         // running; it never aborts the surrounding list.
-                        eprintln!(
-                            "{}{}",
-                            self.diagnostic_prefix(),
-                            crate::posix_errors::message(&error)
-                        );
-                        self.exit_code = 1;
+                        self.report_io_error_routed(command, &error)?;
                     }
                     Err(ExecuteError::ExitCode(code)) => {
                         handle_exit_code!(code, command)
@@ -1400,12 +1425,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                 }
                 Err(ExecuteError::ExitCode(code)) => {
                     handle_exit_code!(code, command)
@@ -1466,12 +1486,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                 }
                 Err(ExecuteError::Return(code)) if subshell_state.is_some() => {
                     // GNU: `return N` inside a `( )` subshell ends the child
@@ -1562,12 +1577,7 @@ impl Executor {
                     // command's write failure — GNU's parent shell ignores
                     // SIGPIPE, reports the failed write with status 1 and
                     // keeps executing the list; only errexit promotes it.
-                    eprintln!(
-                        "{}{}",
-                        self.diagnostic_prefix(),
-                        crate::posix_errors::message(&error)
-                    );
-                    self.exit_code = 1;
+                    self.report_io_error_routed(command, &error)?;
                     // A compound's own failed redirection (the wrapper's
                     // open() -> ExecuteError::IoError) is THIS level's
                     // failure, not a body-inherited aggregate: GNU fires
@@ -1669,7 +1679,12 @@ impl Executor {
                 }
             }
             if command.inverted {
-                self.exit_code = invert_exit_status(self.exit_code);
+                // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a
+                // compound's OWN redirect failure suppresses the flip (mark
+                // left set for an outer `! !` wrapper; boundaries consume).
+                if !self.compound_redirect_failed.get() {
+                    self.exit_code = invert_exit_status(self.exit_code);
+                }
             }
             self.set_pipestatus([self.exit_code]);
 
@@ -1806,6 +1821,10 @@ impl Executor {
             self.with_errexit_suppressed(|executor| {
                 executor.execute_pipeline_command(pipeline_command)
             })?;
+            // rubash#846: pipeline-level `!` always flips (GNU
+            // execute_cmd.c:763 wait-side); consume any stage-set mark — the
+            // pipeline owns the adjudicated status from here.
+            self.take_compound_redirect_failed();
             self.exit_code = invert_exit_status(self.exit_code);
             return Ok(Some(end + 1));
         }
@@ -1815,6 +1834,8 @@ impl Executor {
         for command in pipeline {
             self.execute_command(command)?;
         }
+        // rubash#846: same pipeline-level always-flip rule as above.
+        self.take_compound_redirect_failed();
         self.exit_code = invert_exit_status(self.exit_code);
         Ok(Some(end + 1))
     }

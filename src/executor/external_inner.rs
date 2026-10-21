@@ -705,7 +705,7 @@ impl Executor {
     /// (`ref -> a[1]`) has no env representation, so nothing is exported.
     /// Unresolvable namerefs keep the literal name (nameref11.sub `r=/ f`
     /// exports `r` as a plain variable).
-    fn tempenv_export_name(&self, base_name: &str) -> Option<String> {
+    pub(in crate::executor) fn tempenv_export_name(&self, base_name: &str) -> Option<String> {
         match self.nameref_resolution(base_name) {
             NamerefResolution::Target(target) => {
                 if target.contains('[') {
@@ -904,6 +904,7 @@ impl Executor {
         // GNU fork.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        suppress_orphan_console(&mut process);
         let spawned = process.spawn();
         // Drop the Command NOW: std retains every `Stdio::from(..)` it was
         // given (the #144 shared capture-pipe write clones among them), so a
@@ -916,6 +917,7 @@ impl Executor {
         drop(process);
         match spawned {
             Ok(mut child) => {
+                adopt_orphan_console(child.id());
                 for dup in parent_side_dups {
                     crate::fd::close_handle(dup);
                 }

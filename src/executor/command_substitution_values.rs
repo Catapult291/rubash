@@ -93,7 +93,7 @@ impl Executor {
         let mut stdout = Vec::new();
         // rubash#704 R6.2: same GNU any-found rule as the direct path
         // (builtins/command.def:111-121): one resolved operand suffices for
-        // status 0, and the command.def:95-96 no-operand early return makes
+        // status 0, and the command.def:96-97 no-operand early return makes
         // `$(command -v)` succeed with empty output.
         let mut any_found = false;
         let names = &words[1 + first_name..];
@@ -142,10 +142,10 @@ impl Executor {
             .unwrap_or(word);
         let word = word.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(word);
         if word == "${@}" {
-            return Some(self.shell_state.positional_params.clone());
+            return Some(self.shell_state.positional_window_cloned());
         }
         if word == "$@" && kind.map_or(true, |kind| *kind == TokenKind::Word) {
-            return Some(self.shell_state.positional_params.clone());
+            return Some(self.shell_state.positional_window_cloned());
         }
         if let Some(name) = whole_word_braced_parameter_body(word) {
             // A quoted indirect reference whose target is @ or * expands with
@@ -278,12 +278,12 @@ impl Executor {
                         }
                     }
                     if indirect == "@" {
-                        return Some(self.shell_state.positional_params.clone());
+                        return Some(self.shell_state.positional_window_cloned());
                     }
                     if indirect == "*" {
                         return Some(vec![self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .join(&self.ifs_first_char_separator())]);
                     }
                     if is_shell_name(indirect) {
@@ -291,12 +291,12 @@ impl Executor {
                             self.shell_state.env_vars.get(indirect).map(String::as_str)
                         {
                             if target == "@" {
-                                return Some(self.shell_state.positional_params.clone());
+                                return Some(self.shell_state.positional_window_cloned());
                             }
                             if target == "*" {
                                 return Some(vec![self
                                     .shell_state
-                                    .positional_params
+                                    .positional_window()
                                     .join(&self.ifs_first_char_separator())]);
                             }
                         }
@@ -336,11 +336,11 @@ impl Executor {
                     };
                     if !word_used {
                         if var_name == "@" {
-                            return Some(self.shell_state.positional_params.clone());
+                            return Some(self.shell_state.positional_window_cloned());
                         }
                         return Some(vec![self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .join(&self.ifs_first_char_separator())]);
                     }
                 }
@@ -357,7 +357,7 @@ impl Executor {
             if let Some((var_name, offset, length)) = self.parse_parameter_substring(name) {
                 if var_name == "@" {
                     return Some(positional_parameter_substring_with_zero(
-                        &self.shell_state.positional_params,
+                        self.shell_state.positional_window(),
                         &self.script_name_value(),
                         offset,
                         length,
@@ -365,7 +365,7 @@ impl Executor {
                 }
                 if var_name == "*" {
                     let values = positional_parameter_substring_with_zero(
-                        &self.shell_state.positional_params,
+                        self.shell_state.positional_window(),
                         &self.script_name_value(),
                         offset,
                         length,
@@ -424,14 +424,14 @@ impl Executor {
             let mut values = vec!["set".to_string(), "--".to_string()];
             values.extend(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|value| shell_single_quote_assignment_value(value)),
             );
             values
         } else {
             self.shell_state
-                .positional_params
+                .positional_window()
                 .iter()
                 .map(|value| self.apply_parameter_transform_value(value, transform))
                 .collect::<Vec<_>>()
@@ -541,7 +541,7 @@ impl Executor {
         }
         let values = self
             .shell_state
-            .positional_params
+            .positional_window()
             .iter()
             .map(|value| modify(value))
             .collect::<Vec<_>>();
@@ -574,7 +574,7 @@ impl Executor {
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     |segment| match segment {
                         QuotedPositionalAtSegment::PositionalAt(_) => {
-                            self.shell_state.positional_params.clone()
+                            self.shell_state.positional_window_cloned()
                         }
                         QuotedPositionalAtSegment::ArrayAt(name, _) => self
                             .array_subscript_range_values(name, 0, None)
@@ -613,23 +613,41 @@ impl Executor {
         // `expression` is the already-stripped parameter name (`foo[@]`,
         // `foo[*]`, or a transform expression), so the `[@]`/`[*]` suffix is
         // present directly - there is no leading `${` to remove first.
+        //
+        // Perf: the indexed branch borrows the content-addressed memo
+        // (`indexed_array_entries_cached`, same discipline as the assoc parse
+        // memo) instead of re-scanning the storage string per join; the
+        // storage decode already yields final element text, so the
+        // `normalize_array_expanded_value` pass is the identity and is
+        // skipped rather than cloned through a second `Vec`. The `[*]`
+        // separator (`subst.c:2902 string_list_dollar_star` over
+        // `subst.c:2864 ifs_firstchar`) is looked up once, outside any
+        // per-element loop.
         let array_name = expression
             .strip_suffix("[@]")
             .or_else(|| expression.strip_suffix("[*]"))
             .unwrap_or_default();
-        let ordered = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, array_name) {
-            assoc_hash_ordered_values(
+        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, array_name) {
+            // Assoc: hash-slot order (assoc.c/hashlib.c hash_search buckets);
+            // `assoc_hash_ordered_values` already borrows its parse memo, and
+            // its elements are final text — no normalize clone.
+            let ordered = assoc_hash_ordered_values(
                 value,
                 assoc_nbuckets(&self.shell_state.env_vars, array_name),
-            )
+            );
+            return self.join_expanded_array_values(ordered, expression);
+        }
+        // Indexed: memoised index-order entries (GNU array.c array_max_index
+        // order); borrow the values, no intermediate `Vec<String>` clone.
+        let entries = indexed_array_entries_cached(value);
+        if expression.ends_with("[*]") {
+            let separator = self.ifs_first_char_separator();
+            let parts: Vec<&str> = entries.values().map(String::as_str).collect();
+            parts.join(&separator)
         } else {
-            array_values(value)
-        };
-        let values = ordered
-            .into_iter()
-            .map(normalize_array_expanded_value)
-            .collect::<Vec<_>>();
-        self.join_expanded_array_values(values, expression)
+            let parts: Vec<&str> = entries.values().map(String::as_str).collect();
+            parts.join(" ")
+        }
     }
 
     pub(in crate::executor) fn join_expanded_array_values(
@@ -638,8 +656,9 @@ impl Executor {
         expression: &str,
     ) -> String {
         if expression.ends_with("[*]") {
-            // GNU dollar_star (subst.c string_list_dollar_star): IFS[0], the
-            // empty string when IFS is set empty, a space when IFS is unset.
+            // GNU dollar_star (subst.c:2902 string_list_dollar_star): IFS[0], the
+            // empty string when IFS is set empty, a space when IFS is unset
+            // (subst.c:2864 ifs_firstchar).
             return values.join(&self.ifs_first_char_separator());
         }
         values.join(" ")
@@ -711,6 +730,30 @@ impl Executor {
         {
             return None;
         }
+        // #800A: the same inline stand-in the simple-command path uses
+        // (external_file_builtins::external_tput). The harvest assets pay
+        // ~32 `$(tput …)` calls per source, and without this arm each one
+        // spawned the real child (~17ms host, ~300ms on the harvest
+        // runner). Admission is the byte-exact whitelist; a non-admitted
+        // shape (option forms, unlisted TERM, unknown caps) falls through
+        // to the external spawner below, unchanged. Like the tty arm this
+        // &self path records no hash-table entry (`$(tty)` has the same
+        // introspection face).
+        #[cfg(windows)]
+        if matches!(first_word, "tput" | "/bin/tput" | "/usr/bin/tput") {
+            if let Some(outcome) = self.admitted_tput_outcome_for_words(&stdio.expanded_words) {
+                let (output, status) = match outcome {
+                    crate::executor::tput_emulation::TputOutcome::Bytes(bytes) => {
+                        (bytes.into_owned(), 0)
+                    }
+                    // ncurses: an absent capability prints nothing, exits 1
+                    // (verified `TERM=vt100 tput setaf 1`).
+                    crate::executor::tput_emulation::TputOutcome::Absent => (String::new(), 1),
+                };
+                self.last_command_substitution_status.set(Some(status));
+                return Some(output);
+            }
+        }
         let Some(program) = find_user_command(&stdio.expanded_words[0], &self.shell_state.env_vars)
         else {
             if stdio.expanded_words.first().map(String::as_str) == Some("mktemp") {
@@ -773,7 +816,9 @@ impl Executor {
         // substitution pipe read ends at their numbers in the child.
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
+        suppress_orphan_console(&mut process);
         let mut spawned = process.spawn().ok()?;
+        adopt_orphan_console(spawned.id());
         if let Some(input) = piped_stdin.as_deref() {
             if let Some(mut child_stdin) = spawned.stdin.take() {
                 use std::io::Write;

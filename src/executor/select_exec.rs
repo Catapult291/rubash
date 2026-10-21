@@ -105,6 +105,11 @@ impl Executor {
         let result = self.apply_command_output_redirects(&redirect_cmd, &mut body);
         let status = self.exit_code;
         if let Err(error) = result {
+            // rubash#846 (GNU execute_cmd.c:854-883): the select's OWN
+            // redirect failure — mark it for the `!` flip sites.
+            if matches!(error, ExecuteError::IoError(_)) {
+                self.note_compound_redirect_failure();
+            }
             let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
             self.exit_code = status;
             finish_result?;
@@ -113,7 +118,7 @@ impl Executor {
         select_command.body = body.commands;
 
         let values: Vec<String> = if select_command.default_positional {
-            self.shell_state.positional_params.clone()
+            self.shell_state.positional_window_cloned()
         } else {
             let mut values = Vec::new();
             for (index, word) in select_command.words.iter().enumerate() {

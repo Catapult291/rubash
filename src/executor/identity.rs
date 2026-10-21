@@ -23,7 +23,7 @@
 //! 19044, `-o` Msys, `-m` x86_64, `arch` == `uname -m`).
 
 /// Version the engine-built uname/arch report in their `--version` banner.
-pub const ENGINE_BUILTIN_VERSION: &str = "5.3.0";
+pub const ENGINE_BUILTIN_VERSION: &str = "5.3.20";
 
 /// Which platform identity the engine currently presents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

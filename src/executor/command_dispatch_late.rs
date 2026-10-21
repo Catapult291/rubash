@@ -31,41 +31,61 @@ impl Executor {
         // strip is borrow-only (GNU copies word->flags, it does not touch
         // the text); the owned per-argument clone existed only so the `-v`
         // rewrite could replace an operand in place, so rewrites are kept
-        // in a side table and resolved at use instead.
-        let stripped: Vec<&str> = args
-            .iter()
-            .map(|arg| crate::builtins::arrayref::take_arrayref_flag(arg).1)
-            .collect();
-        fn resolve<'a>(
-            stripped: &[&'a str],
-            overrides: &'a [(usize, String)],
-            index: usize,
-        ) -> &'a str {
-            overrides
-                .iter()
-                .find(|(position, _)| *position == index)
-                .map(|(_, value)| value.as_str())
-                .unwrap_or(stripped[index])
+        // in a side table and merged once below. Single `Vec<&str>` collect:
+        // the old `stripped` + `resolve` + `builtins/test.rs` three-`Vec`
+        // chain (GNU test.c test_command works on `argv` in place) is one
+        // merge; `-t` presence fuses into the same `-v` scan so `while [ ]`
+        // pays no second linear pass.
+        fn strip(arg: &str) -> &str {
+            crate::builtins::arrayref::take_arrayref_flag(arg).1
         }
         let mut overrides: Vec<(usize, String)> = Vec::new();
+        let mut has_t = false;
         let mut index = 0;
-        while index + 1 < stripped.len() {
-            if resolve(&stripped, &overrides, index) == "-v" {
-                match self.rewrite_operand_array_subscript(resolve(
-                    &stripped,
-                    &overrides,
-                    index + 1,
-                )) {
-                    Ok(rewritten) => overrides.push((index + 1, rewritten)),
+        while index < args.len() {
+            let current = strip(&args[index]);
+            if current == "-t" {
+                has_t = true;
+            }
+            // Operands are skipped after a `-v` (GNU test.c unary_operator
+            // consumes the next word), so the operator test never sees a
+            // rewritten value — borrow-only compare, no resolve table scan.
+            if current == "-v" && index + 1 < args.len() {
+                let operand = strip(&args[index + 1]);
+                if operand == "-t" {
+                    has_t = true;
+                }
+                match self.rewrite_operand_array_subscript(operand) {
+                    Ok(rewritten) => {
+                        if rewritten == "-t" {
+                            has_t = true;
+                        }
+                        overrides.push((index + 1, rewritten));
+                    }
                     Err(()) => return Ok(1),
                 }
-                index += 1;
+                index += 2;
+                continue;
             }
             index += 1;
         }
-        let args: Vec<&str> = (0..stripped.len())
-            .map(|index| resolve(&stripped, &overrides, index))
-            .collect();
+        // Overrides arrive in increasing index order, so merge with a moving
+        // pointer: each side advances once (early-exit when past the index),
+        // no per-index linear `find` over the table.
+        let mut merged: Vec<&str> = Vec::with_capacity(args.len());
+        {
+            let mut next_override = 0usize;
+            for (position, arg) in args.iter().enumerate() {
+                while next_override < overrides.len() && overrides[next_override].0 < position {
+                    next_override += 1;
+                }
+                if next_override < overrides.len() && overrides[next_override].0 == position {
+                    merged.push(overrides[next_override].1.as_str());
+                } else {
+                    merged.push(strip(arg));
+                }
+            }
+        }
         // The fd-terminal marks (__RUBASH_FD_TERMINAL_<fd>, consumed ONLY by
         // the `-t` operator arm in builtins/test.rs) are rebuilt by
         // sync_fd_terminal_marks with a full env_vars retain + fd-table walk
@@ -74,8 +94,9 @@ impl Executor {
         // mark; refresh them only when this expression can actually consult
         // one (builtins/test.c binop table: `-t` is the only terminal probe;
         // a `-t` in a string-comparison position merely triggers a harmless
-        // idempotent refresh).
-        if args.iter().any(|arg| *arg == "-t") {
+        // idempotent refresh). `has_t` fused into the `-v` scan above: no
+        // second `any()` pass, skip the sync entirely without `-t`.
+        if has_t {
             self.sync_fd_terminal_marks(Some(cmd));
         }
         // GNU execute_cmd.c: test's diagnostics go to the shell's CURRENTLY
@@ -89,7 +110,7 @@ impl Executor {
         // (modernish TESTERE.t probe).
         let mut stderr = Vec::new();
         let status = crate::builtins::test::execute_with_stderr(
-            args.iter().copied(),
+            &merged,
             bracket,
             &self.shell_state.env_vars,
             &mut stderr,
@@ -257,7 +278,15 @@ impl Executor {
                 // like any other missing command.
                 match cmd.conditional_command.as_ref() {
                     Some(command) => {
-                        self.apply_no_output_builtin_redirects(cmd)?;
+                        // rubash#846 (GNU execute_cmd.c:854-883): the
+                        // `[[ ]]` command's OWN redirect failure — mark it
+                        // for the `!` flip sites.
+                        if let Err(error) = self.apply_no_output_builtin_redirects(cmd) {
+                            if matches!(error, ExecuteError::IoError(_)) {
+                                self.note_compound_redirect_failure();
+                            }
+                            return Err(error);
+                        }
                         self.exit_code = self.execute_conditional_command(command);
                         Ok(())
                     }
@@ -265,7 +294,15 @@ impl Executor {
                 }
             }
             "((" => {
-                self.apply_no_output_builtin_redirects(cmd)?;
+                // rubash#846 (GNU execute_cmd.c:854-883): the `(( ))`
+                // command's OWN redirect failure — mark it for the `!` flip
+                // sites.
+                if let Err(error) = self.apply_no_output_builtin_redirects(cmd) {
+                    if matches!(error, ExecuteError::IoError(_)) {
+                        self.note_compound_redirect_failure();
+                    }
+                    return Err(error);
+                }
                 self.exit_code = self.execute_arithmetic_command(cmd);
                 // GNU expr.c:1190-1216: an unbound variable under `set -u`
                 // inside `(( ))` raises FORCE_EOF and terminates the

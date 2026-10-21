@@ -91,6 +91,14 @@ impl Executor {
                 format_indexed_array_storage(BTreeMap::new()),
             );
             mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, base_name);
+            // Keep the structured cell in lockstep (empty array), same as
+            // command_prepare's fail-compound path.
+            crate::executor::arrays::sync_typed_indexed_array(
+                &mut self.shell_state.variables,
+                base_name,
+                &std::collections::BTreeMap::new(),
+            );
+            self.shell_state.env_vars.clear_array_cells_dirty();
         }
         false
     }
@@ -123,15 +131,20 @@ impl Executor {
         self.tempenv_promoted_names.clear();
         let mut previous = Vec::new();
         if !assignments.is_empty() {
+            // Materialize the write-behind marker lists: restore replays
+            // the string, so the snapshot must reflect current flags,
+            // not a stale serialized copy.
+            let exported = self.shell_state.env_vars.rendered_attr_list(EXPORTED_VARS);
+            let nameref = self.shell_state.env_vars.rendered_attr_list(NAMEREF_VARS);
             previous.push((
                 EXPORTED_VARS.to_string(),
-                self.shell_state.env_vars.get(EXPORTED_VARS).cloned(),
+                exported,
                 self.shell_state.variables.get(EXPORTED_VARS).cloned(),
                 None,
             ));
             previous.push((
                 NAMEREF_VARS.to_string(),
-                self.shell_state.env_vars.get(NAMEREF_VARS).cloned(),
+                nameref,
                 self.shell_state.variables.get(NAMEREF_VARS).cloned(),
                 None,
             ));
@@ -453,6 +466,22 @@ impl Executor {
             } else {
                 entries.push((key, element));
             }
+            // Typed-cell sync (assoc fast path), symmetric with the indexed
+            // leg below: `entries` is the post-write key list this render
+            // folds, so the structured assoc cell is synced from the same
+            // list. GNU keeps ONE assoc table — variables.c:3266-3267
+            // bind_variable (nameref cell -> assign_array_element) ->
+            // arrayfunc.c:262 bind_array_variable -> assoc.c:68 assoc_insert
+            // overwrites the key in place — so the cell can never hold a
+            // stale element. The complete-or-absent invariant is what lets
+            // the typed-cell read fast path (executor/arrays/executor.rs:194,
+            // GNU assoc.c:120 assoc_reference) trust the cell; without this
+            // sync a stale typed cell shadows the mirror (rubash#961).
+            crate::executor::arrays::sync_typed_assoc_array(
+                &mut self.shell_state.variables,
+                elem_base,
+                &entries,
+            );
             let new_value = format!(
                 "({})",
                 entries
@@ -470,6 +499,7 @@ impl Executor {
             self.shell_state
                 .env_vars
                 .insert(elem_base.to_string(), new_value);
+            self.shell_state.env_vars.clear_array_cells_dirty();
             self.exit_code = 0;
             return true;
         }
@@ -529,9 +559,15 @@ impl Executor {
             value.to_string()
         };
         entries.insert(index, element);
+        crate::executor::arrays::sync_typed_indexed_array(
+            &mut self.shell_state.variables,
+            elem_base,
+            &entries,
+        );
         self.shell_state
             .env_vars
             .insert(elem_base.to_string(), format_indexed_array_storage(entries));
+        self.shell_state.env_vars.clear_array_cells_dirty();
         self.exit_code = 0;
         true
     }
@@ -770,6 +806,15 @@ impl Executor {
                     // carries a structured cell drops it — the mirror is
                     // authoritative for this shape.
                     sync_typed_indexed_storage(&mut self.shell_state.variables, base_name, &value);
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
+                        sync_typed_assoc_storage(
+                            &mut self.shell_state.variables,
+                            base_name,
+                            &value,
+                        );
+                    } else {
+                        drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
+                    }
                     self.exit_code = 0;
                     return true;
                 }
@@ -1196,6 +1241,9 @@ impl Executor {
                 is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, base_name),
                 &self.shell_state.env_vars,
             );
+            // Partial store before the error report — keep the structured
+            // cell in lockstep from the same render.
+            sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &stored);
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), stored.clone());
@@ -1336,6 +1384,7 @@ impl Executor {
             // lingering structured cell (marker/typed divergence) must not
             // shadow it.
             drop_typed_indexed_array(&mut self.shell_state.variables, base_name);
+            drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
         }
         // GNU variables.c:3139-3140: for an assoc array, a scalar assignment
         // stores the value at key "0" via assign_func. Without this, a value
@@ -1348,6 +1397,9 @@ impl Executor {
             && !value.starts_with(STORAGE_WORD_PREFIX)
         {
             let storage = format!("([\"0\"]={})", quote_assoc_storage_value(&value));
+            // Assoc scalar bind stores at key "0" — keep the structured cell
+            // in lockstep from the same render.
+            sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &storage);
             self.shell_state
                 .env_vars
                 .insert(base_name.to_string(), storage);
@@ -1365,6 +1417,14 @@ impl Executor {
         // process-env projection (exported / special names) still runs.
         if !mirror_written_in_place {
             sync_typed_indexed_storage(&mut self.shell_state.variables, base_name, &value);
+            // Assoc leg of the same discipline: a compound `A=(...)` render
+            // syncs the structured assoc cell, any other shape drops it so
+            // `${A[k]}` falls back to the mirror projection.
+            if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base_name) {
+                sync_typed_assoc_storage(&mut self.shell_state.variables, base_name, &value);
+            } else {
+                drop_typed_assoc_array(&mut self.shell_state.variables, base_name);
+            }
             if let Some(current) = self.shell_state.env_vars.get_mut(base_name) {
                 current.clone_from(&value);
             } else {

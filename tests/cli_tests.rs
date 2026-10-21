@@ -341,6 +341,330 @@ fn c_command_closing_named_coproc_stdin_fd_produces_eof() {
 }
 
 #[test]
+fn typed_cell_stays_consistent_across_builtin_writes() {
+    // Typed-cell reads must agree with the mirror after every kind of
+    // write: plain/compound/append element writes, declare/typeset/local,
+    // export/readonly, unset (whole + element), read, mapfile, coproc,
+    // tempassign, arithmetic, printf -v. Expected outputs verified
+    // against GNU bash 5.3.
+    let cases = [
+        // plain executor writes (hot loop shape)
+        ("a=(1 2 3); echo \"${a[1]}:${#a[@]}\"", "2:3\n"),
+        (
+            "a=(); a[5]=x; a[2]=y; echo \"${a[5]}:${a[2]}:${#a[@]}\"",
+            "x:y:2\n",
+        ),
+        // declare / typeset / local forms
+        ("declare -a d=(p q); echo \"${d[1]}:${#d[@]}\"", "q:2\n"),
+        ("declare -a e; e[0]=z; echo \"${e[0]}:${#e[@]}\"", "z:1\n"),
+        (
+            "f() { local g=(m n); echo \"${g[0]}:${#g[@]}\"; }; f",
+            "m:2\n",
+        ),
+        // export / readonly / unset
+        ("export h=(u v); echo \"${h[1]}\"", "v\n"),
+        ("declare -r k=(w); echo \"${k[0]}\"", "w\n"),
+        (
+            "u=(1 2 3); unset 'u[1]'; echo \"${u[0]}:${u[2]}:${#u[@]}\"",
+            "1:3:2\n",
+        ),
+        ("v=(1 2); unset v; echo \"${v[0]-gone}\"", "gone\n"),
+        // compound append
+        ("w=(a); w+=(b c); echo \"${w[2]}:${#w[@]}\"", "c:3\n"),
+        // arithmetic element write
+        (
+            "declare -ai n; n[0]=4; (( n[0] += 2 )); echo \"${n[0]}\"",
+            "6\n",
+        ),
+        // tempassign does not leak into the cell
+        ("t=orig; T=$t command true; echo \"$t\"", "orig\n"),
+        // interleaved: establish cell via executor write, then builtin
+        // write, then read — catches stale typed cells.
+        (
+            "a=(1 2 3); x=${a[0]}; declare -a a=(9 8); echo \"${a[0]}:${a[1]}\"",
+            "9:8\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; export a=(7 8); echo \"${a[0]}:${#a[@]}\"",
+            "7:2\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; readonly r=(q); echo \"${r[0]}:${a[0]}\"",
+            "q:1\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; unset 'a[1]'; echo \"${a[0]}:${a[2]-gone}:${#a[@]}\"",
+            "1:3:2\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; read -a a <<< \"m n\"; echo \"${a[0]}:${a[1]}\"",
+            "m:n\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; printf -v \"a[1]\" \"%s\" \"ZZ\"; echo \"${a[0]}:${a[1]}\"",
+            "1:ZZ\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; a+=(4 5); echo \"${a[3]}:${#a[@]}\"",
+            "4:5\n",
+        ),
+    ];
+    for (script, expected) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
+            .arg("--")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("run typed-cell probe");
+        assert!(
+            output.status.success(),
+            "failed: {script:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            *expected,
+            "wrong output for {script:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_cell_interleaved_matrix() {
+    // Interleaved typed-cell matrix: establish the cell with an executor
+    // write + a read (`x=${a[0]}`), then overwrite through each builtin
+    // write path, then read back. Catches stale typed cells.
+    // Expected outputs verified against GNU bash 5.3.
+    // R8 uses `<<<` (no pipelines: a pipe would run mapfile/read in a
+    // subshell). R9 coproc is covered separately (fd numbers vary).
+    let cases = [
+        // R1: plain executor writes interleaved with reads
+        (
+            "a=(1 2 3); x=${a[0]}; a[1]=X; echo \"${a[0]}:${a[1]}:${a[2]}:${#a[@]}\"",
+            "1:X:3:3\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; a+=(4 5); echo \"${a[3]}:${a[4]}:${#a[@]}\"",
+            "4:5:5\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; a=(9 8 7); echo \"${a[0]}:${a[1]}:${a[2]}:${#a[@]}\"",
+            "9:8:7:3\n",
+        ),
+        (
+            "a=(); a[5]=x; x=${a[5]}; a[2]=y; echo \"${a[5]}:${a[2]}:${#a[@]}\"",
+            "x:y:2\n",
+        ),
+        // R2: declare -a compound re-establish
+        (
+            "a=(1 2 3); x=${a[0]}; declare -a a=(9 8); echo \"${a[0]}:${a[1]}:${#a[@]}\"",
+            "9:8:2\n",
+        ),
+        // R3: local / typeset shadowing must not corrupt the outer cell
+        (
+            "a=(1 2 3); x=${a[0]}; f() { local a=(9 8); echo \"${a[0]}:${a[1]}\"; }; f; echo \"${a[0]}:${#a[@]}\"",
+            "9:8\n1:3\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; f() { typeset -a a=(7 6 5); echo \"${a[0]}:${#a[@]}\"; }; f; echo \"${a[0]}\"",
+            "7:3\n1\n",
+        ),
+        (
+            "f() { local g=(m n); y=${g[0]}; g[1]=Z; echo \"${g[0]}:${g[1]}:${#g[@]}\"; }; f",
+            "m:Z:2\n",
+        ),
+        // R4a: integer array overall (R4b illegal subscript is separate)
+        (
+            "declare -ai n=(1 2 3); x=${n[0]}; n[1]=10; (( n[0] += 5 )); echo \"${n[0]}:${n[1]}:${n[2]}\"",
+            "6:10:3\n",
+        ),
+        // R5: subshell wrapper isolates the inner write
+        (
+            "a=(1 2 3); x=${a[0]}; ( a=(9 8); echo \"${a[0]}:${a[1]}:${#a[@]}\" ); echo \"${a[0]}:${#a[@]}\"",
+            "9:8:2\n1:3\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; ( read -a a <<< \"m n\"; echo \"${a[0]}:${a[1]}\" ); echo \"${a[0]}:${#a[@]}\"",
+            "m:n\n1:2\n",
+        ),
+        // R6: export forms
+        (
+            "a=(1 2 3); x=${a[0]}; export a=(7 8); echo \"${a[0]}:${#a[@]}\"",
+            "7:2\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; export -a a; a[0]=Z; echo \"${a[0]}:${a[1]}\"",
+            "Z:2\n",
+        ),
+        (
+            "export h=(u v); y=${h[0]}; h[0]=U; echo \"${h[0]}:${h[1]}\"",
+            "U:v\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; declare -x a=(5 6 7); echo \"${a[0]}:${#a[@]}\"",
+            "5:3\n",
+        ),
+        // R7: readonly cells stay readable after establishment
+        (
+            "declare -r k=(w v); x=${k[0]}; echo \"${k[0]}:${k[1]}:${#k[@]}\"",
+            "w:v:2\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; readonly r=(q w); echo \"${r[0]}:${r[1]}:${a[0]}\"",
+            "q:w:1\n",
+        ),
+        (
+            "declare -r k=(w); x=${k[0]}; k2=${k[0]}; echo \"${k[0]}:$k2\"",
+            "w:w\n",
+        ),
+        // R8: read builtin via herestring (no pipes)
+        (
+            "a=(1 2); x=${a[0]}; read -a a <<< \"m n\"; echo \"${a[0]}:${a[1]}:${#a[@]}\"",
+            "m:n:2\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; IFS=\":\" read -a a <<< \"p:q:r\"; echo \"${a[0]}:${a[1]}:${a[2]}\"",
+            "p:q:r\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; read -r 'a[0]' <<< \"hello\"; echo \"${a[0]}:${a[1]}\"",
+            "hello:2\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; read -a a <<< \"\"; echo \"${#a[@]}:${a[0]-empty}\"",
+            "0:empty\n",
+        ),
+        // R10: mapfile via herestring / command substitution
+        (
+            "a=(1 2); x=${a[0]}; mapfile -t a <<< \"$(printf 'm\\nn')\"; echo \"${a[0]}:${a[1]}:${#a[@]}\"",
+            "m:n:2\n",
+        ),
+        (
+            "a=(9 9 9); x=${a[0]}; mapfile -t -n 1 a <<< \"$(printf 'm\\nn')\"; echo \"${a[0]}:${#a[@]}\"",
+            "m:1\n",
+        ),
+        // R11: unset element / whole / re-establish
+        (
+            "a=(1 2 3); x=${a[0]}; unset 'a[1]'; echo \"${a[0]}:${a[2]-gone}:${#a[@]}\"",
+            "1:3:2\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; unset a; echo \"${a[0]-gone}:${#a[@]}\"",
+            "gone:0\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; unset 'a[0]'; a[0]=Z; echo \"${a[0]}:${a[1]}:${#a[@]}\"",
+            "Z:2:3\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; unset a; a=(7 8); echo \"${a[0]}:${a[1]}:${#a[@]}\"",
+            "7:8:2\n",
+        ),
+        // R12: arithmetic element writes
+        (
+            "declare -ai n; n[0]=4; y=${n[0]}; (( n[0] += 2 )); echo \"${n[0]}\"",
+            "6\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; (( a[1] += 10 )); echo \"${a[0]}:${a[1]}\"",
+            "1:12\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; i=2; (( a[i] *= 4 )); echo \"${a[2]}\"",
+            "12\n",
+        ),
+        // R13: printf -v element writes
+        (
+            "a=(1 2 3); x=${a[0]}; printf -v \"a[1]\" \"%s\" \"ZZ\"; echo \"${a[0]}:${a[1]}:${a[2]}\"",
+            "1:ZZ:3\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; printf -v 'a[0]' \"%d\" 42; echo \"${a[0]}\"",
+            "42\n",
+        ),
+        (
+            "a=(1 2); x=${a[0]}; printf -v a \"%s\" \"whole\"; echo \"$a:${a[0]}\"",
+            "whole:whole\n",
+        ),
+        (
+            "a=(1 2 3); x=${a[0]}; printf -v \"a[2]\" \"%s-%s\" foo bar; echo \"${a[2]}\"",
+            "foo-bar\n",
+        ),
+        (
+            "a=(x); y=${a[0]}; printf -v \"a[5]\" \"%s\" \"far\"; echo \"${a[0]}:${a[5]}:${#a[@]}\"",
+            "x:far:2\n",
+        ),
+        // R14: tempassign must not leak into the cell
+        (
+            "a=(1 2 3); x=${a[0]}; a=tmp command true; echo \"${a[0]}:${#a[@]}\"",
+            "1:3\n",
+        ),
+    ];
+    for (script, expected) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
+            .arg("--")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("run typed-cell matrix probe");
+        assert!(
+            output.status.success(),
+            "failed: {script:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            *expected,
+            "wrong output for {script:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_cell_interleaved_matrix_illegal_and_coproc() {
+    // R4b: illegal subscript diagnostics (regex avoids the shell-name prefix).
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg("--")
+        .arg("-c")
+        .arg("declare -ai n=(1 2); x=${n[0]}; n[]=X")
+        .output()
+        .expect("run typed-cell illegal-subscript probe");
+    assert!(!output.status.success());
+    assert_stderr_matches(
+        &String::from_utf8_lossy(&output.stderr),
+        r"bad array subscript",
+    );
+
+    // R9a: coproc after an established cell; fd numbers vary so match
+    // them with a regex instead of asserting specific digits.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg("--")
+        .arg("-c")
+        .arg("a=(1 2 3); x=${a[0]}; coproc C { printf 'coproc-ok\\n'; }; read -r out <&\"${C[0]}\"; echo \"$out\"; wait \"$C_PID\"")
+        .output()
+        .expect("run typed-cell coproc probe");
+    assert!(
+        output.status.success(),
+        "coproc probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "coproc-ok\n");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg("--")
+        .arg("-c")
+        .arg("a=(1 2 3); x=${a[0]}; coproc C { sleep 1; }; printf '%s %s\\n' \"${C[0]}\" \"${C[1]}\"; wait \"$C_PID\"")
+        .output()
+        .expect("run typed-cell coproc fd probe");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fd = Regex::new(r"^\d+ \d+\n$").expect("valid regex");
+    assert!(
+        fd.is_match(&stdout),
+        "coproc fds should be two integers, got {stdout:?}"
+    );
+}
+
+#[test]
 fn c_command_retires_finished_coproc_endpoints_before_later_redirects() {
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
         .arg("--")
@@ -362,6 +686,48 @@ fn c_command_retires_finished_coproc_endpoints_before_later_redirects() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "bash: line 1: 4: Bad file descriptor\n"
+    );
+}
+
+#[test]
+fn unset_scalar_base_index_zero_is_unset_for_operators() {
+    // An unset variable has no element 0: `-`/`=`/`+` must see an unset
+    // parameter (like any other missing element), while a set-but-empty
+    // scalar keeps its empty element 0. A dynamic scalar (RANDOM) reads
+    // live through element 0. Probed against GNU bash 5.3.
+    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg("--")
+        .arg("-c")
+        .arg(
+            "unset Z; printf 'minus0=[%s] minus5=[%s] plus=[%s] colonminus=[%s] plain=[%s]\\n' \
+             \"${Z[0]-d}\" \"${Z[5]-d}\" \"${Z[0]+a}\" \"${Z[0]:-d}\" \"${Z[0]}\"; \
+             Z=''; printf 'empty-minus=[%s] empty-plus=[%s] empty-colonminus=[%s]\\n' \
+             \"${Z[0]-d}\" \"${Z[0]+a}\" \"${Z[0]:-d}\"; \
+             unset Q; : \"${Q[0]=dd}\"; printf 'assigned=[%s:%s]\\n' \"$Q\" \"${Q[0]}\"; \
+             printf 'random=[%s]\\n' \"${RANDOM[0]-d}\"",
+        )
+        .output()
+        .expect("run unset scalar index-zero probe");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "minus0=[d] minus5=[d] plus=[] colonminus=[d] plain=[]"
+    );
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "empty-minus=[] empty-plus=[a] empty-colonminus=[d]"
+    );
+    assert_eq!(lines.next().unwrap_or_default(), "assigned=[dd:dd]");
+    let random = lines.next().unwrap_or_default();
+    let value = random
+        .strip_prefix("random=[")
+        .and_then(|s| s.strip_suffix(']'));
+    assert!(
+        value.is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())),
+        "RANDOM[0] must read the live dynamic value, got {random:?}"
     );
 }
 
@@ -4197,7 +4563,7 @@ fn version_appends_build_metadata_after_the_gnu_block_rubash_488() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
-        lines[0].starts_with("GNU bash, version 5.3.0(1)-release ("),
+        lines[0].starts_with("GNU bash, version 5.3.20(1)-release ("),
         "GNU banner line 1 changed: {:?}",
         lines[0]
     );

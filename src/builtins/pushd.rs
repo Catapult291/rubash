@@ -8,14 +8,13 @@ mod stack;
 
 pub(crate) use stack::{load_stack, save_stack, set_stack_value, stack_value, stack_words};
 
-use crate::executor::markers::DATA_DOLLAR;
 use crate::executor::types::READONLY_VARS;
+use crate::shell::var_table::VarTable;
 use parse::{parse_popd_operand, parse_pushd_operand, PopdOperand, PushdOperand};
 use stack::{
     is_stack_index, logical_dir_exists, normalize_stack_dir, resolved_index, stack_index,
     strip_double_dash,
 };
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 const EXECUTION_SUCCESS: i32 = 0;
@@ -36,7 +35,7 @@ pub enum StackBuiltin {
 pub fn execute(
     builtin: StackBuiltin,
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     diagnostic_prefix: &str,
 ) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
@@ -54,7 +53,7 @@ pub fn execute(
 pub(crate) fn execute_with_io<'a, I, W, E>(
     builtin: StackBuiltin,
     args: I,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     diagnostic_prefix: &str,
     stdout: &mut W,
     stderr: &mut E,
@@ -179,6 +178,21 @@ where
                         return Ok(EXECUTION_FAILURE);
                     }
                 }
+                PushdOperand::NoOp => {
+                    // GNU pushd.def:288-291 `if (list == 0) return
+                    // (EXECUTION_SUCCESS)`: consumed options with no operand
+                    // left (`pushd -n`, `pushd -n --`) are a silent success —
+                    // the stack is untouched and nothing prints.
+                    // rubash#859, #896.
+                    return Ok(EXECUTION_SUCCESS);
+                }
+                PushdOperand::TooManyArgs => {
+                    // GNU cd.def:326-330 CD_COMPLAINS via pushd.def:298, whose
+                    // non-zero verdict pushd maps to EXECUTION_FAILURE
+                    // (:310-315): the message only, no usage line, rc 1.
+                    writeln!(stderr, "{diagnostic_prefix}pushd: too many arguments")?;
+                    return Ok(EXECUTION_FAILURE);
+                }
                 PushdOperand::Index {
                     index,
                     from_right,
@@ -228,6 +242,41 @@ where
                         writeln!(stderr, "{diagnostic_prefix}pushd: null directory")?;
                         return Ok(EXECUTION_FAILURE);
                     }
+                    // GNU pushd.def:223-225: a lone `-` breaks the option walk
+                    // as a verbatim Dir operand, and pushd.def:298 routes it
+                    // through cd_builtin — whose `cd -` arm (cd.def:339-349)
+                    // substitutes $OLDPWD. An unset OLDPWD is `OLDPWD not set`
+                    // (rc 1); a set-but-empty one canonicalizes to the cwd
+                    // (change_to_directory("") via make_absolute + canon), a
+                    // no-op success. LCD_PRINTPATH (cd.def:371-374) echoes the
+                    // RAW value on success only — a stale OLDPWD prints no
+                    // echo — and the failure diagnostic names the raw value
+                    // too (cd.def:427), e.g. `pushd: /gone: No such file...`.
+                    // With -n the word stays a raw push (`pushd -n -`
+                    // stores "-"), never an OLDPWD lookup.
+                    let resolved_dir = if dir == "-" && !no_cd {
+                        let Some(oldpwd) = env_vars.get("OLDPWD").cloned() else {
+                            writeln!(stderr, "{diagnostic_prefix}pushd: OLDPWD not set")?;
+                            return Ok(EXECUTION_FAILURE);
+                        };
+                        let resolved = if oldpwd.is_empty() {
+                            stack
+                                .first()
+                                .cloned()
+                                .or_else(|| env_vars.get("PWD").cloned())
+                                .unwrap_or_else(|| "/".to_string())
+                        } else {
+                            normalize_stack_dir(&oldpwd, env_vars)
+                        };
+                        if !logical_dir_exists(&resolved, env_vars) {
+                            writeln!(
+                                stderr,
+                                "{diagnostic_prefix}pushd: {oldpwd}: No such file or directory"
+                            )?;
+                            return Ok(EXECUTION_FAILURE);
+                        }
+                        writeln!(stdout, "{oldpwd}")?;
+                        resolved
                     // pushd.def:301: with -n, cd_builtin is never called and
                     // `add_dirstack_element (savestring (list->word->word))`
                     // pushes the RAW operand word unconditionally — no
@@ -235,7 +284,7 @@ where
                     // the cd path only). An empty expansion therefore stays
                     // "" on the stack (`HOME=; pushd -n ~` yields
                     // `<cwd> ""`), and `pushd -n ./sub` stores "./sub".
-                    let resolved_dir = if no_cd {
+                    } else if no_cd {
                         dir.clone()
                     } else {
                         let resolved = normalize_stack_dir(&dir, env_vars);
@@ -439,7 +488,7 @@ fn stack_range_error<E: Write>(
 /// under the invoking builtin's prolog, and the caller skips its stack
 /// mutation. Returns true when any bind failed.
 fn bindpwd_write<E: Write>(
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut crate::shell::var_table::VarTable,
     old_pwd: &str,
     new_pwd: &str,
     diagnostic_prefix: &str,
@@ -463,11 +512,8 @@ fn bindpwd_write<E: Write>(
 
 /// The same readonly-marker membership cd.rs reads for its own bindpwd mirror
 /// (`__RUBASH_READONLY_VARS`, DATA_DOLLAR-separated names).
-fn var_is_readonly(env_vars: &HashMap<String, String>, name: &str) -> bool {
-    env_vars
-        .get(READONLY_VARS)
-        .map(|vars| vars.split(DATA_DOLLAR).any(|var| var == name))
-        .unwrap_or(false)
+fn var_is_readonly(env_vars: &crate::shell::var_table::VarTable, name: &str) -> bool {
+    env_vars.is_marked(READONLY_VARS, name)
 }
 
 /// How the top-of-stack popd's inner cd (GNU cd_to_string) resolved.
@@ -486,7 +532,7 @@ enum PopdChdir {
 /// failed (diagnostic already printed).
 fn popd_chdir<E: Write>(
     target: &str,
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stderr: &mut E,
     diagnostic_prefix: &str,
 ) -> io::Result<Option<PopdChdir>> {

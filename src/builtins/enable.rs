@@ -3,6 +3,7 @@
 //! GNU Bash source ownership:
 //! - builtins/enable.def (`enable_builtin`)
 
+use crate::shell::var_table::VarTable;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -80,7 +81,7 @@ const SPECIAL_BUILTINS: &[&str] = &[
     "shift", "source", "times", "trap", "unset",
 ];
 
-pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::Result<i32> {
+pub fn execute(args: &[String], env_vars: &mut VarTable) -> io::Result<i32> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     execute_with_io(args, env_vars, &mut stdout, &mut stderr)
@@ -88,7 +89,7 @@ pub fn execute(args: &[String], env_vars: &mut HashMap<String, String>) -> io::R
 
 pub(crate) fn execute_with_io<W, E>(
     args: &[String],
-    env_vars: &mut HashMap<String, String>,
+    env_vars: &mut VarTable,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<i32>
@@ -272,7 +273,7 @@ where
 
 /// Change a builtin's enabled state without parsing an `enable` command.
 /// Embedding hosts use this for policy defaults before user startup code runs.
-pub fn set_disabled(env_vars: &mut HashMap<String, String>, name: &str, disabled: bool) {
+pub fn set_disabled(env_vars: &mut VarTable, name: &str, disabled: bool) {
     let mut builtins = disabled_builtins(env_vars);
     if disabled {
         if !builtins.iter().any(|builtin| builtin == name) {
@@ -303,7 +304,7 @@ fn disabled_builtins(env_vars: &HashMap<String, String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn set_disabled_builtins(env_vars: &mut HashMap<String, String>, disabled: &[String]) {
+fn set_disabled_builtins(env_vars: &mut VarTable, disabled: &[String]) {
     if disabled.is_empty() {
         env_vars.remove(DISABLED_BUILTINS);
     } else {

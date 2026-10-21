@@ -23,15 +23,19 @@ pub(crate) mod pattern;
 use args::{
     conditional_effective_len, conditional_logical_index, conditional_outer_parentheses,
     conditional_pattern_or_string_matches, conditional_regex_operands, is_conditional_file_binary,
-    is_conditional_file_unary, reassemble_extglob_args, restore_numeric_decimal_regex_escapes,
+    is_conditional_file_unary, is_conditional_numeric_op, needs_extglob_reassembly,
+    reassemble_extglob_args, restore_numeric_decimal_regex_escapes,
 };
 
 pub(super) use args::simple_grep_pattern_matches;
 pub(crate) use extglob::extglob_case_pattern_matches;
 #[allow(unused_imports)]
 pub(in crate::executor) use extglob::extglob_case_pattern_matches_nocase;
+pub(in crate::executor) use extglob::extglob_case_pattern_matches_nocase_with_word_chars;
+pub(crate) use extglob::extglob_case_pattern_matches_with_word_chars;
 pub(in crate::executor) use pattern::{
     case_bracket_expression_matches_with_case, case_pattern_matches, case_pattern_matches_nocase,
+    case_pattern_matches_nocase_with_word_chars, case_pattern_matches_with_word_chars,
 };
 
 pub(crate) fn shell_pattern_matches(pattern: &str, word: &str) -> bool {
@@ -55,8 +59,16 @@ impl Executor {
         // TODO(parse.y/execute_cmd.c/test.c): Bash `[[` is a compound command
         // with its own parser, operators, pattern matching, and short-circuit
         // logic. Keep extending this bridge with test.c-compatible primitives.
-        let args = reassemble_extglob_args(args);
-        let args = args.as_slice();
+        // Reassembly only fires when a word ending in an extglob operator is
+        // followed by a bare `(` token; when no such pair exists the whole-Vec
+        // clone is a pure copy, so borrow the original slice instead.
+        let reassembled;
+        let args = if needs_extglob_reassembly(args) {
+            reassembled = reassemble_extglob_args(args);
+            reassembled.as_slice()
+        } else {
+            args
+        };
         if let Some(inner) = conditional_outer_parentheses(args) {
             return self.execute_conditional(inner);
         }
@@ -214,15 +226,10 @@ impl Executor {
                 }
                 i32::from(!self.conditional_string_binary(left, op, right))
             }
-            [left, op, right, end]
-                if matches!(op.as_str(), "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
-                    && end == "]]" =>
-            {
+            [left, op, right, end] if is_conditional_numeric_op(op) && end == "]]" => {
                 self.conditional_numeric_binary_status(left, op, right)
             }
-            [left, op, right]
-                if matches!(op.as_str(), "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") =>
-            {
+            [left, op, right] if is_conditional_numeric_op(op) => {
                 self.conditional_numeric_binary_status(left, op, right)
             }
             [left, op, right, end] if is_conditional_file_binary(op) && end == "]]" => {
@@ -248,9 +255,13 @@ impl Executor {
         // operands compare as their real text (rubash#379).
         // E400-aware: user U+E401 data (E400 E401) must survive.
         crate::executor::markers::strip_ansi_c_ifs_guard(
-            &self
-                .expand_word_mut(word)
-                .replace(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, ""),
+            // E002 is registry-zone: a typed `$'\uE002'` arrives
+            // E400-escaped and is user data — strip only the BARE
+            // carrier (rubash#840).
+            &crate::executor::markers::restore_bare_sentinels(
+                &self.expand_word_mut(word),
+                &[(crate::executor::embedded_mutations::QUOTED_NULL_MARKER, "")],
+            ),
         )
     }
 
@@ -336,6 +347,26 @@ impl Executor {
                     Err(()) => 1,
                 };
                 return Some(status);
+            }
+        }
+
+        // Arithmetic-comparison leaf (`[[ a -op b ]]`): the operands are
+        // arithmetic values, not patterns, so the quoted-pattern pass below
+        // can never fire for these operators. Handle it here instead of
+        // falling through to `execute_conditional`, which would re-run
+        // `reassemble_extglob_args` plus the paren/logical scans a second
+        // time. The token shape must already match: a `(` token would change
+        // it and falls through to the full path (where the extglob merge
+        // happens), so this is admission, not a semantic shortcut. rubash#117:
+        // the value work stays in `conditional_numeric_binary_status`.
+        if let [left, op, right, end] = args {
+            if end == "]]" && is_conditional_numeric_op(op) {
+                return Some(self.conditional_numeric_binary_status(left, op, right));
+            }
+        }
+        if let [left, op, right] = args {
+            if is_conditional_numeric_op(op) {
+                return Some(self.conditional_numeric_binary_status(left, op, right));
             }
         }
 
@@ -991,6 +1022,29 @@ impl Executor {
         op: &str,
         right: &str,
     ) -> i32 {
+        // Whitelist fast path (rubash#117 admission, not a blacklist): both
+        // operands are already plain decimal literals, so GNU's
+        // cond_expand_word (execute_cmd.c:4024) and test.c:357 arithcomp ->
+        // evalexp are the identity. Skip the whole expand + subscript +
+        // dynamic-context + eval + flush + sync chain for both operands.
+        // A literal cannot write, diagnose, or read RANDOM/arrays, so the
+        // only observable side effects are the xtrace line and the status.
+        // Doubt (octal leading zero, sign, overflow, `$`/`[`/quote carriers)
+        // -> None -> the full path below.
+        if let (Some(left_val), Some(right_val)) = (
+            cond_arith_decimal_literal(left),
+            cond_arith_decimal_literal(right),
+        ) {
+            // Mirror the per-eval boundary: a successful eval clears the
+            // stale evalerror record and leaves no diagnostics.
+            let _ = crate::executor::arithmetic::take_arith_eval_error();
+            let _ = crate::executor::arithmetic::take_arith_eval_diags();
+            self.xtrace_conditional_term(op, left, Some(right));
+            // A literal can never queue an arithmetic write, but keep the
+            // boundary identical to the full path (the take-walk is empty).
+            super::arithmetic::sync_arith_writes(self);
+            return i32::from(!conditional_numeric_matches(left_val, op, right_val));
+        }
         let left_expanded = self.expand_cond_arith_operand(left);
         let right_expanded = self.expand_cond_arith_operand(right);
         self.xtrace_conditional_term(op, &left_expanded, Some(&right_expanded));
@@ -1039,17 +1093,42 @@ impl Executor {
         };
         self.flush_arith_diags(Some("[["));
         super::arithmetic::sync_arith_writes(self);
-        let matched = match op {
-            "-eq" => left_val == right_val,
-            "-ne" => left_val != right_val,
-            "-lt" => left_val < right_val,
-            "-le" => left_val <= right_val,
-            "-gt" => left_val > right_val,
-            "-ge" => left_val >= right_val,
-            _ => false,
-        };
-        i32::from(!matched)
+        i32::from(!conditional_numeric_matches(left_val, op, right_val))
     }
+}
+
+/// GNU `[[ a -op b ]]` comparison verdict (test.c:357 arithcomp compares the
+/// two `intmax_t` results). Shared by the literal whitelist and the full
+/// expand+eval path so the two spellings cannot drift.
+fn conditional_numeric_matches(left_val: i128, op: &str, right_val: i128) -> bool {
+    match op {
+        "-eq" => left_val == right_val,
+        "-ne" => left_val != right_val,
+        "-lt" => left_val < right_val,
+        "-le" => left_val <= right_val,
+        "-gt" => left_val > right_val,
+        "-ge" => left_val >= right_val,
+        _ => false,
+    }
+}
+
+/// A `[[ ]]` arithmetic operand that is a plain, unambiguous decimal literal.
+/// GNU test.c:357 arithcomp -> evalexp (expr.c) reads such a token as its own
+/// value: no expansion, no assignment, no octal/sign/base reinterpretation.
+/// Only that exact class is whitelisted — a multi-digit leading zero takes
+/// GNU strlong's octal arm (`[[ 010 -eq 8 ]]` is true), a sign goes through
+/// the unary operators, an overflow takes strlong's wrapping/error arm, and
+/// any `$`/`[`/quote carrier spelling is not a literal at all. Every rejected
+/// shape returns None and keeps the full expand+eval path.
+fn cond_arith_decimal_literal(raw: &str) -> Option<i128> {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    raw.parse::<i64>().ok().map(|value| value as i128)
 }
 
 fn contains_extglob_pattern(pattern: &str) -> bool {

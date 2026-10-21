@@ -198,7 +198,8 @@ impl Executor {
         }
         // GNU let.def: let_builtin passes EXP_EXPANDED to evalexp, so the
         // arithmetic evaluator does NOT expand $var. In GNU expr.c,
-        // legal_variable_starter(c) is ISALPHA(c) || (c == '_'), so '$' is
+        // legal_variable_starter(c) is the CNAMESTART syntax-table test
+        // (general.h:117; ISALPHA-gated before bash53-019), so '$' is
         // not a valid operand character. When the evaluator sees '$var'
         // after an operator, it reports "operand expected" with the '$var'
         // token. The recorded evalerror carries that token already; the
@@ -426,11 +427,11 @@ impl Executor {
                 }
                 Some('@') | Some('*') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.join(" "));
+                    output.push_str(&self.shell_state.positional_window().join(" "));
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -444,7 +445,7 @@ impl Executor {
                     } else {
                         output.push_str(
                             self.shell_state
-                                .positional_params
+                                .positional_window()
                                 .get(index - 1)
                                 .map(String::as_str)
                                 .unwrap_or(""),

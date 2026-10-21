@@ -435,8 +435,13 @@ impl Printer {
                     // print_cmd.c reprints assignments as source-level text
                     // only (xtrace_print_assignment, print_cmd.c:514), so the
                     // transport marker must never survive into declare -f
-                    // output (rubash#126).
-                    format!("{name}={source}")
+                    // output (rubash#126). Marker-zone literals inside the
+                    // compound source carry the script-entry E400 escape —
+                    // fold it for display (rubash#856).
+                    format!(
+                        "{name}={}",
+                        crate::executor::markers::fold_literal_char_escapes(source)
+                    )
                 } else if raws_aligned {
                     let raw = &cmd.assignment_raws[index];
                     if raw.is_empty() {
@@ -445,7 +450,12 @@ impl Printer {
                         // GNU's assignment word text carries ANSI-C spans
                         // decoded (parse.y:5566-5575); see
                         // decode_ansi_c_word_spans.
-                        format!("{name}={}", decode_ansi_c_word_spans(raw))
+                        format!(
+                            "{name}={}",
+                            crate::executor::markers::fold_literal_char_escapes(
+                                &decode_ansi_c_word_spans(raw)
+                            )
+                        )
                     }
                 } else {
                     format!("{name}={}", render_assignment_value(value))
@@ -521,8 +531,10 @@ impl Printer {
             }
         }
         // GNU's word text carries ANSI-C spans decoded (parse.y:5566-5575);
-        // decode raw `$'...'` spans the same way before printing.
-        decode_ansi_c_word_spans(&rendered)
+        // decode raw `$'...'` spans the same way before printing. Marker-
+        // zone literals arrive E400-escaped from script entry (#856): fold
+        // the escape back so the printed word shows the user's source chars.
+        crate::executor::markers::fold_literal_char_escapes(&decode_ansi_c_word_spans(&rendered))
     }
 
     /// Re-serialize a command substitution body (print_comsub): newlines in

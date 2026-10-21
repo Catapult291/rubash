@@ -19,12 +19,50 @@
 
 ### 实现方法论（务必先读）
 
-Rubash 是对 GNU Bash **语义**的从零重写，兼容性以 GNU Bash 5.3.0 的**可观测行为**为准，通过黑盒差分测试验证。贡献代码前请阅读 [`docs/PROVENANCE.md`](docs/PROVENANCE.md)，并遵守四条规范：
+Rubash 是对 GNU Bash **语义**的从零重写，兼容性以 GNU Bash 5.3.x 的**可观测行为**为准，通过黑盒差分测试验证。贡献代码前请阅读 [`docs/PROVENANCE.md`](docs/PROVENANCE.md)，并遵守四条规范：
 
-1. **从观测行为出发实现**：先对 GNU Bash 5.3.0 跑探针，让 Rubash 对齐观测到的输出；vendored 源码只用于理解语义
-2. **commit 与注释用"行为对齐"语言**：写清对齐了哪条 GNU 行为、用什么探针验证（如 `fix(jobs): wait interrupted by trapped signal, status 128+sig (jobs.tests jobs9.sub; byte-verified vs 5.3.0)`），不要用"移植自 X.c:NNN"作为变更的主描述
+1. **从观测行为出发实现**：先对 GNU Bash 5.3.x 跑探针，让 Rubash 对齐观测到的输出；vendored 源码只用于理解语义
+2. **commit 与注释用"行为对齐"语言**：写清对齐了哪条 GNU 行为、用什么探针验证（如 `fix(jobs): wait interrupted by trapped signal, status 128+sig (jobs.tests jobs9.sub; byte-verified vs 5.3.x)`），不要用"移植自 X.c:NNN"作为变更的主描述
 3. **保持表达独立**：新代码遵循 Rust 惯用法和 Rubash 现有模块结构，不镜像 GNU C 的控制流与布局
 4. **GPL 物料不进 MIT 路径**：GNU 树的测试数据/夹具/文档只活在 `third_party/bash` 子模块内；Rubash 侧夹具只记录参考 shell 的**观测输出**
+
+### 兼容性契约与验证规则（必读，#892）
+
+本仓的契约是“行为与 GNU Bash 5.3.x 一致”。下述六条是评审的硬门槛，违反会直接 REQUEST-CHANGES。面向 agent 的操作细则见 `AGENTS.md`，此处只收录对所有贡献者生效的规则。
+
+#### 1. Oracle：最新稳定版（现为 GNU Bash 5.3.20）
+
+- 权威 oracle：WSL `/usr/local/bin/bash`（owner 编译，跟随 vendored patchlevel 重建；现 Bash-5.3 patch 20 / `9c465866`）。对比必须用脚本文件同时跑两侧（`target/debug/rubash.exe case.sh` vs `wsl bash /mnt/.../case.sh`）；禁止用 `wsl bash -c` 传带双层引号或双反斜杠的用例（wsl.exe 命令行透传会把 `\\` 压成 `\`，基线作废）。
+- 以下都不是 oracle：WSL `/usr/bin/bash`（5.2.21）、Git Bash（5.2.x）、winuxsh 垫片（版本更旧，行为不同）。在 5.2 下验证过的行为主张一律视为未验证。
+- 语义分歧以 `third_party/bash/` 的 C 源码为准：改行为前先找到 owning C 函数，把 `文件:行 函数名` 与 WSL 5.3.x 脚本实测输出写进任务/PR 描述，再动手。C 源码没有定论时如实标注 unverified，不许猜。
+- #895 已落地：vendored mirror 升到 `9c465866`（Bash-5.3 patch 20），`scripts/true-baseline.sh` 版本门自动读 `third_party/bash/patchlevel.h` 跟随；后续 bump 只需 oracle 侧按同补丁级别重建。
+
+#### 2. 无窗口探针
+
+- 本机探针/测试禁止逐形态起 `wsl.exe` 或可见控制台进程：单个脚本批量跑完全部形态，输出重定向到文件（Python 探针起子进程必须带 `subprocess.CREATE_NO_WINDOW (0x08000000)`，不弹可见控制台）；长构建/长测试同样落文件。
+- 与他人共享机器：不留常驻进程，探针沙盒自建自清；收尾前确认没有残留的 `rubash.exe`/`bash.exe`/suite runner 进程。
+
+#### 3. 共享环境零变更
+
+- 不改 PATH/env/全局配置。CRLF 导致的 WSL 侧 `command not found` 只用 `.gitattributes`（`*.sh`/`*.rs` 已钉 `eol=lf`）+ `git add --renormalize` 修，不逐个改脚本。
+- 测量前保证干净环境（`unset BASH_ENV`，清掉外来函数/别名）；环境变量泄漏导致的大幅漂移会使整轮测量作废。
+
+#### 4. PR 前跑全量
+
+- `cargo test --no-fail-fast -- --test-threads=1`，并与 pristine master 基线双向对比失败集：失败集一致才开 PR。
+- 上游兼容改动另按 `AGENTS.md`“Bash Test Suite”章节跑对应基线切片；未实测的 PASS 声称不作数。
+
+#### 5. GPL 纪律
+
+- 行为坐标引用合法且是惯例（如 `printf.def:1427`、`subst.c:3950`），坐标以本仓 vendored mirror（`9c465866`）为准。
+- GPL C 代码与逐行翻译严禁入仓（见 `docs/PROVENANCE.md` 四条规范）。
+
+#### 6. 流程
+
+- 一个 issue 一个主题分支，WIP 及时 commit + push（pre-commit 有 fmt 钩子）。
+- PR 描述带 oracle 证据（5.3.x 脚本实测输出 + owning C 函数）；CI 全绿是合入门槛，合并由维护者执行，作者不自合并。
+- 多 PR 并行时 `scripts/regression-catalog/manifest.tsv` 冲突由后合并者重解，双方行都保留。
+- 兼容性修复经实测后同步更新 README「Compatibility at a Glance」台账（点-in-time 快照已归档至 issue #477，状态以 issue tracker 为准，只认实测）。
 
 ### 提交代码
 

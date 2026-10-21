@@ -43,7 +43,7 @@ fn run_help(binary: &Path) -> (i32, String, String) {
 fn expected_gnu_help(shell_name: &str) -> String {
     let mut expected = String::new();
     expected.push_str(&format!(
-        "GNU bash, version 5.3.0(1)-release-({})\n",
+        "GNU bash, version 5.3.20(1)-release-({})\n",
         rubash::executor::machtype_value()
     ));
     expected.push_str(&format!(

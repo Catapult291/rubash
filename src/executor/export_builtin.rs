@@ -51,7 +51,11 @@ impl Executor {
         // inside the pure builtin (setattr/apply.rs `env_vars.insert`), so
         // refresh the structured cell for assignment operands — a previously
         // typed array must not shadow the new storage (GNU keeps one owner,
-        // bind_variable variables.c:3286).
+        // bind_variable variables.c:3286). The mark-aware dispatch also
+        // covers `export -A A=(...)` / `export -A A+=(...)`: the assoc render
+        // would otherwise leave ShellValue::AssociativeArray stale (the
+        // indexed sync drops no assoc cell), which the command-boundary
+        // verify_typed_cells net catches.
         for arg in &args {
             if let Some((raw, _)) = arg.split_once('=') {
                 let base = raw.trim_end_matches('+');
@@ -60,7 +64,11 @@ impl Executor {
                     continue;
                 }
                 if let Some(mirror) = self.shell_state.env_vars.get(base).cloned() {
-                    sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, &mirror);
+                    } else {
+                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    }
                 }
             }
         }
@@ -159,7 +167,9 @@ impl Executor {
     /// scalar that already exists there (e.g. HOME seeded at startup) keeps a
     /// stale value after an export NAME=value assignment. Mirror the assigned
     /// values into the typed owner for plain scalar names; arrays/assocs/
-    /// namerefs are synced by their own paths.
+    /// namerefs are synced by their own paths. One attr_of probe covers the
+    /// three shape flags; a missing typed cell skips the mirror entirely
+    /// (expansion falls back to env_vars).
     pub(in crate::executor) fn sync_setattr_typed_assignments<'a>(
         &mut self,
         args: impl Iterator<Item = &'a str>,
@@ -177,24 +187,19 @@ impl Executor {
             let (raw_name, _) = arg.split_once('=').unwrap_or((arg, ""));
             let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
             let (base, _) = assignment_name_and_append(name);
-            if is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, base)
-                || is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base)
-                || is_marked_var(&self.shell_state.env_vars, NAMEREF_VARS, base)
-            {
+            let attrs = self.shell_state.env_vars.attr_of(base);
+            if attrs.array || attrs.assoc || attrs.nameref {
                 continue;
             }
-            match self.shell_state.env_vars.get(base) {
-                Some(value) => match self.shell_state.variables.get_mut(base) {
-                    Some(variable) => {
-                        variable.value = crate::shell::ShellValue::Scalar(value.clone());
-                    }
-                    None => {
-                        let _ = self.shell_state.variables.set_scalar(base, value.clone());
-                    }
-                },
-                None => {
-                    self.shell_state.variables.remove(base);
+            if self.shell_state.variables.get(base).is_none() {
+                continue;
+            }
+            if let Some(value) = self.shell_state.env_vars.get(base).cloned() {
+                if let Some(variable) = self.shell_state.variables.get_mut(base) {
+                    variable.value = crate::shell::ShellValue::Scalar(value);
                 }
+            } else {
+                self.shell_state.variables.remove(base);
             }
         }
     }

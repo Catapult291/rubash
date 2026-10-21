@@ -189,12 +189,12 @@ fn user_e401_not_stripped_by_guard_paths() {
 }
 
 /// PR #821 rework: an UNQUOTED command substitution inside a `[[ == ]]`
-/// glob pattern arrives CSB1-protected (`*__RUBASH_CSB1_01;*`), which is
-/// all printable ASCII — literal_pattern_equality / simple_glob_matches
-/// admitted it on `pattern.bytes()` alone and verdicted before the
-/// byte-spelling normalization gate ran. sides_need_byte_char_matching
-/// must run first so the payload decodes to the byte-char the word side
-/// carries (GNU bash 5.3.0: the `==` forms below are matches).
+/// glob pattern arrives sentinel-protected (`*<U+E319>01;*`), and the
+/// raw transport spelling is what literal_pattern_equality /
+/// simple_glob_matches would verdict on `pattern.bytes()` alone — the
+/// byte-spelling normalization gate must run first so the payload decodes
+/// to the byte-char the word side carries (GNU bash 5.3.x: the `==` forms
+/// below are matches).
 #[test]
 fn unquoted_comsub_byte_in_conditional_pattern() {
     assert_eq!(

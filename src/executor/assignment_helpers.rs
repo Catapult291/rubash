@@ -11,6 +11,48 @@ pub(in crate::executor) fn split_assignment_word(word: &str) -> Option<(&str, &s
     }
 }
 
+/// Whitelist admission for the literal-word fast paths in
+/// `expand_word_mut_with_context` and `expand_command_word` (rubash#117
+/// discipline: doubt falls through to the full pipeline). When this
+/// returns true the cooked token carries no expansion syntax at all, so
+/// GNU subst.c:11229 expand_word_internal pushes every character
+/// unchanged — no CTLESC is produced without quoting/expansion
+/// introducers, braces.c find_first_valid_brace finds no brace,
+/// pathexp.c unquoted_glob_pattern_p finds no metacharacter, and field
+/// splitting never sees an expansion result.
+///
+/// The excluded classes, each mapped to the pipeline branch that owns it:
+/// `$` and `` ` `` (every substitution/parameter arm), `'` `"` `\`
+/// (quote removal / DATA_* carriers / escape handling), `{` `}` (brace
+/// expansion), `~` (tilde), `*` `?` `[` (pathname expansion), `(` `)`
+/// `<` `>` (process substitutions / comsub bodies), any byte outside
+/// printable ASCII (QUOTED_WORD_PREFIX, STORAGE_WORD_PREFIX, CTLESC,
+/// IFS_GLUE and every other C0/PUA carrier ride non-printing and fail
+/// the set test on the first byte), whitespace (a token equal to its raw
+/// text cannot contain any), and `=` inside a longer word
+/// (assignment-shaped word arms: `a=b` must reach split_assignment_word).
+/// The single-byte test operators `[`, `]`, `=` are admitted exactly:
+/// `[` alone never opens a glob class or a subscript, `]` alone closes
+/// nothing, and `=` alone names no assignment (split_assignment_word
+/// needs a shell name before it), so the full pipeline returns them
+/// unchanged. Longer words carrying those bytes (`[a]`, `a=b`) keep the
+/// slow path.
+pub(in crate::executor) fn is_expand_fast_literal_word(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    if word == "[" || word == "]" || word == "=" {
+        return true;
+    }
+    word.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'.' | b'/' | b':' | b',' | b'-' | b'+' | b'%' | b'@'
+            )
+    })
+}
+
 pub(in crate::executor) fn assignment_name_and_append(name: &str) -> (&str, bool) {
     name.strip_suffix('+')
         .map(|base| (base, true))
@@ -74,7 +116,10 @@ pub(in crate::executor) fn append_assoc_value(
         .first()
         .map(|token| {
             token.starts_with('[')
-                && !token.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG)
+                && !crate::executor::markers::contains_bare_sentinel(
+                    token,
+                    crate::executor::markers::COMPOUND_EXPANSION_WS_TAG,
+                )
         })
         .unwrap_or(false);
 
@@ -180,7 +225,10 @@ pub(in crate::executor) fn assoc_bare_elements(value: &str) -> Vec<String> {
         .first()
         .map(|token| {
             token.starts_with('[')
-                && !token.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG)
+                && !crate::executor::markers::contains_bare_sentinel(
+                    token,
+                    crate::executor::markers::COMPOUND_EXPANSION_WS_TAG,
+                )
         })
         .unwrap_or(false);
     if !strict_mode {
@@ -208,7 +256,10 @@ pub(crate) fn assoc_empty_key_words(value: &str) -> Vec<String> {
         .first()
         .map(|token| {
             token.starts_with('[')
-                && !token.contains(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG)
+                && !crate::executor::markers::contains_bare_sentinel(
+                    token,
+                    crate::executor::markers::COMPOUND_EXPANSION_WS_TAG,
+                )
         })
         .unwrap_or(false);
     if strict_mode {
@@ -405,80 +456,104 @@ pub(in crate::executor) fn format_assoc_storage(entries: Vec<(String, String)>) 
     rendered
 }
 
-/// One `[k]=v` storage segment, quoted exactly as `format_assoc_storage`
-/// renders it, so a string built by appending segments is byte-identical to
-/// one built by a full render whenever no key repeats.
-pub(in crate::executor) fn assoc_element_segment(key: &str, value: &str) -> String {
-    format!(
-        "[{}]={}",
-        quote_assoc_key(key),
-        quote_assoc_storage_value(value)
-    )
+/// Whether `key` may be written bare in the storage form. The storage form is
+/// re-parsed by `split_storage_words` on every read: a bare ``` or `$` in the
+/// key opens a substitution span in that tokenizer and glues the following
+/// pairs into this pair's value (assoc9.sub dict['`']=2 then dict["'"]=3), so
+/// they must force quoting alongside whitespace, quotes, backslash and `]`.
+fn assoc_key_is_plain(key: &str) -> bool {
+    !key.is_empty()
+        && !key
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | ']' | '`' | '$'))
 }
 
-/// Append one segment to a `(...)` storage string in O(segment) time: only the
-/// closing `)` shifts, so the whole array is never re-rendered (rubash#618).
+/// Value analogue of [`assoc_key_is_plain`]: a value may carry `]` unquoted.
+fn assoc_value_is_plain(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | '`' | '$'))
+}
+
+/// Push `value` in the forced double-quoted storage form. Inside "..." the
+/// storage tokenizer still honors `$` and ``` as substitution openers (they
+/// are not gated on in_double), so they are backslash-escaped like `\"` and
+/// `\\\\`; `unquote_storage_value`'s double-quote branch decodes all four.
+fn push_assoc_storage_value_forced(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        if matches!(ch, '"' | '\\' | '`' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+}
+
+fn push_assoc_key(out: &mut String, key: &str) {
+    if assoc_key_is_plain(key) {
+        out.push_str(key);
+    } else {
+        push_assoc_storage_value_forced(out, key);
+    }
+}
+
+fn push_assoc_storage_value(out: &mut String, value: &str) {
+    if assoc_value_is_plain(value) {
+        out.push_str(value);
+    } else {
+        push_assoc_storage_value_forced(out, value);
+    }
+}
+
+/// Append one `[key]=value` segment to a `(...)` storage string in O(segment)
+/// time, writing the quoted bytes straight into the buffer: only the closing
+/// `)` shifts, so the whole array is never re-rendered (rubash#618). The bytes
+/// are quoted exactly as `format_assoc_storage` renders them, so an append-built
+/// string is byte-identical to a full render whenever no key repeats.
 ///
 /// Returns `false` when the storage is not in the appendable `(...)` shape, so
 /// the caller falls back to a canonical render instead of corrupting a value
 /// that is not an assoc cell yet.
-pub(in crate::executor) fn assoc_storage_append(storage: &mut String, segment: &str) -> bool {
+pub(in crate::executor) fn assoc_storage_append_element(
+    storage: &mut String,
+    key: &str,
+    value: &str,
+) -> bool {
     if storage.len() < 2 || !storage.starts_with('(') || !storage.ends_with(')') {
         return false;
     }
-    let at = storage.len() - 1;
-    // `()` has no entries to separate from; anything longer already carries a
-    // first segment that the new one must be space-delimited from.
-    if at > 1 {
-        storage.insert_str(at, &format!(" {segment}"));
-    } else {
-        storage.insert_str(at, segment);
+    storage.pop(); // drop the closing ')'
+                   // `()` has no entries to separate from; anything longer already carries a
+                   // first segment that the new one must be space-delimited from.
+    if storage.len() > 1 {
+        storage.push(' ');
     }
+    storage.push('[');
+    push_assoc_key(storage, key);
+    storage.push(']');
+    storage.push('=');
+    push_assoc_storage_value(storage, value);
+    storage.push(')');
     true
 }
 
 pub(in crate::executor) fn quote_assoc_key(key: &str) -> String {
-    // The storage form is re-parsed by split_storage_words on every read:
-    // a bare ``` or `$` in the key opens a substitution span in that
-    // tokenizer and glues the following pairs into this pair's value
-    // (assoc9.sub dict['`']=2 then dict["'"]=3), so they must
-    // force quoting alongside whitespace, quotes, backslash and `]`.
-    if !key.is_empty()
-        && !key
-            .chars()
-            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | ']' | '`' | '$'))
-    {
+    if assoc_key_is_plain(key) {
         return key.to_string();
     }
-
-    quote_assoc_storage_value_forced(key)
+    let mut quoted = String::new();
+    push_assoc_storage_value_forced(&mut quoted, key);
+    quoted
 }
 
 pub(in crate::executor) fn quote_assoc_storage_value(value: &str) -> String {
-    if !value.is_empty()
-        && !value
-            .chars()
-            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | '`' | '$'))
-    {
+    if assoc_value_is_plain(value) {
         return value.to_string();
     }
-
-    quote_assoc_storage_value_forced(value)
-}
-
-fn quote_assoc_storage_value_forced(value: &str) -> String {
-    // Inside "..." the storage tokenizer still honors `$` and ``` as
-    // substitution openers (they are not gated on in_double), so they
-    // are backslash-escaped like `\"` and `\\\\`; unquote_storage_value's
-    // double-quote branch decodes all four.
-    let mut quoted = String::from("\"");
-    for ch in value.chars() {
-        if matches!(ch, '"' | '\\' | '`' | '$') {
-            quoted.push('\\');
-        }
-        quoted.push(ch);
-    }
-    quoted.push('"');
+    let mut quoted = String::new();
+    push_assoc_storage_value_forced(&mut quoted, value);
     quoted
 }
 
@@ -739,6 +814,16 @@ pub(in crate::executor) fn split_indexed_tagged_token(
         chars.next();
     }
     while let Some(ch) = chars.next() {
+        // E400 + c is the literal-char escape — user data riding
+        // transport; the escaped member never satisfies the E309/IFS_GLUE
+        // arms below (rubash#840).
+        if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+            current.push(ch);
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
+            continue;
+        }
         if ch == crate::executor::COMPOUND_EXPANSION_WS_TAG
             && chars.peek().is_some_and(|next| is_boundary(*next))
         {
@@ -960,6 +1045,16 @@ impl Iterator for StorageWordIter<'_> {
             if escaped {
                 word.push(ch);
                 escaped = false;
+                continue;
+            }
+            // E400 + c is the literal-char escape — user data riding
+            // transport; the escaped member never satisfies the E309 /
+            // IFS_GLUE arms below (rubash#840).
+            if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+                word.push(ch);
+                if let Some((_, next)) = chars.next() {
+                    word.push(next);
+                }
                 continue;
             }
             if ch == '\\' && in_double {
@@ -1195,35 +1290,42 @@ pub(in crate::executor) fn unquote_storage_value(value: &str) -> String {
     }
 
     fn restore_quote_markers(value: &str) -> String {
-        value
-            .replace(DATA_DOLLAR, "$")
-            .replace(crate::executor::markers::DATA_BACKTICK, "`")
-            .replace(crate::executor::markers::DATA_SQUOTE, "'")
-            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
-            // The \x1c expansion-whitespace tag (embedded_mutations
-            // expansion_ws_marked) marks the whitespace itself as data;
-            // strip the tag and keep the character it protected.
-            .replace(crate::executor::markers::IFS_GLUE, "")
-            .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-            .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
-            .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\"")
+        // The registry-zone sentinels restore in ONE E400-aware scan: a
+        // typed `$'\uE0xx'`/`$'\uE3xx'` arrives as the escaped member of
+        // an E400 literal-char pair and is user data — only BARE carriers
+        // decode, and the pair rides through (rubash#840). C0 carriers
+        // stay plain replaces — typed C0 bytes never arrive bare (they
+        // ride raw-byte marker pairs).
+        crate::executor::markers::restore_bare_sentinels(
+            &value
+                .replace(DATA_DOLLAR, "$")
+                .replace(crate::executor::markers::DATA_BACKTICK, "`")
+                .replace(crate::executor::markers::DATA_SQUOTE, "'")
+                .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+                // The \x1c expansion-whitespace tag (embedded_mutations
+                // expansion_ws_marked) marks the whitespace itself as
+                // data; strip the tag and keep the character it protected.
+                .replace(crate::executor::markers::IFS_GLUE, "")
+                // PARAM_NAME_END_MARKER is transport-only (a quote boundary
+                // terminating an unbraced `$name`); a stored value never
+                // keeps it.
+                .replace(crate::executor::markers::PARAM_NAME_END_MARKER, ""),
             // Expansion-result protection carriers (GNU subst.c:11862
-            // add_quoted_string port of the preserve walker): decode after
-            // the quote removal so no earlier pass read their backslash/$/
-            // backtick/quote data as syntax (rubash#295).
-            .replace(
-                crate::executor::markers::ASSIGN_EXPANSION_BACKSLASH_STR,
-                "\\",
-            )
-            .replace(crate::executor::markers::ASSIGN_SQ_DOLLAR_STR, "$")
-            .replace(crate::executor::markers::ASSIGN_SQ_BACKTICK_STR, "`")
-            .replace(crate::executor::markers::ASSIGN_SQ_BACKSLASH_STR, "\\")
-            .replace(crate::executor::markers::ASSIGN_EXPANSION_DQUOTE_STR, "\"")
-            .replace(crate::executor::markers::ASSIGN_EXPANSION_SQUOTE_STR, "'")
-            // PARAM_NAME_END_MARKER is transport-only (a quote boundary
-            // terminating an unbraced `$name`); a stored value never keeps
-            // it.
-            .replace(crate::executor::markers::PARAM_NAME_END_MARKER, "")
+            // add_quoted_string port of the preserve walker) decode after
+            // the quote removal so no earlier pass read their
+            // backslash/$/backtick/quote data as syntax (rubash#295).
+            &[
+                (crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, ""),
+                (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+                (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+                (crate::executor::markers::ASSIGN_EXPANSION_BACKSLASH, "\\"),
+                (crate::executor::markers::ASSIGN_SQ_DOLLAR, "$"),
+                (crate::executor::markers::ASSIGN_SQ_BACKTICK, "`"),
+                (crate::executor::markers::ASSIGN_SQ_BACKSLASH, "\\"),
+                (crate::executor::markers::ASSIGN_EXPANSION_DQUOTE, "\""),
+                (crate::executor::markers::ASSIGN_EXPANSION_SQUOTE, "'"),
+            ],
+        )
     }
 
     if value == "\\\"\\" {
@@ -1307,20 +1409,24 @@ pub(in crate::executor) fn unquote_storage_value(value: &str) -> String {
         // from ANSI-C decoding that must survive remove_shell_quotes.
         // The markers are restored to actual quotes at output time.
         // \x1c is the expansion-whitespace tag (expansion_ws_marked): the
-        // whitespace it precedes is data, the tag itself is not.
-        return decoded
-            .replace(crate::executor::markers::IFS_GLUE, "")
-            .replace(crate::executor::COMPOUND_EXPANSION_WS_TAG, "")
-            .replace(
-                crate::executor::markers::ASSIGN_EXPANSION_BACKSLASH_STR,
-                "\\",
-            )
-            .replace(crate::executor::markers::ASSIGN_SQ_DOLLAR_STR, "$")
-            .replace(crate::executor::markers::ASSIGN_SQ_BACKTICK_STR, "`")
-            .replace(crate::executor::markers::ASSIGN_SQ_BACKSLASH_STR, "\\")
-            .replace(crate::executor::markers::ASSIGN_EXPANSION_DQUOTE_STR, "\"")
-            .replace(crate::executor::markers::ASSIGN_EXPANSION_SQUOTE_STR, "'")
-            .replace(crate::executor::markers::PARAM_NAME_END_MARKER, "");
+        // whitespace it precedes is data, the tag itself is not. The
+        // registry-zone sentinels restore in one E400-aware scan so a
+        // typed `$'\uE3xx'` riding an E400 pair survives as user data —
+        // only BARE carriers decode (rubash#840).
+        return crate::executor::markers::restore_bare_sentinels(
+            &decoded
+                .replace(crate::executor::markers::IFS_GLUE, "")
+                .replace(crate::executor::markers::PARAM_NAME_END_MARKER, ""),
+            &[
+                (crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, ""),
+                (crate::executor::markers::ASSIGN_EXPANSION_BACKSLASH, "\\"),
+                (crate::executor::markers::ASSIGN_SQ_DOLLAR, "$"),
+                (crate::executor::markers::ASSIGN_SQ_BACKTICK, "`"),
+                (crate::executor::markers::ASSIGN_SQ_BACKSLASH, "\\"),
+                (crate::executor::markers::ASSIGN_EXPANSION_DQUOTE, "\""),
+                (crate::executor::markers::ASSIGN_EXPANSION_SQUOTE, "'"),
+            ],
+        );
     };
 
     let mut unquoted = String::new();
@@ -1349,4 +1455,62 @@ pub(in crate::executor) fn unquote_storage_value(value: &str) -> String {
 
 pub(in crate::executor) fn quote_compound_field_value(value: &str) -> String {
     quote_array_value(value)
+}
+
+#[cfg(test)]
+mod assoc_storage_tests {
+    use super::*;
+
+    /// The append fast lane (rubash#618) must stay byte-identical to a full
+    /// `format_assoc_storage` render: readers re-parse the mirror string, so a
+    /// divergence would be a silent value/key mismatch. Pin the contract over
+    /// the quoting classes the quoters distinguish (plain, whitespace, quote,
+    /// backslash, `]`, `` ` ``, `$`, empty).
+    #[test]
+    fn append_element_matches_full_render() {
+        let keys = [
+            "k0", "a b", "a'b", "a\"b", "a\\b", "a]b", "a`b", "a$b", "", "a=b",
+        ];
+        let values = ["v0", "x y", "x'y", "x\"y", "x\\y", "x]y", "x`y", "x$y", ""];
+        for key in keys {
+            for value in values {
+                let mut appended = String::from("([first]=1)");
+                assert!(assoc_storage_append_element(&mut appended, key, value));
+                let mut entries = vec![("first".to_string(), "1".to_string())];
+                entries.push((key.to_string(), value.to_string()));
+                assert_eq!(
+                    appended,
+                    format_assoc_storage(entries),
+                    "append vs render for key={key:?} value={value:?}"
+                );
+            }
+        }
+        // Empty cell: `()` grows to a single segment with no leading space.
+        let mut empty = String::from("()");
+        assert!(assoc_storage_append_element(&mut empty, "k", "v"));
+        assert_eq!(empty, "([k]=v)");
+        // Non-cell shapes are refused so the caller falls back to the render.
+        let mut scalar = String::from("plain");
+        assert!(!assoc_storage_append_element(&mut scalar, "k", "v"));
+        assert_eq!(scalar, "plain");
+    }
+
+    /// The appended mirror must parse back to the exact (key, value) pair —
+    /// quoting that the parse step would fold differently would corrupt the
+    /// key set the typed cell syncs from.
+    #[test]
+    fn append_element_round_trips_through_parse() {
+        for (key, value) in [
+            ("k$i", "v0"),
+            ("a b", "x y"),
+            ("a]b", "x]y"),
+            ("a`b", "x$y"),
+            ("", ""),
+        ] {
+            let mut storage = String::from("()");
+            assert!(assoc_storage_append_element(&mut storage, key, value));
+            let parsed = assoc_entries(&storage);
+            assert_eq!(parsed, vec![(key.to_string(), value.to_string())]);
+        }
+    }
 }

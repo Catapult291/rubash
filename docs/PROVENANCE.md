@@ -19,12 +19,12 @@ Rubash is a **from-scratch rewrite of GNU Bash semantics in Rust**.
 
 ## 2. How compatibility is defined and measured
 
-The compatibility target is the **observable behavior** of GNU Bash 5.3.0,
+The compatibility target is the **observable behavior** of GNU Bash 5.3.x,
 never its source text.
 
 - The oracle is black-box differential testing: the harness in
   `scripts/true-baseline.sh` runs GNU Bash's own 83-suite upstream test
-  corpus against GNU Bash 5.3.0 (WSL, owner-compiled) and Rubash, and
+  corpus against GNU Bash 5.3.x (WSL, owner-compiled) and Rubash, and
   byte-compares stdout/stderr. See the rubash README "Compatibility at a Glance"
   ledger (snapshot archive: issue #477) for the current ledger and
   methodology history.
@@ -56,14 +56,14 @@ The GNU Bash source tree is vendored as a separate git submodule
 ## 4. Contributor rules (binding)
 
 1. **Implement from observed behavior.** Run the probe against GNU Bash
-   5.3.0 first; make Rubash match the observation. Consulting the vendored
+   5.3.x first; make Rubash match the observation. Consulting the vendored
    source to understand *what the behavior is* is fine; the deliverable is
    the behavior, expressed in idiomatic Rust.
 2. **Describe work as behavior alignment, not code porting.** Commit
    messages and comments should say what GNU behavior is matched and how it
    was probed:
    - Prefer: `fix(jobs): wait interrupted by trapped signal, status 128+sig
-     (GNU jobs.tests jobs9.sub; byte-verified vs 5.3.0)`
+     (GNU jobs.tests jobs9.sub; byte-verified vs 5.3.x)`
    - Avoid: `ported from jobs.c:NNN` as the primary description of a
      change. Historical commits are not rewritten; new ones set the tone.
 3. **Keep expression independent.** New code follows Rust idioms and
@@ -86,7 +86,7 @@ licensing questions, contact the maintainers.
 代码的移植或翻译。GNU Bash 源码未被编译进、链接进或复制进 Rubash 自身代码；
 `src/`、`tests/`、`scripts/` 的表达是独立的 Rust 惯用法，适用 MIT 许可证。
 
-**兼容性如何定义与验证**：以 GNU Bash 5.3.0 的**可观测行为**为目标，通过黑盒
+**兼容性如何定义与验证**：以 GNU Bash 5.3.x 的**可观测行为**为目标，通过黑盒
 差分测试验证——harness 用 GNU Bash 自己的 83 套官方语料对两个 shell 做 byte 级
 输出对比；现行台账见 rubash README「Compatibility at a Glance」及 issue #477 归档）。
 

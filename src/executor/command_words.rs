@@ -1,5 +1,5 @@
 use super::*;
-use crate::executor::markers::{DATA_DOLLAR, DATA_DOLLAR_STR, STORAGE_WORD_PREFIX};
+use crate::executor::markers::STORAGE_WORD_PREFIX;
 
 impl Executor {
     /// GNU execute_cmd.c:4188 bind_lastarg: bind `$_` to `value`, strip the
@@ -54,24 +54,14 @@ impl Executor {
         //     first rewrite of this guard left behind (still 4 KB per
         //     command) — bind_lastarg's observable effect is only the `_`
         //     unexport, which is_marked covers exactly.
+        // `_` membership -> the structured attr map, answered by
+        // is_marked (EXPORTED_VARS is one of the ten attribute keys;
+        // VarAttrs::flag). Unset the bit through the structured map;
+        // the serialized string is rendered on demand and never
+        // rewritten here (#916).
         let needs_rewrite = is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, "_");
         if needs_rewrite {
-            let joined = self
-                .shell_state
-                .env_vars
-                .get(EXPORTED_VARS)
-                .map(|exported| {
-                    exported
-                        .split(DATA_DOLLAR)
-                        .filter(|name| !name.is_empty() && *name != "_")
-                        .collect::<Vec<_>>()
-                        .join(DATA_DOLLAR_STR)
-                });
-            if let Some(joined) = joined {
-                self.shell_state
-                    .env_vars
-                    .insert(EXPORTED_VARS.to_string(), joined);
-            }
+            self.shell_state.env_vars.unmark_name(EXPORTED_VARS, "_");
         }
         // perf17: GNU's second half is bind_variable("_", value) — one
         // variable-cell update (variables.c). The old shape cloned the

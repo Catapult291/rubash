@@ -11,7 +11,6 @@ use std::io::{self, Write};
 use crate::executor::path::{shell_directory_entries, shell_path_entries};
 
 use crate::builtins::alias::Alias;
-use crate::executor::markers::DATA_DOLLAR;
 
 const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
@@ -671,7 +670,7 @@ pub enum CompletionBuiltin {
 pub fn execute_with_io<E>(
     builtin: CompletionBuiltin,
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
@@ -708,7 +707,7 @@ where
 /// produce (pcomplete.c:1251 gen_compspec_completions).
 pub(crate) fn execute_compgen_with_dynamic<E>(
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
@@ -799,7 +798,7 @@ fn pattern_uses_extglob(pattern: &str) -> bool {
 pub(crate) fn apply_completion_actions(
     actions: u64,
     word: &str,
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
@@ -898,7 +897,7 @@ pub(crate) fn complete_line_candidates(
     line: &str,
     cursor: usize,
     specs: &CompletionRegistry,
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
@@ -969,7 +968,7 @@ pub(crate) fn complete_line_candidates(
 /// level, which reads them from the stdout buffer).
 fn execute_compgen<E>(
     args: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
     job_names: &[String],
@@ -1242,14 +1241,14 @@ fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String
     candidates
 }
 
-fn service_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
+fn service_completion_candidates(env_vars: &crate::shell::var_table::VarTable) -> Vec<String> {
     let mut candidates = ["SERVICE", "SERVICENAME"]
         .iter()
         .filter_map(|name| env_vars.get(*name))
         .filter(|value| !value.is_empty())
         .cloned()
         .collect::<Vec<_>>();
-    candidates.extend(marked_completion_names(env_vars, SERVICE_NAMES));
+    candidates.extend(env_vars.marked_names(SERVICE_NAMES));
     candidates.sort();
     candidates.dedup();
     candidates
@@ -1269,31 +1268,22 @@ fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
     candidates
 }
 
-fn array_variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
+fn array_variable_completion_candidates(
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Vec<String> {
     let mut candidates = BTreeSet::new();
-    candidates.extend(marked_completion_names(env_vars, ARRAY_VARS));
-    candidates.extend(marked_completion_names(env_vars, ASSOC_VARS));
+    candidates.extend(env_vars.marked_names(ARRAY_VARS));
+    candidates.extend(env_vars.marked_names(ASSOC_VARS));
     candidates.into_iter().collect()
 }
 
-fn exported_variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
-    let mut candidates = marked_completion_names(env_vars, EXPORTED_VARS);
+fn exported_variable_completion_candidates(
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Vec<String> {
+    let mut candidates = env_vars.marked_names(EXPORTED_VARS);
     candidates.sort();
     candidates.dedup();
     candidates
-}
-
-fn marked_completion_names(env_vars: &HashMap<String, String>, key: &str) -> Vec<String> {
-    env_vars
-        .get(key)
-        .map(|value| {
-            value
-                .split(DATA_DOLLAR)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn alias_completion_candidates(aliases: &HashMap<String, Alias>) -> Vec<String> {
@@ -1885,12 +1875,17 @@ mod completion_hook_tests {
     use std::collections::HashMap;
 
     fn empty_context() -> (
-        HashMap<String, String>,
+        crate::shell::var_table::VarTable,
         HashMap<String, crate::builtins::alias::Alias>,
         Vec<String>,
         Vec<String>,
     ) {
-        (HashMap::new(), HashMap::new(), Vec::new(), Vec::new())
+        (
+            crate::shell::var_table::VarTable::default(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     #[test]

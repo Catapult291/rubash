@@ -12,6 +12,7 @@
 
 ### 变更
 
+- **wrapper 重spawn 的 argv 握手旗标按消费者在位门控**（#873 后续）：`--internal-bg-wrapper=<nonce>` 是 niu CLI 专属旗标，此前 wrapper 重spawn 无条件附加——嵌入式宿主（niubash 的 niu 启动器）与任何不经 `consume_background_wrapper_handshake` 的 CLI 会把它当未知选项拒收（`bash: --internal-bg-wrapper=<nonce>: invalid option` + usage），后台命令 spawn 即死（niubash master CI background_spawn_args 两红）。现旗标仅当本进程 CLI 在启动时调用过 consume（`background_wrapper_flag_consumer_present()`，rubash main.rs 每次启动必调）才附加；非消费者宿主得到 env-nonce-only 重spawn——env 键对非消费者惰性（不被读、消费者启动即清洗），单通道永不 arm（#866 契约不变）。rubash 本体行为逐 spawn 等价（消费者恒在位）；宿主采纳 consume 即恢复完整双通道握手与 #737 cascade。
 - **Windows 无宿主 sudo 回落 PATH 执行**（#810 行为变化披露，#813 补记）：`sudo cmd` 在 Windows 且嵌入宿主**未注册 elevation handler** 时，曾一律由 host builtin 应答 "elevation handler is not configured"（rc 1），PATH 从不被咨询；自 #810 起该名字按外部命令走 PATH 解析——有 sudo.exe 的机器（Win11 System32）真实提升执行，没有的报 command-not-found rc 127，`builtin sudo` 无 handler 时报 `builtin: sudo: not a shell builtin`（rc 1）。introspection 契约不变：`command -v`/`type -a`/`enable -a`/`compgen -b` 依旧把 sudo 报告为外部命令（docs/builtins.md §3 隐藏 builtin 条款）。方向与 GNU 更近（GNU 无 sudo builtin）。#813 以两条 windows-only 测试钉死两臂执行路由（假 sudo PATH 实跑、`builtin sudo` rc 1）。
 
 ### 性能
@@ -68,6 +69,7 @@
 
 ### 构建
 
+- **发行来源戳记补 dirty 工作树摘要**（#827 建议 3）：`--version` 的 `build:` 指纹此前只铸 `git rev-parse --short HEAD`——哈希诚实但不担保内容，v1.4.0 事故正是"banner 报某 commit、二进制实际编译了该 commit 加未提交改动"（#488 家族盲区：哈希可见、工作树内容不可验证）。现携带未提交改动的树铸 `<rev>-dirty-<8 hex>`，digest 为 `git diff HEAD --binary` 的 SHA-256 前 4 字节（暂存/未暂存改动皆入；未跟踪文件不置 dirty，同 `git describe --dirty`/`diff-index --quiet HEAD` 语义）：同内容同 digest，任何改动必改 banner，两个不同脏树不再可能印出同一戳。`RUBASH_BUILD_HASH` 显式钉值不能洗白脏树——钉值由 crate 侧 `option_env!` 直读（rustc dep-info 自带失效跟踪，改钉即重编），build.rs 把 git 派生戳发在独立变量 `RUBASH_GIT_STAMP`、脏半段单发 `RUBASH_GIT_DIRTY_SUFFIX`；钉值只赢修订半段，仓库在场时 `-dirty[-<digest>]` 仍追加。build.rs 不发任何 `cargo:rerun-if-*` 指令——任何一条（含 `rerun-if-env-changed`）都会让 cargo 退出默认整包扫描，增量重建即把陈旧戳烙进已变更的树（PR #939 评审复现的 #827 事故形：脏树增量构建仍印裸 HEAD）。`tests/build_rs_dirty.rs` 7 例 fixture（净树裸哈希、脏树 digest 稳定且随内容变、已暂存算脏、未跟踪不算脏、脏后缀恰为戳尾、源码级禁 rerun-if 守卫、还原恢复裸戳），与 niubash `tests/build_rs_dirty.rs` 同源。
 - **命令替换 pipeline-filter 死链删除**（#710）：`command_substitution_pipeline_filter` 的 8 条 filter 臂（sort/sed/tr/head/grep/wc/tail/uniq）连同其唯一调用链——`command_substitution_pipeline_output`、`timed_command_substitution_inner` 的 `|` 臂、`command_substitution_pipeline_first_stage`、孤儿助手 `split_pipeline_words`/`echo_raw_output`——自 rubash#117 平凡性 gate 之后不可达：gate 字节白名单拒绝 `|`，能抵达 filter 的替换体不可能含管线；且该链还只住在 `time` 前缀快捷方式内，进一步收窄。运行时复核：入口探针在 producer×filter 电池（含反引号、嵌套 comsub、alias 注入 `|`、`cat`/generic 首段、`time` 前缀形）上零命中；阳性对照（gate 临时放行 `|`）全部探针命中并复现休眠特征（`$(…|wc)` 默认单列 `1`，而活跃路径是三列）。`$( … | … )` 的可观测行为本就由真执行器管线（pipeline_exec）与外部二进制产出，删除零行为差；同步移除孤儿 doc-sync 测试与 `docs/builtins.md` 的 `substitution-fastpath-list` 机器块（审计 §2.5 加 resolution 注记）。新增 `tests/issue710_comsub_pipeline_reachability.rs` 钉住路由（wc 默认三列、echo 引导管线不吞、八 filter 走真执行器、time 前缀管线、末段状态语义），期望值与 WSL GNU 5.3.0 逐字节一致；全量失败集与基线双向一致。
 
 ## [1.4.0] - 2026-10-10
@@ -443,5 +445,6 @@ GNU Bash 5.3.0 兼容性大幅推进。83 套件 true-baseline 总差异从 3427
 
 ## 链接
 
+- [unixwin.dev](https://unixwin.dev) — 产品门户（文档与下载统一入口）
 - [GitHub Releases](https://github.com/unixwin/rubash/releases)
 - [问题跟踪器](https://github.com/unixwin/rubash/issues)

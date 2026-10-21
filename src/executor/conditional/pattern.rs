@@ -1,11 +1,11 @@
 pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bool {
     // The byte-spelling gate runs BEFORE the pattern-only fast paths:
-    // literal_pattern_equality and simple_glob_matches admit on
-    // `pattern.bytes()` alone, and every byte of `__RUBASH_CSB1_xx;` is
-    // printable ASCII with no glob syntax, so a pattern carrying a comsub
-    // payload prefix (`[[ $v == *$(printf '\001')* ]]`, rubash#729 rework)
-    // would be verdicted against the word's raw spelling and never reach
-    // the normalization that decodes the payload.
+    // literal_pattern_equality and simple_glob_matches verdict on the raw
+    // chars and cannot see marker spellings — a `?` must match a carried
+    // byte, not fail on its marker spelling, and a pattern carrying a
+    // comsub payload sentinel (`[[ $v == *$(printf '\001')* ]]`,
+    // rubash#729 rework) would be verdicted against the word's raw
+    // spelling and never reach the normalization that decodes the payload.
     if sides_need_byte_char_matching(pattern, word) {
         let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
         let word: Vec<char> = flatten_word_to_byte_chars(word);
@@ -23,6 +23,7 @@ pub(in crate::executor) fn case_pattern_matches(pattern: &str, word: &str) -> bo
 }
 
 pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
+    // Byte-spelling gate runs BEFORE the pattern-only fast paths (see above).
     if sides_need_byte_char_matching(pattern, word) {
         let pattern: Vec<char> = flatten_pattern_to_byte_chars(pattern);
         let word: Vec<char> = flatten_word_to_byte_chars(word);
@@ -37,6 +38,66 @@ pub(in crate::executor) fn case_pattern_matches_nocase(pattern: &str, word: &str
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
     case_pattern_matches_at_with_case(&pattern, 0, &word, 0, true)
+}
+
+/// Word-hoisted twin of [`case_pattern_matches`]: the `case` subject word is
+/// identical for every arm, so `execute_case_command`
+/// (GNU `execute_cmd.c:3644 execute_case_command`, word built once via
+/// `expand_word_leave_quoted` + `dequote_string` at 3695-3699, then matched
+/// per arm with `strmatch` at 3736) stages its `Vec<char>` once outside the
+/// arm loop and reuses it here. The pattern side still stages per arm — it
+/// differs per candidate — while the literal / simple-glob fast paths stay
+/// borrow-only.
+///
+/// `word_chars` is a LAZY cell: the literal / simple-glob fast paths never
+/// consult it, and GNU's `strmatch` for a literal arm does no char staging
+/// either, so the common 20-literal-arm loop must not pay a per-execution
+/// `Vec<char>` build for a cache that is never read. The caller seeds it on
+/// the first arm that actually reaches the staged matcher. The raw-byte-marker
+/// path is rare; it delegates to the allocating form rather than duplicating
+/// the flatten logic.
+pub(in crate::executor) fn case_pattern_matches_with_word_chars(
+    pattern: &str,
+    word: &str,
+    word_chars: &mut Option<Vec<char>>,
+) -> bool {
+    // Byte-spelling gate runs BEFORE the pattern-only fast paths (see
+    // above): the fast paths verdict on raw chars and cannot see marker
+    // spellings, so a marked word must go through the flattening base
+    // function instead of the staged raw-char path below.
+    if sides_need_byte_char_matching(pattern, word) {
+        return case_pattern_matches(pattern, word);
+    }
+    if let Some(verdict) = literal_pattern_equality(pattern, word, false) {
+        return verdict;
+    }
+    if let Some(verdict) = simple_glob_matches(pattern, word, false) {
+        return verdict;
+    }
+    let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, false)
+}
+
+/// Nocase twin of [`case_pattern_matches_with_word_chars`].
+pub(in crate::executor) fn case_pattern_matches_nocase_with_word_chars(
+    pattern: &str,
+    word: &str,
+    word_chars: &mut Option<Vec<char>>,
+) -> bool {
+    // Byte-spelling gate first (see base function above).
+    if sides_need_byte_char_matching(pattern, word) {
+        return case_pattern_matches_nocase(pattern, word);
+    }
+    if let Some(verdict) = literal_pattern_equality(pattern, word, true) {
+        return verdict;
+    }
+    if let Some(verdict) = simple_glob_matches(pattern, word, true) {
+        return verdict;
+    }
+    let word_chars = word_chars.get_or_insert_with(|| word.chars().collect());
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    case_pattern_matches_at_with_case(&pattern_chars, 0, word_chars, 0, true)
 }
 
 /// Direct char-wise match for the simple-glob class: a pattern whose every
@@ -157,18 +218,9 @@ fn literal_pattern_equality(pattern: &str, word: &str, nocase: bool) -> Option<b
         })
 }
 
-/// Check if the pattern contains raw-byte marker sentinels (U+E000).
-/// When present, GNU's byte-level pattern matching (subst.c glob_pattern_patscan)
-/// matches raw bytes against the word's byte representation, so we flatten
-/// both sides to byte-chars for the char-level matcher.
-fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
-    pattern.contains(
-        char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-            .expect("raw-byte sentinel is a valid char"),
-    )
-}
-
-/// Normalization gate for byte-level matching (rubash#729).
+/// Normalization gate for byte-level matching (rubash#729). Subsumes the
+/// narrower raw-byte-marker check landed by #983: the 0xEE lead byte below
+/// already covers the whole PUA marker plane including E000.
 ///
 /// GNU matches patterns and words as BYTE strings (subst.c pat_substr /
 /// sm_loop.c gmatch walk `unsigned char` buffers). Rubash transport has
@@ -176,7 +228,7 @@ fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
 /// (E000+E0xx, the entry encoding), a CTLESC-quoted pair (a quoted span
 /// quote-protects each pair char), a literal C0 char (a
 /// `substitution_result_visible_text` decode that re-materialized the
-/// byte), and the `__RUBASH_CSB1_xx;` payload (protect_command_substitution_
+/// byte), and the `U+E319<hex><hex>;` payload (protect_command_substitution_
 /// output). Two sides carrying DIFFERENT spellings of the same byte must
 /// still match — `[[ $v == *"$(printf '\001')"* ]]` failed because the word
 /// held the pair while the quoted command-substitution pattern held the
@@ -184,7 +236,7 @@ fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
 ///
 /// The gate fires when EITHER side names a byte-level spelling: a raw-byte
 /// marker (0xEE is the UTF-8 lead byte of the whole PUA marker plane), a
-/// command-substitution payload prefix, or a literal C0 char outside
+/// command-substitution payload sentinel, or a literal C0 char outside
 /// \t/\n (0x01..=0x1f, the carrier-collision block; \t/\n words are the
 /// common case and match un-flattened today, so they keep the fast path).
 /// Both sides are then flattened, so CTLESC quote marks dequote
@@ -192,11 +244,11 @@ fn pattern_contains_raw_byte_markers(pattern: &str) -> bool {
 ///
 /// #735 safety: a user `$'\uE4xx'` char arrives E400-prefixed
 /// (push_literal_char); normalization never consumes an E400 escape (it
-/// has no E000/E0xx-pair or CSB1 shape), so escaped user data flattens
-/// identically on both sides and can never be read as a marker.
+/// has no E000/E0xx-pair or sentinel-payload shape), so escaped user data
+/// flattens identically on both sides and can never be read as a marker.
 fn sides_need_byte_char_matching(pattern: &str, word: &str) -> bool {
     fn carries(text: &str) -> bool {
-        text.contains(crate::executor::markers::COMSUB_PAYLOAD_PREFIX)
+        text.contains(crate::executor::markers::COMSUB_PAYLOAD_SENTINEL)
             || text
                 .bytes()
                 .any(|b| b == 0xEE || (b < 0x20 && b != b'\t' && b != b'\n'))
@@ -229,7 +281,7 @@ fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
-    let pattern = decode_payload_prefixes_to_pairs(pattern);
+    let pattern = decode_payload_sentinels_to_pairs(pattern);
     let mut output = Vec::new();
     let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -315,47 +367,57 @@ fn try_consume_ctlesc_quoted_pair(
     )
 }
 
-/// Rewrite the `__RUBASH_CSB1_xx;` payload spelling (protect_command_substitution_
-/// output) into the raw-byte marker pair the byte-char walk understands, so
-/// a command-substitution byte meets the same byte in any other spelling
-/// (rubash#729). A doubled introducer (a literal prefix in the protected
-/// output) re-emits the prefix text.
-fn decode_payload_prefixes_to_pairs(text: &str) -> String {
-    const PREFIX: &str = crate::executor::markers::COMSUB_PAYLOAD_PREFIX;
-    if !text.contains(PREFIX) {
+/// Rewrite the `U+E319<hex><hex>;` payload spelling
+/// (protect_command_substitution_output) into the raw-byte marker pair the
+/// byte-char walk understands, so a command-substitution byte meets the
+/// same byte in any other spelling (rubash#729). Same grammar as
+/// execution_misc::decode_command_substitution_payload: an E400-escaped
+/// sentinel is user data (rubash#840) and the pair rides through verbatim;
+/// a sentinel without the full `<hex><hex>;` tail is malformed protocol
+/// and re-emits verbatim.
+fn decode_payload_sentinels_to_pairs(text: &str) -> String {
+    use crate::executor::markers::{COMSUB_PAYLOAD_SENTINEL, LITERAL_CHAR_ESCAPE};
+    use crate::executor::substitution_metadata::{RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST};
+    if !text.contains(COMSUB_PAYLOAD_SENTINEL) {
         return text.to_string();
     }
     let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find(PREFIX) {
-        output.push_str(&rest[..index]);
-        let after = &rest[index + PREFIX.len()..];
-        if let Some(escaped) = after.strip_prefix(PREFIX) {
-            output.push_str(PREFIX);
-            rest = escaped;
-        } else if after.len() >= 3 && after.as_bytes()[2] == b';' {
-            if let Ok(byte) = u8::from_str_radix(&after[..2], 16) {
-                output.push(
-                    char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-                        .expect("sentinel is valid"),
-                );
-                output.push(
-                    char::from_u32(
-                        crate::executor::substitution_metadata::RAW_BYTE_MARKER_FIRST + byte as u32,
-                    )
-                    .expect("marker char is valid"),
-                );
-                rest = &after[3..];
-            } else {
-                output.push_str(PREFIX);
-                rest = after;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            output.push(ch);
+            if let Some(next) = chars.next() {
+                output.push(next);
             }
-        } else {
-            output.push_str(PREFIX);
-            rest = after;
+            continue;
+        }
+        if ch != COMSUB_PAYLOAD_SENTINEL {
+            output.push(ch);
+            continue;
+        }
+        let mut probe = chars.clone();
+        let byte = match (probe.next(), probe.next(), probe.next()) {
+            (Some(high), Some(low), Some(';'))
+                if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() =>
+            {
+                u8::from_str_radix(&format!("{high}{low}"), 16).ok()
+            }
+            _ => None,
+        };
+        match byte {
+            Some(byte) => {
+                output.push(char::from_u32(RAW_BYTE_MARKER_ESCAPE).expect("sentinel is valid"));
+                output.push(
+                    char::from_u32(RAW_BYTE_MARKER_FIRST + byte as u32)
+                        .expect("marker char is valid"),
+                );
+                chars.next();
+                chars.next();
+                chars.next();
+            }
+            None => output.push(ch),
         }
     }
-    output.push_str(rest);
     output
 }
 
@@ -367,7 +429,7 @@ fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
-    let word = decode_payload_prefixes_to_pairs(word);
+    let word = decode_payload_sentinels_to_pairs(word);
     let mut output = Vec::new();
     let mut chars = word.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -531,6 +593,30 @@ mod tests {
         assert!(!case_pattern_matches("\u{18}[\u{18}e", "\\[\\E"));
         assert!(case_pattern_matches("[0;31m\u{18}", "[0;31m\\"));
         assert!(!case_pattern_matches("[0;31m\u{18}", "[0;31m]"));
+    }
+
+    /// GNU matches bytes, not chars (subst.c glob_pattern_patscan walks
+    /// unsigned char buffers): a word carrying a raw-byte marker pair for
+    /// a single byte must match a single-char pattern. Regression test
+    /// for the word-side blind spot in the byte-spelling gate: previously
+    /// only the pattern side was checked, so `[[ $x == ? ]]` with a
+    /// carried 0x11 byte fell through to the plain char-wise matcher and
+    /// wrongly failed (the two-char marker spelling never equals one `?`).
+    #[test]
+    fn carried_byte_matches_single_char_pattern() {
+        // \u{e000}\u{e012} is the stored spelling of byte 0x11
+        // (RAW_BYTE_MARKER_ESCAPE + FIRST + byte).
+        let carried = "\u{e000}\u{e012}";
+        assert!(case_pattern_matches("?", carried));
+        assert!(case_pattern_matches_nocase("?", carried));
+        assert!(case_pattern_matches("*", carried));
+        assert!(!case_pattern_matches("??", carried));
+        assert!(!case_pattern_matches("x", carried));
+        // Plain words without marker spellings keep the old behavior.
+        assert!(case_pattern_matches("?", "q"));
+        assert!(!case_pattern_matches("??", "q"));
+        assert!(case_pattern_matches("a", "a"));
+        assert!(!case_pattern_matches("a", "b"));
     }
 }
 

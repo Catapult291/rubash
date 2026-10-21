@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
+use crate::executor::markers::STORAGE_WORD_PREFIX;
 use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
-use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 use crate::executor::{mark_env_name, split_storage_words, unquote_storage_value, ARRAY_VARS};
 
 pub(in crate::executor) fn normalize_array_expanded_value(value: String) -> String {
@@ -140,6 +140,28 @@ pub(in crate::executor) fn parse_array_numeric_subscript(name: &str) -> Option<(
     let (array_name, subscript) = parse_array_subscript(name)?;
     let index = subscript.parse::<usize>().ok()?;
     Some((array_name, index))
+}
+
+/// A clean negative-literal subscript (`-N`, nothing else): the raw text is
+/// exactly `-` followed by `[1-9][0-9]*` and parses as `i64`.
+///
+/// GNU arrayfunc.c:1581 normalizes a negative indexed subscript as
+/// `array_max_index + 1 + ind`, so a literal needs no evalexp — but only a
+/// literal with this exact shape is value-identical to its parse. A leading
+/// zero would be octal under shell arithmetic (`-08` is an evalexp operand
+/// error, not -8; `-0` is element 0, not `max + 1`), and any whitespace,
+/// quote, sign repetition or expansion (`- 1`, `'-1'`, `--1`, `-$i`) must
+/// keep the full expand+evalexp pipeline with its diagnostics. Whitelist
+/// admission: anything rejected here rides the slow path unchanged.
+pub(in crate::executor) fn clean_negative_literal_subscript(key: &str) -> Option<i64> {
+    let digits = key.strip_prefix('-')?;
+    if !matches!(digits.as_bytes().first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    key.parse::<i64>().ok()
 }
 
 /// Split a bare array reference `name[subscript]` into its parts.
@@ -370,16 +392,49 @@ where
     if need_separator {
         mirror.push(' ');
     }
-    mirror.push_str(&format!(
-        "[{first_index}]={}",
-        quote_array_value(first_element)
-    ));
+    push_indexed_segment(mirror, first_index, first_element);
     for (index, element) in segments {
         mirror.push(' ');
-        mirror.push_str(&format!("[{index}]={}", quote_array_value(element)));
+        push_indexed_segment(mirror, index, element);
     }
     mirror.push(')');
     true
+}
+
+/// Append the decimal spelling of `value` to `out` without allocating (the
+/// element-fill hot path appends one segment per write, so the index digits
+/// must not cost a `to_string`).
+fn push_decimal(out: &mut String, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // Every byte is an ASCII digit, so the slice is valid UTF-8.
+    out.push_str(std::str::from_utf8(&digits[start..]).unwrap_or("0"));
+}
+
+/// Append one `[index]=<quoted>` render segment to `mirror`, byte-identical
+/// to `format!("[{index}]={}", quote_array_value(value))` but without the
+/// two intermediate `String` allocations for the plain (double-quotable)
+/// value form — the shape every numeric fill element takes. Non-plain
+/// values still ride the full quoter.
+fn push_indexed_segment(mirror: &mut String, index: usize, value: &str) {
+    mirror.push('[');
+    push_decimal(mirror, index);
+    mirror.push_str("]=");
+    if quote_array_value_is_plain(value) {
+        mirror.push('"');
+        mirror.push_str(value);
+        mirror.push('"');
+    } else {
+        mirror.push_str(&quote_array_value(value));
+    }
 }
 
 /// Sync (or invalidate) the structured cell from a rendered mirror value.
@@ -426,6 +481,126 @@ pub(crate) fn drop_typed_indexed_array(store: &mut crate::shell::VariableStore, 
         Some(crate::shell::ShellValue::IndexedArray(_))
     ) {
         store.remove(name);
+    }
+}
+
+/// Assoc analogue of `sync_typed_indexed_array`: structured-cell
+/// synchronization for associative arrays. `shell_state.variables`
+/// (`ShellValue::AssociativeArray`) is the O(1) `${A[k]}` truth — GNU reads
+/// it with `assoc_reference` (assoc.c:120, a single `hash_search`, never a
+/// table walk) — while the rendered `env_vars` string stays the projection
+/// every storage reader sees. `entries` always comes from the same parse the
+/// mirror render folds (`dedupe_assoc_entries`), so the structured key set
+/// equals the mirror-derived key set by construction. A readonly refusal
+/// would leave the structured cell older than the mirror — drop it so reads
+/// fall back to the mirror projection.
+pub(crate) fn sync_typed_assoc_array(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    entries: &[(String, String)],
+) {
+    if store
+        .replace_associative_array(
+            name,
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .is_err()
+    {
+        drop_typed_assoc_array(store, name);
+    }
+}
+
+/// Outcome of a fast-append typed-cell upsert: the caller uses it to schedule
+/// the next canonical render without over-compacting a growing fill.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AssocElementUpsert {
+    /// The key was absent: the mirror gained a NEW canonical segment, so the
+    /// append produced no duplicate and the mirror is still compact.
+    NewKey,
+    /// The key already existed: the mirror now carries a duplicate segment
+    /// that a canonical render must eventually fold.
+    Overwrote,
+    /// No synced assoc cell to update (absent, wrong shape, or readonly): the
+    /// mirror grew but the cell did not, so the caller must force a canonical
+    /// re-sync.
+    NoCell,
+}
+
+/// Fast-append assoc write path (the rubash#618 budget scheme): the mirror
+/// grows by one `[k]=v` segment without a re-parse, so there is no canonical
+/// entry list to sync from. Upsert in place when the cell is already an assoc
+/// cell (the same O(1) `assoc_insert` shape GNU uses); report a missing or
+/// wrong-shape cell to the caller — the next canonical write re-syncs it. A
+/// readonly cell would go stale behind the mirror write, so drop it instead.
+pub(crate) fn upsert_typed_assoc_element(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> AssocElementUpsert {
+    let Some(variable) = store.get_mut(name) else {
+        return AssocElementUpsert::NoCell;
+    };
+    if variable.readonly {
+        drop_typed_assoc_array(store, name);
+        return AssocElementUpsert::NoCell;
+    }
+    if let crate::shell::ShellValue::AssociativeArray(entries) = &mut variable.value {
+        // GNU assoc.c assoc_insert: overwrite an existing binding in place.
+        // Reusing the stored key's allocation on the overwrite arm keeps a
+        // same-key burst (the common `m[k]=v` hot shape) from allocating a
+        // fresh key String per write.
+        match entries.get_mut(key) {
+            Some(slot) => {
+                *slot = value.to_string();
+                AssocElementUpsert::Overwrote
+            }
+            None => {
+                entries.insert(key.to_string(), value.to_string());
+                AssocElementUpsert::NewKey
+            }
+        }
+    } else {
+        AssocElementUpsert::NoCell
+    }
+}
+
+/// Remove only an assoc structured cell (indexed/scalar cells keep their
+/// behavior untouched). Used whenever a mirror write bypasses the assoc
+/// sync paths; reads then fall back to the mirror projection.
+pub(crate) fn drop_typed_assoc_array(store: &mut crate::shell::VariableStore, name: &str) {
+    if matches!(
+        store.get(name).map(|variable| &variable.value),
+        Some(crate::shell::ShellValue::AssociativeArray(_))
+    ) {
+        store.remove(name);
+    }
+}
+
+/// Assoc analogue of `sync_typed_indexed_storage`: sync (or invalidate) the
+/// structured assoc cell from a rendered mirror value. The caller gates on
+/// the ASSOC mark; any shape that is not an assoc render drops the cell so
+/// the mirror stays authoritative. Reuses the memoised assoc parse, so the
+/// compound-write path hits the previous write's render instead of
+/// re-scanning it.
+pub(crate) fn sync_typed_assoc_storage(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    storage: &str,
+) {
+    if storage.starts_with(STORAGE_WORD_PREFIX) {
+        // Indexed render — not an assoc cell's shape; drop so the mirror
+        // stays authoritative.
+        drop_typed_assoc_array(store, name);
+        return;
+    }
+    if storage.starts_with('(') && storage.ends_with(')') {
+        let parsed = crate::executor::assignment_helpers::assoc_entries(storage);
+        sync_typed_assoc_array(store, name, &parsed);
+    } else {
+        drop_typed_assoc_array(store, name);
     }
 }
 
@@ -522,9 +697,17 @@ pub(in crate::executor) fn quote_array_value(value: &str) -> String {
     // decode_rendered_array_value still hands readers the real quote
     // (issue #109: `x=($'a"b')` then `declare -p x` printed the E011
     // carrier bytes instead of "a\"b").
-    let value = value
-        .replace(crate::lexer::ANSI_C_QUOTE_MARKER_STR, "'")
-        .replace(crate::lexer::ANSI_C_DQUOTE_MARKER_STR, "\"");
+    // E400-aware (rubash#840): a typed `$'\uE010'`/`$'\uE011'` arrives
+    // as the escaped member of an E400 pair and is user data — only BARE
+    // carriers restore; the pair stays transport for the read-back
+    // boundary (cell/mirror parity).
+    let value = crate::executor::markers::restore_bare_sentinels(
+        value,
+        &[
+            (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+            (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+        ],
+    );
     // GNU expand_string_assignment (subst.c:4345-4353) ends every expanded
     // assignment RHS word with dequote_list -> dequote_string
     // (subst.c:4807), stripping the CTLESC carrier pairs that the walker
@@ -770,17 +953,14 @@ pub(in crate::executor) fn is_array_storage(value: &str) -> bool {
 }
 
 pub(in crate::executor) fn is_marked_array_var(
-    env_vars: &HashMap<String, String>,
+    env_vars: &crate::shell::var_table::VarTable,
     name: &str,
 ) -> bool {
-    const ARRAY_VARS: &str = "__RUBASH_ARRAY_VARS";
-    const ASSOC_VARS: &str = "__RUBASH_ASSOC_VARS";
-    [ARRAY_VARS, ASSOC_VARS].iter().any(|key| {
-        env_vars
-            .get(*key)
-            .map(|value| value.split(DATA_DOLLAR).any(|marked| marked == name))
-            .unwrap_or(false)
-    })
+    // Structured flags, not the serialized string: writers stopped
+    // maintaining the string per mark (#916 follow-up). ASSOC counts as
+    // array-like here (same contract as before).
+    use crate::executor::types::{ARRAY_VARS, ASSOC_VARS};
+    env_vars.is_marked(ARRAY_VARS, name) || env_vars.is_marked(ASSOC_VARS, name)
 }
 
 fn rendered_array_values(value: &str) -> Vec<String> {
@@ -922,4 +1102,166 @@ fn decode_ansic_escapes(value: &str) -> String {
     // compares a raw carrier byte against the pair-encoded form (intl.tests
     // unicode1.sub U+0018/U+001B/U+001C/U+001D).
     crate::executor::substitution_metadata::bytes_to_assignment_shell_text(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::{ShellValue, VariableStore};
+    use std::collections::BTreeMap;
+
+    fn readonly_indexed_store(name: &str, values: &[&str]) -> VariableStore {
+        let mut store = VariableStore::default();
+        store.set_scalar(name, "").unwrap();
+        let entries: BTreeMap<i64, String> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as i64, value.to_string()))
+            .collect();
+        let variable = store.get_mut(name).unwrap();
+        variable.value = ShellValue::IndexedArray(entries);
+        variable.readonly = true;
+        store
+    }
+
+    fn usize_entries(values: &[&str]) -> BTreeMap<usize, String> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index, value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_reads_fall_back_to_mirror() {
+        // storage.rs:432-436: a refused write (readonly typed cell while the
+        // mirror write still lands, e.g. `read -a` on a readonly array) must
+        // not leave the structured cell shadowing the mirror — drop it so
+        // reads fall back to the mirror projection.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO", &["old0", "old1"]);
+        let fresh = usize_entries(&["new0", "new1"]);
+        sync_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO", &fresh);
+        assert!(
+            store.get("RUBASH_DIRTY_RO").is_none(),
+            "refused sync must drop the stale typed cell"
+        );
+        // The landed mirror still serves the fresh values.
+        let mirror = format_indexed_array_storage(fresh);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+        assert_eq!(array_value_at(&mirror, 1).as_deref(), Some("new1"));
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_on_dense_replace() {
+        // Same contract through the dense replacer used by `read -a` /
+        // declare sync writers: refusal drops the cell, the mirror stays
+        // authoritative.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO2", &["old0"]);
+        replace_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO2", ["new0"]);
+        assert!(
+            store.get("RUBASH_DIRTY_RO2").is_none(),
+            "refused replace must drop the stale typed cell"
+        );
+        let mirror = format_indexed_array_values(vec!["new0".to_string()]);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+    }
+
+    #[test]
+    fn clean_negative_literal_admits_only_dash_nonzero_digits() {
+        // The negative-subscript fast lane (executor.rs) must admit exactly
+        // the spellings whose shell-arithmetic value equals the literal:
+        // `-[1-9][0-9]*`. A leading zero is octal (`-08` is an evalexp
+        // error, `-0` is element 0), and whitespace/quotes/signs/expansions
+        // keep the full expand+evalexp pipeline with its diagnostics.
+        assert_eq!(clean_negative_literal_subscript("-1"), Some(-1));
+        assert_eq!(clean_negative_literal_subscript("-10"), Some(-10));
+        assert_eq!(clean_negative_literal_subscript("-0"), None);
+        assert_eq!(clean_negative_literal_subscript("-08"), None);
+        assert_eq!(clean_negative_literal_subscript("-01"), None);
+        assert_eq!(clean_negative_literal_subscript("1"), None);
+        assert_eq!(clean_negative_literal_subscript("-"), None);
+        assert_eq!(clean_negative_literal_subscript("--1"), None);
+        assert_eq!(clean_negative_literal_subscript("- 1"), None);
+        assert_eq!(clean_negative_literal_subscript("-1 "), None);
+        assert_eq!(clean_negative_literal_subscript(" -1"), None);
+        assert_eq!(clean_negative_literal_subscript("'-1'"), None);
+        assert_eq!(clean_negative_literal_subscript("-$i"), None);
+        assert_eq!(clean_negative_literal_subscript(""), None);
+        // i64 overflow rides the slow path (whose i128 evalexp owns the
+        // diagnostic), exactly like any other rejected spelling.
+        assert_eq!(
+            clean_negative_literal_subscript("-99999999999999999999"),
+            None
+        );
+    }
+
+    #[test]
+    fn indexed_mirror_segment_append_matches_full_render() {
+        // The write-path in-place append must stay byte-identical to the
+        // canonical renderer for every value shape: plain double-quotable
+        // values (the numeric fill-loop case) go through the direct push,
+        // and anything the quoter special-cases still rides
+        // `quote_array_value`. This is the `declare -p` correctness bar for
+        // `append_indexed_mirror_segments`.
+        let values = [
+            "0",
+            "7999",
+            "plain value",
+            "",
+            "a\"b",
+            "a$b",
+            "a`b",
+            "a\\b",
+            "a(b",
+            "$'x'",
+            "a b c",
+        ];
+        let mut entries: BTreeMap<usize, String> = BTreeMap::new();
+        let mut table = crate::shell::var_table::VarTable::default();
+        table.insert("m".to_string(), format!("{STORAGE_WORD_PREFIX_STR}()"));
+        for (index, value) in values.iter().enumerate() {
+            entries.insert(index, (*value).to_string());
+            assert!(append_indexed_mirror_segments(
+                &mut table,
+                "m",
+                std::iter::once((index, *value)),
+            ));
+        }
+        let rendered = format_indexed_array_storage(entries);
+        assert_eq!(table.get("m").map(String::as_str), Some(rendered.as_str()));
+    }
+
+    #[test]
+    fn assoc_upsert_reports_new_overwrite_and_missing_cell() {
+        // The fast-append budget spends only on an OVERWRITE (a new key adds no
+        // duplicate segment, so a fill stays compact), so the upsert outcome
+        // must distinguish the two. A cell the append cannot sync reports
+        // NoCell so the caller forces a canonical re-sync.
+        let mut store = VariableStore::default();
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NoCell,
+            "no cell yet"
+        );
+        store.set_scalar("A", "").unwrap();
+        store.get_mut("A").unwrap().value =
+            ShellValue::AssociativeArray(std::collections::HashMap::new());
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NewKey
+        );
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v2"),
+            AssocElementUpsert::Overwrote
+        );
+        assert_eq!(store.associative_element("A", "k"), Some("v2"));
+        // A readonly cell is dropped behind the mirror write and reports
+        // NoCell so reads fall back and the next canonical write re-syncs.
+        store.get_mut("A").unwrap().readonly = true;
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v3"),
+            AssocElementUpsert::NoCell
+        );
+        assert!(store.get("A").is_none(), "readonly cell dropped");
+    }
 }

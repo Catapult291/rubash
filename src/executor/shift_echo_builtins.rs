@@ -23,7 +23,7 @@ impl Executor {
                 self.exit_code = status;
             }
             crate::builtins::shift::ShiftAction::Shift(amount) => {
-                if amount > self.shell_state.positional_params.len() {
+                if amount > self.shell_state.positional_len() {
                     // GNU general.c:112 (posix_initialize): `set -o posix'
                     // turns print_shift_error ON, so the out-of-range
                     // diagnostic prints in posix mode even without the
@@ -46,9 +46,27 @@ impl Executor {
                     self.exit_code = 1;
                     return Ok(());
                 }
-                let mut positional = self.shell_state.positional_params.clone();
-                positional.drain(0..amount);
-                self.set_positional_params(positional);
+                // Offset window (variables.c `loptend` port): bumping the
+                // base is O(1) — no per-shift clone of every remaining
+                // param and no drain memmove. The shifted prefix stays in
+                // the backing storage, invisible behind the window, until
+                // the next reset/compaction reclaims it.
+                self.shell_state.positional_offset += amount;
+                let offset = self.shell_state.positional_offset;
+                let len = self.shell_state.positional_params.len();
+                if offset >= len {
+                    // Empty window: drop the dead prefix outright so a
+                    // shift-to-empty never retains memory (`set --`
+                    // likewise starts from a clean storage).
+                    self.shell_state.positional_params.clear();
+                    self.shell_state.positional_offset = 0;
+                } else if offset > 1024 && offset >= len / 2 {
+                    // Long shift run without a reset: fold the dead prefix
+                    // so the backing storage stays O(live) (amortized O(1)
+                    // per shift; GNU frees the shifted list cells likewise).
+                    self.shell_state.positional_params.drain(..offset);
+                    self.shell_state.positional_offset = 0;
+                }
                 self.exit_code = 0;
             }
         }

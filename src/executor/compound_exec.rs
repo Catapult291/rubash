@@ -328,8 +328,34 @@ impl Executor {
             commands: vec![(*inverted_command.command).clone()],
         };
         self.with_errexit_suppressed(|executor| executor.execute_ast(&commands))?;
+        // GNU execute_cmd.c:854-883 vs :1204: a compound's OWN redirect
+        // failure returns before the invert step, so the flip is suppressed
+        // while compound_redirect_failed is set (rubash#846). The mark is
+        // left set on purpose: an outer `! ! C` wrapper suppresses in turn
+        // (GNU: the inner command never runs — the outer redirect fails
+        // first — so both levels observe status 1), and the owning
+        // boundary consumes it (subshell-region single-inverted-body flip
+        // at :1831, pipeline wait-side flip at :763, comsub/function/eval
+        // completion discard, flat-loop backstop clear).
+        if self.compound_redirect_failed.get() {
+            return Ok(());
+        }
         self.exit_code = invert_exit_status(self.exit_code);
         Ok(())
+    }
+
+    /// Record a compound's own do_redirections failure (GNU
+    /// execute_cmd.c:854-883). Call only with the apply-stage IoError —
+    /// never ExpansionFailure (failglob aborts before do_redirections and
+    /// flips normally) and never a body write error.
+    pub(in crate::executor) fn note_compound_redirect_failure(&self) {
+        self.compound_redirect_failed.set(true);
+    }
+
+    /// Consume the compound-redirect-failure mark (fork/call boundaries and
+    /// the pipeline wait-side flip own the adjudicated status from here).
+    pub(in crate::executor) fn take_compound_redirect_failed(&self) -> bool {
+        self.compound_redirect_failed.replace(false)
     }
 
     pub(in crate::executor) fn execute_background_ast_command(
@@ -437,9 +463,11 @@ impl Executor {
                 use std::os::unix::process::CommandExt;
                 process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
             }
+            suppress_orphan_console(&mut process);
             match process.spawn() {
                 Ok(child) => {
                     let pid = child.id();
+                    adopt_orphan_console(pid);
                     self.background_children
                         .insert(pid, crate::fd::SpawnedChild::from(child));
                     self.shell_state
@@ -566,17 +594,40 @@ impl Executor {
             }
         }
         // rubash#866: second handshake channel — the nonce rides argv too,
-        // ahead of every other argument. main() consumes it (with the env
-        // entry above) before the GNU option parser or the `-c` driver sees
+        // ahead of every other argument. The host CLI consumes it (with the
+        // env entry above) before any option parser or the `-c` driver sees
         // anything; the wrapper role arms only when both channels agree.
-        spawn_args.insert(
-            0,
-            format!(
-                "{}{}",
-                crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
-                wrapper_nonce
-            ),
-        );
+        // rubash#873: the flag is niu-CLI-specific, so it rides ONLY when
+        // this process's own CLI declared itself a handshake consumer
+        // (rubash main.rs — and adopting hosts — call
+        // consume_background_wrapper_handshake at startup). A launcher that
+        // never consumes (niubash's niu) or any foreign face would reject
+        // the unknown option — `bash: --internal-bg-wrapper=<nonce>:
+        // invalid option` + usage — and the background command would die at
+        // spawn (the niubash background_spawn_args CI red). For those hosts
+        // the respawn is env-nonce-only: the key is inert for a
+        // non-consumer (never read; scrubbed by any rubash that does
+        // start), and a single channel can never arm — the rubash#866
+        // contract holds either way.
+        //
+        // cfg(test): this crate's OWN unit tests drive the Executor
+        // in-process — the test harness process never runs main.rs, so the
+        // consumer bit would make the attach order-dependent (true only
+        // after the handshake unit tests happened to run first). In the
+        // unit-test process the respawn target is always this repo's own
+        // engine binary (CARGO_BIN_EXE / test_rubash_binary_from_current_
+        // exe), whose main does consume — attaching unconditionally there
+        // is exactly the pre-gate behavior the suite was green under.
+        if crate::builtins::kill::background_wrapper_flag_consumer_present() || cfg!(test) {
+            spawn_args.insert(
+                0,
+                format!(
+                    "{}{}",
+                    crate::builtins::kill::BACKGROUND_WRAPPER_FLAG,
+                    wrapper_nonce
+                ),
+            );
+        }
 
         // GNU forks the async subshell: the child's fd table is a copy of the
         // parent's. std::process::Command cannot express a per-spawn handle
@@ -1365,7 +1416,12 @@ impl Executor {
         }
         self.print_time_shell(time_command.posix_format, started);
         if time_command.inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(())
     }
@@ -1418,7 +1474,12 @@ impl Executor {
         );
         result?;
         if inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(())
     }
@@ -1466,7 +1527,12 @@ impl Executor {
 
         self.print_time_shell(prefix.posix_format, started);
         if prefix.inverted {
-            self.exit_code = invert_exit_status(self.exit_code);
+            // rubash#846 (GNU execute_cmd.c:854-883 vs :1204): a compound
+            // inner's OWN redirect failure suppresses the `!` flip (mark
+            // left set for an outer `! !` wrapper, as elsewhere).
+            if !self.compound_redirect_failed.get() {
+                self.exit_code = invert_exit_status(self.exit_code);
+            }
         }
         Ok(Some(index + next_index))
     }
@@ -1538,6 +1604,18 @@ impl Executor {
         }
 
         let mut ran_body = false;
+        // Canonical-counter fast loop (see run_arith_counter_fast_loop): the
+        // slow init above already ran with full semantics (DEBUG fire,
+        // xtrace, failure handling), so a failed init never reaches here.
+        if !arithmetic_failed {
+            if let Some(counter) = self.try_enter_arith_counter_fast_loop(arithmetic, body) {
+                let result = self.run_arith_counter_fast_loop(&counter, body, for_line);
+                // Mirror the function tail below: the entry `loop_depth += 1`
+                // is balanced here; the fast loop always ends with status 0.
+                self.shell_state.loop_depth -= 1;
+                return result;
+            }
+        }
         // Header strings are borrowed from the parsed node, so the body
         // cannot mutate them: trim once per loop entry. GNU eval_arith_for_
         // expr (execute_cmd.c:3163) consults the trap table per evaluation;
@@ -1666,6 +1744,187 @@ impl Executor {
         Ok(())
     }
 
+    /// Admission probe for the canonical-counter fast loop: `Some` admits,
+    /// `None` is doubt and the caller runs the slow loop unchanged.
+    /// Whitelist only (rubash#117): the counter shapes
+    /// (`arith_counter_loop_shapes`), a single bare-`:` body, the canonical
+    /// init binding left by the slow init, clean variable marks, an empty
+    /// arithmetic write log, no installed trap actions, no tracing, an
+    /// enabled builtin-`:` target and no background jobs. Every condition
+    /// the skipped per-iteration work could observe is verified here; the
+    /// `:` body cannot change any of them (it runs no code at all on the
+    /// fast path), and no trap handler can run either, so entry validation
+    /// holds for the whole loop by induction.
+    fn try_enter_arith_counter_fast_loop(
+        &self,
+        arithmetic: &ArithmeticForCommand,
+        body: &[CommandNode],
+    ) -> Option<crate::executor::arithmetic::ArithCounterLoop> {
+        for_body_is_bare_colon(body)?;
+        let counter = crate::executor::arithmetic::arith_counter_loop_shapes(
+            &arithmetic.init,
+            &arithmetic.test,
+            &arithmetic.update,
+        )?;
+        // The slow init ran first: the binding must be exactly its canonical
+        // decimal rendering, proving the variable reads plainly.
+        let rendered = counter.init.to_string();
+        if self
+            .shell_state
+            .env_vars
+            .get(&counter.var)
+            .map(String::as_str)
+            != Some(rendered.as_str())
+        {
+            return None;
+        }
+        if crate::executor::arithmetic::arith_counter_var_doubtful(
+            &self.shell_state.env_vars,
+            &counter.var,
+        ) {
+            return None;
+        }
+        if !crate::executor::arithmetic::arith_write_log_is_empty() {
+            return None;
+        }
+        if self.arith_counter_trap_installed() {
+            return None;
+        }
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "xtrace")
+            || crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "verbose")
+        {
+            return None;
+        }
+        // `enable -n :` is mishandled by the slow path today (rubash still
+        // runs the builtin where GNU reports 127); a function named `:`
+        // overrides the builtin in both shells. Either doubt runs slow so
+        // the fast loop can never diverge from the slow one.
+        if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, ":")
+            || self.shell_state.functions.contains_key(":")
+        {
+            return None;
+        }
+        if !self.shell_state.job_table.jobs.is_empty() || !self.background_children.is_empty() {
+            return None;
+        }
+        Some(counter)
+    }
+
+    /// Whether any trap action is installed. The fast loop executes no
+    /// commands, so a trapped signal delivered mid-loop would sit in the
+    /// mailbox until the loop ends while the slow path dispatches it at the
+    /// next `:` boundary. Any non-empty `__RUBASH_TRAP_*` action —
+    /// DEBUG/ERR/EXIT/RETURN/signal alike, including reset-suppressed ones
+    /// (doubt runs slow) — disqualifies. Empty actions (`trap '' SIG` =
+    /// SIG_IGN) install no shell code and stay admissible: dispositions
+    /// cannot change without a `trap` call, which nothing on the fast path
+    /// can issue. Metadata keys (`TRAP_RESET`, `TRAP_ORIG_IGNORES`) are not
+    /// actions and are skipped.
+    fn arith_counter_trap_installed(&self) -> bool {
+        use crate::builtins::trap::{TRAP_ORIG_IGNORES, TRAP_PREFIX, TRAP_RESET};
+        self.shell_state.env_vars.iter().any(|(key, action)| {
+            key.starts_with(TRAP_PREFIX)
+                && key.as_str() != TRAP_RESET
+                && key.as_str() != TRAP_ORIG_IGNORES
+                && !action.is_empty()
+        })
+    }
+
+    /// Fast driver for canonical `for ((v=C0; v<C1; v++)); do :; done`
+    /// loops admitted by `try_enter_arith_counter_fast_loop`. GNU
+    /// execute_arith_for_command (execute_cmd.c:3219) re-evaluates the test
+    /// and update through expr.c descent and dispatches the `:` body through
+    /// execute_command_internal on every iteration; the fast loop performs
+    /// the identical counter directly (i64 wrapping, mirroring bash_arith),
+    /// the identical update write pipeline (env insert, write-log record,
+    /// process-env mirror, typed-cell sync — the same calls in the same
+    /// order as the slow `PostInc` path) and the identical net end-state
+    /// (line/command stamps, `_`, status 0). Per-iteration work the slow
+    /// path repeats — the DEBUG/line/xtrace probes, the arithmetic ticket
+    /// (pre-expansion scans, nounset machinery, dynamic-context snapshot,
+    /// parse and diagnostics) and the full `:` dispatch — is provably
+    /// unobservable here: no DEBUG action or trace can fire (gated at
+    /// entry, nothing mid-loop can arm one), the counter variable stays
+    /// canonical (only fast writes touch it), and no jobs, traps or
+    /// failures can appear. A fatal signal soldiers through the periodic
+    /// mailbox drain exactly as the slow body's per-command boundary does
+    /// (delivery timing is inherently racy either way).
+    fn run_arith_counter_fast_loop(
+        &mut self,
+        counter: &crate::executor::arithmetic::ArithCounterLoop,
+        body: &[CommandNode],
+        for_line: Option<usize>,
+    ) -> Result<(), ExecuteError> {
+        // Pure-function admission over the same slice: entry verified a bare
+        // `:` body, so this re-derivation yields the same node (precedent:
+        // the `changed implies present` expect).
+        let colon = for_body_is_bare_colon(body).expect("fast-loop entry admits only bare-`:`");
+        let var = counter.var.clone();
+        let mut current = counter.init;
+        let mut iters: u64 = 0;
+        // GNU pins the for line as the ambient line_number while the body
+        // runs (execute_cmd.c:3236); the envelope keeps that net effect
+        // while nothing inside observes it.
+        let result: Result<(), ExecuteError> = self.with_ambient_line(for_line, |executor| {
+            loop {
+                if current >= counter.bound {
+                    break Ok(());
+                }
+                // Signal-death parity with the slow body's per-command
+                // boundary (see above); with no actions installed only the
+                // fatal-delivery Err paths can trigger, which propagate
+                // exactly as a slow body error does. The 1024-iteration tick
+                // amortizes the mailbox poll to ~zero per iteration.
+                if iters & 1023 == 0 {
+                    executor.run_pending_signal_traps()?;
+                }
+                // Wrapping increment mirrors bash_arith (`value as i64`).
+                let updated = current.wrapping_add(1);
+                let new_value = updated.to_string();
+                // By induction `old` is exactly the stored rendering: entry
+                // verified the canonical init and only fast writes (same
+                // rendering) touch the binding mid-loop.
+                let old_value = Some(current.to_string());
+                executor
+                    .shell_state
+                    .env_vars
+                    .insert(var.clone(), new_value.clone());
+                crate::executor::arithmetic::record_arith_write(&var, old_value);
+                crate::executor::sync_shell_assignment_process_env(
+                    &executor.shell_state.env_vars,
+                    &var,
+                    &new_value,
+                );
+                crate::executor::arithmetic::sync_arith_writes(executor);
+                current = updated;
+                iters += 1;
+            }
+        });
+        result?;
+        if iters > 0 {
+            // The skipped `:` iterations each stamped these byte-identical
+            // values; one call each leaves the identical net state (all
+            // three helpers are equality-gated no-ops on repeat).
+            self.set_current_line(colon);
+            self.set_current_command(colon);
+            self.bind_underscore(":");
+        }
+        // Net CURRENT_LINE of the slow loop: the update-restore stamps the
+        // for line after the last body (and the failing test-restore stamps
+        // it on a zero-trip loop).
+        if let Some(line) = for_line {
+            self.set_current_line_value(line);
+        }
+        // Every fast evaluation succeeds, as the slow ones provably do for
+        // admitted shapes; no diagnostic slot is ever written.
+        self.shell_state.arithmetic_last_error_category.set(None);
+        // Verified against GNU 5.3: the loop always ends 0 here — a ran body
+        // of `:` leaves 0, and a zero-trip loop returns 0 (`false;
+        // for ((i=5;i<3;i++)); do :; done; echo $?` prints 0).
+        self.exit_code = 0;
+        Ok(())
+    }
+
     pub(in crate::executor) fn execute_if_command_with_redirects(
         &mut self,
         cmd: &CommandNode,
@@ -1703,11 +1962,20 @@ impl Executor {
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
         let mut if_command = if_command.clone();
-        let result = apply_if_redirects(self, &redirect_cmd, &mut if_command).and_then(|()| {
-            self.with_command_input_redirects(cmd, |executor| {
+        // rubash#846 (GNU execute_cmd.c:854-883): an apply-stage IoError
+        // is the if's OWN redirect failure — mark it for the `!` flip
+        // sites. Body-stage errors flow through unmarked and flip normally.
+        let result = match apply_if_redirects(self, &redirect_cmd, &mut if_command) {
+            Err(error) => {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                Err(error)
+            }
+            Ok(()) => self.with_command_input_redirects(cmd, |executor| {
                 executor.execute_if_command(&if_command)
-            })
-        });
+            }),
+        };
         let status = self.exit_code;
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         self.exit_code = status;
@@ -1734,14 +2002,23 @@ impl Executor {
         let group_outputs =
             self.materialize_compound_output_process_substitutions(&mut redirect_cmd)?;
         let mut loop_command = loop_command.clone();
-        let result = apply_redirects_to_commands(self, &redirect_cmd, &mut loop_command.body)
-            .and_then(|()| {
-                self.with_loop_fd_heredocs(cmd, |executor| {
-                    executor.with_command_input_redirects(cmd, |executor| {
-                        executor.execute_loop_command(&loop_command)
-                    })
+        // rubash#846 (GNU execute_cmd.c:854-883): an apply-stage IoError
+        // is the loop's OWN redirect failure — mark it for the `!` flip
+        // sites. Body-stage errors flow through unmarked and flip normally.
+        let result = match apply_redirects_to_commands(self, &redirect_cmd, &mut loop_command.body)
+        {
+            Err(error) => {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                Err(error)
+            }
+            Ok(()) => self.with_loop_fd_heredocs(cmd, |executor| {
+                executor.with_command_input_redirects(cmd, |executor| {
+                    executor.execute_loop_command(&loop_command)
                 })
-            });
+            }),
+        };
         let status = self.exit_code;
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         self.exit_code = status;
@@ -1908,7 +2185,27 @@ impl Executor {
             let mut body_ast = Ast {
                 commands: subshell_command.body.clone(),
             };
-            self.apply_command_output_redirects(&stdio_redirect_cmd, &mut body_ast)?;
+            // rubash#846 (GNU execute_cmd.c:1759-1762): the subshell's own
+            // redirect failure in the forked child exits inverted — the
+            // parent wait-side (:763) flips it back, netting status 1 with
+            // no flip. Mark it so an enclosing `!` suppresses its flip.
+            if let Err(error) =
+                self.apply_command_output_redirects(&stdio_redirect_cmd, &mut body_ast)
+            {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                // rubash#940: the subshell boundary owns its saved state on
+                // every exit path — GNU's forked child dies with its own
+                // copy and nothing leaks back (execute_cmd.c:1576). The
+                // early apply-failure return skipped the restore below and
+                // leaked subshell_depth + the child trap reset into the
+                // parent.
+                self.restore_flat_subshell(saved_state, saved_cwd);
+                self.fd_table = saved_fd_table;
+                self.command_expansion_failed.set(saved_expansion_failed);
+                return Err(error);
+            }
             body_owned = Some(body_ast.commands);
         }
         let body: &[CommandNode] = body_owned.as_deref().unwrap_or(&subshell_command.body);
@@ -2036,6 +2333,28 @@ impl Executor {
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
+        // rubash#846 (GNU execute_cmd.c:1808-1833 execute_in_subshell): the
+        // forked child lifts CMD_INVERT_RETURN off the direct body and flips
+        // the adjudicated result — `( ! C>bad )` is 0 while a top-level
+        // `! C>bad` is 1. Only the single-inverted-command body qualifies
+        // (tcom is the direct body; a `!` nested in a list keeps its flag
+        // into execute_command_internal and hits the :854 early return).
+        // Consume the mark when flipping; otherwise leave it for an
+        // enclosing `!` (`! ( C>bad )` suppresses) or the flat-loop backstop.
+        let mut status = status;
+        if self.compound_redirect_failed.get()
+            && body.len() == 1
+            && (body[0].inverted_command.is_some() || body[0].inverted)
+        {
+            self.take_compound_redirect_failed();
+            status = invert_exit_status(status);
+        } else {
+            // Body-set marks die with the forked child (GNU
+            // execute_in_subshell): the parent judges the region by status
+            // only. (The region's OWN redirect failure returns before this
+            // point, leaving the mark for an enclosing `!`.)
+            self.compound_redirect_failed.set(false);
+        }
         self.exit_code = status;
         finish_result?;
         self.exit_code = status;
@@ -2448,14 +2767,25 @@ impl Executor {
             } else {
                 child.stderr(Stdio::inherit());
             }
-            self.apply_coproc_redirects(cmd, &mut child)?;
+            // rubash#846 (GNU execute_cmd.c:1759-1762 + :2583): the
+            // coproc child's own redirect failure exits inverted and the
+            // parent flips it back — net status 1, no flip. Mark it so an
+            // enclosing `!` suppresses its flip.
+            if let Err(error) = self.apply_coproc_redirects(cmd, &mut child) {
+                if matches!(error, ExecuteError::IoError(_)) {
+                    self.note_compound_redirect_failure();
+                }
+                return Err(error);
+            }
 
+            suppress_orphan_console(&mut child);
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
                     // but keep the parent ends until after spawn so stdio uses
                     // the correct pipe direction on all hosts.
                     let pid = child_proc.id();
+                    adopt_orphan_console(pid);
                     if let Some(target) = coproc_stderr_target {
                         if let Some(stderr) = child_proc.stderr.take() {
                             let forwarder =
@@ -2671,6 +3001,22 @@ impl Executor {
                             "__RUBASH_ARRAY_VARS",
                             &bind_name,
                         );
+                        // Keep the structured cell in lockstep so typed
+                        // reads trust it (verified against the mirror by
+                        // debug_assert in the read path). The two coproc
+                        // fds occupy indexes 0 and 1.
+                        {
+                            use std::collections::BTreeMap;
+                            let mut entries = BTreeMap::new();
+                            entries.insert(0usize, coproc_read_fd.to_string());
+                            entries.insert(1usize, coproc_write_fd.to_string());
+                            crate::executor::arrays::sync_typed_indexed_array(
+                                &mut self.shell_state.variables,
+                                &bind_name,
+                                &entries,
+                            );
+                        }
+                        self.shell_state.env_vars.clear_array_cells_dirty();
                         // bind_variable (execute_cmd.c:2441) is nameref-aware:
                         // `coproc ref` with ref_PID a nameref assigns through
                         // it and hits the resolved target's readonly check.
@@ -2810,7 +3156,19 @@ impl Executor {
         // (print_case_command_head, print_cmd.c:731 -> `case WORD in `) and
         // run_debug_trap fires before the word is expanded, so the trap sees
         // the raw unexpanded word — `case "$v" in ` keeps the quotes.
-        if self.debug_trap_in_scope() {
+        // GNU's run_debug_trap (trap.c) is a no-op when no DEBUG action is
+        // armed; gate the head-text `format!` on that presence test so the
+        // common no-trap loop does not allocate a String per `case` (same
+        // folded admission as the ast_exec per-command DEBUG preamble,
+        // rubash#186).
+        if self.debug_trap_in_scope()
+            && !self.debug_trap_running
+            && crate::builtins::trap::has_active_trap_action(
+                &self.shell_state.env_vars,
+                "DEBUG",
+                "__RUBASH_TRAP_DEBUG",
+            )
+        {
             let raw_word = if case_command.word_metadata.raw.is_empty() {
                 case_command.word.as_str()
             } else {
@@ -2863,6 +3221,15 @@ impl Executor {
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
         let mut fall_through = false;
         let mut matched_any = false;
+        // GNU execute_cmd.c:3644 execute_case_command builds `word` once
+        // (expand_word_leave_quoted + dequote_string, 3695-3699) and reuses
+        // it for every arm's strmatch at 3736. Stage its `Vec<char>` once
+        // here so the N-arm loop below does not re-collect it per candidate;
+        // the pattern side still stages per arm (it differs per arm) while
+        // the literal / simple-glob fast paths stay borrow-only. The cell is
+        // LAZY: a loop of static literal arms (GNU strmatch's no-staging
+        // path) never builds it.
+        let mut word_chars: Option<Vec<char>> = None;
         let mut index = 0;
         while let Some(clause) = case_command.clauses.get(index) {
             let matched = fall_through
@@ -2874,19 +3241,28 @@ impl Executor {
                         return false;
                     }
                     if case_pattern_has_extglob(&stripped) {
+                        // Extglob staging needs the word chars immediately
+                        // (no literal fast path in extglob_matches_at); seed
+                        // the lazy cell here.
+                        let word_chars =
+                            word_chars.get_or_insert_with(|| word.chars().collect());
                         if nocasematch {
-                            crate::executor::conditional::extglob_case_pattern_matches_nocase(
-                                &stripped, &word,
+                            crate::executor::conditional::extglob_case_pattern_matches_nocase_with_word_chars(
+                                &stripped, word_chars,
                             )
                         } else {
-                            crate::executor::conditional::extglob_case_pattern_matches(
-                                &stripped, &word,
+                            crate::executor::conditional::extglob_case_pattern_matches_with_word_chars(
+                                &stripped, word_chars,
                             )
                         }
                     } else if nocasematch {
-                        case_pattern_matches_nocase(&stripped, &word)
+                        case_pattern_matches_nocase_with_word_chars(
+                            &stripped,
+                            &word,
+                            &mut word_chars,
+                        )
                     } else {
-                        case_pattern_matches(&stripped, &word)
+                        case_pattern_matches_with_word_chars(&stripped, &word, &mut word_chars)
                     }
                 });
             self.abandon_on_arithmetic_expansion_error()?;
@@ -2970,14 +3346,15 @@ impl Executor {
         // application only add per-execution churn; keep the ambient line
         // binding (line_number = case_command->line) semantics intact.
         // RESTRICTED_SHELL (#804): refuse before any splice or creation.
-        if compound_command_has_redirects(cmd) {
+        let has_redirects = compound_command_has_redirects(cmd);
+        if has_redirects {
             if let Some(message) = self.restricted_compound_redirect_error(cmd)? {
                 self.write_default_stderr(&message)?;
                 self.exit_code = 1;
                 return Ok(());
             }
         }
-        if !compound_command_has_redirects(cmd) {
+        if !has_redirects {
             let case_line = cmd.line;
             return self.with_ambient_line(case_line, |executor| {
                 executor.execute_case_command(case_command)
@@ -2991,6 +3368,11 @@ impl Executor {
         let result = self.apply_case_command_redirects(&redirect_cmd, &mut case_command);
         let status = self.exit_code;
         if let Err(error) = result {
+            // rubash#846 (GNU execute_cmd.c:854-883): the case's OWN
+            // redirect failure — mark it for the `!` flip sites.
+            if matches!(error, ExecuteError::IoError(_)) {
+                self.note_compound_redirect_failure();
+            }
             let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
             self.exit_code = status;
             finish_result?;
@@ -3154,8 +3536,74 @@ fn if_condition_is_side_effect_free(condition: &[CommandNode]) -> bool {
         && command.coproc_command.is_none()
 }
 
-/// True when the compound statement's own CommandNode carries any redirect,
-/// heredoc, here-string, or structured process substitution — i.e. when the
+/// Whitelist for the arith-for counter fast driver: exactly one bare `:`
+/// command with every assignment/redirect/substitution/channel field empty —
+/// the same structural admission as #661's `if_condition_is_side_effect_free`
+/// (kept in sync field-for-field), narrowed to `:` alone. `Some` admits and
+/// hands back the node for the fast loop's end-state replication;
+/// everything else is doubt and runs the slow loop. Shadowing (a `:`
+/// function, a disabled `:`) is gated at the call site.
+fn for_body_is_bare_colon(body: &[CommandNode]) -> Option<&CommandNode> {
+    let [command] = body else {
+        return None;
+    };
+    if !matches!(command.words.as_slice(), [word] if word == ":") {
+        return None;
+    }
+    if !(command.assignments.is_empty()
+        && command.assignment_raws.is_empty()
+        && command.compound_assignments.is_empty()
+        && command.array_element_assignments.is_empty()
+        && command.process_substitutions.is_empty()
+        && command.command_substitutions.is_empty()
+        && command.arithmetic_expansions.is_empty()
+        && command.parameter_expansions.is_empty()
+        && command.brace_expansions.is_empty()
+        && command.extglob_patterns.is_empty()
+        && command.tilde_expansions.is_empty()
+        && command.pathname_patterns.is_empty()
+        && command.word_quotes.is_empty()
+        && command.redirects.is_empty()
+        && command.redirect_in.is_none()
+        && command.redirect_out.is_none()
+        && command.append.is_none()
+        && command.redirect_err.is_none()
+        && command.redirect_err_append.is_none()
+        && command.heredoc.is_none()
+        && command.heredoc_body.is_none()
+        && command.heredoc_delimiter.is_none()
+        && command.heredoc_redirects.is_empty()
+        && command.here_string.is_none()
+        && command.here_string_carrier.is_none()
+        && command.pipe.is_none()
+        && !command.background
+        && command.and_or.is_none()
+        && !command.inverted
+        && !command.subshell
+        && !command.subshell_end
+        && command.pipeline_command.is_none()
+        && command.and_or_list.is_none()
+        && command.time_command.is_none()
+        && command.background_command.is_none()
+        && command.inverted_command.is_none()
+        && command.for_command.is_none()
+        && command.arithmetic_command.is_none()
+        && command.if_command.is_none()
+        && command.loop_command.is_none()
+        && command.conditional_command.is_none()
+        && command.subshell_command.is_none()
+        && command.case_command.is_none()
+        && command.select_command.is_none()
+        && command.function_command.is_none()
+        && command.brace_group.is_none()
+        && command.coproc_command.is_none())
+    {
+        return None;
+    }
+    Some(command)
+}
+
+/// True when the compound statement's own CommandNode carries any redirect,/// heredoc, here-string, or structured process substitution — i.e. when the
 /// clone-and-apply machinery in the `*_with_redirects` wrappers has work to
 /// do. Mirrors every field consulted by materialize_compound_output_
 /// process_substitutions, apply_*_redirects, and with_command_input_redirects
@@ -3351,14 +3799,17 @@ fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
 }
 
 fn case_pattern_has_extglob(pattern: &str) -> bool {
-    let chars = pattern.chars().collect::<Vec<_>>();
+    // Zero-alloc scan (no `Vec<char>` staging): extglob operators and the
+    // backslash escape are single-byte ASCII, so a byte scan is equivalent
+    // to the char scan — multibyte continuation bytes never equal them.
+    let bytes = pattern.as_bytes();
     let mut index = 0usize;
-    while index + 1 < chars.len() {
-        if chars[index] == '\\' {
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
             index += 2;
             continue;
         }
-        if matches!(chars[index], '@' | '*' | '+' | '?' | '!') && chars[index + 1] == '(' {
+        if matches!(bytes[index], b'@' | b'*' | b'+' | b'?' | b'!') && bytes[index + 1] == b'(' {
             return true;
         }
         index += 1;
@@ -3874,6 +4325,205 @@ mod case_arm_static_tests {
             let mut executor = Executor::new();
             executor.execute_ast(&ast).ok();
             assert_eq!(executor.last_exit_code(), code, "{script:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod arith_counter_fast_loop_tests {
+    //! Contract for the canonical-counter fast driver
+    //! (`try_enter_arith_counter_fast_loop` / `run_arith_counter_fast_loop`):
+    //! whitelisted shapes must admit and evaluate exactly like the slow
+    //! loop, and every doubt shape must fall through to it. The differential
+    //! test below runs each script twice — once fast, once forced slow via
+    //! an undelivered WINCH trap that installs an action (so the trap gate
+    //! disqualifies) without changing any other semantics — and compares
+    //! the full observable end-state.
+    use super::for_body_is_bare_colon;
+    use crate::executor::arithmetic::{arith_counter_loop_shapes, ArithCounterLoop};
+    use crate::executor::Executor;
+
+    fn for_body(script: &str) -> Vec<crate::parser::CommandNode> {
+        let tokens = crate::lexer::tokenize(script);
+        let ast = crate::parser::parse(&tokens);
+        ast.commands
+            .first()
+            .and_then(|cmd| cmd.for_command.as_ref())
+            .map(|for_command| for_command.body.clone())
+            .unwrap_or_else(|| panic!("no for body in {script:?}"))
+    }
+
+    #[test]
+    fn counter_shapes_admit_canonical() {
+        assert_eq!(
+            arith_counter_loop_shapes("i=0", "i<200000", "i++"),
+            Some(ArithCounterLoop {
+                var: "i".to_string(),
+                init: 0,
+                bound: 200000,
+            })
+        );
+        // Whitespace around the tokens still parses to the same counter.
+        assert_eq!(
+            arith_counter_loop_shapes("i = 0", "i < 200000", "i ++"),
+            Some(ArithCounterLoop {
+                var: "i".to_string(),
+                init: 0,
+                bound: 200000,
+            })
+        );
+    }
+
+    #[test]
+    fn counter_shapes_reject_doubt() {
+        // Empty sections, other operators, other updates, name mismatches,
+        // signed/octal/huge bounds, dynamic names: all slow.
+        for (init, test, update) in [
+            ("", "i<3", "i++"),
+            ("i=0", "", "i++"),
+            ("i=0", "i<3", ""),
+            ("i=0", "i<=3", "i++"),
+            ("i=0", "i==3", "i++"),
+            ("i=0", "i!=3", "i++"),
+            ("i=0", "i>3", "i++"),
+            ("i=0", "i<3", "i--"),
+            ("i=0", "i<3", "++i"),
+            ("i=0", "i<3", "i+=1"),
+            ("i=0", "i<3", "i=i+1"),
+            ("i=0", "i<3", "i=3"),
+            ("j=0", "i<3", "i++"),
+            ("i=0", "i<3", "j++"),
+            ("i=0", "i<N", "i++"),
+            ("i=+0", "i<3", "i++"),
+            ("i=-1", "i<3", "i++"),
+            ("i=00", "i<3", "i++"),
+            ("i=0", "i<007", "i++"),
+            ("i=0", "i<99999999999999999999999", "i++"),
+            ("i=99999999999999999999999", "i<3", "i++"),
+            ("RANDOM=0", "RANDOM<3", "RANDOM++"),
+            ("i=0", "i<3", "RANDOM++"),
+            ("i=0", "i++", "i++"),
+            ("i<3", "i<3", "i++"),
+        ] {
+            assert!(
+                arith_counter_loop_shapes(init, test, update).is_none(),
+                "admitted doubt ({init:?}, {test:?}, {update:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_colon_body_admission() {
+        assert!(for_body_is_bare_colon(&for_body("for ((i=0;i<3;i++)); do :; done")).is_some());
+        for script in [
+            "for ((i=0;i<3;i++)); do : x; done",
+            "for ((i=0;i<3;i++)); do :>f; done",
+            "for ((i=0;i<3;i++)); do true; done",
+            "for ((i=0;i<3;i++)); do :; :; done",
+            "for ((i=0;i<3;i++)); do ((x++)); done",
+            "for ((i=0;i<3;i++)); do ! :; done",
+            "for ((i=0;i<3;i++)); do : & done",
+        ] {
+            assert!(
+                for_body_is_bare_colon(&for_body(script)).is_none(),
+                "admitted non-trivial body {script:?}"
+            );
+        }
+    }
+
+    /// Observable end-state compared field-for-field between the fast loop
+    /// and the same loop forced slow.
+    fn run_and_snapshot(script: &str) -> (i32, Vec<(String, String)>) {
+        let tokens = crate::lexer::tokenize(script);
+        let ast = crate::parser::parse(&tokens);
+        let mut executor = Executor::new();
+        executor.execute_ast(&ast).ok();
+        let code = executor.last_exit_code();
+        let mut watched = [
+            "i",
+            "_",
+            "__RUBASH_CURRENT_LINE",
+            "__RUBASH_CMD_START_LINE",
+            "__RUBASH_LAST_COMMAND",
+            "__RUBASH_CURRENT_COMMAND",
+        ];
+        watched.sort();
+        let mut snapshot = Vec::new();
+        for key in watched {
+            snapshot.push((
+                key.to_string(),
+                executor.get_env(key).unwrap_or("<unset>").to_string(),
+            ));
+        }
+        // The arithmetic write log must drain on both paths.
+        assert!(
+            crate::executor::arithmetic::arith_write_log_is_empty(),
+            "write log pending after {script:?}"
+        );
+        (code, snapshot)
+    }
+
+    #[test]
+    fn fast_and_slow_loops_agree() {
+        // (script body, expected final `i`)
+        for (body, expected_i) in [
+            ("for ((i=0;i<0;i++)); do :; done", "0"),
+            ("for ((i=0;i<1;i++)); do :; done", "1"),
+            ("for ((i=0;i<50;i++)); do :; done", "50"),
+            ("for ((i = 0; i < 50; i ++)); do :; done", "50"),
+            ("i=999; for ((i=0;i<50;i++)); do :; done", "50"),
+            ("for ((i=7;i<60;i++)); do :; done", "60"),
+        ] {
+            // A `: PIVOT` prefix pins `_` identically on both arms: the
+            // slow-forcing `trap` command below would otherwise bind its own
+            // last word (`WINCH`) and skew the comparison.
+            let fast_script = format!(": PIVOT; {body}");
+            let (fast_code, fast_state) = run_and_snapshot(&fast_script);
+            // An installed-but-undelivered WINCH action disqualifies the
+            // fast loop via the trap gate without changing any semantics.
+            let slow_script = format!("trap 'true' WINCH; : PIVOT; {body}");
+            let (slow_code, slow_state) = run_and_snapshot(&slow_script);
+            assert_eq!(fast_code, slow_code, "exit of {body:?}");
+            assert_eq!(fast_state, slow_state, "state of {body:?}");
+            assert_eq!(fast_code, 0, "loop must end 0: {body:?}");
+            let final_i = fast_state
+                .iter()
+                .find(|(key, _)| key == "i")
+                .map(|(_, value)| value.as_str());
+            assert_eq!(final_i, Some(expected_i), "final i of {body:?}");
+        }
+    }
+
+    #[test]
+    fn fast_loop_binds_canonical_counter() {
+        let tokens = crate::lexer::tokenize("for ((i=0;i<5;i++)); do :; done");
+        let ast = crate::parser::parse(&tokens);
+        let mut executor = Executor::new();
+        executor.execute_ast(&ast).ok();
+        assert_eq!(executor.get_env("i"), Some("5"));
+        assert_eq!(executor.get_env("_"), Some(":"));
+        assert_eq!(executor.last_exit_code(), 0);
+    }
+
+    #[test]
+    fn gates_fall_back_without_changing_semantics() {
+        // Each gate-breaker forces the slow loop; results must still match
+        // GNU (verified byte-for-byte against system bash during review).
+        for script in [
+            // DEBUG action installed: trap fires on the slow path.
+            "trap 'echo -n' DEBUG; for ((i=0;i<3;i++)); do :; done; echo \"i=$i\"",
+            // `:` shadowed by a function.
+            ":() { echo -n FN; }; for ((i=0;i<3;i++)); do :; done; echo \"i=$i\"",
+            // Non-canonical body.
+            "for ((i=0;i<3;i++)); do echo -n \"B$i \"; done",
+            // Non-canonical update.
+            "for ((i=0;i<3;i++)); do :; done; for ((i=0;i<3;i+=1)); do :; done; echo \"i=$i\"",
+        ] {
+            let tokens = crate::lexer::tokenize(script);
+            let ast = crate::parser::parse(&tokens);
+            let mut executor = Executor::new();
+            executor.execute_ast(&ast).ok();
+            assert_eq!(executor.get_env("i"), Some("3"), "{script:?}");
         }
     }
 }

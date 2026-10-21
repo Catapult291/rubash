@@ -310,7 +310,7 @@ impl Executor {
     fn special_assignment_required(&self, name: &str, require_non_empty: bool) -> bool {
         let is_set = match name {
             "!" => self.shell_state.last_background_pid.is_some(),
-            "@" | "*" => !self.shell_state.positional_params.is_empty(),
+            "@" | "*" => !self.shell_state.positional_window().is_empty(),
             _ => true,
         };
         if require_non_empty {
@@ -414,7 +414,7 @@ impl Executor {
         if let Ok(index) = indirect_name.parse::<usize>() {
             return match self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .get(index.saturating_sub(1))
             {
                 Some(target_name) => Some(self.parameter_operator_value(target_name)),
@@ -1479,7 +1479,13 @@ impl Executor {
                 Some(first) if first.is_ascii_digit() => {
                     index += 1;
                     let digit = first.to_digit(10).unwrap_or(0) as usize;
-                    if digit > 0 && self.shell_state.positional_params.get(digit - 1).is_none() {
+                    if digit > 0
+                        && self
+                            .shell_state
+                            .positional_window()
+                            .get(digit - 1)
+                            .is_none()
+                    {
                         return (Some(format!("${first}")), comsubs);
                     }
                 }
@@ -1595,7 +1601,13 @@ impl Executor {
                 Some(first) if first.is_ascii_digit() => {
                     chars.next();
                     let index = first.to_digit(10).unwrap_or(0) as usize;
-                    if index > 0 && self.shell_state.positional_params.get(index - 1).is_none() {
+                    if index > 0
+                        && self
+                            .shell_state
+                            .positional_window()
+                            .get(index - 1)
+                            .is_none()
+                    {
                         return Some(format!("${first}"));
                     }
                 }
@@ -1886,8 +1898,13 @@ impl Executor {
                 // GNU err_unboundvar(name) carries the bare reference
                 // (`1`, not `1#pat`).
                 let reference = &core[..parameter_reference_len(core)];
-                return (index > 0 && self.shell_state.positional_params.get(index - 1).is_none())
-                    .then(|| reference.to_string());
+                return (index > 0
+                    && self
+                        .shell_state
+                        .positional_window()
+                        .get(index - 1)
+                        .is_none())
+                .then(|| reference.to_string());
             }
             if is_shell_name(base) {
                 // GNU subst.c:9807: the parameter reference ends at the
@@ -1944,8 +1961,13 @@ impl Executor {
         }
 
         if let Ok(index) = name.parse::<usize>() {
-            return (index > 0 && self.shell_state.positional_params.get(index - 1).is_none())
-                .then(|| name.to_string());
+            return (index > 0
+                && self
+                    .shell_state
+                    .positional_window()
+                    .get(index - 1)
+                    .is_none())
+            .then(|| name.to_string());
         }
 
         if is_shell_name(name) {
@@ -2203,14 +2225,14 @@ impl Executor {
 
     pub(in crate::executor) fn parameter_error_value(&self, name: &str) -> Option<String> {
         match name {
-            "#" => Some(self.shell_state.positional_params.len().to_string()),
+            "#" => Some(self.shell_state.positional_window().len().to_string()),
             // GNU chk_atstar (subst.c): `$@`/`$*` are UNSET with zero
             // positional parameters, so `-` substitutes the default word
             // (more-exp.tests `${*-x}` with no args prints x) instead of
             // keeping a null value.
-            "@" | "*" if self.shell_state.positional_params.is_empty() => None,
+            "@" | "*" if self.shell_state.positional_window().is_empty() => None,
             // GNU string_list_dollar_star: `*` joins with IFS[0]; `@` space.
-            "@" => Some(self.shell_state.positional_params.join(" ")),
+            "@" => Some(self.shell_state.positional_window().join(" ")),
             "*" => Some(self.positional_params_star_joined()),
             "?" => Some(self.dollar_question_status().to_string()),
             "$" => Some(self.shell_pid_value().to_string()),
@@ -2228,7 +2250,7 @@ impl Executor {
                 if let Ok(index) = name.parse::<usize>() {
                     return self
                         .shell_state
-                        .positional_params
+                        .positional_window()
                         .get(index.saturating_sub(1))
                         .cloned();
                 }

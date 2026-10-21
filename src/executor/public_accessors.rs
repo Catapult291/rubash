@@ -1,11 +1,12 @@
 use super::*;
+use crate::shell::var_table::VarTable;
 
 /// Stamp a line-number env key without allocating when the value is
 /// unchanged. Byte-identical inserts are idempotent, so the equality gate
 /// is behavior-neutral; it exists because a loop body re-stamps the same
 /// line once per command (GNU's line_number is a C int — execute_cmd.c
 /// SET_LINE_NUMBER — and costs nothing to re-assign).
-fn stamp_env_usize(env_vars: &mut HashMap<String, String>, key: &str, line: usize) -> bool {
+fn stamp_env_usize(env_vars: &mut VarTable, key: &str, line: usize) -> bool {
     let mut buffer = [0u8; 20];
     let mut value = line;
     let mut position = buffer.len();
@@ -895,6 +896,17 @@ impl Executor {
         true
     }
 
+    /// Mark this executor as a login shell (GNU `LOGIN_SHELL`): records
+    /// the `__RUBASH_LOGIN_SHELL` carrier the startup/profile/logout
+    /// paths read, and reports the `login_shell` shopt as on (`shopt -q
+    /// login_shell`). Every login marking (flag, argv[0] `-` mark, lib
+    /// API) funnels through here so the shopt can never drift from the
+    /// carrier.
+    pub fn mark_login_shell(&mut self) {
+        self.set_env("__RUBASH_LOGIN_SHELL", "1");
+        self.set_shopt_option("login_shell", true);
+    }
+
     pub(in crate::executor) fn restore_shell_env(
         &mut self,
         saved_env: crate::shell::var_table::VarTable,
@@ -967,11 +979,50 @@ impl Executor {
     }
 
     pub fn env_vars_snapshot(&self) -> HashMap<String, String> {
-        self.shell_state.env_vars.values_map().clone()
+        // Materialize marker strings so snapshots keep the historical
+        // shape (child-env bootstrapping reads them); the live table
+        // itself stays write-behind (#916).
+        let mut snapshot = self.shell_state.env_vars.values_map().clone();
+        for key in crate::shell::var_table::ATTR_KEYS {
+            match self.shell_state.env_vars.rendered_attr_list(key) {
+                Some(rendered) => {
+                    snapshot.insert(key.to_string(), rendered);
+                }
+                None => {
+                    snapshot.remove(key);
+                }
+            }
+        }
+        snapshot
     }
 
     pub fn env_vars(&self) -> &HashMap<String, String> {
         self.shell_state.env_vars.values_map()
+    }
+
+    /// Test/diagnostic visibility into the typed indexed-array dirty flag
+    /// (`VarTable::array_cells_dirty`): true after an unsynced mirror write
+    /// (arithmetic element stores) until the executor re-syncs the
+    /// structured cell. Integration tests (`tests/executor_tests.rs`)
+    /// cannot reach the `pub(crate)` shell state, so this accessor exposes
+    /// the bit.
+    pub fn array_cells_dirty(&self) -> bool {
+        self.shell_state.env_vars.array_cells_dirty()
+    }
+
+    /// Re-sync one array's structured cell from its mirror and clear the
+    /// dirty flag (same two steps the executor sync points in
+    /// `temporary_assignments.rs` / `compound_exec.rs` perform, scoped to
+    /// `name`). Test/diagnostic support for the dirty-flag unit tests.
+    pub fn sync_array_cells_from_mirror(&mut self, name: &str) {
+        if let Some(storage) = self.shell_state.env_vars.get(name).cloned() {
+            crate::executor::arrays::sync_typed_indexed_storage(
+                &mut self.shell_state.variables,
+                name,
+                &storage,
+            );
+        }
+        self.shell_state.env_vars.clear_array_cells_dirty();
     }
 
     /// GNU execute_cmd.c:5080 — the source builtin holds sourcenest for its
@@ -993,11 +1044,23 @@ impl Executor {
     }
 
     pub(crate) fn positional_params(&self) -> Vec<String> {
-        self.shell_state.positional_params.clone()
+        self.shell_state.positional_window_cloned()
     }
 
     pub fn set_positional_params(&mut self, positional_params: Vec<String>) {
         self.shell_state.positional_params = positional_params;
+        self.shell_state.positional_offset = 0;
+    }
+
+    /// Live `$1..$#` window (offset-aware; see
+    /// `ShellState::positional_window`).
+    pub(crate) fn positional_window(&self) -> &[String] {
+        self.shell_state.positional_window()
+    }
+
+    /// `$#` over the live window.
+    pub(crate) fn positional_len(&self) -> usize {
+        self.shell_state.positional_len()
     }
 
     pub fn inherit_process_stdin(&mut self) {
@@ -1205,7 +1268,26 @@ impl Executor {
         // (`'[[' '-n' '$unset' ']]'`); pipelines record the full
         // `a | b` text. bash_command_source_text is that renderer;
         // bash_command_text only knows simple commands.
-        let command = bash_command_source_text(cmd);
+        // GNU `case` is the exception: execute_cmd.c:3655 prints only the
+        // HEAD (`print_case_command_head` -> `case WORD in `), never the
+        // clause list, so `$BASH_COMMAND` during the case word expansion is
+        // the head. Rendering all N arms per execution here was also the
+        // dominant per-arm cost of a literal-arm `case` loop.
+        //
+        // Literal fast render (same whitelist as the expansion fast
+        // paths): an all-literal command's text is just its words joined
+        // with single spaces — no renderer walk, no per-word String allocs.
+        // Anything else falls through to the full renderer below, so the
+        // stored text is byte-identical either way (the contract test pins
+        // fast == slow on dispatch-verb and quoting shapes).
+        let command = if let Some(case_command) = &cmd.case_command {
+            crate::executor::command_text::case_command_head_source_text(case_command)
+        } else if let Some(literal) = crate::executor::command_text::try_render_literal_command(cmd)
+        {
+            literal
+        } else {
+            bash_command_source_text(cmd)
+        };
         // Same equality gate as the line stamps: GNU keeps
         // the_printed_command in a C global, so recording it is a pointer
         // store; inserting a byte-identical value into both env keys for
@@ -1587,8 +1669,19 @@ impl Drop for Executor {
         }
 
         for (name, value) in &self.process_env_snapshot {
+            // A fork-time snapshot restore is not an assignment mirror, so
+            // the #916 special-name gate in set_process_env must not apply:
+            // a comsub child that unbound an ordinary inherited name
+            // removed the real process-env copy (unset_process_env removes
+            // it now — rubash#917), and the parent's copy must come back
+            // exactly as the snapshot recorded it. TMPDIR keeps its
+            // pre-#916 exclusion (never mirrored, so leave it alone rather
+            // than restoring or removing it).
+            if name == "TMPDIR" {
+                continue;
+            }
             if is_valid_process_env(name, value) {
-                set_process_env(name, value);
+                env::set_var(name, value);
             } else {
                 env::remove_var(name);
             }
