@@ -382,6 +382,17 @@ out=3
         r##"declare -a a=([0]="1" [1]="2" [2]="3" [3]="4")
 "##,
     ),
+    // Write-side subscript fast lane: the word expansion already ran the
+    // subscript's ONE expand_arith_string pass, so a clean decimal cooked
+    // index is the value GNU's array_expand_index (arrayfunc.c:1368) would
+    // feed to evalexp. Before the lane, the raw subscript was re-expanded,
+    // running its arithmetic side effect a SECOND time.
+    (
+        "subscript_arith_side_effect_runs_once",
+        r##"i=0; a=(); a[$((i++))]=x; echo "i=$i:${a[0]}:${#a[@]}""##,
+        r##"i=1:x:1
+"##,
+    ),
 ];
 
 #[test]

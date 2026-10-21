@@ -136,7 +136,9 @@ impl Executor {
         // GNU reports the LHS the way it was WRITTEN -- `h[]`, `A[""]`,
         // `A[$EMPTY]` -- not the whole assignment word and not the expanded
         // index (arrays.c `err_badarraysub`).
-        let lhs_as_written = format!("{name}[{}]", raw_subscript.unwrap_or(index));
+        // Lazy: only the error branches print the LHS as written, so a
+        // successful element write must not pay a `format!` allocation.
+        let lhs_as_written = || format!("{name}[{}]", raw_subscript.unwrap_or(index));
         let value_is_syntactic_compound_list = element_assignment.is_some_and(|assignment| {
             let raw_value = assignment.value.trim();
             raw_value.starts_with('(')
@@ -317,7 +319,7 @@ impl Executor {
                         )
                     )
                 } else {
-                    lhs_as_written
+                    lhs_as_written()
                 };
                 eprintln!("{}{lhs}: bad array subscript", self.diagnostic_prefix());
                 self.exit_code = 1;
@@ -460,7 +462,7 @@ impl Executor {
         // status 0, array25.sub), so only a truly EMPTY subscript is a bad
         // array subscript (`h[]=10`).
         if index.trim().is_empty() && raw_subscript.is_none_or(str::is_empty) {
-            self.report_bad_array_subscript(&lhs_as_written);
+            self.report_bad_array_subscript(&lhs_as_written());
             // Bad-subscript class for the eval boundary (rubash#637).
             self.evalerror_subscript_pending.set(true);
             self.exit_code = 1;
@@ -481,61 +483,80 @@ impl Executor {
         // rebuild the arith-context text from raw so sq/dq/backslash get
         // their GNU treatment; when they differ `index` IS the expansion
         // product and feeds evalexp verbatim.
-        let eval_text;
-        let mut eval_input = match raw_subscript {
-            // A single-quoted span survives GNU's arith-context expansion as
-            // literal text but does NOT protect the `$x` inside it —
-            // `a['$v']` expands to `'2'` and evalexp reports operand
-            // expected. The cooked `index` dropped the sq wrapper at parse
-            // time, so rebuild via the same expand_arithmetic_special_
-            // parameters pass the `${a[...]}` read path uses (sq -> \x17
-            // data, `$x`/`$((...))`/`$(...)` expand, dq removed).
-            Some(raw) if raw.contains('\'') => {
-                eval_text = self.expand_arithmetic_special_parameters(raw);
-                eval_text.as_str()
-            }
-            // Quoting other than sq (dq, backslash) normalizes identically
-            // in the cooked index only when no substitution ran; rebuild the
-            // dq/escape-stripped form from raw so `a[" "]` resolves to 0.
-            Some(raw) if crate::lexer::remove_shell_quotes(raw) == index => {
-                eval_text = super::arithmetic::arith_subscript_text(raw);
-                eval_text.as_str()
-            }
-            // GNU never word-expands the LHS subscript of `name[sub]=v`:
-            // array_expand_index (arrayfunc.c:1356) receives the RAW text
-            // and expand_arith_string is its ONE expansion pass — a `$(...)`
-            // produced by that pass is data to evalexp, never re-scanned
-            // (a[$key] with key=`x],b[$(echo uname >&2)` errors with the
-            // literal token, verified GNU 5.3). Feeding the already-expanded
-            // `index` here ran the produced `$(...)` a second time.
-            Some(raw) => {
-                eval_text = super::arithmetic::arith_subscript_text(raw);
-                eval_text.as_str()
-            }
-            _ => index,
+        // Write-side subscript fast lane (perf: the `a[$i]=$i` fill loop).
+        // The word expansion already ran the subscript's ONE
+        // expand_arith_string pass, so the cooked `index` is its product.
+        // For a clean decimal literal that product IS what GNU
+        // arrayfunc.c:1368 array_expand_index feeds to evalexp, so
+        // re-entering the arithmetic pipeline only (a) runs a `$(...)` /
+        // `$((...))` side effect a SECOND time (verified: rubash runs
+        // `a[$(echo SIDE)]=v`'s command twice, GNU once) and (b) pays a full
+        // evalexp parse per element write. Whitelist admission, real
+        // pipeline as fallback: a single-quoted raw span keeps the full
+        // path (GNU's arith pass leaves `'...'` literal while the cooked
+        // text dropped the wrapper, so `a['7']` must keep erroring), and
+        // every non-decimal cooked index is untouched.
+        let literal_index = match raw_subscript {
+            Some(raw) if raw.contains('\'') => None,
+            _ => super::arithmetic::literal_decimal_subscript(index),
         };
-        // GNU evaluates the subscript arithmetically even when it is all
-        // whitespace — `h[ ]=10` stores h[0]=10 (array25.sub): whitespace
-        // only coerces to 0 AFTER the sq check above kept `' '` literal.
-        if eval_input.trim().is_empty() {
-            eval_input = "0";
-        }
-        // GNU arrayfunc.c:355-360 assign_array_element: ALL_ELEMENT_SUB
-        // rejects both `@` and `*` subscripts on an indexed element
-        // assignment before the arith eval (err_badarraysub prints w —
-        // the whole `name[sub]` word).
-        if matches!(eval_input.trim(), "*" | "@") {
-            self.report_bad_array_subscript(&lhs_as_written);
-            // Bad-subscript class for the eval boundary (rubash#637).
-            self.evalerror_subscript_pending.set(true);
-            self.exit_code = 1;
-            return true;
-        }
-        let computed_index =
+        let computed_index = if let Some(index) = literal_index {
+            index
+        } else {
+            let eval_text;
+            let mut eval_input = match raw_subscript {
+                // A single-quoted span survives GNU's arith-context expansion
+                // as literal text but does NOT protect the `$x` inside it —
+                // `a['$v']` expands to `'2'` and evalexp reports operand
+                // expected. The cooked `index` dropped the sq wrapper at parse
+                // time, so rebuild via the same expand_arithmetic_special_
+                // parameters pass the `${a[...]}` read path uses (sq -> \x17
+                // data, `$x`/`$((...))`/`$(...)` expand, dq removed).
+                Some(raw) if raw.contains('\'') => {
+                    eval_text = self.expand_arithmetic_special_parameters(raw);
+                    eval_text.as_str()
+                }
+                // Quoting other than sq (dq, backslash) normalizes identically
+                // in the cooked index only when no substitution ran; rebuild the
+                // dq/escape-stripped form from raw so `a[" "]` resolves to 0.
+                Some(raw) if crate::lexer::remove_shell_quotes(raw) == index => {
+                    eval_text = super::arithmetic::arith_subscript_text(raw);
+                    eval_text.as_str()
+                }
+                // GNU never word-expands the LHS subscript of `name[sub]=v`:
+                // array_expand_index (arrayfunc.c:1356) receives the RAW text
+                // and expand_arith_string is its ONE expansion pass — a `$(...)`
+                // produced by that pass is data to evalexp, never re-scanned
+                // (a[$key] with key=`x],b[$(echo uname >&2)` errors with the
+                // literal token, verified GNU 5.3). Feeding the already-expanded
+                // `index` here ran the produced `$(...)` a second time.
+                Some(raw) => {
+                    eval_text = super::arithmetic::arith_subscript_text(raw);
+                    eval_text.as_str()
+                }
+                _ => index,
+            };
+            // GNU evaluates the subscript arithmetically even when it is all
+            // whitespace — `h[ ]=10` stores h[0]=10 (array25.sub): whitespace
+            // only coerces to 0 AFTER the sq check above kept `' '` literal.
+            if eval_input.trim().is_empty() {
+                eval_input = "0";
+            }
+            // GNU arrayfunc.c:355-360 assign_array_element: ALL_ELEMENT_SUB
+            // rejects both `@` and `*` subscripts on an indexed element
+            // assignment before the arith eval (err_badarraysub prints w —
+            // the whole `name[sub]` word).
+            if matches!(eval_input.trim(), "*" | "@") {
+                self.report_bad_array_subscript(&lhs_as_written());
+                // Bad-subscript class for the eval boundary (rubash#637).
+                self.evalerror_subscript_pending.set(true);
+                self.exit_code = 1;
+                return true;
+            }
             match self.eval_indexed_subscript(SubscriptSource::Protected(eval_input)) {
                 IndexedSubscript::Index(index) => index,
                 IndexedSubscript::Empty => {
-                    self.report_bad_array_subscript(&lhs_as_written);
+                    self.report_bad_array_subscript(&lhs_as_written());
                     // Bad-subscript class for the eval boundary (rubash#637).
                     self.evalerror_subscript_pending.set(true);
                     self.exit_code = 1;
@@ -555,7 +576,8 @@ impl Executor {
                     self.exit_code = 1;
                     return true;
                 }
-            };
+            }
+        };
         if computed_index < 0
             && resolve_indexed_array_subscript(
                 &self
@@ -571,7 +593,7 @@ impl Executor {
             eprintln!(
                 "{}{}: bad array subscript",
                 self.diagnostic_prefix(),
-                lhs_as_written
+                lhs_as_written()
             );
             // Bad-subscript class for the eval boundary (rubash#637).
             self.evalerror_subscript_pending.set(true);
@@ -590,7 +612,7 @@ impl Executor {
                 eprintln!(
                     "{}{}: bad array subscript",
                     self.diagnostic_prefix(),
-                    lhs_as_written
+                    lhs_as_written()
                 );
                 // Bad-subscript class for the eval boundary (rubash#637).
                 self.evalerror_subscript_pending.set(true);
@@ -613,30 +635,33 @@ impl Executor {
         // re-parsing the mirror render (O(n) per write, O(n^2) to build an
         // n-element array).
         let structured = self.shell_state.variables.indexed_array_shape(name);
-        let current_element = if structured.is_some() {
-            self.shell_state
-                .variables
-                .get(name)
-                .and_then(|variable| match &variable.value {
-                    crate::shell::ShellValue::IndexedArray(values) => {
-                        values.get(&typed_index).cloned()
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default()
-        } else {
-            let current = self
-                .shell_state
-                .env_vars
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
-            indexed_array_entries(&current)
-                .get(&index)
-                .cloned()
-                .unwrap_or_default()
-        };
+        // The old element is only read for `+=`; a plain `=` overwrites and
+        // must not pay the cell lookup (structured) or a full mirror parse
+        // (non-structured) at all.
         let element = if append {
+            let current_element = if structured.is_some() {
+                self.shell_state
+                    .variables
+                    .get(name)
+                    .and_then(|variable| match &variable.value {
+                        crate::shell::ShellValue::IndexedArray(values) => {
+                            values.get(&typed_index).cloned()
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            } else {
+                let current = self
+                    .shell_state
+                    .env_vars
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+                indexed_array_entries(&current)
+                    .get(&index)
+                    .cloned()
+                    .unwrap_or_default()
+            };
             if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
                 (eval_arith_value(&current_element) + eval_arith_value(value)).to_string()
             } else {

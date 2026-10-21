@@ -392,16 +392,49 @@ where
     if need_separator {
         mirror.push(' ');
     }
-    mirror.push_str(&format!(
-        "[{first_index}]={}",
-        quote_array_value(first_element)
-    ));
+    push_indexed_segment(mirror, first_index, first_element);
     for (index, element) in segments {
         mirror.push(' ');
-        mirror.push_str(&format!("[{index}]={}", quote_array_value(element)));
+        push_indexed_segment(mirror, index, element);
     }
     mirror.push(')');
     true
+}
+
+/// Append the decimal spelling of `value` to `out` without allocating (the
+/// element-fill hot path appends one segment per write, so the index digits
+/// must not cost a `to_string`).
+fn push_decimal(out: &mut String, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // Every byte is an ASCII digit, so the slice is valid UTF-8.
+    out.push_str(std::str::from_utf8(&digits[start..]).unwrap_or("0"));
+}
+
+/// Append one `[index]=<quoted>` render segment to `mirror`, byte-identical
+/// to `format!("[{index}]={}", quote_array_value(value))` but without the
+/// two intermediate `String` allocations for the plain (double-quotable)
+/// value form — the shape every numeric fill element takes. Non-plain
+/// values still ride the full quoter.
+fn push_indexed_segment(mirror: &mut String, index: usize, value: &str) {
+    mirror.push('[');
+    push_decimal(mirror, index);
+    mirror.push_str("]=");
+    if quote_array_value_is_plain(value) {
+        mirror.push('"');
+        mirror.push_str(value);
+        mirror.push('"');
+    } else {
+        mirror.push_str(&quote_array_value(value));
+    }
 }
 
 /// Sync (or invalidate) the structured cell from a rendered mirror value.
@@ -1132,5 +1165,41 @@ mod tests {
             clean_negative_literal_subscript("-99999999999999999999"),
             None
         );
+    }
+
+    #[test]
+    fn indexed_mirror_segment_append_matches_full_render() {
+        // The write-path in-place append must stay byte-identical to the
+        // canonical renderer for every value shape: plain double-quotable
+        // values (the numeric fill-loop case) go through the direct push,
+        // and anything the quoter special-cases still rides
+        // `quote_array_value`. This is the `declare -p` correctness bar for
+        // `append_indexed_mirror_segments`.
+        let values = [
+            "0",
+            "7999",
+            "plain value",
+            "",
+            "a\"b",
+            "a$b",
+            "a`b",
+            "a\\b",
+            "a(b",
+            "$'x'",
+            "a b c",
+        ];
+        let mut entries: BTreeMap<usize, String> = BTreeMap::new();
+        let mut table = crate::shell::var_table::VarTable::default();
+        table.insert("m".to_string(), format!("{STORAGE_WORD_PREFIX_STR}()"));
+        for (index, value) in values.iter().enumerate() {
+            entries.insert(index, (*value).to_string());
+            assert!(append_indexed_mirror_segments(
+                &mut table,
+                "m",
+                std::iter::once((index, *value)),
+            ));
+        }
+        let rendered = format_indexed_array_storage(entries);
+        assert_eq!(table.get("m").map(String::as_str), Some(rendered.as_str()));
     }
 }
