@@ -456,80 +456,104 @@ pub(in crate::executor) fn format_assoc_storage(entries: Vec<(String, String)>) 
     rendered
 }
 
-/// One `[k]=v` storage segment, quoted exactly as `format_assoc_storage`
-/// renders it, so a string built by appending segments is byte-identical to
-/// one built by a full render whenever no key repeats.
-pub(in crate::executor) fn assoc_element_segment(key: &str, value: &str) -> String {
-    format!(
-        "[{}]={}",
-        quote_assoc_key(key),
-        quote_assoc_storage_value(value)
-    )
+/// Whether `key` may be written bare in the storage form. The storage form is
+/// re-parsed by `split_storage_words` on every read: a bare ``` or `$` in the
+/// key opens a substitution span in that tokenizer and glues the following
+/// pairs into this pair's value (assoc9.sub dict['`']=2 then dict["'"]=3), so
+/// they must force quoting alongside whitespace, quotes, backslash and `]`.
+fn assoc_key_is_plain(key: &str) -> bool {
+    !key.is_empty()
+        && !key
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | ']' | '`' | '$'))
 }
 
-/// Append one segment to a `(...)` storage string in O(segment) time: only the
-/// closing `)` shifts, so the whole array is never re-rendered (rubash#618).
+/// Value analogue of [`assoc_key_is_plain`]: a value may carry `]` unquoted.
+fn assoc_value_is_plain(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | '`' | '$'))
+}
+
+/// Push `value` in the forced double-quoted storage form. Inside "..." the
+/// storage tokenizer still honors `$` and ``` as substitution openers (they
+/// are not gated on in_double), so they are backslash-escaped like `\"` and
+/// `\\\\`; `unquote_storage_value`'s double-quote branch decodes all four.
+fn push_assoc_storage_value_forced(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        if matches!(ch, '"' | '\\' | '`' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+}
+
+fn push_assoc_key(out: &mut String, key: &str) {
+    if assoc_key_is_plain(key) {
+        out.push_str(key);
+    } else {
+        push_assoc_storage_value_forced(out, key);
+    }
+}
+
+fn push_assoc_storage_value(out: &mut String, value: &str) {
+    if assoc_value_is_plain(value) {
+        out.push_str(value);
+    } else {
+        push_assoc_storage_value_forced(out, value);
+    }
+}
+
+/// Append one `[key]=value` segment to a `(...)` storage string in O(segment)
+/// time, writing the quoted bytes straight into the buffer: only the closing
+/// `)` shifts, so the whole array is never re-rendered (rubash#618). The bytes
+/// are quoted exactly as `format_assoc_storage` renders them, so an append-built
+/// string is byte-identical to a full render whenever no key repeats.
 ///
 /// Returns `false` when the storage is not in the appendable `(...)` shape, so
 /// the caller falls back to a canonical render instead of corrupting a value
 /// that is not an assoc cell yet.
-pub(in crate::executor) fn assoc_storage_append(storage: &mut String, segment: &str) -> bool {
+pub(in crate::executor) fn assoc_storage_append_element(
+    storage: &mut String,
+    key: &str,
+    value: &str,
+) -> bool {
     if storage.len() < 2 || !storage.starts_with('(') || !storage.ends_with(')') {
         return false;
     }
-    let at = storage.len() - 1;
-    // `()` has no entries to separate from; anything longer already carries a
-    // first segment that the new one must be space-delimited from.
-    if at > 1 {
-        storage.insert_str(at, &format!(" {segment}"));
-    } else {
-        storage.insert_str(at, segment);
+    storage.pop(); // drop the closing ')'
+                   // `()` has no entries to separate from; anything longer already carries a
+                   // first segment that the new one must be space-delimited from.
+    if storage.len() > 1 {
+        storage.push(' ');
     }
+    storage.push('[');
+    push_assoc_key(storage, key);
+    storage.push(']');
+    storage.push('=');
+    push_assoc_storage_value(storage, value);
+    storage.push(')');
     true
 }
 
 pub(in crate::executor) fn quote_assoc_key(key: &str) -> String {
-    // The storage form is re-parsed by split_storage_words on every read:
-    // a bare ``` or `$` in the key opens a substitution span in that
-    // tokenizer and glues the following pairs into this pair's value
-    // (assoc9.sub dict['`']=2 then dict["'"]=3), so they must
-    // force quoting alongside whitespace, quotes, backslash and `]`.
-    if !key.is_empty()
-        && !key
-            .chars()
-            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | ']' | '`' | '$'))
-    {
+    if assoc_key_is_plain(key) {
         return key.to_string();
     }
-
-    quote_assoc_storage_value_forced(key)
+    let mut quoted = String::new();
+    push_assoc_storage_value_forced(&mut quoted, key);
+    quoted
 }
 
 pub(in crate::executor) fn quote_assoc_storage_value(value: &str) -> String {
-    if !value.is_empty()
-        && !value
-            .chars()
-            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '\'' | '"' | '\\' | '`' | '$'))
-    {
+    if assoc_value_is_plain(value) {
         return value.to_string();
     }
-
-    quote_assoc_storage_value_forced(value)
-}
-
-fn quote_assoc_storage_value_forced(value: &str) -> String {
-    // Inside "..." the storage tokenizer still honors `$` and ``` as
-    // substitution openers (they are not gated on in_double), so they
-    // are backslash-escaped like `\"` and `\\\\`; unquote_storage_value's
-    // double-quote branch decodes all four.
-    let mut quoted = String::from("\"");
-    for ch in value.chars() {
-        if matches!(ch, '"' | '\\' | '`' | '$') {
-            quoted.push('\\');
-        }
-        quoted.push(ch);
-    }
-    quoted.push('"');
+    let mut quoted = String::new();
+    push_assoc_storage_value_forced(&mut quoted, value);
     quoted
 }
 
@@ -1431,4 +1455,62 @@ pub(in crate::executor) fn unquote_storage_value(value: &str) -> String {
 
 pub(in crate::executor) fn quote_compound_field_value(value: &str) -> String {
     quote_array_value(value)
+}
+
+#[cfg(test)]
+mod assoc_storage_tests {
+    use super::*;
+
+    /// The append fast lane (rubash#618) must stay byte-identical to a full
+    /// `format_assoc_storage` render: readers re-parse the mirror string, so a
+    /// divergence would be a silent value/key mismatch. Pin the contract over
+    /// the quoting classes the quoters distinguish (plain, whitespace, quote,
+    /// backslash, `]`, `` ` ``, `$`, empty).
+    #[test]
+    fn append_element_matches_full_render() {
+        let keys = [
+            "k0", "a b", "a'b", "a\"b", "a\\b", "a]b", "a`b", "a$b", "", "a=b",
+        ];
+        let values = ["v0", "x y", "x'y", "x\"y", "x\\y", "x]y", "x`y", "x$y", ""];
+        for key in keys {
+            for value in values {
+                let mut appended = String::from("([first]=1)");
+                assert!(assoc_storage_append_element(&mut appended, key, value));
+                let mut entries = vec![("first".to_string(), "1".to_string())];
+                entries.push((key.to_string(), value.to_string()));
+                assert_eq!(
+                    appended,
+                    format_assoc_storage(entries),
+                    "append vs render for key={key:?} value={value:?}"
+                );
+            }
+        }
+        // Empty cell: `()` grows to a single segment with no leading space.
+        let mut empty = String::from("()");
+        assert!(assoc_storage_append_element(&mut empty, "k", "v"));
+        assert_eq!(empty, "([k]=v)");
+        // Non-cell shapes are refused so the caller falls back to the render.
+        let mut scalar = String::from("plain");
+        assert!(!assoc_storage_append_element(&mut scalar, "k", "v"));
+        assert_eq!(scalar, "plain");
+    }
+
+    /// The appended mirror must parse back to the exact (key, value) pair —
+    /// quoting that the parse step would fold differently would corrupt the
+    /// key set the typed cell syncs from.
+    #[test]
+    fn append_element_round_trips_through_parse() {
+        for (key, value) in [
+            ("k$i", "v0"),
+            ("a b", "x y"),
+            ("a]b", "x]y"),
+            ("a`b", "x$y"),
+            ("", ""),
+        ] {
+            let mut storage = String::from("()");
+            assert!(assoc_storage_append_element(&mut storage, key, value));
+            let parsed = assoc_entries(&storage);
+            assert_eq!(parsed, vec![(key.to_string(), value.to_string())]);
+        }
+    }
 }
