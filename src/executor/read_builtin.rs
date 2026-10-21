@@ -2480,11 +2480,24 @@ impl Executor {
         // duration (make_cmd.c:704-718 → redir.c:1159-1166 close), so
         // `read -u 5 x <&5-` sees fd 5 invalid exactly like GNU's
         // read.def:377-381 sh_validfd check (verified vs WSL GNU 5.3.0).
+        // The close lives inside the `redir_fd != redirector` guard
+        // (redir.c:1128): `read x <&0-` is a complete no-op and leaves the
+        // descriptor open (rubash#938).
         if let Some(redirect) = cmd.redirect_in.as_ref() {
             let target = self.expand_redirect_target(redirect);
-            if redirect_target_fd_and_move(&target) == Some((fd, true)) {
+            if redirect_target_fd_and_move(&target) == Some((fd, true))
+                && redirect.fd.unwrap_or(0) != fd
+            {
                 return false;
             }
+        }
+        // fd 0 is a descriptor whenever the table recorded no explicit
+        // close — the same F_GETFD rule sh_validfd applies (and the same
+        // stdio-always-open rule validate_builtin_dup_source uses). A
+        // pipeline stage's fd 0 can carry no fd-table endpoint yet still
+        // be a perfectly valid read target on the transports below.
+        if fd == 0 {
+            return !self.fd_table.is_closed(0);
         }
         if self.fd_table.is_open_for_read(fd) {
             return true;
@@ -2503,7 +2516,9 @@ impl Executor {
     }
 
     fn read_timeout_zero_status(&mut self, cmd: &CommandNode, read_fd: Option<u32>) -> i32 {
-        if let Some(fd) = read_fd {
+        // `-u 0` polls fd 0 — the same descriptor the no-`-u` arm below
+        // polls (read.def:539-562 select() on the one descriptor).
+        if let Some(fd) = read_fd.filter(|fd| *fd != 0) {
             if matches!(
                 self.fd_table.read_endpoint(fd),
                 Some(FdReadEndpoint::InheritedProcessStdin)
