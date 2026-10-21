@@ -1,12 +1,32 @@
-use super::pattern::{extglob_match_literal, extglob_match_literal_nocase};
+use super::pattern::{
+    extglob_match_literal, extglob_match_literal_nocase, flatten_pattern_to_byte_chars,
+    flatten_word_to_byte_chars, sides_need_byte_char_matching,
+    sides_need_byte_char_matching_staged,
+};
 
 pub(crate) fn extglob_case_pattern_matches(pattern: &str, word: &str) -> bool {
+    // Byte-spelling gate first (same invariant as case_pattern_matches): a
+    // comsub payload sentinel or raw-byte marker pair must normalize to the
+    // byte-char before matching, or the staged raw chars verdict the
+    // transport spelling (`shopt -s extglob; [[ $v == a$(printf '\001')c ]]`
+    // and `+(a$(printf '\001')c)` alike — rubash#729).
+    if sides_need_byte_char_matching(pattern, word) {
+        let pattern = flatten_pattern_to_byte_chars(pattern);
+        let word = flatten_word_to_byte_chars(word);
+        return extglob_matches_at_with_case(&pattern, 0, &word, 0, false);
+    }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
     extglob_matches_at(&pattern, 0, &word, 0)
 }
 
 pub(in crate::executor) fn extglob_case_pattern_matches_nocase(pattern: &str, word: &str) -> bool {
+    // Byte-spelling gate first (see extglob_case_pattern_matches).
+    if sides_need_byte_char_matching(pattern, word) {
+        let pattern = flatten_pattern_to_byte_chars(pattern);
+        let word = flatten_word_to_byte_chars(word);
+        return extglob_matches_at_with_case(&pattern, 0, &word, 0, true);
+    }
     let pattern: Vec<char> = pattern.chars().collect();
     let word: Vec<char> = word.chars().collect();
     extglob_matches_at_with_case(&pattern, 0, &word, 0, true)
@@ -20,6 +40,14 @@ pub(crate) fn extglob_case_pattern_matches_with_word_chars(
     pattern: &str,
     word_chars: &[char],
 ) -> bool {
+    // Byte-spelling gate first: the staged chars cannot decode marker
+    // spellings, so re-materialize the word text only when the gate fires.
+    if sides_need_byte_char_matching_staged(pattern, word_chars) {
+        let word: String = word_chars.iter().collect();
+        let pattern = flatten_pattern_to_byte_chars(pattern);
+        let word = flatten_word_to_byte_chars(&word);
+        return extglob_matches_at_with_case(&pattern, 0, &word, 0, false);
+    }
     let pattern_chars: Vec<char> = pattern.chars().collect();
     extglob_matches_at(&pattern_chars, 0, word_chars, 0)
 }
@@ -29,6 +57,13 @@ pub(in crate::executor) fn extglob_case_pattern_matches_nocase_with_word_chars(
     pattern: &str,
     word_chars: &[char],
 ) -> bool {
+    // Byte-spelling gate first (see the non-nocase twin above).
+    if sides_need_byte_char_matching_staged(pattern, word_chars) {
+        let word: String = word_chars.iter().collect();
+        let pattern = flatten_pattern_to_byte_chars(pattern);
+        let word = flatten_word_to_byte_chars(&word);
+        return extglob_matches_at_with_case(&pattern, 0, &word, 0, true);
+    }
     let pattern_chars: Vec<char> = pattern.chars().collect();
     extglob_matches_at_with_case(&pattern_chars, 0, word_chars, 0, true)
 }

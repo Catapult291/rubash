@@ -215,3 +215,34 @@ fn unquoted_comsub_byte_in_conditional_pattern() {
         "1\n"
     );
 }
+
+/// PR #821 rework round 3: the same payload SANDWICHED between literals
+/// (`a$(printf '\001')c`) carries no glob syntax, so the `[[ == ]]`
+/// dispatch's literal-equality arm verdicted the raw `U+E319<hex>;`
+/// spelling against the word's literal byte without ever reaching the
+/// byte-spelling gate. GNU (execute_cmd.c:4043 patmatch -> xstrmatch on
+/// unsigned char buffers) verdicts byte strings: every widened registered
+/// C0 byte below matches.
+#[test]
+fn unquoted_comsub_byte_sandwiched_in_conditional_pattern() {
+    for byte in ["001", "002", "005"] {
+        let script =
+            format!("v=$(printf \"a\\\\{byte}c\"); [[ $v == a$(printf '\\{byte}')c ]]; echo $?");
+        assert_eq!(rubash_stdout(&script), "0\n", "byte {byte}");
+    }
+    // The sandwich gate must not claim a genuinely different byte.
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; [[ $v == a$(printf '\\002')c ]]; echo $?"),
+        "1\n"
+    );
+    // Star-flanked and case-arm spellings of the sandwich already worked;
+    // pin them so the equality fix stays symmetric.
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; [[ $v == a$(printf '\\001')c* ]]; echo $?"),
+        "0\n"
+    );
+    assert_eq!(
+        rubash_stdout("v=$'a\\x01c'; case $v in a$(printf '\\001')c) echo m;; *) echo n;; esac"),
+        "m\n"
+    );
+}

@@ -1,5 +1,7 @@
 use super::super::pattern_contains_glob;
-use super::pattern::{case_pattern_matches, case_pattern_matches_nocase};
+use super::pattern::{
+    case_pattern_matches, case_pattern_matches_nocase, sides_need_byte_char_matching,
+};
 
 pub(in crate::executor) fn is_conditional_file_unary(op: &str) -> bool {
     matches!(
@@ -227,7 +229,18 @@ pub(in crate::executor) fn conditional_pattern_or_string_matches(
     right: &str,
     nocase: bool,
 ) -> bool {
-    if pattern_contains_glob(right) {
+    // The byte-spelling gate also guards the no-glob literal compare
+    // (rubash#729): a comsub payload sandwiched between literals
+    // (`[[ $v == a$(printf '\001')c ]]`) carries no glob syntax, so a
+    // pattern-only check would hand the `U+E319<hex>;` protocol spelling
+    // to plain equality against the word's literal-byte spelling and
+    // never reach normalization. GNU verdicts both operands as byte
+    // strings (execute_cmd.c:4043 patmatch -> cond_expand_word ->
+    // shmatch.c xstrmatch -> sm_loop.c internal_strmatch on unsigned
+    // char buffers); on a glob-free pattern case_pattern_matches
+    // degenerates to the same literal compare with both spellings
+    // normalized first.
+    if pattern_contains_glob(right) || sides_need_byte_char_matching(right, left) {
         if nocase {
             case_pattern_matches_nocase(right, left)
         } else {

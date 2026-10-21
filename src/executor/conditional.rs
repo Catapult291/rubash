@@ -712,11 +712,16 @@ impl Executor {
     }
 
     pub(super) fn conditional_regex_match(&mut self, left: &str, right: &str) -> bool {
+        // Both operands are byte strings in GNU (sh_regmatch regexec's the
+        // expanded text); decode the comsub payload spelling on the subject
+        // side too, symmetric with the pattern decode inside
+        // compile_conditional_regex.
+        let left = crate::executor::execution_misc::decode_command_substitution_payload(left);
         let right = restore_numeric_decimal_regex_escapes(right);
         let Ok(regex) = self.compile_conditional_regex(&right) else {
             return false;
         };
-        let Some(captures) = regex.captures(left) else {
+        let Some(captures) = regex.captures(&left) else {
             self.clear_bash_rematch();
             return false;
         };
@@ -758,7 +763,7 @@ impl Executor {
         let left_exp = self.expand_conditional_word(left);
         let right_exp = self.expand_conditional_word(right);
         let right_f = restore_numeric_decimal_regex_escapes(&right_exp);
-        let left = left_exp;
+        let left = crate::executor::execution_misc::decode_command_substitution_payload(&left_exp);
         let right = right_f;
         // GNU xtrace prints arg2 as cond_expand_word returned it —
         // expanded but not yet glob-quoted (execute_cmd.c:4074).
@@ -795,7 +800,9 @@ impl Executor {
         if crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "compat31") {
             return self.conditional_regex_match_status(left, right);
         }
-        let left = self.expand_conditional_word(left);
+        let left = crate::executor::execution_misc::decode_command_substitution_payload(
+            &self.expand_conditional_word(left),
+        );
         let right = self.quote_aware_regex_rhs(right, metadata);
         let right = restore_numeric_decimal_regex_escapes(&right);
         self.xtrace_conditional_term("=~", &left, Some(&right));
@@ -824,7 +831,14 @@ impl Executor {
     }
 
     fn compile_conditional_regex(&self, pattern: &str) -> Result<regex::Regex, regex::Error> {
-        let pattern = translate_posix_bracket_classes(pattern);
+        // The comsub payload spelling is transport text, not regex syntax:
+        // decode it to the carried byte so `[[ $v =~ a$(printf '\001')c ]]`
+        // compiles the pattern GNU's cond_expand_word produced — the raw
+        // byte 0x01 (execute_cmd.c:4137 sh_regmatch regcomps the expanded
+        // operand). rubash#729 widened the protected byte set, so this
+        // decode boundary is what keeps the sentinel out of regcomp.
+        let pattern = crate::executor::execution_misc::decode_command_substitution_payload(pattern);
+        let pattern = translate_posix_bracket_classes(&pattern);
         // GNU regcomp rejects an unknown `[:name:]` with REG_ECTYPE
         // ("Invalid character class name"); the regex crate parses the
         // span as a nested class instead, so validate names before

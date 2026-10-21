@@ -246,14 +246,34 @@ fn literal_pattern_equality(pattern: &str, word: &str, nocase: bool) -> Option<b
 /// (push_literal_char); normalization never consumes an E400 escape (it
 /// has no E000/E0xx-pair or sentinel-payload shape), so escaped user data
 /// flattens identically on both sides and can never be read as a marker.
-fn sides_need_byte_char_matching(pattern: &str, word: &str) -> bool {
-    fn carries(text: &str) -> bool {
-        text.contains(crate::executor::markers::COMSUB_PAYLOAD_SENTINEL)
-            || text
-                .bytes()
-                .any(|b| b == 0xEE || (b < 0x20 && b != b'\t' && b != b'\n'))
-    }
-    carries(pattern) || carries(word)
+pub(in crate::executor) fn sides_need_byte_char_matching(pattern: &str, word: &str) -> bool {
+    str_carries_byte_spelling(pattern) || str_carries_byte_spelling(word)
+}
+
+/// Staged-word twin of [`sides_need_byte_char_matching`] for the
+/// `*_with_word_chars` matcher entries, which hold the word as `&[char]`.
+pub(in crate::executor) fn sides_need_byte_char_matching_staged(
+    pattern: &str,
+    word: &[char],
+) -> bool {
+    str_carries_byte_spelling(pattern) || chars_carry_byte_spelling(word)
+}
+
+fn str_carries_byte_spelling(text: &str) -> bool {
+    text.contains(crate::executor::markers::COMSUB_PAYLOAD_SENTINEL)
+        || text
+            .bytes()
+            .any(|b| b == 0xEE || (b < 0x20 && b != b'\t' && b != b'\n'))
+}
+
+/// The `carries` probe for a char slice: a `0xEE` UTF-8 lead byte names
+/// exactly U+E000..=U+EFFF, so the codepoint range is the same question.
+fn chars_carry_byte_spelling(chars: &[char]) -> bool {
+    chars.iter().any(|&c| {
+        c == crate::executor::markers::COMSUB_PAYLOAD_SENTINEL
+            || (0xE000..=0xEFFF).contains(&(c as u32))
+            || ((c as u32) < 0x20 && !matches!(c, '\t' | '\n'))
+    })
 }
 
 /// U+E100+byte byte-char → the byte it carries, or None for any other char.
@@ -277,7 +297,7 @@ pub(crate) use crate::executor::markers::BYTE_CHAR_BASE;
 /// byte-char; all other chars stay verbatim. A CTLESC-quoted raw-byte
 /// marker pair (`CTLESC E000 [CTLESC] E0xx`, the quoted-span spelling of
 /// the pair) resolves to the single byte-char the pair carries.
-fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
+pub(in crate::executor) fn flatten_pattern_to_byte_chars(pattern: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
@@ -425,7 +445,7 @@ fn decode_payload_sentinels_to_pairs(text: &str) -> String {
 /// become byte-chars; Unicode chars become their UTF-8 byte-chars. A
 /// CTLESC-quoted pair (the quoted-span spelling of a carried byte) resolves
 /// to its byte-char, symmetric with the pattern side.
-fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
+pub(in crate::executor) fn flatten_word_to_byte_chars(word: &str) -> Vec<char> {
     use crate::executor::substitution_metadata::{
         RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST, RAW_BYTE_MARKER_LAST,
     };
