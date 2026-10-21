@@ -881,34 +881,15 @@ impl Executor {
     /// and execute_cmd.c:4468 runs the stored SIMPLE_COM as-is — so the
     /// output equals the input plus the pipeline's standard post-conditions
     /// (cleared kind vectors, metadata per the shared predicate).
-    /// Returns the expanded node or `None` to run the real path. The only
-    /// name-based exclusions are words whose expansion can itself fail
-    /// (`[`, `[[` report bad-substitution shapes) and dispatch verbs whose
-    /// expansion-phase side effects are out of scope for a loop fast path;
-    /// everything else is structural, so the roster cannot silently rot.
-    /// A contract test pins fast output == pipeline output per word.
-    pub(in crate::executor) fn try_expand_literal_command(
-        cmd: &CommandNode,
-    ) -> Option<CommandNode> {
-        let [word] = cmd.words.as_slice() else {
-            return None;
-        };
-        if word.is_empty()
-            || !word.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || matches!(
-                        b,
-                        b'_' | b'.' | b',' | b':' | b'@' | b'%' | b'+' | b'-' | b'/'
-                    )
-            })
-        {
-            return None;
-        }
-        match word.as_str() {
-            "[" | "[[" | "command" | "builtin" | "exec" | "eval" | "source" | "." => return None,
-            _ => {}
-        }
-        if !cmd.assignments.is_empty()
+    /// Shared structural gate for the literal fast paths: `true` when the
+    /// command carries anything the word-expansion pipeline could act on
+    /// (assignments, redirections, substitutions, globs, quotes, compound
+    /// forms, heredocs). Both `try_expand_literal_command` (single word)
+    /// and the multi-word literal path use this one predicate so the two
+    /// admissions can never diverge on structure — a second copy would be
+    /// a silent-divergence risk every time the CommandNode grows a field.
+    fn command_has_expandable_structure(cmd: &CommandNode) -> bool {
+        !cmd.assignments.is_empty()
             || !cmd.assignment_raws.is_empty()
             || !cmd.compound_assignments.is_empty()
             || !cmd.array_element_assignments.is_empty()
@@ -933,7 +914,106 @@ impl Executor {
             || !cmd.heredoc_redirects.is_empty()
             || cmd.here_string.is_some()
             || cmd.here_string_carrier.is_some()
+    }
+
+    /// Multi-word extension of [`Self::try_expand_literal_command`]: every
+    /// word fast-literal with `raw == word`, no expandable structure, and
+    /// no ARRAYREF marks. GNU subst.c:11229 `expand_word_internal` walks
+    /// each such word pushing every character unchanged (same argument as
+    /// the single-word path, applied per word), and the post-expansion
+    /// stages are identity on the result: the `[`/`[[` test branch only
+    /// materializes each word (a no-op without marker bytes), the general
+    /// branch's glob finds no metacharacters (`NoMatch` renders the same
+    /// text), and `take_arrayref_flag` finds no flag prefix (admission
+    /// requires all marks clear). The constructed node mirrors the
+    /// single-word path field-for-field. No first-word denylist: the
+    /// single-word exclusions cover words whose expansion can itself fail
+    /// or dispatch verbs with expansion-phase side effects, but a word
+    /// that is byte-identical to its raw text and carries no syntax from
+    /// the shared whitelist cannot fail or side-effect — the contract test
+    /// pins fast == pipeline output for the dispatch-verb shapes
+    /// (`[`, `[[`, `command`, `declare`, `export`, `unset`, `eval`, ...).
+    pub(in crate::executor) fn try_expand_literal_words_command(
+        &self,
+        cmd: &CommandNode,
+    ) -> Option<CommandNode> {
+        if cmd.words.len() < 2 {
+            return None;
+        }
+        for (index, word) in cmd.words.iter().enumerate() {
+            if !crate::executor::assignment_helpers::is_expand_fast_literal_word(word) {
+                return None;
+            }
+            let raw_matches = cmd
+                .word_metadata
+                .get(index)
+                .is_some_and(|metadata| metadata.raw == *word);
+            if !raw_matches {
+                return None;
+            }
+        }
+        if Self::command_has_expandable_structure(cmd) {
+            return None;
+        }
+        // No ARRAYREF marks possible, by the whitelist's own shape (no
+        // call needed): `arrayref_operand_marks` can only set a mark via
+        // `valid_array_reference` on an operand, which requires a `[`
+        // bracket plus an identifier base — but the only admitted words
+        // carrying brackets are exactly `[` and `]` (longer bracket words
+        // keep the slow path), and neither is a valid reference (`[`
+        // has no base, `]` has no bracket). Likewise the leading
+        // assignment-word skip needs `split_assignment_word` to hit, and
+        // no admitted word splits (longer `=` words are excluded; bare
+        // `=` has an empty name). `array_element_assignments` is empty by
+        // the structural check above. The debug build re-runs the real
+        // function as a tripwire: if the whitelist ever widens to admit a
+        // reference-shaped word, this fires in tests instead of shipping
+        // a silent divergence (rubash#117).
+        debug_assert!(
+            self.arrayref_operand_marks(cmd)
+                .iter()
+                .all(|marked| !*marked),
+            "literal words must never carry ARRAYREF marks: {:?}",
+            cmd.words
+        );
+        // Same minimal construction as the single-word path (see it for
+        // the per-field rationale): clone the words, keep metadata exactly
+        // per the shared predicate, carry the routing fields.
+        let mut expanded = CommandNode::new();
+        expanded.words = cmd.words.clone();
+        if Self::preserves_word_metadata(cmd) {
+            expanded.word_metadata = cmd.word_metadata.clone();
+        }
+        expanded.line = cmd.line;
+        expanded.logical_line = cmd.logical_line;
+        expanded.pipe = cmd.pipe;
+        expanded.background = cmd.background;
+        expanded.and_or = cmd.and_or;
+        expanded.inverted = cmd.inverted;
+        Some(expanded)
+    }
+    pub(in crate::executor) fn try_expand_literal_command(
+        cmd: &CommandNode,
+    ) -> Option<CommandNode> {
+        let [word] = cmd.words.as_slice() else {
+            return None;
+        };
+        if word.is_empty()
+            || !word.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'_' | b'.' | b',' | b':' | b'@' | b'%' | b'+' | b'-' | b'/'
+                    )
+            })
         {
+            return None;
+        }
+        match word.as_str() {
+            "[" | "[[" | "command" | "builtin" | "exec" | "eval" | "source" | "." => return None,
+            _ => {}
+        }
+        if Self::command_has_expandable_structure(cmd) {
             return None;
         }
         // Clone and apply the pipeline's own post-conditions: cleared kind
@@ -1042,6 +1122,17 @@ impl Executor {
         // dispatch) cannot distinguish the result — it is byte-identical
         // to what the pipeline produces for this input shape.
         if let Some(expanded) = Self::try_expand_literal_command(cmd) {
+            return Ok(expanded);
+        }
+        // Multi-word twin of the single-word fast path above (same
+        // whitelist discipline, same constructed shape): an all-literal
+        // command such as `[ 1 -eq 2 ]` runs the per-word pipeline,
+        // per-word materialize, and per-word glob loop for what the
+        // pipeline provably returns unchanged. The admission (every word
+        // fast-literal with raw == word, no expandable structure, no
+        // ARRAYREF marks) is checked up front so the win scales with the
+        // word count instead of costing per word.
+        if let Some(expanded) = self.try_expand_literal_words_command(cmd) {
             return Ok(expanded);
         }
 
@@ -5285,6 +5376,55 @@ mod command_word_materialization_tests {
         }
     }
 
+    /// Proof pin for the ARRAYREF-marks argument in
+    /// `try_expand_literal_words_command`: no word the shared whitelist
+    /// admits can ever satisfy `split_assignment_word` (leading-word skip)
+    /// or `valid_array_reference` (operand marks). Exhaustive over every
+    /// 1- and 2-byte string drawn from the whitelist's own byte set plus
+    /// the bracket/equals bytes, so a future whitelist widening that
+    /// admits a reference-shaped word fails here instead of silently
+    /// breaking the fast path's no-marks premise.
+    #[test]
+    fn literal_words_carry_no_arrayref_marks() {
+        use crate::executor::assignment_helpers::is_expand_fast_literal_word;
+        use crate::executor::assignment_helpers::split_assignment_word;
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+        bytes.extend(b"_.,:@%+-/[]=");
+        let mut check = |word: &str| {
+            if is_expand_fast_literal_word(word) {
+                assert!(
+                    split_assignment_word(word).is_none(),
+                    "{word:?} splits as assignment"
+                );
+                assert!(
+                    !crate::builtins::arrayref::valid_array_reference(word, false, false, false),
+                    "{word:?} is a valid array reference"
+                );
+                assert!(
+                    !crate::builtins::arrayref::valid_array_reference(word, true, false, false),
+                    "{word:?} is a valid array reference (noexpand)"
+                );
+            }
+        };
+        for &b in &bytes {
+            check(std::str::from_utf8(&[b]).unwrap());
+        }
+        for &a in &bytes {
+            for &b in &bytes {
+                check(std::str::from_utf8(&[a, b]).unwrap());
+            }
+        }
+        // Documented singletons and near-miss shapes.
+        for word in [
+            "[", "]", "=", "==", "[a]", "a]", "a=b", "a[", "[", "]]", "a[0]",
+        ] {
+            if is_expand_fast_literal_word(word) {
+                check(word);
+            }
+        }
+    }
+
     fn single_word_node(word: &str) -> Option<crate::parser::CommandNode> {
         let tokens = crate::lexer::tokenize(word);
         let ast = crate::parser::parse(&tokens);
@@ -5292,6 +5432,83 @@ mod command_word_materialization_tests {
             return None;
         }
         ast.commands.into_iter().next()
+    }
+
+    /// Multi-word twin of `test_hot_shape_takes_literal_fast_path`: the
+    /// command-level fast path must admit exactly the all-literal shapes
+    /// and construct the same node the slow pipeline would. Admission is
+    /// pinned per word (raw == word, shared whitelist); construction is
+    /// pinned field-for-field (words clone, metadata only per the shared
+    /// predicate, routing fields carried). Dispatch-verb shapes are
+    /// covered on purpose: a literal `[`, `[[`, `command`, `declare`,
+    /// `export`, `unset`, `eval` widens nothing — the whitelist admits
+    /// only syntax-free words, so the pipeline provably returns them
+    /// unchanged and any future divergence fails here first.
+    #[test]
+    fn multiword_literal_fast_path_admits_and_constructs() {
+        use super::Executor;
+        let mut executor = Executor::new();
+        // (source, expect_admitted)
+        let shapes = [
+            ("[ 1 -eq 2 ]", true),
+            ("[ x = y ]", true),
+            ("[ -n foo ]", true),
+            ("test 1 -eq 2", true),
+            // `[[`/`]]` are not in the shared whitelist (longer bracket
+            // words keep the slow path by design) — `[[ ... ]]` stays slow.
+            ("[[ -n foo ]]", false),
+            ("true 1 2 3", true),
+            ("command true", true),
+            ("declare -a foo", true),
+            ("export foo", true),
+            ("unset foo", true),
+            ("eval true", true),
+            ("echo a b c", true),
+            ("[ $x -eq 2 ]", false),
+            ("[ \"a\" = b ]", false),
+            ("echo a > out", false),
+            ("A=1 true", false),
+            ("echo a$b", false),
+            ("unset 'a[1]'", false),
+        ];
+        for (src, admitted) in shapes {
+            let tokens = crate::lexer::tokenize(src);
+            let ast = crate::parser::parse(&tokens);
+            assert_eq!(ast.commands.len(), 1, "{src:?} parses to one command");
+            let cmd = &ast.commands[0];
+            let fast = executor.try_expand_literal_words_command(cmd);
+            assert_eq!(
+                fast.is_some(),
+                admitted,
+                "{src:?} admission changed (words={:?})",
+                cmd.words
+            );
+            if let Some(expanded) = fast {
+                let expected: Vec<String> = src.split_whitespace().map(str::to_string).collect();
+                assert_eq!(
+                    expanded.words, expected,
+                    "{src:?} words changed: {:?}",
+                    expanded.words
+                );
+                let keep_metadata = Executor::preserves_word_metadata(cmd);
+                assert_eq!(
+                    expanded.word_metadata.is_empty(),
+                    !keep_metadata,
+                    "{src:?} metadata handling changed"
+                );
+                assert_eq!(expanded.line, cmd.line, "{src:?} line dropped");
+                // The live pipeline must agree byte-for-byte.
+                let piped = executor.expand_command_words(cmd).expect("pipeline failed");
+                assert_eq!(
+                    piped.words, expanded.words,
+                    "{src:?} fast != pipeline words"
+                );
+                assert_eq!(
+                    piped.word_metadata, expanded.word_metadata,
+                    "{src:?} fast != pipeline metadata"
+                );
+            }
+        }
     }
 
     // rubash#875: the raw-skip helpers return beyond-the-buffer sentinels for
