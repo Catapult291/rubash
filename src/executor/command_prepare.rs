@@ -888,7 +888,7 @@ impl Executor {
     /// and the multi-word literal path use this one predicate so the two
     /// admissions can never diverge on structure — a second copy would be
     /// a silent-divergence risk every time the CommandNode grows a field.
-    fn command_has_expandable_structure(cmd: &CommandNode) -> bool {
+    pub(in crate::executor) fn command_has_expandable_structure(cmd: &CommandNode) -> bool {
         !cmd.assignments.is_empty()
             || !cmd.assignment_raws.is_empty()
             || !cmd.compound_assignments.is_empty()

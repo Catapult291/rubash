@@ -1273,8 +1273,18 @@ impl Executor {
         // clause list, so `$BASH_COMMAND` during the case word expansion is
         // the head. Rendering all N arms per execution here was also the
         // dominant per-arm cost of a literal-arm `case` loop.
+        //
+        // Literal fast render (same whitelist as the expansion fast
+        // paths): an all-literal command's text is just its words joined
+        // with single spaces — no renderer walk, no per-word String allocs.
+        // Anything else falls through to the full renderer below, so the
+        // stored text is byte-identical either way (the contract test pins
+        // fast == slow on dispatch-verb and quoting shapes).
         let command = if let Some(case_command) = &cmd.case_command {
             crate::executor::command_text::case_command_head_source_text(case_command)
+        } else if let Some(literal) = crate::executor::command_text::try_render_literal_command(cmd)
+        {
+            literal
         } else {
             bash_command_source_text(cmd)
         };
