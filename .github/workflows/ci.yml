@@ -94,6 +94,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # rubash#945: the only lane that compiles #[cfg(all(test, windows))]
+      # code. The ubuntu/macos lib-test jobs cfg it out, and `cargo test
+      # --test regression` below builds the lib WITHOUT cfg(test) — so a
+      # broken windows-only test signature (4aaedfb8 VarTable, cd.rs)
+      # shipped green. Runs the tests too, not just --no-run: these
+      # windows-gated unit tests otherwise never execute in CI.
+      - name: Run Rust library tests
+        run: cargo test --lib
+
       # wt4/ci lane (2026-09-27): byte-pinned regression suite.
       # - tests/regression/golden/*.gnu.{out,err} are GNU Bash 5.3.0
       #   captures (WSL, /usr/local/bin/bash) of the fixture scripts under
