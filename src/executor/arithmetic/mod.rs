@@ -283,7 +283,10 @@ impl Executor {
         // The same $#/$- special-parameter substitutions
         // expand_arithmetic_special_parameters performs.
         let routed = routed
-            .replace("$#", &self.shell_state.positional_params.len().to_string())
+            .replace(
+                "$#",
+                &self.shell_state.positional_window().len().to_string(),
+            )
             .replace("$-", "0");
         let protected = routed
             .replace("\\\"", crate::executor::markers::DATA_DQUOTE_STR)
@@ -1344,7 +1347,10 @@ impl Executor {
         // $- -> 0 (shell flags not meaningful in arithmetic), $# -> param count
         // GNU Bash treats $- as 0 in $(( $- )). See array.tests line 60.
         let expression = expression
-            .replace("$#", &self.shell_state.positional_params.len().to_string())
+            .replace(
+                "$#",
+                &self.shell_state.positional_window().len().to_string(),
+            )
             .replace("$-", "0");
         // GNU subst.c: the text between (( and )) is treated as if in double
         // quotes — single quotes are literal data for expr.c (`(( '1' ))` is

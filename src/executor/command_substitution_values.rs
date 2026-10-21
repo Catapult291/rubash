@@ -142,10 +142,10 @@ impl Executor {
             .unwrap_or(word);
         let word = word.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(word);
         if word == "${@}" {
-            return Some(self.shell_state.positional_params.clone());
+            return Some(self.shell_state.positional_window_cloned());
         }
         if word == "$@" && kind.map_or(true, |kind| *kind == TokenKind::Word) {
-            return Some(self.shell_state.positional_params.clone());
+            return Some(self.shell_state.positional_window_cloned());
         }
         if let Some(name) = whole_word_braced_parameter_body(word) {
             // A quoted indirect reference whose target is @ or * expands with
@@ -278,12 +278,12 @@ impl Executor {
                         }
                     }
                     if indirect == "@" {
-                        return Some(self.shell_state.positional_params.clone());
+                        return Some(self.shell_state.positional_window_cloned());
                     }
                     if indirect == "*" {
                         return Some(vec![self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .join(&self.ifs_first_char_separator())]);
                     }
                     if is_shell_name(indirect) {
@@ -291,12 +291,12 @@ impl Executor {
                             self.shell_state.env_vars.get(indirect).map(String::as_str)
                         {
                             if target == "@" {
-                                return Some(self.shell_state.positional_params.clone());
+                                return Some(self.shell_state.positional_window_cloned());
                             }
                             if target == "*" {
                                 return Some(vec![self
                                     .shell_state
-                                    .positional_params
+                                    .positional_window()
                                     .join(&self.ifs_first_char_separator())]);
                             }
                         }
@@ -336,11 +336,11 @@ impl Executor {
                     };
                     if !word_used {
                         if var_name == "@" {
-                            return Some(self.shell_state.positional_params.clone());
+                            return Some(self.shell_state.positional_window_cloned());
                         }
                         return Some(vec![self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .join(&self.ifs_first_char_separator())]);
                     }
                 }
@@ -357,7 +357,7 @@ impl Executor {
             if let Some((var_name, offset, length)) = self.parse_parameter_substring(name) {
                 if var_name == "@" {
                     return Some(positional_parameter_substring_with_zero(
-                        &self.shell_state.positional_params,
+                        self.shell_state.positional_window(),
                         &self.script_name_value(),
                         offset,
                         length,
@@ -365,7 +365,7 @@ impl Executor {
                 }
                 if var_name == "*" {
                     let values = positional_parameter_substring_with_zero(
-                        &self.shell_state.positional_params,
+                        self.shell_state.positional_window(),
                         &self.script_name_value(),
                         offset,
                         length,
@@ -424,14 +424,14 @@ impl Executor {
             let mut values = vec!["set".to_string(), "--".to_string()];
             values.extend(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .iter()
                     .map(|value| shell_single_quote_assignment_value(value)),
             );
             values
         } else {
             self.shell_state
-                .positional_params
+                .positional_window()
                 .iter()
                 .map(|value| self.apply_parameter_transform_value(value, transform))
                 .collect::<Vec<_>>()
@@ -541,7 +541,7 @@ impl Executor {
         }
         let values = self
             .shell_state
-            .positional_params
+            .positional_window()
             .iter()
             .map(|value| modify(value))
             .collect::<Vec<_>>();
@@ -574,7 +574,7 @@ impl Executor {
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
                     |segment| match segment {
                         QuotedPositionalAtSegment::PositionalAt(_) => {
-                            self.shell_state.positional_params.clone()
+                            self.shell_state.positional_window_cloned()
                         }
                         QuotedPositionalAtSegment::ArrayAt(name, _) => self
                             .array_subscript_range_values(name, 0, None)

@@ -455,7 +455,7 @@ impl Executor {
                 .env_vars
                 .get(FUNCTION_STDIN_OFFSET)
                 .cloned();
-            let old_positional_params = self.shell_state.positional_params.clone();
+            let old_positional_params = self.shell_state.positional_window_cloned();
             self.shell_state
                 .env_vars
                 .insert("__RUBASH_CURRENT_FUNCTION".to_string(), name.to_string());

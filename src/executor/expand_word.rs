@@ -544,14 +544,14 @@ impl Executor {
             "$?" => Some(self.dollar_question_status().to_string()),
             "$$" => Some(self.shell_pid_value().to_string()),
             "$!" => Some(self.last_background_pid_value()),
-            "$@" => Some(self.shell_state.positional_params.join(" ")),
+            "$@" => Some(self.shell_state.positional_window().join(" ")),
             // Bash joins `$*` with the first character of IFS, not a space.
             "$*" => Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .join(&self.ifs_first_char_separator()),
             ),
-            "$#" => Some(self.shell_state.positional_params.len().to_string()),
+            "$#" => Some(self.shell_state.positional_window().len().to_string()),
             "$-" => Some(self.shell_option_flags()),
             _ => tilde_expand::expand_word_prefix(word, &self.shell_state.env_vars),
         }

@@ -426,11 +426,11 @@ impl Executor {
                 }
                 Some('@') | Some('*') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.join(" "));
+                    output.push_str(&self.shell_state.positional_window().join(" "));
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -444,7 +444,7 @@ impl Executor {
                     } else {
                         output.push_str(
                             self.shell_state
-                                .positional_params
+                                .positional_window()
                                 .get(index - 1)
                                 .map(String::as_str)
                                 .unwrap_or(""),

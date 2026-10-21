@@ -1895,7 +1895,7 @@ impl Executor {
         // (quoted `"$@"` is handled by quoted_positional_at_word_values_with_raw).
         if word == "$@" && !raw_word_is_quoted(raw) {
             return field_split_positional_values_with_ifs(
-                self.shell_state.positional_params.clone(),
+                self.shell_state.positional_window_cloned(),
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
             );
         }
@@ -1914,7 +1914,7 @@ impl Executor {
                 .get("IFS")
                 .is_some_and(|ifs| ifs.is_empty())
         {
-            return self.shell_state.positional_params.clone();
+            return self.shell_state.positional_window_cloned();
         }
         if word == "$*"
             && !raw_word_is_quoted(raw)
@@ -1924,7 +1924,7 @@ impl Executor {
                 .get("IFS")
                 .is_some_and(|ifs| ifs.is_empty())
         {
-            return self.shell_state.positional_params.clone();
+            return self.shell_state.positional_window_cloned();
         }
         if !declare_assignment_word {
             // GNU param_expand's UNBRACED `$X` nameref branch (subst.c
@@ -2339,10 +2339,10 @@ impl Executor {
         var_name: &str,
     ) -> Option<(Vec<String>, bool)> {
         if var_name == "@" {
-            return Some((self.shell_state.positional_params.clone(), true));
+            return Some((self.shell_state.positional_window_cloned(), true));
         }
         if var_name == "*" {
-            return Some((self.shell_state.positional_params.clone(), false));
+            return Some((self.shell_state.positional_window_cloned(), false));
         }
         let (base, is_at) = var_name
             .strip_suffix("[@]")
@@ -2542,7 +2542,7 @@ impl Executor {
         // line). A null IFS leaves $@ on the per-parameter path below,
         // which already matches GNU.
         if !outer_double_quoted && matches!(alternate, "$@" | "${@}" | "$*" | "${*}") {
-            if self.shell_state.positional_params.is_empty() {
+            if self.shell_state.positional_window().is_empty() {
                 return Some(Vec::new());
             }
             match self.shell_state.env_vars.get("IFS").map(String::as_str) {
@@ -2552,12 +2552,12 @@ impl Executor {
                         // through expand_string_for_rhs -> W_SPLITSPACE over
                         // escaped elements: one preserved word per positional
                         // (exp9.sub `${var-$*}` with `set -- abc 'def ghi' jkl`).
-                        return Some(self.shell_state.positional_params.clone());
+                        return Some(self.shell_state.positional_window_cloned());
                     }
                 }
                 Some(ifs) => {
                     if alternate == "$@" || alternate == "${@}" {
-                        let joined = self.shell_state.positional_params.join(" ");
+                        let joined = self.shell_state.positional_window().join(" ");
                         return Some(field_split_values_with_ifs(&joined, Some(ifs)));
                     }
                 }
@@ -2573,7 +2573,7 @@ impl Executor {
         // null IFS leaves $@ on the per-parameter path (the re-parse path
         // below), which already matches GNU.
         if !outer_double_quoted
-            && !self.shell_state.positional_params.is_empty()
+            && !self.shell_state.positional_window().is_empty()
             && (alternate.starts_with("${@") || alternate.starts_with("${*"))
             && alternate.ends_with('}')
         {
@@ -2585,11 +2585,19 @@ impl Executor {
                     } else {
                         " ".to_string()
                     };
-                    let joined = self.shell_state.positional_params.join(&separator);
+                    let joined = self.shell_state.positional_window().join(&separator);
+                    // Temporarily collapse the window to the single joined
+                    // word for the recursive expansion, then restore the
+                    // full backing storage AND offset (disjoint field
+                    // borrows so the outstanding `ifs` env borrow stays
+                    // live, as before).
                     let saved = std::mem::take(&mut self.shell_state.positional_params);
+                    let saved_offset =
+                        std::mem::replace(&mut self.shell_state.positional_offset, 0);
                     self.shell_state.positional_params = vec![joined];
                     let values = self.quoted_positional_at_word_values(alternate, None);
                     self.shell_state.positional_params = saved;
+                    self.shell_state.positional_offset = saved_offset;
                     if let Some(values) = values {
                         let result: Vec<String> = values
                             .into_iter()
@@ -2792,12 +2800,12 @@ impl Executor {
         // String-based operator path collapses these to a single joined
         // field, so intercept here and return the per-parameter fields.
         if !word_used && var_name == "@" {
-            return Some(self.shell_state.positional_params.clone());
+            return Some(self.shell_state.positional_window_cloned());
         }
         if !word_used && var_name == "*" {
             return Some(vec![self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .join(&self.ifs_first_char_separator())]);
         }
 
@@ -2863,7 +2871,7 @@ impl Executor {
         if alternate == "$*" || alternate == "${*}" {
             return Some(vec![self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .join(&self.ifs_first_char_separator())]);
         }
 
@@ -3716,7 +3724,7 @@ fn quoted_pure_reference_expands_empty(content: &str, executor: &Executor) -> bo
         }
         return executor
             .shell_state
-            .positional_params
+            .positional_window()
             .get(position - 1)
             .is_none_or(|value| value.is_empty());
     }

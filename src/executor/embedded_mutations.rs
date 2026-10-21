@@ -870,7 +870,7 @@ impl Executor {
                 }
                 Some('@') => {
                     chars.next();
-                    let value = self.shell_state.positional_params.join(" ");
+                    let value = self.shell_state.positional_window().join(" ");
                     let value = protect_rhs_value(&value, protect_rhs_data);
                     if expansion_ws_marked(alternate, preserve_quotes, in_double) {
                         output.push_str(&mark_expansion_whitespace(&value, preserve_quotes));
@@ -891,7 +891,7 @@ impl Executor {
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -1227,7 +1227,7 @@ impl Executor {
                     } else {
                         let value = self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .get(index - 1)
                             .map(String::as_str)
                             .unwrap_or("");
@@ -1859,7 +1859,7 @@ impl Executor {
         // receive the raw source and splice for themselves at their own
         // parse boundary.
         let words = split_shell_words(&self.comsub_body_alias_splice_extracted(source));
-        let saved_positional_params = self.shell_state.positional_params.clone();
+        let saved_positional_params = self.shell_state.positional_window_cloned();
         // GNU subst.c:7143 command_substitute feeds the body to
         // parse_and_execute, so the real parser owns each word's quoting:
         // `"$x"` stays one field, `""` stays one empty argument, and `"*"`

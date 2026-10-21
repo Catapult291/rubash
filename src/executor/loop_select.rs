@@ -28,10 +28,10 @@ impl Executor {
         }
 
         let values = if for_command.default_positional {
-            if self.shell_state.positional_params.is_empty() {
+            if self.shell_state.positional_window().is_empty() {
                 Vec::new()
             } else {
-                self.shell_state.positional_params.clone()
+                self.shell_state.positional_window_cloned()
             }
         } else {
             let mut values = Vec::new();

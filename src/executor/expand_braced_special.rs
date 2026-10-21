@@ -7,10 +7,10 @@ impl Executor {
         unquoted: bool,
     ) -> Option<String> {
         match name {
-            "#" => return Some(self.shell_state.positional_params.len().to_string()),
+            "#" => return Some(self.shell_state.positional_window().len().to_string()),
             // GNU string_list_dollar_star: `*` joins with IFS[0] in scalar
             // contexts; `@` stays space-joined.
-            "@" => return Some(self.shell_state.positional_params.join(" ")),
+            "@" => return Some(self.shell_state.positional_window().join(" ")),
             "*" => return Some(self.positional_params_star_joined()),
             "?" => return Some(self.dollar_question_status().to_string()),
             "$" => return Some(self.shell_pid_value().to_string()),
@@ -23,7 +23,7 @@ impl Executor {
         if let Ok(index) = name.parse::<usize>() {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .get(index.saturating_sub(1))
                     .cloned()
                     .unwrap_or_default(),
@@ -148,7 +148,7 @@ impl Executor {
         if indirect_name == "#" {
             return Some(
                 self.shell_state
-                    .positional_params
+                    .positional_window()
                     .last()
                     .cloned()
                     .unwrap_or_default(),
@@ -172,7 +172,7 @@ impl Executor {
 
         let target_name = if let Ok(index) = indirect_name.parse::<usize>() {
             self.shell_state
-                .positional_params
+                .positional_window()
                 .get(index.saturating_sub(1))
                 .cloned()
                 .unwrap_or_default()
@@ -280,11 +280,11 @@ impl Executor {
         // re-expands as $@/$*; scalar context joins with a space for @ and
         // IFS[0] for * (string_list_dollar_at / string_list_dollar_star).
         match target_name.as_str() {
-            "@" => return Some(self.shell_state.positional_params.join(" ")),
+            "@" => return Some(self.shell_state.positional_window().join(" ")),
             "*" => {
                 return Some(
                     self.shell_state
-                        .positional_params
+                        .positional_window()
                         .join(&self.ifs_first_char_separator()),
                 )
             }
@@ -300,7 +300,7 @@ impl Executor {
             if !target_name.starts_with('0') || target_name == "0" {
                 return Some(
                     self.shell_state
-                        .positional_params
+                        .positional_window()
                         .get(index.saturating_sub(1))
                         .cloned()
                         .unwrap_or_default(),

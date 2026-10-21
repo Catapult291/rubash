@@ -289,6 +289,7 @@ impl Executor {
                 function_def_infos: imported_function_def_infos,
                 function_definition_locations: HashMap::new(),
                 positional_params: Vec::new(),
+                positional_offset: 0,
                 pipestatus: vec![0],
                 function_name_stack: Vec::new(),
                 bash_argc_stack: Vec::new(),

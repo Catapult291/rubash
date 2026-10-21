@@ -303,7 +303,10 @@ impl Executor {
                     .trim();
                 // Still expand special parameters ($#, $-) inside the expression.
                 let expr = expr
-                    .replace("$#", &self.shell_state.positional_params.len().to_string())
+                    .replace(
+                        "$#",
+                        &self.shell_state.positional_window().len().to_string(),
+                    )
                     .replace("$-", "0");
                 let overlaid =
                     crate::executor::expand_braced_indices::env_vars_with_pending_subscript_writes(
@@ -1215,7 +1218,7 @@ impl Executor {
         if let Ok(index) = indirect_name.parse::<usize>() {
             return self
                 .shell_state
-                .positional_params
+                .positional_window()
                 .get(index.saturating_sub(1))
                 .cloned();
         }
@@ -1245,10 +1248,10 @@ impl Executor {
                 // `b c` parameter under the default IFS); quoted "$@" keeps
                 // one word per parameter verbatim.
                 return Some(if quoted_array_word {
-                    self.shell_state.positional_params.clone()
+                    self.shell_state.positional_window_cloned()
                 } else {
                     field_split_positional_values_with_ifs(
-                        self.shell_state.positional_params.clone(),
+                        self.shell_state.positional_window_cloned(),
                         self.shell_state.env_vars.get("IFS").map(String::as_str),
                     )
                 });
@@ -1257,11 +1260,11 @@ impl Executor {
                 return Some(if quoted_array_word {
                     vec![self
                         .shell_state
-                        .positional_params
+                        .positional_window()
                         .join(&self.ifs_first_char_separator())]
                 } else {
                     field_split_positional_values_with_ifs(
-                        self.shell_state.positional_params.clone(),
+                        self.shell_state.positional_window_cloned(),
                         self.shell_state.env_vars.get("IFS").map(String::as_str),
                     )
                 });

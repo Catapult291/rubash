@@ -379,7 +379,7 @@ impl Executor {
             crate::builtins::trap::mark_startup_ignores(&mut self.shell_state.env_vars);
         }
         let saved_pipestatus = self.shell_state.pipestatus.clone();
-        let saved_positional_params = self.shell_state.positional_params.clone();
+        let saved_positional_params = self.shell_state.positional_window_cloned();
         let saved_bash_source_stack = self.shell_state.bash_source_stack.clone();
         let saved_bash_lineno_stack = self.shell_state.bash_lineno_stack.clone();
         let saved_bash_argc_stack = self.shell_state.bash_argc_stack.clone();

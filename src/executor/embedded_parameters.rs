@@ -496,7 +496,7 @@ impl Executor {
                 }
                 Some('@') => {
                     chars.next();
-                    let value = self.shell_state.positional_params.join(" ");
+                    let value = self.shell_state.positional_window().join(" ");
                     if preserve_quotes {
                         push_preserved_expansion_output(&mut output, &value, in_double);
                     } else {
@@ -514,7 +514,7 @@ impl Executor {
                 }
                 Some('#') => {
                     chars.next();
-                    output.push_str(&self.shell_state.positional_params.len().to_string());
+                    output.push_str(&self.shell_state.positional_window().len().to_string());
                 }
                 Some('-') => {
                     chars.next();
@@ -913,7 +913,7 @@ impl Executor {
                     } else {
                         let value = self
                             .shell_state
-                            .positional_params
+                            .positional_window()
                             .get(index - 1)
                             .map(String::as_str)
                             .unwrap_or("");

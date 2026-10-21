@@ -86,7 +86,7 @@ impl Executor {
         length: Option<isize>,
     ) -> String {
         let selected = positional_parameter_substring_with_zero(
-            &self.shell_state.positional_params,
+            self.shell_state.positional_window(),
             &self.script_name_value(),
             offset,
             length,

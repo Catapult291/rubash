@@ -118,7 +118,7 @@ impl Executor {
         select_command.body = body.commands;
 
         let values: Vec<String> = if select_command.default_positional {
-            self.shell_state.positional_params.clone()
+            self.shell_state.positional_window_cloned()
         } else {
             let mut values = Vec::new();
             for (index, word) in select_command.words.iter().enumerate() {

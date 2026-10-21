@@ -1043,11 +1043,23 @@ impl Executor {
     }
 
     pub(crate) fn positional_params(&self) -> Vec<String> {
-        self.shell_state.positional_params.clone()
+        self.shell_state.positional_window_cloned()
     }
 
     pub fn set_positional_params(&mut self, positional_params: Vec<String>) {
         self.shell_state.positional_params = positional_params;
+        self.shell_state.positional_offset = 0;
+    }
+
+    /// Live `$1..$#` window (offset-aware; see
+    /// `ShellState::positional_window`).
+    pub(crate) fn positional_window(&self) -> &[String] {
+        self.shell_state.positional_window()
+    }
+
+    /// `$#` over the live window.
+    pub(crate) fn positional_len(&self) -> usize {
+        self.shell_state.positional_len()
     }
 
     pub fn inherit_process_stdin(&mut self) {
