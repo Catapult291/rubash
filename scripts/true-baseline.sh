@@ -230,10 +230,17 @@ RUBSIDE_PATH="${RUBSIDE_PATH:-$BASE:$WINPATH_AS_WSL}"
 #     carries U+00E9 where GNU keeps raw bytes C3 A9. Recorded so the
 #     ledger can attribute such diffs to the engine family (#540 class),
 #     never charged to the helpers.
+#
+# Every comparison must first prove it compared something: .parity.sh
+# ends each invocation with a literal tail-arg operand, so a valid dump
+# MUST contain its bytes (hex 7461696c2d617267). Without that assertion
+# the equality test cannot tell "identical" from "both empty" -- a
+# broken helper or spawn path has already produced an all-green matrix
+# that compared nothing (rubash#767 thread, verified with a stubbed od).
 PARITY_LOG="${PARITY_LOG_OVERRIDE:-$REPO/target/issue-suites/results/helper-parity.log}"
 mkdir -p "$(dirname -- "$PARITY_LOG")"
 helper_parity() {
-  local h fmt g r fail=0 info=0
+  local h fmt g r ghex rhex fail=0 info=0
   for h in recho zecho; do
     [ -x "$BASE/$h" ]     || { echo "FATAL: oracle ELF $BASE/$h missing (gcc build failed?)" >&2; exit 9; }
     [ -f "$BASE/$h.exe" ] || { echo "FATAL: arm PE $BASE/$h.exe missing (rustc build failed?)" >&2; exit 9; }
@@ -262,6 +269,23 @@ EOS
     for h in recho zecho; do
       g=$( cd "$BASE" && PATH="$BASE:/usr/bin:/bin" "$GNU_BASH" ./.parity.sh "$h" "$fmt" </dev/null 2>&1 | od -An -tx1 )
       r=$( cd "$BASE" && env PATH="$RUBSIDE_PATH" WSLENV="$WSLENV:PATH/p" "$RUB" ./.parity.sh "$h.exe" "$fmt" </dev/null 2>&1 | od -An -tx1 )
+      # Sentinel round-trip assertion before any equality test: both
+      # dumps must contain the literal tail-arg operand's bytes
+      # (od -tx1 may wrap, so compare whitespace-stripped hex). A dump
+      # without it -- empty capture, "command not found", spawn failure
+      # -- is a FAIL even when the other side fails identically.
+      ghex=$(printf %s "$g" | tr -d ' \n')
+      rhex=$(printf %s "$r" | tr -d ' \n')
+      case "$ghex@$rhex" in
+        *7461696c2d617267*@*7461696c2d617267*) ;;
+        *)
+          echo "FAIL $h  printf '$fmt' (tail-arg sentinel missing; empty==empty is a false pass)" >&2
+          echo "  oracle: $g" >&2
+          echo "  arm   : $r" >&2
+          fail=$((fail + 1))
+          continue
+          ;;
+      esac
       if [ "$g" = "$r" ]; then
         echo "OK   $h  printf '$fmt'" >> "$PARITY_LOG"
       else
