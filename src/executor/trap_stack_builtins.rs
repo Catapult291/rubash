@@ -25,6 +25,37 @@ impl Executor {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Result<(), ExecuteError> {
+        // Silent-builtin short-circuit (perf): `shift` and friends succeed
+        // with empty stdout/stderr buffers on the hot path. GNU runs such a
+        // builtin's writes through its redirected descriptors, but a zero-
+        // byte write is a no-op on every sink (capture buffers, pipes,
+        // files, closed fds — the fd-closed diagnostic in
+        // route_builtin_buffered_output only fires on non-empty output).
+        // With no per-command redirects there is no open/truncate side
+        // effect to preserve either (GNU do_redirections opens before the
+        // builtin runs; here there is nothing to open), so skip the full
+        // pipeline (marker decode alloc + fd-table Hash seeding + ordered
+        // redirect walk + 0-byte writes) outright. Any redirect present,
+        // or any non-empty buffer, takes the slow path. Anything
+        // semantically doubtful likewise stays on the slow path by
+        // construction (this gate only fires on the provably empty case).
+        if stdout.is_empty()
+            && stderr.is_empty()
+            && cmd.redirects.is_empty()
+            && cmd.redirect_in.is_none()
+            && cmd.redirect_out.is_none()
+            && cmd.append.is_none()
+            && cmd.redirect_err.is_none()
+            && cmd.redirect_err_append.is_none()
+            && cmd.heredoc.is_none()
+            && cmd.heredoc_body.is_none()
+            && cmd.here_string.is_none()
+            && cmd.here_string_carrier.is_none()
+            && cmd.heredoc_redirects.is_empty()
+        {
+            self.last_builtin_write_failed.set(false);
+            return Ok(());
+        }
         // Exact-once consumer boundary for U+E000 raw-byte markers carried
         // in word data (ANSI-C \xHH / octal bytes >= 0x80, raw-byte
         // substitution payloads). Builtins write to the real byte sinks
