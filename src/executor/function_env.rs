@@ -153,9 +153,18 @@ pub(in crate::executor) fn exported_function_env_value(
     } else if commands.is_empty() {
         format!("() {{ :; }}{}", redirect_suffix_text(def_redirects))
     } else {
-        let mut output = String::from("() {");
+        // GNU variables.c exportstr -> print_cmd.c print_function_def in
+        // string mode: the body list prints at indentation 1 — the first
+        // command follows `{ ` plus the indent (two spaces total), each
+        // later command starts after `;` + newline + one space, and the
+        // closing brace sits on its own line (rubash#1057):
+        // `() {  echo a;\n echo b\n}`.
+        let mut output = String::from("() {  ");
         for (index, command) in commands.iter().enumerate() {
-            output.push('\n');
+            if index > 0 {
+                output.push('\n');
+                output.push(' ');
+            }
             output.push_str(command);
             let command_has_heredoc = body
                 .get(index)
