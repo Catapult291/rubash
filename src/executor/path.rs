@@ -376,25 +376,28 @@ struct DirListing {
 /// grid. One read_dir per directory replaces the grid and is remembered
 /// for the life of the fingerprint.
 ///
-/// Case contract (rubash#799). GNU findcmd.c joins the command NAME onto
-/// each PATH element and stats the result — findcmd.c:580-586 accepts the
-/// first regular executable file whose NAME matches byte-for-byte (on a
-/// case-sensitive fs `r` and `R` are different commands; WSL GNU bash 5.3
-/// probe: `command -v r` finds only the literally-spelled `r`, never a
-/// sibling `R`). The Windows stat layer folds case behind bash's back, so
-/// the listing walk must re-impose GNU's byte-exactness itself:
+/// Case contract (rubash#799, stem relaxed by rubash#1283 — owner ruling
+/// 2026-10-22). GNU findcmd.c joins the command NAME onto each PATH element
+/// and stats the result — findcmd.c:580-586 accepts the first regular
+/// executable file whose NAME matches byte-for-byte (on a case-sensitive fs
+/// `r` and `R` are different commands). The Windows namespace folds case
+/// (System32 itself ships `PING.EXE` / `NETSTAT.EXE` / `TRACERT.EXE` /
+/// `HOSTNAME.EXE`), so byte-exactness cannot be transplanted whole: the
+/// walk keeps GNU's shape but compares the way the volume answers.
 ///
-/// * `exact` answers the probe for the candidate's literal spelling. The
-///   command NAME (the stem) must match byte-for-byte: lowercase `r` never
-///   resolves to `R.exe` (the #799 harvest hang: a gitconfig alias `r = …`
-///   launched GNU R's interactive interpreter and ate the session).
-/// * `fold` admits one Windows-native deviation that has no GNU analogue at
-///   all — the appended EXTENSION compares ASCII-case-insensitively, so
-///   `R` still runs an on-disk `R.EXE` (extension case is a PATHEXT-form
-///   artifact, not part of the command name; msys bash form oracle
-///   5.2.37/5.3: bare `R` resolves `R.exe`/`R.bat`, extensionless file
-///   resolves verbatim). The stem check stays byte-exact inside the fold
-///   arm, and the RESOLVED spelling is always the on-disk one.
+/// * `exact` answers the probe for the candidate's literal spelling and
+///   keeps byte-equal names winning within a directory.
+/// * `fold` admits the two Windows-native deviations that have no GNU
+///   analogue — the STEM compares ASCII-case-insensitively (lowercase
+///   `ping` reaches an on-disk `PING.EXE`, mirroring every Windows shell:
+///   CMD, PowerShell, msys bash all fold; the #799 harvest hang — a
+///   gitconfig alias `r = …` launching GNU R's interpreter — is accepted
+///   again as the price of that parity, same as Git Bash) and the appended
+///   EXTENSION compares ASCII-case-insensitively (`R` still runs an on-disk
+///   `R.EXE`; extension case is a PATHEXT-form artifact, not part of the
+///   command name). The RESOLVED spelling is always the on-disk one.
+///   Extensionless on-disk names have no extension arm and still answer
+///   only their literal spelling.
 ///
 /// The listing is a cache, not an oracle: before a miss is concluded every
 /// candidate name is stat'ed directly, and a probe hit re-reads the
@@ -444,8 +447,9 @@ fn read_dir_listing(directory: &Path) -> DirListing {
 }
 
 /// One probe candidate for the listing-assisted PATH walk: the file name the
-/// directory listing is asked about (exact spelling for the byte-exact stem
-/// contract, rubash#799), its ASCII-lowercase form for the extension-case
+/// directory listing is asked about (exact spelling for the byte-equal
+/// arm, rubash#799 as relaxed by #1283), its ASCII-lowercase form for the
+/// stem/extension-case
 /// fallback, and the spelled file name to join onto a directory when the
 /// listing claims it. Built ONCE per lookup, not per directory: GNU
 /// findcmd.c:623 find_user_command_in_path passes the same NAME to
@@ -535,15 +539,17 @@ fn find_in_path_via_listings(
         for dir in dirs.iter() {
             let listing = cached_dir_listing(&mut cache, dir);
             for candidate in &candidates {
-                // rubash#799: the command stem must match byte-for-byte —
-                // the exact set answers with the candidate's own spelling,
-                // so `r` never lifts `R.exe`. The fold arm below is the only
-                // case tolerance: the PATHEXT-style appended extension
-                // compares ASCII-case-insensitively (on-disk `R.EXE` still
-                // runs as `R`), and the resolved spelling stays the on-disk
-                // one. Extensionless candidates carry no extension for the
-                // OS to fold, so they never enter the fold arm — that arm
-                // must not become a whole-name fold or #799 comes back.
+                // rubash#799 relaxed by rubash#1283: within one directory a
+                // byte-equal listing hit (arm above) wins; this fold arm
+                // admits the volume's ASCII case-folding on BOTH the stem
+                // (System32 ships PING.EXE/NETSTAT.EXE/TRACERT.EXE — a
+                // lowercase `ping` must reach them) and the appended
+                // extension. The exact set answers with the candidate's own
+                // spelling, so a same-directory `ping.exe` still beats a
+                // `PING.EXE` fold. Extensionless candidates carry no
+                // extension for the OS to fold, so they never enter the
+                // fold arm — that arm must not become a whole-name fold
+                // past the stem (`dir/foo bar` never matches `foo`).
                 if listing.exact.contains(candidate.listing_key.as_str()) {
                     // The listing only proves the NAME exists; confirm the stat
                     // walk's exact semantics for directories and dangling symlinks.
@@ -555,7 +561,7 @@ fn find_in_path_via_listings(
                 }
                 if candidate.file.extension().is_some() {
                     if let Some(disk) = listing.fold.get(candidate.fold_key.as_str()) {
-                        if listing_stem_exact_extension_ci(disk, &candidate.file) {
+                        if listing_stem_ci_extension_ci(disk, &candidate.file) {
                             let path = dir.join(disk);
                             if path.is_file() {
                                 return Some(path);
@@ -588,25 +594,42 @@ fn find_in_path_via_listings(
     None
 }
 
-/// The fold arm's match predicate (rubash#799): the on-disk name `disk`
-/// matches the candidate when the STEM is byte-exact (the command name is
-/// case-sensitive, as on GNU's case-sensitive fs) and only the appended
-/// EXTENSION differs by ASCII case (`R` still runs an on-disk `R.EXE`).
+/// The fold arm's match predicate (rubash#799, stem relaxed by rubash#1283):
+/// the on-disk name `disk` matches the candidate when the STEM compares
+/// ASCII-case-insensitively (the Windows namespace folds case: System32
+/// ships `PING.EXE` / `NETSTAT.EXE` / `TRACERT.EXE` / `HOSTNAME.EXE`, and a
+/// lowercase invocation must reach them) and the appended EXTENSION differs
+/// by ASCII case at most (`R` still runs an on-disk `R.EXE`). Byte-equal
+/// candidates never reach this arm — the exact arm above already answered.
 /// `candidate` must carry an extension — the caller gates that.
 #[cfg(not(unix))]
-fn listing_stem_exact_extension_ci(disk: &str, candidate: &Path) -> bool {
+fn listing_stem_ci_extension_ci(disk: &str, candidate: &Path) -> bool {
     let Some(stem) = candidate.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
     let Some(ext) = candidate.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    let Some(rest) = disk.strip_prefix(stem) else {
+    let Some(rest) = strip_prefix_ascii_ci(disk, stem) else {
         return false;
     };
     match rest.strip_prefix('.') {
         Some(disk_ext) => disk_ext.eq_ignore_ascii_case(ext),
         None => false,
+    }
+}
+
+/// ASCII-case-insensitive prefix strip. `get` keeps multi-byte boundaries
+/// safe: a prefix length that would slice mid-char yields `None` and the
+/// fold simply misses (non-ASCII names never fold — #799's domain is the
+/// ASCII command namespace).
+#[cfg(not(unix))]
+fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&text[prefix.len()..])
+    } else {
+        None
     }
 }
 
@@ -616,9 +639,11 @@ fn listing_stem_exact_extension_ci(disk: &str, candidate: &Path) -> bool {
 /// the listing of any directory where a probe hits. The probe is only a
 /// staleness signal, never a match: the filesystem folds case behind the
 /// command name's back (`dir/r.exe` stats true for on-disk `R.exe`), so the
-/// rescan re-imposes the rubash#799 byte-exact stem contract on the fresh
+/// rescan re-applies the listing contract (rubash#799 case policy as
+/// relaxed by #1283) on the fresh
 /// listing. A probe hit on a listing that turns out identical costs the
-/// re-read but no rescan (the #799-rejected name stays rejected). When a
+/// re-read but no rescan (the stale-miss name stays stale until the
+/// listing moves). When a
 /// listing actually moved, the dispatcher-probe outcomes ride the same
 /// directories — a `wpm` install that adds a link can also flip a
 /// `winuxcmd help NAME` answer — so they are cleared with it. Returns true
@@ -5645,11 +5670,14 @@ mod tests {
             find_user_command("toolA", &env_vars),
             Some(dir_a.join("toolA.exe"))
         );
-        // rubash#799: lowercase `toolb` never lifts on-disk `TOOLB.exe`
-        // (the stem is the command name; byte-exact), while `TOOLB`
-        // resolves with the ON-DISK spelling through the ASCII-case fold
-        // of the appended extension.
-        assert_eq!(find_user_command("toolb", &env_vars), None);
+        // rubash#799 as relaxed by #1283: lowercase `toolb` reaches
+        // on-disk `TOOLB.exe` through the ASCII stem fold and reports the
+        // ON-DISK spelling, and so does `TOOLB` (byte-equal and folded
+        // spellings converge on the same file on a case-folding volume).
+        assert_eq!(
+            find_user_command("toolb", &env_vars),
+            Some(dir_b.join("TOOLB.exe"))
+        );
         assert_eq!(
             find_user_command("TOOLB", &env_vars),
             Some(dir_b.join("TOOLB.exe"))
@@ -5708,12 +5736,14 @@ mod tests {
 
         // A probe hit is a staleness signal, never a match: the
         // filesystem folds case, so `ghost_tool` stats true against
-        // on-disk `GHOST_TOOL.exe`, but the rescan re-imposes the
-        // rubash#799 byte-exact stem contract — the miss must stand,
-        // while the exact-cased name still resolves through the
-        // extension-fold arm.
+        // on-disk `GHOST_TOOL.exe`; the rescan refreshes the listing and
+        // the stem fold then resolves it (rubash#799 as relaxed by
+        // #1283), reporting the on-disk spelling.
         fs::write(dir.join("GHOST_TOOL.exe"), b"").unwrap();
-        assert_eq!(find_user_command("ghost_tool", &env_vars), None);
+        assert_eq!(
+            find_user_command("ghost_tool", &env_vars),
+            Some(dir.join("GHOST_TOOL.exe"))
+        );
         assert_eq!(
             find_user_command("GHOST_TOOL", &env_vars),
             Some(dir.join("GHOST_TOOL.exe"))
