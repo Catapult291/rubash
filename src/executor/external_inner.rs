@@ -1468,7 +1468,7 @@ fn is_exec_format_error(error: &io::Error) -> bool {
 /// directly on modern Linux). Directories and unreadable files are
 /// left to the normal spawn-error classification.
 #[cfg(unix)]
-fn is_enoexec_candidate(program: &std::path::Path) -> bool {
+pub(in crate::executor) fn is_enoexec_candidate(program: &std::path::Path) -> bool {
     use std::io::Read;
     if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
         return false;

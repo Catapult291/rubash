@@ -432,7 +432,10 @@ impl Executor {
         // The gate runs BEFORE any wrapper-only setup (exe resolution, env
         // block, handle duplication): a direct spawn pays none of it.
         let direct_plan = if !self.xtrace_enabled() && !captured_pipe_writer {
-            self.background_direct_external_command(&background_command.command)
+            self.background_direct_external_command(
+                &background_command.command,
+                !consumed.is_empty() && consumed.iter().all(|entry| *entry),
+            )
         } else {
             None
         };
@@ -781,6 +784,7 @@ impl Executor {
     fn background_direct_external_command(
         &mut self,
         command: &CommandNode,
+        redirects_fully_consumed: bool,
     ) -> Option<(std::path::PathBuf, Vec<String>)> {
         // A restricted shell refuses command names carrying `/' before any
         // dispatch (execute_prepared_command -> restricted_command_error,
@@ -815,14 +819,19 @@ impl Executor {
         {
             return None;
         }
-        // No assignments (tempenv belongs to the child in GNU) and no
-        // redirections beyond the async fd 0-2 stdio rules this caller
-        // already resolved into handles.
-        if !command.assignments.is_empty()
-            || !command.compound_assignments.is_empty()
-            || !command.array_element_assignments.is_empty()
-            || !command.assignment_raws.is_empty()
-            || !command.redirects.is_empty()
+        // No assignments (tempenv belongs to the child in GNU).
+        // Redirections are admissible only when resolve_background_stdio
+        // consumed EVERY entry of `command.redirects` into the fd 0-2
+        // handles the direct spawn receives: the Option mirror fields
+        // (redirect_out & friends) duplicate entries of that list, so a
+        // fully-consumed list means the stdio triple carries the whole
+        // redirection set and nothing is left for a child shell to
+        // re-apply. Any unconsumed remainder (fd>2, {fd} vars, procsub
+        // targets, failed opens whose diagnostic belongs to the job)
+        // keeps the wrapper (rubash#1033: a redirected simple external
+        // used to ALWAYS take the wrapper, so $! named the wrapper and
+        // kill/wait never reached the real job's traps).
+        let redirect_fields_present = !command.redirects.is_empty()
             || command.redirect_in.is_some()
             || command.redirect_out.is_some()
             || command.append.is_some()
@@ -833,7 +842,12 @@ impl Executor {
             || command.heredoc_delimiter.is_some()
             || !command.heredoc_redirects.is_empty()
             || command.here_string.is_some()
-            || command.here_string_carrier.is_some()
+            || command.here_string_carrier.is_some();
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+            || !command.assignment_raws.is_empty()
+            || (redirect_fields_present && !redirects_fully_consumed)
         {
             return None;
         }
@@ -957,6 +971,14 @@ impl Executor {
         };
         // Script files need the shell fallback the wrapper's child provides.
         if crate::executor::path::should_run_with_shell(&program) {
+            return None;
+        }
+        // On unix a shebangless text file is an execve-ENOEXEC case:
+        // a native spawn would hand it to glibc execvp's /bin/sh
+        // fallback instead of this shell (rubash#1037) — the wrapper's
+        // foreground-classification path owns it, so stay out.
+        #[cfg(unix)]
+        if super::external_inner::is_enoexec_candidate(&program) {
             return None;
         }
         Some((program, expanded.words))
