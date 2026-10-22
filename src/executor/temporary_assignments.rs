@@ -981,7 +981,18 @@ impl Executor {
                 true,
             );
         }
-        if base_name == "SECONDS" && !append {
+        // GNU variables.c:3839 unbind_variable: `unset` removes a dynamic
+        // variable's cell entirely, so a later assignment binds an
+        // ORDINARY variable (static value, `declare -- SECONDS="7"`)
+        // instead of re-arming the dynamic getter (rubash#1050). When
+        // the name carries the unbound mark, every dynamic assignment
+        // arm below must stand down and let the plain bind happen.
+        let dynamic_unbound = is_marked_var(
+            &self.shell_state.env_vars,
+            UNSET_DYNAMIC_VARS,
+            base_name,
+        );
+        if base_name == "SECONDS" && !append && !dynamic_unbound {
             let assigned = value.trim().parse::<i64>().unwrap_or(0);
             let start = self
                 .shell_state
@@ -996,7 +1007,7 @@ impl Executor {
             set_process_env(base_name, assigned.to_string());
             return true;
         }
-        if base_name == "RANDOM" && !append {
+        if base_name == "RANDOM" && !append && !dynamic_unbound {
             // GNU variables.c:1393-1408 assign_random: a non-numeric value
             // fails valid_number and returns without reseeding; a numeric
             // seed runs sbrand — rseed = seed, last_random_value = 0.
@@ -1007,22 +1018,22 @@ impl Executor {
             set_process_env(base_name, value);
             return true;
         }
-        if base_name == "SRANDOM" && !append {
+        if base_name == "SRANDOM" && !append && !dynamic_unbound {
             return true;
         }
-        if base_name == "BASHPID" && !append {
+        if base_name == "BASHPID" && !append && !dynamic_unbound {
             return true;
         }
-        if base_name == "BASH_SUBSHELL" && !append {
+        if base_name == "BASH_SUBSHELL" && !append && !dynamic_unbound {
             return true;
         }
-        if base_name == "FUNCNAME" && !append {
+        if base_name == "FUNCNAME" && !append && !dynamic_unbound {
             return true;
         }
-        if base_name == "LINENO" && !append {
+        if base_name == "LINENO" && !append && !dynamic_unbound {
             return true;
         }
-        if base_name == "BASH_COMMAND" && !append {
+        if base_name == "BASH_COMMAND" && !append && !dynamic_unbound {
             return true;
         }
         if is_noassign_bash_array(base_name) && !append {
