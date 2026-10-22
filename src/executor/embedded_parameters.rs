@@ -60,6 +60,13 @@ thread_local! {
 
 const MAX_EXPAND_DEPTH: usize = 50;
 
+/// Whether the embedded-parameter walker is past its recursion limit: at the
+/// limit it returns the (masked) word unchanged, so fast paths that bypass
+/// the walker must reproduce that instead of expanding.
+pub(in crate::executor) fn expand_depth_limit_reached() -> bool {
+    EXPAND_DEPTH.with(|depth| depth.get() >= MAX_EXPAND_DEPTH)
+}
+
 impl Executor {
     pub(in crate::executor) fn expand_embedded_parameters(&self, word: &str) -> String {
         self.expand_embedded_parameters_with_context(word, false)
