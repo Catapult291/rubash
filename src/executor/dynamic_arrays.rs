@@ -905,7 +905,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn next_random_value(&self) -> u32 {
-        next_random_from_state(&self.shell_state.random_state)
+        next_random_from_state(&self.shell_state.random_state, &self.shell_state.env_vars)
     }
 
     pub(in crate::executor) fn next_srandom_value(&self) -> u32 {

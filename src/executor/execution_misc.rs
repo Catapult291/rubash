@@ -991,15 +991,42 @@ fn intrand32(last: u32) -> u32 {
     }
 }
 
+/// GNU lib/sh/random.c:99-113 brand(): the 15-bit fold
+/// `(rseed >> 16) ^ (rseed & 65535)` applies only when
+/// shell_compatibility_level > 50; at lower levels the raw state is
+/// masked directly (`ret = rseed & BASH_RAND_MAX`) — the pre-5.1
+/// generator sequence `shopt -s compat32/compat44` selects
+/// (rubash#1167). The level derivation mirrors GNU's: a set compatNN
+/// flag (all ≤ 44) wins, else the BASH_COMPAT parse, else the 5.3
+/// default of 53.
+pub(in crate::executor) fn random_compat_fold(env_vars: &HashMap<String, String>) -> bool {
+    for flag in [
+        "compat31", "compat32", "compat40", "compat41", "compat42", "compat43", "compat44",
+    ] {
+        if crate::builtins::shopt::option_enabled(env_vars, flag) {
+            return false;
+        }
+    }
+    shell_compatibility_level_value(env_vars) > 50
+}
+
 /// GNU lib/sh/random.c:99-113 brand() + variables.c:1424-1431
-/// get_random_number: fold the 31-bit seed to 15 bits via
-/// `(rseed >> 16) ^ (rseed & 65535)` (the shell_compatibility_level > 50
-/// path) and resample while the draw repeats the previous value.
-pub(in crate::executor) fn next_random_from_state(state: &RandomGen) -> u32 {
+/// get_random_number: advance the Park-Miller state, fold per the
+/// compat level (see random_compat_fold), and resample while the draw
+/// repeats the previous value.
+pub(in crate::executor) fn next_random_from_state(
+    state: &RandomGen,
+    env_vars: &HashMap<String, String>,
+) -> u32 {
+    let fold = random_compat_fold(env_vars);
     loop {
         let rseed = intrand32(state.rseed.get());
         state.rseed.set(rseed);
-        let ret = ((rseed >> 16) ^ (rseed & 65_535)) & 32_767;
+        let ret = if fold {
+            ((rseed >> 16) ^ (rseed & 65_535)) & 32_767
+        } else {
+            rseed & 32_767
+        };
         if ret != state.last_value.get() {
             state.last_value.set(ret);
             return ret;

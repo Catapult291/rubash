@@ -312,7 +312,7 @@ impl ConditionalArithParser<'_> {
             if name == "RANDOM" {
                 return self
                     .random_state
-                    .map(|state| i128::from(next_random_from_state(state)));
+                    .map(|state| i128::from(next_random_from_state(state, self.env_vars)));
             }
             if name == "SRANDOM" {
                 return self
