@@ -1738,6 +1738,82 @@ impl Executor {
         &self,
         name: &str,
     ) -> Option<String> {
+        if let Some(reported) = self.nounset_braced_head_is_unbound(name) {
+            return Some(reported);
+        }
+        self.nounset_braced_operator_word_unbound(name)
+    }
+
+    /// GNU subst.c parameter_brace_expand: once the head reference's own
+    /// unbound check (subst.c:10170-10180) passes, the words the expansion
+    /// ALWAYS evaluates are expanded under the same nounset rule — the
+    /// substring offset/length (subst.c:8395 verify_substring_values via
+    /// expand_arith_string + param_expand), the patsub pattern and
+    /// replacement (subst.c:9387 parameter_brace_patsub), the
+    /// prefix/suffix removal patterns, and the casemod pattern. An unset
+    /// `$name` inside one reports `name: unbound variable` exactly like a
+    /// top-level reference (rubash#1149). The lazy default / assign /
+    /// alternate / error words are NOT scanned here: GNU expands them
+    /// only when the operator fires on the head's state, which the head
+    /// check already adjudicated.
+    fn nounset_braced_operator_word_unbound(&self, name: &str) -> Option<String> {
+        // The `#` length form owns its tail elsewhere (its remainders are
+        // the `$#` parameter's own operators or bad substitutions), and
+        // the `!` indirect form's tails are adjudicated by the indir arms
+        // of parameter_expansion_error_in_word_context.
+        if name.starts_with(['#', '!']) {
+            return None;
+        }
+        if let Some((_, pattern, replacement, _)) = parse_parameter_replacement(name) {
+            if let Some(unbound) = self.nounset_unbound_parameter(pattern) {
+                return Some(unbound);
+            }
+            if let Some(unbound) = self.nounset_unbound_parameter(replacement) {
+                return Some(unbound);
+            }
+            return None;
+        }
+        if let Some((_, _, pattern)) = parse_parameter_case_mod(name) {
+            return self.nounset_unbound_parameter(pattern);
+        }
+        // Single-char special parameters (`@`, `*`) are in OPERATOR_SET,
+        // so parameter_reference_len stops at 0 for them; they are their
+        // own one-char reference.
+        let ref_len = parameter_reference_len(name);
+        let ref_len = if ref_len == 0 {
+            name.chars().next().map_or(0, |c| c.len_utf8())
+        } else {
+            ref_len
+        };
+        let tail = &name[ref_len..];
+        if let Some(rest) = tail.strip_prefix(':') {
+            if matches!(rest.chars().next(), Some('-' | '=' | '+' | '?')) {
+                return None;
+            }
+            let (offset, length, has_length) =
+                crate::executor::parameter_core::split_top_level_colon(rest);
+            if let Some(unbound) = self.nounset_unbound_parameter(offset) {
+                return Some(unbound);
+            }
+            if has_length {
+                if let Some(unbound) = self.nounset_unbound_parameter(length) {
+                    return Some(unbound);
+                }
+            }
+            return None;
+        }
+        if let Some(pattern) = tail
+            .strip_prefix("##")
+            .or_else(|| tail.strip_prefix('#'))
+            .or_else(|| tail.strip_prefix("%%"))
+            .or_else(|| tail.strip_prefix('%'))
+        {
+            return self.nounset_unbound_parameter(pattern);
+        }
+        None
+    }
+
+    fn nounset_braced_head_is_unbound(&self, name: &str) -> Option<String> {
         if name == "!" {
             // GNU subst.c: the last-background-pid parameter is unset until a
             // background job runs; under nounset it reports an unbound

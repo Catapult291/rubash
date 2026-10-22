@@ -1001,7 +1001,7 @@ fn single_quoted_operand_span(text: &str) -> Option<String> {
     None
 }
 
-fn split_top_level_colon(input: &str) -> (&str, &str, bool) {
+pub(in crate::executor) fn split_top_level_colon(input: &str) -> (&str, &str, bool) {
     // GNU subst.c skip_to_delim (subst.c:2198-2300) finds the offset/length
     // separator colon with full shell-syntax awareness. In arithmetic context
     // (SD_ARITHEXP, used by parameter_brace_substring) it additionally:
