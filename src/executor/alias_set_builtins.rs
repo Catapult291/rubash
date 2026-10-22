@@ -163,6 +163,17 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1020: the fast paths below apply flags/positionals and
+        // return success without ever looking at cmd's redirections, so
+        // `set -- -a -b > o1.txt` silently dropped the redirect (no file,
+        // no error) and `set -- -b 2>/bad/path` masked the open failure.
+        // GNU do_redirections runs before the builtin (redir.c), and the
+        // full path (execute_set -> write_buffered_builtin_output) honors
+        // them — route any redirected `set` there.
+        if compound_command_has_redirects(cmd) {
+            self.exit_code = self.execute_set(cmd)?;
+            return Ok(());
+        }
         if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted")
             && cmd.words[1..]
                 .iter()
