@@ -126,7 +126,11 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         match word {
             "let" => {
-                self.exit_code = self.execute_let(&cmd.words[1..]);
+                // Same fd-2 binding contract as `(( ))` (rubash#1127):
+                // let's own redirections apply while its diagnostics run.
+                self.exit_code = self.with_compound_output_redirects(cmd, |executor| {
+                    Ok(executor.execute_let(&cmd.words[1..]))
+                })?;
                 Ok(())
             }
             "umask" => {
@@ -303,7 +307,16 @@ impl Executor {
                     }
                     return Err(error);
                 }
-                self.exit_code = self.execute_arithmetic_command(cmd);
+                // GNU redir.c do_redirections binds the `(( ))` command's
+                // own redirections for its whole execution, and error.c
+                // writes the evalerror diagnostic to fd 2 as bound — so
+                // `((a+=1)) 2>&1` reports on stdout (rubash#1127). Bind the
+                // output redirects in the fd table around the evaluation;
+                // the diagnostic printers route through fd 2 (arith_diag).
+                let arith_status = self.with_compound_output_redirects(cmd, |executor| {
+                    Ok(executor.execute_arithmetic_command(cmd))
+                })?;
+                self.exit_code = arith_status;
                 // GNU expr.c:1190-1216: an unbound variable under `set -u`
                 // inside `(( ))` raises FORCE_EOF and terminates the
                 // noninteractive shell (probe a2: `set -u; ((b)); echo
