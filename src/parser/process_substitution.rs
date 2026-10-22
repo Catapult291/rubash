@@ -559,6 +559,23 @@ fn process_substitution_source(tokens: &[Token]) -> String {
             continue;
         }
 
+        // rubash#1024: a bare physical newline mid-body is a canonical line
+        // break (parse.y:4632 print_comsub reprints the body with its own
+        // newlines), so it re-parses as `\n` rather than `;`: body
+        // diagnostics then number from the enclosing command's line instead
+        // of collapsing to line 1. An explicit `;` before the newline
+        // (`a;\nb`) keeps the `;` spelling above — the canonical model
+        // numbers that shape like GNU without a second separator.
+        if token.kind == TokenKind::Semicolon
+            && token.line_break
+            && !source.is_empty()
+            && !source.ends_with(';')
+            && !source.ends_with('\n')
+        {
+            source.push('\n');
+            continue;
+        }
+
         if !source.is_empty() && !source.ends_with('\n') {
             source.push(' ');
         }

@@ -2,7 +2,7 @@
 //!
 //! Windows process handles and waiting primitives stay in the executor/backend.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub type JobId = u32;
 
@@ -43,6 +43,17 @@ pub struct JobTable {
     pub jobs: BTreeMap<JobId, JobEntry>,
     pub pid_to_job: HashMap<u32, JobId>,
     pub completed_statuses: HashMap<u32, i32>,
+    /// rubash#1022: pids of forked process-substitution placeholders (real
+    /// OS children, born zombies) whose recorded status lives in
+    /// completed_statuses. Membership means "signallable but unreaped":
+    /// kill -0 succeeds (the zombie exists), an explicit `wait` or the bare
+    /// `wait` reaps it while the recorded status stays for repeat waits
+    /// (bgpids parity). The per-command refresh deliberately does not reap:
+    /// with /dev/fd pipes GNU's output-procsub children outlive the
+    /// creating command, so older `$!` holders stay signallable until a
+    /// wait consumes them. Synthetic fallback pids (non-unix / fork
+    /// failure) never enter.
+    pub procsub_placeholders: HashSet<u32>,
     current_job: Option<JobId>,
     previous_job: Option<JobId>,
 }

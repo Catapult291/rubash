@@ -2723,7 +2723,7 @@ impl Executor {
                     .env_vars
                     .remove(&fd_output_process_substitution_key(target_fd));
             }
-            Some(FdWriteEndpoint::ProcessSubstitution { path, command }) => {
+            Some(FdWriteEndpoint::ProcessSubstitution { path, command, .. }) => {
                 self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
                 self.shell_state.env_vars.insert(
                     fd_output_key(target_fd),
@@ -2836,11 +2836,43 @@ impl Executor {
         };
 
         let path = self.empty_process_substitution_temp()?;
+        // rubash#1022: GNU subst.c:6362 forks the procsub at expansion, so
+        // $! names it while the body runs. The persistent body only runs at
+        // close; register the fork placeholder now (pending: no recorded
+        // status yet) so `kill -0 $!`/`kill $!` reach the forked child in
+        // the meantime. The status lands in completed_statuses when the fd
+        // closes and the body runs (close_persistent_output_fd).
+        let previous =
+            self.fd_table
+                .entries
+                .get(&fd)
+                .and_then(|entry| match entry.write.as_ref() {
+                    Some(FdWriteEndpoint::ProcessSubstitution { procsub_pid, .. }) => *procsub_pid,
+                    _ => None,
+                });
+        if let Some(previous) = previous {
+            // A replaced-but-never-closed fd abandons its body (pre-existing
+            // temp/body lifecycle); at least reap the orphaned zombie so a
+            // rebinding loop cannot accumulate one placeholder per iteration.
+            self.reap_procsub_placeholder(previous, true);
+        }
+        #[cfg(unix)]
+        let procsub_pid = match Self::fork_procsub_placeholder(0) {
+            Some(pid) => {
+                self.shell_state.job_table.procsub_placeholders.insert(pid);
+                self.shell_state.last_background_pid = Some(pid);
+                Some(pid)
+            }
+            None => None,
+        };
+        #[cfg(not(unix))]
+        let procsub_pid = None;
         self.fd_table.open_output(
             fd,
             FdWriteEndpoint::ProcessSubstitution {
                 path: path.clone(),
                 command: source.to_string(),
+                procsub_pid,
             },
             fd >= 10,
         );
@@ -2864,6 +2896,17 @@ impl Executor {
                 Some(FdWriteEndpoint::CoprocStdin { pid, .. }) => Some(*pid),
                 _ => None,
             });
+        // rubash#1022: complete the placeholder registered at open with the
+        // body's status (close runs the deferred body); $! itself is left
+        // alone — it has named this pid since the open.
+        let pending_pid =
+            self.fd_table
+                .entries
+                .get(&fd)
+                .and_then(|entry| match entry.write.as_ref() {
+                    Some(FdWriteEndpoint::ProcessSubstitution { procsub_pid, .. }) => *procsub_pid,
+                    _ => None,
+                });
         self.fd_table.close_output(fd);
         if let Some(pid) = coproc_pid {
             self.mark_coproc_array_endpoint_closed(pid, fd);
@@ -2876,7 +2919,7 @@ impl Executor {
         if let (Some(target), Some(source)) = (target, source) {
             let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
             let input = fs::read_to_string(&path).unwrap_or_default();
-            self.execute_persistent_output_process_substitution(&source, input)?;
+            self.execute_persistent_output_process_substitution(&source, input, pending_pid)?;
             let _ = fs::remove_file(path);
         }
         Ok(())
@@ -2949,9 +2992,23 @@ impl Executor {
         &mut self,
         source: &str,
         input: String,
+        pending_pid: Option<u32>,
     ) -> Result<(), ExecuteError> {
-        let tokens = crate::lexer::tokenize(source);
-        let ast = crate::parser::parse(&tokens);
+        // rubash#1024: bracket the inline body run with the enclosing
+        // command's lines (same discipline as the non-persistent output
+        // form in external_setup.rs) so body diagnostics report the
+        // script line, not the body-local line 1.
+        let old_current_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CURRENT_LINE")
+            .cloned();
+        let old_cmd_start_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CMD_START_LINE")
+            .cloned();
+        let ast = super::command_substitution::parse_procsub_body(self, source);
         let old_stdin = self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
         let old_offset = self
             .shell_state
@@ -3005,6 +3062,40 @@ impl Executor {
             FUNCTION_STDIN_OFFSET,
             old_offset,
         );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            "__RUBASH_CURRENT_LINE",
+            old_current_line,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            "__RUBASH_CMD_START_LINE",
+            old_cmd_start_line,
+        );
+        // rubash#1022: record the deferred body's status the way the inline
+        // forms do. A pending pid (registered at open) is only completed —
+        // $! has named it since the open and stays put. Without one (a
+        // same-command body: compound or assignment form) register fresh so
+        // $! names the substitution and `wait $!` reports this status.
+        let status = match &result {
+            Ok(()) => self.exit_code,
+            Err(ExecuteError::ExitCode(code))
+            | Err(ExecuteError::ExpansionFailure(code))
+            | Err(ExecuteError::Return(code)) => *code,
+            _ => 1,
+        };
+        match pending_pid {
+            Some(pid) => {
+                self.shell_state
+                    .job_table
+                    .completed_statuses
+                    .insert(pid, status);
+                self.reap_procsub_placeholder(pid, true);
+            }
+            None => {
+                self.register_process_substitution_status(status);
+            }
+        }
         result
     }
 

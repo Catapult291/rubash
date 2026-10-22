@@ -838,7 +838,7 @@ impl Executor {
             shell_path_to_windows(target, &self.shell_state.env_vars)
         };
         let input = fs::read_to_string(&path).unwrap_or_default();
-        self.execute_persistent_output_process_substitution(&source, input)?;
+        self.execute_persistent_output_process_substitution(&source, input, None)?;
         let _ = fs::remove_file(path);
         Ok(())
     }
@@ -860,8 +860,22 @@ impl Executor {
         output: &OutputProcessSubstitution,
     ) -> Result<(), ExecuteError> {
         let input = fs::read(&output.path).unwrap_or_default();
-        let tokens = crate::lexer::tokenize(&output.source);
-        let ast = crate::parser::parse(&tokens);
+        // rubash#1024: the body executes on this executor (not a subshell
+        // clone), so its per-command CURRENT_LINE stamps would leak the
+        // body-local lines into the parent shell. Bracket the run with the
+        // enclosing command's lines the way the fd-0 save/restore above
+        // brackets the input redirection.
+        let old_current_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CURRENT_LINE")
+            .cloned();
+        let old_cmd_start_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CMD_START_LINE")
+            .cloned();
+        let ast = super::command_substitution::parse_procsub_body(self, &output.source);
         let old_stdin = self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
         let old_offset = self
             .shell_state
@@ -931,6 +945,16 @@ impl Executor {
             &mut self.shell_state.env_vars,
             FUNCTION_STDIN_OFFSET,
             old_offset,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            "__RUBASH_CURRENT_LINE",
+            old_current_line,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            "__RUBASH_CMD_START_LINE",
+            old_cmd_start_line,
         );
         result
     }
@@ -1032,6 +1056,7 @@ impl Executor {
             FdWriteEndpoint::ProcessSubstitution {
                 path: temp.to_path_buf(),
                 command: String::new(),
+                procsub_pid: None,
             },
             true,
         );
@@ -1127,15 +1152,42 @@ impl Executor {
         self.write_process_substitution_temp_bytes(output.as_bytes())
     }
 
+    /// Fork the rubash#1022 `$!` placeholder: a child that exits at once
+    /// with the already-recorded procsub status. Only async-signal-safe
+    /// work happens post-fork (`_exit`), so forking a multithreaded shell
+    /// is safe — the child never touches locks, allocators, or Rust
+    /// destructors (the process ends via `_exit`, not return).
+    #[cfg(unix)]
+    pub(in crate::executor) fn fork_procsub_placeholder(status: i32) -> Option<u32> {
+        // SAFETY: the child calls only `_exit`, which is async-signal-safe;
+        // no heap or lock state is consulted between fork and exit.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return None;
+        }
+        if pid == 0 {
+            unsafe { libc::_exit(status) };
+        }
+        Some(pid as u32)
+    }
+
     /// GNU subst.c:6362 process_substitute forks an asynchronous child for
     /// every process substitution; jobs.c adds that fork to the job list so
     /// `$!` expands to its pid (execute_cmd.c) and `wait $!` reports the
     /// child's exit status (procsub.tests: `cat <(exit 123); wait $!` ->
     /// 123). Rubash evaluates `<(...)` substitutions inline while
-    /// materializing the containing command, so the already-finished status
-    /// is recorded under a synthetic pid in the dedicated high range that
-    /// cannot collide with a real OS child pid.
-    pub(in crate::executor) fn register_process_substitution_status(&mut self, status: i32) {
+    /// materializing the containing command; the already-finished status is
+    /// recorded under a forked placeholder pid (rubash#1022).
+    ///
+    /// The placeholder is a real child that exits at once with the recorded
+    /// status: it is born a zombie, so `kill -0` and signal delivery behave
+    /// exactly like GNU's just-exited procsub, while the recorded status
+    /// (not the placeholder's own, though they agree) stays the source of
+    /// truth for `wait` — immune to the fork/exit race. An explicit `wait`
+    /// (or the bare `wait`) reaps it; output-form placeholders otherwise
+    /// stay signallable across commands the way GNU's pipe-held procsub
+    /// children outlive the creating command.
+    pub(in crate::executor) fn register_process_substitution_status(&mut self, status: i32) -> u32 {
         const PROCSUB_SEQ_KEY: &str = "RUBASH_INTERNAL_PROCSUB_SEQ";
         let seq = self
             .shell_state
@@ -1146,12 +1198,26 @@ impl Executor {
         self.shell_state
             .env_vars
             .insert(PROCSUB_SEQ_KEY.to_string(), seq.wrapping_add(1).to_string());
+        #[cfg(unix)]
+        let pid = match Self::fork_procsub_placeholder(status) {
+            Some(pid) => {
+                self.shell_state.job_table.procsub_placeholders.insert(pid);
+                pid
+            }
+            None => self.shell_pid.wrapping_add(0x4000_0000).wrapping_add(seq),
+        };
+        // Without fork (non-unix) or when the fork fails, keep the previous
+        // synthetic pid in the dedicated high range that cannot collide with
+        // a real OS child pid; it carries the status for `wait` exactly as
+        // before, only without signal reachability.
+        #[cfg(not(unix))]
         let pid = self.shell_pid.wrapping_add(0x4000_0000).wrapping_add(seq);
         self.shell_state
             .job_table
             .completed_statuses
             .insert(pid, status);
         self.shell_state.last_background_pid = Some(pid);
+        pid
     }
 
     pub(in crate::executor) fn write_process_substitution_temp_bytes(

@@ -314,6 +314,15 @@ impl Executor {
                     return Ok(interrupt);
                 }
             }
+            // rubash#1022: GNU's no-operand wait also reaps finished
+            // process substitutions (jobs.c waits the last procsub when it
+            // is $!). Completed placeholders are already dead, so the
+            // non-blocking sweep only drops their kernel shells — a later
+            // `kill -0 $!` then reports ESRCH like GNU's reaped procsub.
+            // Pending placeholders (still-open persistent `>(...)`) are
+            // left alone: GNU would block, but an unkillable block here
+            // could hang the shell, so they stay signallable instead.
+            self.sweep_procsub_placeholders();
             self.write_buffered_builtin_output(cmd, &[], &[])?;
             // Bash's no-operand wait reports success after waiting for all
             // current jobs; individual statuses require an explicit operand.
@@ -530,6 +539,32 @@ impl Executor {
                 return Some((*pid, *status));
             }
         }
+        // GNU jobs.c wait_for_any_job scans the jobs table first and the
+        // procsubs list second: an operand-less `wait -n` also reports a
+        // finished process substitution (rubash#1022: `echo x > >(exit 9);
+        // wait -n` returns 9 on GNU). Oldest first — pids grow
+        // monotonically, so the minimum is the earliest-registered
+        // still-completed placeholder.
+        if candidates.is_empty() {
+            if let Some(pid) = self
+                .shell_state
+                .job_table
+                .procsub_placeholders
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    self.shell_state
+                        .job_table
+                        .completed_statuses
+                        .contains_key(pid)
+                })
+                .min()
+            {
+                if let Some(status) = self.shell_state.job_table.completed_statuses.get(&pid) {
+                    return Some((pid, *status));
+                }
+            }
+        }
         None
     }
 
@@ -558,6 +593,78 @@ impl Executor {
 
     pub(in crate::executor) fn refresh_background_jobs(&mut self) -> Result<(), ExecuteError> {
         self.refresh_background_jobs_with_protected_coprocs(&[])
+    }
+
+    /// Reap one forked procsub placeholder (rubash#1022). Returns true when
+    /// the pid is no longer a live placeholder (reaped now, or already gone
+    /// — ECHILD). Non-placeholder pids are never touched.
+    pub(in crate::executor) fn reap_procsub_placeholder(&mut self, pid: u32, block: bool) -> bool {
+        if !self
+            .shell_state
+            .job_table
+            .procsub_placeholders
+            .contains(&pid)
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let mut status = 0;
+            let flags = if block { 0 } else { libc::WNOHANG };
+            // SAFETY: waitpid on a direct-child pid is async-signal-safe;
+            // the status word is a stack local. Only the placeholder set's
+            // pids are ever passed, so no foreign or runtime-owned child
+            // (background_children handles) can be reaped here.
+            let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, flags) };
+            if reaped == pid as libc::pid_t
+                || (reaped < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            {
+                self.shell_state.job_table.procsub_placeholders.remove(&pid);
+                return true;
+            }
+            return false;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = block;
+            // Placeholders are only forked on unix; drop the stale entry so
+            // a cross-platform state clone never sticks.
+            self.shell_state.job_table.procsub_placeholders.remove(&pid);
+            true
+        }
+    }
+
+    /// Reap completed procsub placeholders (rubash#1022). Only the bare
+    /// `wait` uses this: GNU's no-operand wait reaps finished process
+    /// substitutions too (jobs.c waits the last procsub when it is `$!`),
+    /// so afterwards `kill -0` reports ESRCH like GNU's reaped procsub.
+    /// Pending placeholders (no recorded status — a still-open persistent
+    /// `>(...)`) are never swept: the forked zombie is the only liveness
+    /// proof until close completes them, mirroring GNU's live tee. The
+    /// per-command refresh deliberately does NOT sweep: with /dev/fd pipes
+    /// GNU's output-procsub children outlive the creating command, so an
+    /// older `$!` stays signallable until a wait consumes it.
+    pub(in crate::executor) fn sweep_procsub_placeholders(&mut self) {
+        if self.shell_state.job_table.procsub_placeholders.is_empty() {
+            return;
+        }
+        let candidates: Vec<u32> = self
+            .shell_state
+            .job_table
+            .procsub_placeholders
+            .iter()
+            .copied()
+            .filter(|pid| {
+                self.shell_state
+                    .job_table
+                    .completed_statuses
+                    .contains_key(pid)
+            })
+            .collect();
+        for pid in candidates {
+            self.reap_procsub_placeholder(pid, false);
+        }
     }
 
     /// Queue the stderr notice for a child that died by a signal
@@ -831,6 +938,10 @@ impl Executor {
     }
 
     fn forget_background_runtime(&mut self, pid: u32) {
+        // rubash#1022: wait paths land here after consuming a status — reap
+        // a placeholder's zombie without blocking (it is already dead; the
+        // WNOHANG reap only drops the kernel shell).
+        self.reap_procsub_placeholder(pid, false);
         self.background_children.remove(&pid);
         // rubash#169: a background child spawned under a capture scope holds
         // a duplicate of the scope's capture pipe; reaping it (wait paths)
@@ -904,6 +1015,11 @@ impl Executor {
             .copied()
         {
             self.join_coproc_stderr_forwarder(pid)?;
+            // rubash#1022: reap the fork placeholder (born zombie, so the
+            // blocking waitpid returns at once) — a later `kill -0` then
+            // reports ESRCH like GNU's reaped procsub. The recorded status
+            // stays in completed_statuses for repeat waits (bgpids parity).
+            self.reap_procsub_placeholder(pid, true);
             // Waiting consumes the jobs-table entry, but the completed status
             // remains available for a later explicit wait of the same PID.
             self.shell_state
@@ -1295,12 +1411,21 @@ impl Executor {
                 .copied();
         }
         let pid = job.parse::<u32>().ok()?;
+        // rubash#1022: pending procsub placeholders (a still-open persistent
+        // `>(...)` — no recorded status yet) resolve like completed ones so
+        // `kill -0`/`kill` reach the forked child; `wait` on one still
+        // reports "not a child" (127) instead of blocking forever.
         (self.shell_state.job_table.pid_to_job.contains_key(&pid)
             || self
                 .shell_state
                 .job_table
                 .completed_statuses
-                .contains_key(&pid))
+                .contains_key(&pid)
+            || self
+                .shell_state
+                .job_table
+                .procsub_placeholders
+                .contains(&pid))
         .then_some(pid)
     }
 
