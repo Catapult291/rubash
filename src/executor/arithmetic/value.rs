@@ -518,8 +518,10 @@ impl ConditionalArithParser<'_> {
             "+=" => bash_arith(current + rhs),
             "-=" => bash_arith(current - rhs),
             "*=" => bash_arith(current * rhs),
-            "<<=" => bash_arith((current as i64).wrapping_shl(u32::try_from(rhs).ok()?) as i128),
-            ">>=" => bash_arith((current as i64).wrapping_shr(u32::try_from(rhs).ok()?) as i128),
+            // GNU expr.c expshift C-shift semantics (rubash#1135): the
+            // count wraps modulo the word size; it never evalerrors.
+            "<<=" => bash_arith((current as i64).wrapping_shl(rhs as u32) as i128),
+            ">>=" => bash_arith((current as i64).wrapping_shr(rhs as u32) as i128),
             "&=" => bash_arith(current & rhs),
             "^=" => bash_arith(current ^ rhs),
             "|=" => bash_arith(current | rhs),

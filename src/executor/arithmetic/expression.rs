@@ -402,13 +402,18 @@ impl ConditionalArithParser<'_> {
                 self.note_op(self.pos);
                 self.pos += 2;
                 let rhs = self.parse_expr()?;
-                let shift = u32::try_from(rhs).ok()?;
+                // GNU expr.c:856-859 expshift: plain C `val1 << val2` on
+                // intmax_t — the hardware masks the count to 6 bits, so a
+                // negative or oversized count wraps instead of erroring
+                // (`8>>-1` == 8>>63 == 0; rubash#1135). wrapping_shl/shr
+                // apply the same mask to the u32 count.
+                let shift = rhs as u32;
                 value = bash_arith((value as i64).wrapping_shl(shift) as i128);
             } else if self.starts_with(">>") {
                 self.note_op(self.pos);
                 self.pos += 2;
                 let rhs = self.parse_expr()?;
-                let shift = u32::try_from(rhs).ok()?;
+                let shift = rhs as u32;
                 value = bash_arith((value as i64).wrapping_shr(shift) as i128);
             } else {
                 return Some(value);
