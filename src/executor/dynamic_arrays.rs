@@ -343,6 +343,25 @@ impl Executor {
     /// non-numeric value fails valid_number and leaves the state alone.
     /// Applied on the declare/typeset/local bind path, whose assignment
     /// operands bypass apply_shell_assignment's own seed (rubash#541).
+    /// A RANDOM seed written as a canonical decimal integer (optional
+    /// sign, no leading zero) seeds directly; anything else (`010`,
+    /// `0x10`, `abc`, `42x`) goes through evalexp like GNU assign_random
+    /// (rubash#1082).
+    pub(in crate::executor) fn canonical_decimal_seed(value: &str) -> Option<i64> {
+        let trimmed = value.trim();
+        let digits = trimmed
+            .strip_prefix('-')
+            .or_else(|| trimmed.strip_prefix('+'))
+            .unwrap_or(trimmed);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        trimmed.parse::<i64>().ok()
+    }
+
     pub(in crate::executor) fn apply_declare_random_seeds(&self, args: &[String]) {
         for arg in args {
             let Some((name, value)) = arg.split_once('=') else {
@@ -351,10 +370,23 @@ impl Executor {
             if name.ends_with('+') || name != "RANDOM" {
                 continue;
             }
-            if let Ok(seed) = value.trim().parse::<i64>() {
+            if let Some(seed) = Self::canonical_decimal_seed(value) {
+                self.shell_state.random_state.rseed.set(seed as u32);
+                self.shell_state.random_state.last_value.set(0);
+            } else if let Some(seed) =
+                crate::executor::arithmetic::eval_conditional_arith_value(
+                    value,
+                    &self.shell_state.env_vars,
+                )
+            {
+                // Same evalexp seeding as the plain assignment path
+                // (rubash#1082); a failed evaluation leaves the seed
+                // alone — declare's caller surfaces the evalerror.
                 self.shell_state.random_state.rseed.set(seed as u32);
                 self.shell_state.random_state.last_value.set(0);
             }
+            // A failed evaluation leaves the seed alone; the evalerror
+            // record stays for the declare caller's diagnostic path.
         }
     }
 

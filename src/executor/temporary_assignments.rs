@@ -1007,12 +1007,45 @@ impl Executor {
             set_process_env(base_name, assigned.to_string());
             return true;
         }
-        if base_name == "RANDOM" && !append && !dynamic_unbound {
-            // GNU variables.c:1393-1408 assign_random: a non-numeric value
-            // fails valid_number and returns without reseeding; a numeric
-            // seed runs sbrand — rseed = seed, last_random_value = 0.
-            if let Ok(seed) = value.trim().parse::<i64>() {
+        if base_name == "RANDOM" && !append {
+            // GNU variables.c:1393-1424 assign_random -> get_random_number
+            // seeding: after `unset RANDOM` the cell is unbound
+            // (variables.c:3839 unbind_variable) and the name is a plain
+            // variable — `unset RANDOM; RANDOM=42` stores 42 verbatim and
+            // reads it back (rubash#1082).
+            if is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, "RANDOM") {
+                self.shell_state
+                    .env_vars
+                    .insert(base_name.to_string(), value.to_string());
+                set_process_env(base_name, value);
+                return true;
+            }
+            // GNU assign_random evaluates the value with evalexp
+            // (variables.c assign_random -> legal_number/evalexp path):
+            // a plain integer seeds directly; any other expression
+            // (`abc` -> 0 via the unset variable, `010` -> octal 8,
+            // `0x10` -> 16) seeds with its arithmetic value; an evalexp
+            // failure (`42x`, `3.5`) prints the evalexp diagnostic and
+            // leaves the generator unseeded (rubash#1082).
+            if let Some(seed) = Self::canonical_decimal_seed(&value) {
                 self.shell_state.random_state.rseed.set(seed as u32);
+                self.shell_state.random_state.last_value.set(0);
+            } else if let Some(seed) =
+                crate::executor::arithmetic::eval_conditional_arith_value(
+                    &value,
+                    &self.shell_state.env_vars,
+                )
+            {
+                self.shell_state.random_state.rseed.set(seed as u32);
+                self.shell_state.random_state.last_value.set(0);
+            } else if let Some(record) =
+                crate::executor::arithmetic::take_arith_eval_error()
+            {
+                let line = format!("{}{}\n", self.diagnostic_prefix(), record.render());
+                self.emit_assignment_diag(line);
+            } else {
+                // No value and no error (empty string): seed 0.
+                self.shell_state.random_state.rseed.set(0);
                 self.shell_state.random_state.last_value.set(0);
             }
             set_process_env(base_name, value);
