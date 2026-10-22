@@ -4,7 +4,7 @@
 
 # Rubash
 
-An embeddable GNU Bash-compatible shell engine, written from scratch in Rust.
+An embeddable GNU Bash-compatible shell engine, written from scratch in Rust — a native-Windows bash and Git Bash/MSYS2 alternative with no POSIX emulation.
 
 [中文](README.zh-CN.md) · [unixwin.dev](https://unixwin.dev)
 
@@ -22,7 +22,7 @@ Rubash itself is not a shell product. It ships with a reference CLI used by the 
 
 **Measured, not claimed**: compatibility is verified against GNU Bash's own 83-suite upstream test corpus — 83/83 suites pass on the 2026-10-12 full re-run. Raw stdout equality on Windows is 62/83; the other 20 differ only on environment-bound lines (host-tool output, NTFS filename/attr bits, locale, path form — each per-line classified in the ledger), and nameref's single residual line is proven to be GNU Bash's own coproc reap-timing race, not a rubash divergence (ledger below).
 
-**Why native matters**: shells billed as "bash on Windows" (Git Bash, MSYS2) ship a ported bash that rides on a POSIX emulation layer (`msys-2.0.dll`), with fork emulation and path translation that leak quirks into every script. Rubash has no such layer — one self-contained binary speaking Win32 directly.
+**Why native matters**: shells billed as "bash on Windows" (Git Bash, MSYS2) ship a ported bash that rides on a POSIX emulation layer (`msys-2.0.dll`), with fork emulation and path translation that leak quirks into every script. Rubash has no such layer — one self-contained binary speaking Win32 directly, a from-scratch replacement.
 
 **Paths are first-class, one dialect per child**: the MSYS model *guesses* which arguments look like paths and rewrites them — which is why every AI agent and script has to set `MSYS_NO_PATHCONV=1` to stop `/flags` from becoming `C:/Program Files/Git/flags`. Rubash inverts the model with a per-child dialect contract (the same line GNU draws: `shell_execve` hands `execve` the raw word bytes and never rewrites argv). A child that owns a POSIX layer — anything resolved out of a WinuxCmd installation, or through the `winuxcmd` dispatcher — receives its argv **verbatim** and resolves `/d/...`, `/tmp`, `/dev/*` itself. A native Windows program instead receives real Win32 spellings for path-shaped operands, translated **uniformly** (never half of one argv translated and half left POSIX), so a native tool always gets a valid Win32 path for every operand, including not-yet-existing targets it is about to create. For emergency rollback the pre-Option-B translation behavior is available by exporting `__RUBASH_ARGV_DIALECT=legacy`.
 

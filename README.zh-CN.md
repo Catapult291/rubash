@@ -4,7 +4,7 @@
 
 # Rubash
 
-用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎。
+用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎——原生 Windows bash、Git Bash/MSYS2 alternative，无 POSIX 模拟层。
 
 [English](README.md) · [unixwin.dev](https://unixwin.dev)
 
@@ -22,7 +22,7 @@ Rubash 本身不是 shell 产品。它自带一个参考 CLI（供兼容性 harn
 
 **实测而非宣称**：兼容性用 GNU Bash 自己的 83 套上游测试语料验证——2026-10-12 全量重跑 83/83 全部通过。Windows 上原始 stdout 逐字节相等为 62/83；另有 20 套仅在环境绑定行上有差异（宿主工具输出、NTFS 文件名/属性位、locale、路径形式——台账逐行归因），nameref 的唯一残差行经 GNU 自我对跑证实为 GNU 自身 coproc 收割时序竞争、非 rubash 分歧（台账见下）。
 
-**原生的意义**：打着"Windows 上的 bash"旗号的方案（Git Bash、MSYS2）装的是移植版 bash，骑在 POSIX 模拟层（`msys-2.0.dll`）上——fork 模拟、路径翻译的怪癖会渗进每一个脚本。Rubash 没有这层：一个自包含二进制，直接对话 Win32。
+**原生的意义**：打着"Windows 上的 bash"旗号的方案（Git Bash、MSYS2）装的是移植版 bash，骑在 POSIX 模拟层（`msys-2.0.dll`）上——fork 模拟、路径翻译的怪癖会渗进每一个脚本。Rubash 没有这层：一个自包含二进制，直接对话 Win32——从零实现的 from-scratch replacement。
 
 **路径是一等公民，一个子进程一种方言**：MSYS 的模型是*猜*哪些参数像路径然后改写——这就是为什么每个 AI agent 和脚本都得设置 `MSYS_NO_PATHCONV=1`，防止 `/flags` 被改成 `C:/Program Files/Git/flags`。Rubash 用**逐子进程方言契约**把模型反过来（与 GNU 画的是同一条线：`shell_execve` 把原始词字节原样交给 `execve`，从不改写 argv）。自带 POSIX 层的子进程——凡是从 WinuxCmd 安装解析出来的、或经 `winuxcmd` 分发器解析的——拿到的 argv **逐字原样**，`/d/...`、`/tmp`、`/dev/*` 由它自己解析。原生 Windows 程序则拿到路径形参数的真实 Win32 拼写，翻译**整体一致**（绝不半个 argv 被翻译、另一半留在 POSIX 形），原生工具的每个操作数——包括它即将创建的尚不存在目标——都拿到合法 Win32 路径。紧急回退：导出 `__RUBASH_ARGV_DIALECT=legacy` 可恢复 Option-B 之前的翻译行为。
 
