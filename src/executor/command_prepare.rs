@@ -2288,16 +2288,49 @@ impl Executor {
                 .get("IFS")
                 .map(String::as_str)
                 .unwrap_or("");
-            // rubash#743: protect IFS chars inside quoted segments. The
-            // cooked word lost quote positions, so parse the raw word to
-            // find quoted IFS chars, then map them to cooked positions by
-            // simulating quote removal.
-            let mut marked = mark_literal_ifs_chars(word, ifs);
-            if let Some(raw) = raw {
-                marked = mark_quoted_ifs_from_raw(raw, &marked, ifs, self.posix_mode_enabled());
+            // IFS-marking skip (whitelist admission, rubash#117 discipline:
+            // any doubt runs the full passes below). Two independent
+            // identities, each proven by the pass's own code:
+            // - mark_literal_ifs_chars inserts IFS_GLUE only for
+            //   non-blank IFS chars (`ifs.contains(ch)` minus
+            //   ' '/\t/\n); every other arm copies through. When IFS
+            //   carries no non-blank byte (default ' \t\n') the insert
+            //   condition is unsatisfiable, so the pass is the identity.
+            // - mark_quoted_ifs_from_raw records positions only inside
+            //   quote/backslash spans (`'...'`/`"..."`/`\`/`$'...'` arms);
+            //   with none of `'`, `"`, `\` in raw no recording arm can
+            //   fire, the position set stays empty, and both return
+            //   branches hand the input back unchanged. GNU subst.c has
+            //   no shortcut here either (subst.c:11639-11673 always
+            //   CTLESC-protects); this skip only removes passes whose
+            //   output is byte-identical to their input, so downstream
+            //   code (walker, field splitter) cannot distinguish it.
+            //   Saves ~6 allocations per trivial `$name` word
+            //   (`export BK_V$i=x` / `unset BK_V$i`: unquoted, default
+            //   IFS, no IFS bytes).
+            let literal_marks_possible = ifs_literal_marks_possible(ifs);
+            let raw_has_quote_bytes = raw.is_some_and(|raw| raw_has_ifs_quote_bytes(raw));
+            if !literal_marks_possible && !raw_has_quote_bytes {
+                word
+            } else {
+                // rubash#743: protect IFS chars inside quoted segments. The
+                // cooked word lost quote positions, so parse the raw word to
+                // find quoted IFS chars, then map them to cooked positions by
+                // simulating quote removal.
+                let mut marked = if literal_marks_possible {
+                    mark_literal_ifs_chars(word, ifs)
+                } else {
+                    word.to_owned()
+                };
+                if raw_has_quote_bytes {
+                    if let Some(raw) = raw {
+                        marked =
+                            mark_quoted_ifs_from_raw(raw, &marked, ifs, self.posix_mode_enabled());
+                    }
+                }
+                marked_word = marked;
+                &marked_word
             }
-            marked_word = marked;
-            &marked_word
         } else {
             word
         };
@@ -4025,6 +4058,20 @@ fn raw_has_quoted_empty_suffix(raw: &str) -> bool {
     raw.ends_with("''") || raw.ends_with("\"\"")
 }
 
+/// Whitelist predicates for the IFS-marking skip in `expand_command_word`
+/// (rubash#117 discipline: doubt falls through to the full passes).
+/// `ifs_literal_marks_possible` is false exactly when `mark_literal_ifs_chars`
+/// cannot insert a mark (its only mutation needs a non-blank IFS char);
+/// `raw_has_ifs_quote_bytes` is false exactly when `mark_quoted_ifs_from_raw`
+/// cannot record a position (every recording arm needs `'`, `"`, or `\`).
+fn ifs_literal_marks_possible(ifs: &str) -> bool {
+    ifs.bytes().any(|b| !matches!(b, b' ' | b'\t' | b'\n'))
+}
+
+fn raw_has_ifs_quote_bytes(raw: &str) -> bool {
+    raw.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\'))
+}
+
 /// Mark literal IFS characters in the word with \x1c so the field splitter
 /// keeps them as field data. GNU marks literal word characters with CTLESC
 /// during expansion (subst.c expand_word_internal), so only characters that
@@ -5187,6 +5234,7 @@ fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
 mod command_word_materialization_tests {
     use super::mark_literal_ifs_chars;
     use super::materialize_expanded_command_word;
+    use super::{ifs_literal_marks_possible, mark_quoted_ifs_from_raw, raw_has_ifs_quote_bytes};
 
     #[test]
     fn materializes_payload_at_single_boundary() {
@@ -5586,5 +5634,27 @@ mod command_word_materialization_tests {
         // byte-identical, closed substitution bodies included.
         assert_eq!(mark_literal_ifs_chars("plain", " "), "plain");
         assert_eq!(mark_literal_ifs_chars("$(echo a b)", " "), "$(echo a b)");
+    }
+
+    #[test]
+    fn ifs_marking_skip_admission_matches_identity() {
+        // Whitelist unit pins for the expand_command_word skip: default and
+        // blank IFS never insert literal marks; quote-free raws never record
+        // quoted positions — and the skipped passes agree (identity).
+        assert!(!ifs_literal_marks_possible(" \t\n"));
+        assert!(!ifs_literal_marks_possible(""));
+        assert!(!ifs_literal_marks_possible(" \t\n "));
+        assert!(ifs_literal_marks_possible(":"));
+        assert!(ifs_literal_marks_possible(" :"));
+        assert!(!raw_has_ifs_quote_bytes("BK_V$i=x"));
+        assert!(!raw_has_ifs_quote_bytes("export"));
+        assert!(raw_has_ifs_quote_bytes("\"a b\"$w"));
+        assert!(raw_has_ifs_quote_bytes("a\\b"));
+        assert!(raw_has_ifs_quote_bytes("$'a b'"));
+        assert_eq!(mark_literal_ifs_chars("BK_V$i=x", " \t\n"), "BK_V$i=x");
+        assert_eq!(
+            mark_quoted_ifs_from_raw("BK_V$i=x", "BK_V$i=x", " \t\n", false),
+            "BK_V$i=x"
+        );
     }
 }
