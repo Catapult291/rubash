@@ -1254,6 +1254,14 @@ impl Executor {
                     &bytes,
                 ));
             }
+            // rubash#1103: the null device is an immediate EOF, not a live
+            // character device — declining here made `cat </dev/null`
+            // inside a pipeline-stage group fall through to the ambient
+            // stage buffer and print the pipe bytes. GNU reads /dev/null
+            // as empty, always.
+            if is_null_device(&target) {
+                return Some(String::new());
+            }
             // GNU redir.c dup2's the descriptor — a character device has
             // no EOF, so slurping blocks forever on the console
             // (test.tests `t -t 0 < /dev/tty` hung via
