@@ -142,10 +142,22 @@ where
 }
 
 fn current_mask(env_vars: &HashMap<String, String>) -> u32 {
-    env_vars
+    if let Some(mask) = env_vars
         .get("__RUBASH_UMASK")
         .and_then(|value| u32::from_str_radix(value, 8).ok())
-        .unwrap_or(0o022)
+    {
+        return mask;
+    }
+    // No explicit `umask <mode>` seen yet: inherit the real process mask
+    // (GNU builtins/umask.def reads the process umask; rubash#1014).
+    // umask(0) reveals the current mask; restore it immediately.
+    // SAFETY: same read-restore dance as GNU/C libraries; the value is
+    // only used for display here, never to gate file creation.
+    unsafe {
+        let mask = libc::umask(0);
+        libc::umask(mask);
+        mask as u32
+    }
 }
 
 fn parse_mask(mode: &str) -> Option<u32> {
