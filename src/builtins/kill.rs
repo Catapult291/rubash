@@ -1055,7 +1055,21 @@ pub fn take_pending_signals(pid: u32) -> io::Result<Vec<i32>> {
         // covers senders that cannot set the event (tight cadence when the
         // event infrastructure is unavailable, stretched otherwise).
         let fallback_period: u64 = if signal_hint::available() { 1024 } else { 64 };
-        if signals.is_empty() && (signal_hint::signaled() || tick % fallback_period == 0) {
+        // unixwin/rubash#682: WaitForSingleObject(,0) is a real syscall
+        // (~0.3-0.5us) charged to EVERY command boundary — a measurable slice
+        // of the shape-independent per-command floor. The auto-reset event
+        // latches a sender's pulse until a wait consumes it, so sampling it
+        // every HINT_POLL_PERIOD-th poll loses no delivery: a pulse landing
+        // between samples keeps the event set until the next sampled
+        // boundary drains the mailbox. Worst-case added latency is
+        // HINT_POLL_PERIOD-1 boundaries (~25us at the ~3.5us floor), far
+        // inside the 1024-tick filesystem cadence eventless senders already
+        // tolerate.
+        const HINT_POLL_PERIOD: u64 = 8;
+        if signals.is_empty()
+            && (tick % fallback_period == 0
+                || (tick % HINT_POLL_PERIOD == 0 && signal_hint::signaled()))
+        {
             signals = take_file_signals(pid)?;
         }
         Ok(signals)
