@@ -189,6 +189,34 @@ impl Executor {
         // expansion holds no IFS byte) yields false regardless of quoting.
         // Compute it up front and bail before the four raw-word predicates
         // each materialise the word as a `Vec<char>` (rubash#437).
+        // Whitelist short-circuit (rubash#117 discipline): with default
+        // IFS the splitter below (`split_ifs_whitespace`) reacts to
+        // exactly three whitespace bytes plus the IFS_GLUE protection
+        // marker (the guard-to-glue pre-convert runs first, so a guard
+        // byte counts too). A non-empty expanded word holding none of
+        // them — and no guard — provably yields one unchanged field,
+        // so the guard-convert alloc + Vec + field-String materialization
+        // is dead weight. Custom IFS or a present trigger byte runs the
+        // full decision unchanged. The empty word is excluded on
+        // purpose: with no IFS bytes it still collapses from one field
+        // to zero (rubash#995 — an unquoted empty expansion vanishes,
+        // and that face is data-dependent, so it showed only on
+        // Windows CI). `splits_gate_soundness` pins the gate against
+        // the real splitter over an adversarial corpus.
+        if !expanded.is_empty()
+            && self
+                .shell_state
+                .env_vars
+                .get("IFS")
+                .is_none_or(|ifs| ifs == " \t\n")
+            && !expanded
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+            && !expanded.contains(crate::executor::markers::IFS_GLUE)
+            && !expanded.contains(crate::executor::markers::ANSI_C_IFS_GUARD)
+        {
+            return false;
+        }
         let field_split_values = self.field_split_values(expanded);
         let field_split_would_change_word = field_split_values.len() != 1
             || field_split_values
