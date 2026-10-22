@@ -600,6 +600,7 @@ impl Executor {
         // non-zero trap status under debugging_mode skips the body entirely
         // (no RETURN trap either, probe m2: `FN=0` with the body's echo
         // absent); the function call's status is EXECUTION_SUCCESS.
+        let mut debug_entry_return: Option<i32> = None;
         let debug_entry_skip = if function_traced {
             if let Some(line) = body_open_line {
                 self.set_current_line_value(line);
@@ -620,7 +621,21 @@ impl Executor {
                 .unwrap_or_else(|| {
                     crate::executor::command_text::bash_command_source_text(call_cmd)
                 });
-            self.run_debug_trap(&command_text)?.is_some()
+            match self.run_debug_trap(&command_text) {
+                Ok(skip) => skip.is_some(),
+                // rubash#1162: a `return` inside the DEBUG action at the
+                // entry fire (funcnest is already incremented, so the
+                // action runs in this function's frame) returns from THIS
+                // function — GNU bashdb semantics. Feed it into the normal
+                // result path below instead of letting it escape
+                // execute_function, where nothing consumes Return and it
+                // aborted the whole script at the top-level driver.
+                Err(ExecuteError::Return(status)) => {
+                    debug_entry_return = Some(status);
+                    false
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             false
         };
@@ -717,7 +732,9 @@ impl Executor {
         // `debugging_mode == 0 || result == EXECUTION_SUCCESS` branch). The
         // unwind restores below run for the skip path too, like
         // run_unwind_frame does in GNU.
-        let result = if debug_entry_skip {
+        let result = if let Some(status) = debug_entry_return {
+            Err(ExecuteError::Return(status))
+        } else if debug_entry_skip {
             Ok(())
         } else {
             self.with_compound_output_redirects(call_cmd, |executor| {
