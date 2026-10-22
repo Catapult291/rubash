@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="rubash icon: reborn flame">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16203f"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08f8f8"/>
+      <stop offset="1" stop-color="#38b6ff"/>
+    </linearGradient>
+    <mask id="cut">
+      <rect width="256" height="256" fill="#fff"/>
+      <path d="M118 182 V128" fill="none" stroke="#000" stroke-width="23" stroke-linecap="round"/>
+      <path d="M118 150 C118 130 132 122 154 122" fill="none" stroke="#000" stroke-width="23" stroke-linecap="round"/>
+    </mask>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#tile)"/>
+  <rect x="1.5" y="1.5" width="253" height="253" rx="46.5" fill="none" stroke="#2a3a60" stroke-width="3"/>
+  <path mask="url(#cut)" fill="url(#acc)" d="M128 40
+    C142 70 172 90 182 126
+    C190 154 182 186 158 202
+    C147 210 138 215 128 215
+    C118 215 109 210 98 202
+    C74 186 66 154 74 126
+    C81 101 99 88 112 62
+    C114 86 122 102 136 112
+    C127 88 121 64 128 40 Z"/>
+</svg>
