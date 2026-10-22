@@ -1487,6 +1487,7 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
         return None;
     }
     executor.set_env("__RUBASH_STARTUP_FILES_DONE", "1");
+    diagnose_bash_env_directory(executor);
     #[cfg(not(windows))]
     {
         let login = executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1");
@@ -1534,6 +1535,26 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
         let _ = (executor, rc_override);
     }
     None
+}
+
+/// GNU shell.c run_startup_files / maybe_execute_env_file: a
+/// non-interactive shell sources $BASH_ENV; when that name is a
+/// directory the read fails and bash reports `<file>: is a directory`
+/// on stderr, then continues (execution is unaffected). The standalone
+/// rubash binary silently ignored the failure (rubash#1146). Report
+/// the directory case here, once per process (guarded by the caller's
+/// startup-files-done marker).
+fn diagnose_bash_env_directory(executor: &mut Executor) {
+    if executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
+        return;
+    }
+    let Some(bash_env) = executor.get_env("BASH_ENV").filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let path = executor.resolve_shell_path(&bash_env);
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+        eprintln!("rubash: {bash_env}: Is a directory");
+    }
 }
 
 fn run_stdin_script(executor: &mut Executor) -> i32 {
