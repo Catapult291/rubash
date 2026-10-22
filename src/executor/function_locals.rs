@@ -285,6 +285,13 @@ impl Executor {
         let Some(scope) = self.shell_state.local_var_scopes.pop() else {
             return HashSet::new();
         };
+        // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: popping a
+        // frame that shadowed BASH_COMPAT reinstalls the saved binding
+        // through the bind hook, so the compatNN flags re-derive from the
+        // restored value (`local BASH_COMPAT=42` inside f leaves no flag
+        // behind). Silent: teardown paths own no stderr channel; the flags
+        // (the behavior key) are exact.
+        let touched_bashcompat = scope.contains_key("BASH_COMPAT");
         // GNU variables.c:5271-5275 (push_posix_tempvar_internal, reached via
         // pop_var_context -> hash_flush -> push_func_var): a local `-`
         // restores the saved `set -o` options when its frame pops.
@@ -334,6 +341,22 @@ impl Executor {
             self.shell_state.variables.remove(&name);
             if let Some(variable) = variable {
                 let _ = self.shell_state.variables.set(name, variable);
+            }
+        }
+        if touched_bashcompat {
+            // GNU re-runs the bind hook when the saved value is reinstalled
+            // (a restored invalid value re-reports `compatibility value out
+            // of range`, verified oracle) — route it like any assignment
+            // diagnostic.
+            if let Err(diagnostic) = crate::builtins::shopt::sync_compat_flags_from_bash_compat(
+                &mut self.shell_state.env_vars,
+            ) {
+                // GNU sv_shcompat errors never carry a command segment
+                // (internal_error, verified oracle: even `read BASH_COMPAT`
+                // reports bare `BASH_COMPAT: ...`), so the plain
+                // diagnostic_prefix is used, not the assignment one.
+                let line = format!("{}{diagnostic}\n", self.diagnostic_prefix());
+                self.emit_assignment_diag(line);
             }
         }
         names

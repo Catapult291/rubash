@@ -892,14 +892,13 @@ impl Executor {
         // GNU execute_cmd.c:4048-4057 (execute_cond_node): `rmatch &&
         // shell_compatibility_level > 31` selects mode 2 (cond_expand_word
         // QGLOB_REGEXP: quoted characters literalize regex metacharacters).
-        // Under compat31 (shopt sets shell_compatibility_level <= 31) the
-        // mode stays 0 — cond_expand_word's special==0 branch is plain
-        // dequote_list — and sh_regmatch still compiles the result as a
-        // REGEX, so a quoted RHS keeps pattern semantics
-        // (`[[ xa+b =~ "$re" ]]` with re='a+b' matches; rubash#346). The
-        // unquoted-RHS path (conditional_regex_match_status) already has
+        // The level is the derived compat level (shopt compatNN flags win,
+        // else BASH_COMPAT): under `shopt -s compat31` OR `BASH_COMPAT=31`
+        // the mode stays 0 — plain dequote_list — and sh_regmatch still
+        // compiles the result as a REGEX (rubash#346).
+        // The unquoted-RHS path (conditional_regex_match_status) already has
         // exactly those mode-0 semantics.
-        if crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "compat31") {
+        if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 31 {
             return self.conditional_regex_match_status(left, right);
         }
         if self.regex_operands_nounset_fatal(left, right) {

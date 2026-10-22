@@ -31,8 +31,30 @@ impl Executor {
             &mut stdout,
             &mut stderr,
         )?;
+        self.sync_shopt_rebound_var();
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         Ok(status)
+    }
+
+    /// GNU has one variable store; rubash mirrors direct assignments into
+    /// the typed owner for expansion. `shopt -s/-u compatNN` rebinds
+    /// BASH_COMPAT in the mirror only, so a typed cell from an earlier
+    /// direct assignment would shadow it on expansion (verified:
+    /// `BASH_COMPAT=99; shopt -s compat44; echo $BASH_COMPAT` printed 99
+    /// while `declare -p` showed 44). Re-sync the rebound name after every
+    /// shopt invocation (the unset_arrays dual-store precedent); a missing
+    /// typed cell needs nothing (expansion falls back to the mirror).
+    pub(in crate::executor) fn sync_shopt_rebound_var(&mut self) {
+        if self.shell_state.variables.get("BASH_COMPAT").is_none() {
+            return;
+        }
+        if let Some(value) = self.shell_state.env_vars.get("BASH_COMPAT").cloned() {
+            if let Some(variable) = self.shell_state.variables.get_mut("BASH_COMPAT") {
+                variable.value = crate::shell::ShellValue::Scalar(value);
+            }
+        } else {
+            self.shell_state.variables.remove("BASH_COMPAT");
+        }
     }
 
     pub(in crate::executor) fn execute_umask(

@@ -611,6 +611,13 @@ impl Executor {
         if let Some(mark) = self.tempenv_marks.pop() {
             self.tempenv_names.truncate(mark);
         }
+        // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: reinstalling
+        // the saved binding re-runs the hook — flags re-derive from the
+        // restored value and a restored invalid value re-reports
+        // `compatibility value out of range` (verified oracle: temp-prefix
+        // and function-local restores both emit). A restore that removed
+        // the variable takes the `v == 0` arm (flags off, no diagnostic).
+        let touched_bashcompat = previous.iter().any(|(name, ..)| name == "BASH_COMPAT");
         // GNU variables.c:2615-2631 make_local_variable (was_tmpvar): a
         // declare/typeset/local operand bound by this command's prefix was
         // promoted to a frame local — its env binding must survive this
@@ -690,6 +697,18 @@ impl Executor {
         }
         for name in promoted {
             self.mark_exported(&name);
+        }
+        if touched_bashcompat {
+            if let Err(diagnostic) = crate::builtins::shopt::sync_compat_flags_from_bash_compat(
+                &mut self.shell_state.env_vars,
+            ) {
+                // GNU sv_shcompat errors never carry a command segment
+                // (internal_error, verified oracle: even `read BASH_COMPAT`
+                // reports bare `BASH_COMPAT: ...`), so the plain
+                // diagnostic_prefix is used, not the assignment one.
+                let line = format!("{}{diagnostic}\n", self.diagnostic_prefix());
+                self.emit_assignment_diag(line);
+            }
         }
     }
 

@@ -1007,7 +1007,7 @@ pub(in crate::executor) fn random_compat_fold(env_vars: &HashMap<String, String>
             return false;
         }
     }
-    shell_compatibility_level_value(env_vars) > 50
+    crate::builtins::shopt::compatibility_level(env_vars) > 50
 }
 
 /// GNU lib/sh/random.c:99-113 brand() + variables.c:1424-1431

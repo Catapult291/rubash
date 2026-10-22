@@ -616,10 +616,12 @@ impl Executor {
     /// `unbind_array_element` (arrayfunc.c:1165) binds the assoc subscript
     /// verbatim — `akey = sub` — instead of running the deferred
     /// `expand_subscript_string` pass.
-    /// GNU variables.c shell_compatibility_level — see
-    /// shell_compatibility_level_value for the BASH_COMPAT parse.
+    /// GNU `variables.c` `shell_compatibility_level` — the single derived
+    /// level from `crate::builtins::shopt` (compatNN shopt flags win, else
+    /// the strict `BASH_COMPAT` parse, else the 5.3 default). See
+    /// `src/builtins/shopt/compat.rs`.
     fn shell_compatibility_level(&self) -> u32 {
-        shell_compatibility_level_value(&self.shell_state.env_vars)
+        crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars)
     }
 
     pub(in crate::executor) fn unset_array_element(

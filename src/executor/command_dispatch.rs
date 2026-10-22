@@ -196,7 +196,7 @@ impl Executor {
             // to the global, and the frame pop restores nothing for the
             // name. Drop the name from the nearest local scope snapshot
             // so restore_function_locals leaves the live binding in place.
-            if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+            if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 44
                 && self.shell_state.function_depth > 0
             {
                 for name in &absorbed {

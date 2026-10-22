@@ -214,7 +214,7 @@ impl Executor {
         // straight through them (`${v/b/'$y'}` -> 'Y'), a backslash quotes
         // only the quotable set and otherwise stays literal, and a leading
         // tilde is not expanded.
-        if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 42 {
+        if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 42 {
             let marked = Self::mark_patsub_replacement_quotes_compat42(&chars);
             let expanded = self.expand_embedded_parameters(&marked);
             return self.finish_patsub_replacement(&expanded, patsub_replacement);

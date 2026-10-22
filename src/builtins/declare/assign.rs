@@ -36,6 +36,14 @@ where
 {
     let readonly = marked_vars(variables, READONLY_VARS);
     let mut status = EXECUTION_SUCCESS;
+    // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: a declare-family
+    // operand rebinding BASH_COMPAT re-syncs the compatNN shopt flags (the
+    // declare path writes VarTable directly, bypassing bind_variable's
+    // hook). The hook runs on every rebinding — even a value-identical one
+    // (verified oracle: repeated `declare BASH_COMPAT=99` re-reports).
+    let binds_bashcompat = names
+        .iter()
+        .any(|name| crate::builtins::shopt::binds_bashcompat_operand(name));
     for name in names {
         let Some((var_name, value)) = name.split_once('=') else {
             // GNU declare.def: a "name[subscript]" operand without '=' is a
@@ -716,6 +724,17 @@ where
         // recorded word travels up for the fatal diagnostic.
         if oob_word.is_some() {
             return Ok(EXECUTION_FAILURE);
+        }
+    }
+    if binds_bashcompat {
+        // GNU sv_shcompat error shape has no command prefix
+        // (`script: line N: BASH_COMPAT: 99: ...`, verified oracle — even
+        // via `export`/`declare`); the operand itself still binds and the
+        // declare status is unaffected.
+        if let Err(diagnostic) =
+            crate::builtins::shopt::sync_compat_flags_from_bash_compat(variables)
+        {
+            writeln!(stderr, "{}{diagnostic}", diagnostic_prefix(variables),)?;
         }
     }
     Ok(status)

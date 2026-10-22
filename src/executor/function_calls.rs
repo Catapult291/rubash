@@ -526,7 +526,7 @@ impl Executor {
                 for arg in args {
                     self.shell_state.bash_argv_stack.insert(0, arg.clone());
                 }
-            } else if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+            } else if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 44
                 && self.shell_state.bash_arg_bottom.borrow().is_none()
             {
                 // rubash#1110 item 4 / rubash#1051 integration: GNU
@@ -692,7 +692,7 @@ impl Executor {
         // happen — the caller's loop_level carries into the body, so a
         // `break` inside the function breaks the caller's loop.
         let saved_loop_depth = self.shell_state.loop_depth;
-        if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 43 {
+        if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 43 {
             self.shell_state.loop_depth = 0;
         }
         // The fresh loop scope covers fork-inherited depth too: a function
