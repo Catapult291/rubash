@@ -11,7 +11,7 @@ use super::*;
 /// per-process runtime state (FD tables, coproc pipes, command-substitution
 /// and heredoc payloads, trap table entries, line/pid bookkeeping,
 /// evaluation-context flags, test-harness sentinels) stay dropped.
-fn rubash_spawn_inherited_state(key: &str) -> bool {
+pub(in crate::executor) fn rubash_spawn_inherited_state(key: &str) -> bool {
     const KEYS: &[&str] = &[
         "__RUBASH_ARRAY_VARS",
         "__RUBASH_ASSOC_VARS",

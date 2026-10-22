@@ -2312,6 +2312,65 @@ impl Executor {
         }
     }
 
+    /// rubash#1021 helper: spawn a `<(source)` body as a child shell
+    /// writing to a pipe and bind the read end on `fd`, the way GNU
+    /// process_substitute forks instead of collecting output first.
+    /// The child gets the coproc spawn's environment treatment (shell
+    /// vars plus the full function table as BASH_FUNC entries), is
+    /// registered for reaping, and becomes `$!`. Returns false when the
+    /// spawn could not be set up; the caller then falls back to
+    /// synchronous collection.
+    fn bind_input_process_substitution_child(&mut self, fd: u32, source: &str) -> bool {
+        use std::process::{Command, Stdio};
+        let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| "rubash".into());
+        let Ok((reader, writer)) = std::io::pipe() else {
+            return false;
+        };
+        let mut child = Command::new(&exe);
+        child.arg("-c").arg(source);
+        for (key, value) in &self.shell_state.env_vars {
+            if !key.starts_with("__RUBASH_") || super::compound_exec::rubash_spawn_inherited_state(key) {
+                child.env(key, value);
+            }
+        }
+        for (name, body) in &self.shell_state.functions {
+            if !is_exportable_function_name(name) {
+                continue;
+            }
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[]);
+            child.env(
+                exported_function_env_name(name),
+                exported_function_env_value(&body.commands, def_redirects),
+            );
+        }
+        child.stdin(Stdio::inherit());
+        child.stdout(writer);
+        child.stderr(Stdio::inherit());
+        match child.spawn() {
+            Ok(child_proc) => {
+                let pid = child_proc.id();
+                self.background_children
+                    .insert(pid, crate::fd::SpawnedChild::from(child_proc));
+                // GNU process_substitute records the child in $!
+                // (subst.c assigns last_made_pid).
+                self.shell_state.last_background_pid = Some(pid);
+                let file = crate::fd::handle_to_file(crate::fd::into_handle(reader));
+                let file_fd = FileFd::from_file(file, format!("<({source})").into());
+                self.set_fd_input_file(fd, file_fd, fd != 0);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn execute_stdio_only_exec_redirect(
         &mut self,
         cmd: &CommandNode,
@@ -2516,6 +2575,16 @@ impl Executor {
                         .strip_prefix("<(")
                         .and_then(|target| target.strip_suffix(')'))
                     {
+                        // rubash#1021: GNU process_substitute (subst.c)
+                        // forks the body and binds the pipe read end
+                        // immediately; collecting its output first (the
+                        // fallback below) blocks `exec` until the
+                        // producer exits — forever for `tail -f`. Spawn
+                        // the body as a child shell on a real pipe
+                        // instead (same shape as the coproc spawn).
+                        if self.bind_input_process_substitution_child(fd, source) {
+                            continue;
+                        }
                         if let Some(input) = self.process_substitution_output(source) {
                             self.fd_table.open_input(
                                 fd,
