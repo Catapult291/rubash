@@ -154,7 +154,14 @@ where
             ShoptMode::List | ShoptMode::Query => {
                 print_all_shopts(env_vars, print, stdout)?;
             }
-            ShoptMode::Set => {}
+            // GNU builtins/shopt.def shopt_builtin: bare `shopt -s` (no
+            // operands, no -p) lists the SET options in the plain
+            // name/on-off format, exactly like bare `shopt -u` lists the
+            // unset ones (rubash#1107 item 5: `shopt -s compat44;
+            // shopt -s | grep -c compat` is 1 in GNU, was 0).
+            ShoptMode::Set => {
+                print_shopts_by_state(env_vars, true, false, stdout)?;
+            }
         }
         return Ok(status);
     }
