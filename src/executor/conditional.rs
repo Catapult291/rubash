@@ -854,6 +854,54 @@ impl Executor {
         &self,
         pattern: &str,
     ) -> Result<CompiledConditionalRegex, regex::Error> {
+        // perf (rubash#1119): compilation is a pure function of the
+        // expanded pattern text, the nocasematch flag and the locale
+        // granularity (rubash#1061 byte mode) — the decode, POSIX
+        // bracket translation, class-name validation and the regex
+        // build are all deterministic in those inputs — but a full
+        // regex-crate build costs tens of microseconds where glibc
+        // regcomp costs a few, so a `[[ =~ ]]` in a loop paid it every
+        // iteration (233ms vs GNU 42ms for 2000 matches). Cache the
+        // last few compiled programs per thread (the executor is
+        // single-threaded per shell) and hand out clones. Failures
+        // cache as None: the error payload is never inspected (the
+        // diagnostic path re-derives its reason from the pattern
+        // text), so a stand-in error is returned for a known-invalid
+        // pattern.
+        let case_insensitive =
+            crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
+        let byte_mode = conditional_regex_byte_mode();
+        if let Some(cached) = conditional_regex_cache_lookup(pattern, case_insensitive, byte_mode)
+        {
+            return match cached {
+                Some(regex) => Ok((*regex).clone()),
+                None => Err(regex::Regex::new("(").unwrap_err()),
+            };
+        }
+        match self.compile_conditional_regex_uncached(pattern, case_insensitive, byte_mode) {
+            Ok(regex) => {
+                let regex = std::rc::Rc::new(regex);
+                conditional_regex_cache_store(
+                    pattern,
+                    case_insensitive,
+                    byte_mode,
+                    Some(regex.clone()),
+                );
+                Ok((*regex).clone())
+            }
+            Err(error) => {
+                conditional_regex_cache_store(pattern, case_insensitive, byte_mode, None);
+                Err(error)
+            }
+        }
+    }
+
+    fn compile_conditional_regex_uncached(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        byte_mode: bool,
+    ) -> Result<CompiledConditionalRegex, regex::Error> {
         // The comsub payload spelling is transport text, not regex syntax:
         // decode it to the carried byte so `[[ $v =~ a$(printf '\001')c ]]`
         // compiles the pattern GNU's cond_expand_word produced — the raw
@@ -869,8 +917,6 @@ impl Executor {
         if !posix_bracket_class_names_valid(&pattern) || posix_ere_has_extended_group(&pattern) {
             return Err(regex::Regex::new("(").unwrap_err());
         }
-        let case_insensitive =
-            crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
         // GNU regcomp is called WITHOUT REG_NEWLINE (lib/sh/shmatch.c
         // sh_regmatch), so `.` matches a newline (rubash#1058).
         // Granularity follows the locale model (rubash#1061): glibc
@@ -880,7 +926,7 @@ impl Executor {
         // explicitly non-UTF-8 or unset locale in the oracle's C-locale
         // sense takes the byte engine. A UTF-8 locale that is actually
         // active keeps the char engine.
-        if conditional_regex_byte_mode() {
+        if byte_mode {
             regex::bytes::RegexBuilder::new(&pattern)
                 .case_insensitive(case_insensitive)
                 .dot_matches_new_line(true)
@@ -1187,6 +1233,58 @@ fn cond_arith_decimal_literal(raw: &str) -> Option<i128> {
     raw.parse::<i64>().ok().map(|value| value as i128)
 }
 
+thread_local! {
+    /// Compiled-program cache for `[[ =~ ]]` (rubash#1119): the last few
+    /// (pattern, nocasematch, byte-mode) -> program mappings, most
+    /// recent last. `None` records a pattern that failed to compile.
+    /// Bounded so a script generating unbounded distinct patterns
+    /// cannot grow it.
+    static CONDITIONAL_REGEX_CACHE: std::cell::RefCell<
+        Vec<(String, bool, bool, Option<std::rc::Rc<CompiledConditionalRegex>>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const CONDITIONAL_REGEX_CACHE_CAP: usize = 16;
+
+fn conditional_regex_cache_lookup(
+    pattern: &str,
+    case_insensitive: bool,
+    byte_mode: bool,
+) -> Option<Option<std::rc::Rc<CompiledConditionalRegex>>> {
+    CONDITIONAL_REGEX_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache
+            .iter()
+            .rev()
+            .find(|(cached_pattern, cached_ci, cached_bm, _)| {
+                cached_ci == &case_insensitive
+                    && cached_bm == &byte_mode
+                    && cached_pattern == pattern
+            })
+            .map(|(_, _, _, compiled)| compiled.clone())
+    })
+}
+
+fn conditional_regex_cache_store(
+    pattern: &str,
+    case_insensitive: bool,
+    byte_mode: bool,
+    compiled: Option<std::rc::Rc<CompiledConditionalRegex>>,
+) {
+    CONDITIONAL_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(cached_pattern, cached_ci, cached_bm, _)| {
+            !(cached_ci == &case_insensitive
+                && cached_bm == &byte_mode
+                && cached_pattern == pattern)
+        });
+        cache.push((pattern.to_string(), case_insensitive, byte_mode, compiled));
+        if cache.len() > CONDITIONAL_REGEX_CACHE_CAP {
+            cache.remove(0);
+        }
+    });
+}
+
 fn contains_extglob_pattern(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1371,6 +1469,7 @@ fn quote_marked_chars_for_regexp(marked: &[(char, bool)]) -> String {
 /// splitting a multibyte character, exactly what glibc regexec yields)
 /// carries its stray bytes as U+E000 raw-byte marker pairs, which the
 /// normal output boundaries decode back to the original bytes.
+#[derive(Clone)]
 enum CompiledConditionalRegex {
     Text(regex::Regex),
     Bytes(regex::bytes::Regex),
