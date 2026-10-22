@@ -2131,6 +2131,57 @@ impl Executor {
 
         if let Some(redirect) = &cmd.redirect_err {
             let target = self.expand_redirect_target(redirect);
+            // GNU redir.c r_duplicating_output: a `2>&N` / `2>&-` target is
+            // a descriptor dup, never a file name — opening it literally
+            // wrote the exec-failure diagnostic into a file named "&1"
+            // and the message vanished (rubash#1144).
+            if let Some(dup) = target.strip_prefix('&') {
+                // The close form `2>&-` is exactly "-"; the move form
+                // `2>&1-` strips one trailing '-'.
+                let dup_fd = if dup == "-" {
+                    dup
+                } else {
+                    dup.strip_suffix('-').unwrap_or(dup)
+                };
+                let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                    &cmd.words[1..],
+                    crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                    crate::executor::dev_fd_operands::DevOperandStdout::FdTable,
+                );
+                let status = match dup_fd {
+                    "-" => crate::builtins::exec::execute_with_child_stdio(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut std::io::sink(),
+                        Stdio::inherit(),
+                        Stdio::null(),
+                        self.exec_inherited_stdin()?,
+                    )?,
+                    "1" => crate::builtins::exec::execute_with_io(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut crate::executor::GlobalStdout,
+                        self.exec_inherited_stdin()?,
+                    )?,
+                    _ => crate::builtins::exec::execute_with_child_stdio(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut std::io::stderr().lock(),
+                        self.exec_inherited_stdio(1)?,
+                        dup_fd
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(|fd| self.exec_inherited_stdio(fd).ok())
+                            .unwrap_or_else(Stdio::inherit),
+                        self.exec_inherited_stdin()?,
+                    )?,
+                };
+                self.finish_dev_fd_operands(dev_ops);
+                return Ok(status);
+            }
             let mut file = self.create_redirect_output(&target, redirect.clobber)?;
             let child_stderr = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
