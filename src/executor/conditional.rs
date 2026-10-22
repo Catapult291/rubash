@@ -427,17 +427,17 @@ impl Executor {
             [left, op, right, end]
                 if end == "]]"
                     && op == "=~"
-                    && metadata
-                        .get(2)
-                        .is_some_and(|m| Self::conditional_rhs_word_is_quoted(&m.raw)) =>
+                    && metadata.get(2).is_some_and(|m| {
+                        Self::conditional_rhs_word_is_quoted(&m.raw) || m.raw.contains('\\')
+                    }) =>
             {
                 Some(self.conditional_quoted_regex_match_status(left, right, &metadata[2]))
             }
             [left, op, right]
                 if op == "=~"
-                    && metadata
-                        .get(2)
-                        .is_some_and(|m| Self::conditional_rhs_word_is_quoted(&m.raw)) =>
+                    && metadata.get(2).is_some_and(|m| {
+                        Self::conditional_rhs_word_is_quoted(&m.raw) || m.raw.contains('\\')
+                    }) =>
             {
                 Some(self.conditional_quoted_regex_match_status(left, right, &metadata[2]))
             }
@@ -730,13 +730,16 @@ impl Executor {
         true
     }
 
-    pub(super) fn store_bash_rematch(&mut self, captures: regex::Captures<'_>) {
+    pub(super) fn store_bash_rematch(&mut self, captures: Vec<Option<String>>) {
+        // GNU execute_cmd.c:4144-4150 (sh_regmatch -> store: every group in
+        // 0..nmatch gets an element): a group that did not participate is
+        // bound to the EMPTY string, not left unset — `${#BASH_REMATCH[@]}`
+        // counts it and `${BASH_REMATCH[i]+x}` reports it set (rubash#1059,
+        // optional groups and the untaken side of an alternation alike).
         let entries: BTreeMap<usize, String> = captures
-            .iter()
+            .into_iter()
             .enumerate()
-            .filter_map(|(index, capture)| {
-                capture.map(|matched| (index, matched.as_str().to_string()))
-            })
+            .map(|(index, capture)| (index, capture.unwrap_or_default()))
             .collect();
         sync_typed_indexed_array(&mut self.shell_state.variables, "BASH_REMATCH", &entries);
         self.shell_state.env_vars.insert(
@@ -830,7 +833,10 @@ impl Executor {
         self.report_conditional_error(&format!("invalid regular expression `{pattern}': {reason}"));
     }
 
-    fn compile_conditional_regex(&self, pattern: &str) -> Result<regex::Regex, regex::Error> {
+    fn compile_conditional_regex(
+        &self,
+        pattern: &str,
+    ) -> Result<CompiledConditionalRegex, regex::Error> {
         // The comsub payload spelling is transport text, not regex syntax:
         // decode it to the carried byte so `[[ $v =~ a$(printf '\001')c ]]`
         // compiles the pattern GNU's cond_expand_word produced — the raw
@@ -843,15 +849,34 @@ impl Executor {
         // ("Invalid character class name"); the regex crate parses the
         // span as a nested class instead, so validate names before
         // handing the pattern over (cond-regexp2.sub `[[:invalid:]`).
-        if !posix_bracket_class_names_valid(&pattern) {
-            return regex::Regex::new("(");
+        if !posix_bracket_class_names_valid(&pattern) || posix_ere_has_extended_group(&pattern) {
+            return Err(regex::Regex::new("(").unwrap_err());
         }
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(crate::builtins::shopt::option_enabled(
-                &self.shell_state.env_vars,
-                "nocasematch",
-            ))
-            .build()
+        let case_insensitive =
+            crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
+        // GNU regcomp is called WITHOUT REG_NEWLINE (lib/sh/shmatch.c
+        // sh_regmatch), so `.` matches a newline (rubash#1058).
+        // Granularity follows the locale model (rubash#1061): glibc
+        // regexec matches one multibyte CHARACTER in a UTF-8 locale and
+        // one BYTE otherwise; rubash's locale model (locale.rs is_utf8,
+        // unset locale = UTF-8 default) names the active case, and an
+        // explicitly non-UTF-8 or unset locale in the oracle's C-locale
+        // sense takes the byte engine. A UTF-8 locale that is actually
+        // active keeps the char engine.
+        if conditional_regex_byte_mode() {
+            regex::bytes::RegexBuilder::new(&pattern)
+                .case_insensitive(case_insensitive)
+                .dot_matches_new_line(true)
+                .unicode(false)
+                .build()
+                .map(CompiledConditionalRegex::Bytes)
+        } else {
+            regex::RegexBuilder::new(&pattern)
+                .case_insensitive(case_insensitive)
+                .dot_matches_new_line(true)
+                .build()
+                .map(CompiledConditionalRegex::Text)
+        }
     }
 
     /// GNU execute_cmd.c:4077 cond_expand_word(w, 2) -> subst.c:11229
@@ -1322,10 +1347,119 @@ fn quote_marked_chars_for_regexp(marked: &[(char, bool)]) -> String {
     out
 }
 
+/// A compiled `=~` pattern in the granularity the active locale model
+/// dictates (rubash#1061): the char engine for a UTF-8 locale, the byte
+/// engine otherwise. Captures are reported as storage strings in both
+/// modes; in byte mode a capture that is not valid UTF-8 (e.g. `.`
+/// splitting a multibyte character, exactly what glibc regexec yields)
+/// carries its stray bytes as U+E000 raw-byte marker pairs, which the
+/// normal output boundaries decode back to the original bytes.
+enum CompiledConditionalRegex {
+    Text(regex::Regex),
+    Bytes(regex::bytes::Regex),
+}
+
+impl CompiledConditionalRegex {
+    fn captures(&self, left: &str) -> Option<Vec<Option<String>>> {
+        match self {
+            CompiledConditionalRegex::Text(regex) => regex.captures(left).map(|captures| {
+                captures
+                    .iter()
+                    .map(|capture| capture.map(|matched| matched.as_str().to_string()))
+                    .collect()
+            }),
+            CompiledConditionalRegex::Bytes(regex) => {
+                regex.captures(left.as_bytes()).map(|captures| {
+                    captures
+                        .iter()
+                        .map(|capture| {
+                            capture
+                                .map(|matched| regex_capture_bytes_to_storage(matched.as_bytes()))
+                        })
+                        .collect()
+                })
+            }
+        }
+    }
+}
+
+/// Whether `=~` matches byte-wise. GNU regexec is byte-oriented in a
+/// single-byte locale and character-oriented in a UTF-8 locale;
+/// rubash's locale model keeps an UNSET locale in the UTF-8 default for
+/// character counting, but the oracle shells this build is diffed
+/// against run their unset locale as C/POSIX (byte semantics), which is
+/// also what the Android filing measured, so an unset locale name takes
+/// the byte engine here.
+fn conditional_regex_byte_mode() -> bool {
+    !crate::locale::is_utf8() || crate::locale::locale_name().is_empty()
+}
+
+/// Convert one byte-mode capture into rubash's storage spelling: valid
+/// UTF-8 runs stay text; each invalid byte becomes a U+E000 raw-byte
+/// marker pair (executor::markers::push_raw_byte_marker), the same
+/// encoding `$'\xff'` data uses.
+fn regex_capture_bytes_to_storage(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                out.push_str(std::str::from_utf8(&rest[..valid]).unwrap_or_default());
+                let invalid_len = error.error_len().unwrap_or(rest.len() - valid);
+                for &byte in &rest[valid..valid + invalid_len] {
+                    crate::executor::markers::push_raw_byte_marker(&mut out, byte);
+                }
+                rest = &rest[valid + invalid_len..];
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// POSIX ERE has no `(?...)` construct: glibc regcomp rejects every
+/// unescaped `(?` outside a bracket expression with REG_BADRPT
+/// ("Invalid preceding regular expression") — `(?:...)`, `(?i)`,
+/// `(?=...)` alike (rubash#1058). The regex crate accepts several of
+/// these extensions, so scan for the shape before compiling.
+fn posix_ere_has_extended_group(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut index = 0usize;
+    let mut in_class = false;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 1,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                if chars.get(index + 1) == Some(&'?') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Best-effort glibc regerror wording for patterns the regex crate
 /// rejected, so `[[ x =~ bad ]]` diagnostics match GNU's
 /// `invalid regular expression `<pat>': <reason>` shape.
 fn regexp_error_reason(pattern: &str) -> &'static str {
+    if posix_ere_has_extended_group(pattern) {
+        return "Invalid preceding regular expression";
+    }
     let chars: Vec<char> = pattern.chars().collect();
     // Trailing backslash (odd-length run of backslashes at the end).
     let trailing_bs = chars.iter().rev().take_while(|&&c| c == '\\').count();
