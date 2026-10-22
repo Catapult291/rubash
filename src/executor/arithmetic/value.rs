@@ -53,6 +53,14 @@ impl ConditionalArithParser<'_> {
                     .push(ArithEvalDiag::BadSubscript(display.clone()));
                 Some(0)
             }
+            ArithLValue::BadSubscriptElement { display } => {
+                // `a[@]`/`a[*]` read: GNU array_expand_index diagnoses
+                // `a[@]: bad array subscript` ONCE and the element reads
+                // as 0 (arrayfunc.c; verified GNU 5.3.20, rubash#1136).
+                self.diags
+                    .push(ArithEvalDiag::BadSubscript(display.clone()));
+                Some(0)
+            }
             ArithLValue::AssocEmptyKey { name, .. } => {
                 // `C['']` read: the akey failed `*akey == 0` inside
                 // array_value_internal — GNU INDEX_ERROR diagnoses the bare
@@ -565,6 +573,9 @@ impl ConditionalArithParser<'_> {
             // `a[]` has no writable name — GNU's bind fails later with
             // `not a valid identifier`; there is no readonly check.
             ArithLValue::InvalidElement { .. } => return true,
+            // `a[@]` bind likewise fails as a bad subscript, never as a
+            // readonly error (rubash#1136).
+            ArithLValue::BadSubscriptElement { .. } => return true,
             // GNU rejects the empty akey at arrayfunc.c:402-407 BEFORE the
             // readonly check inside bind_assoc_variable, so the empty-key
             // bind is never a readonly failure.
@@ -592,6 +603,12 @@ impl ConditionalArithParser<'_> {
                 // expression value is unaffected).
                 self.diags
                     .push(ArithEvalDiag::InvalidIdentifier(display.clone()));
+            }
+            ArithLValue::BadSubscriptElement { display } => {
+                // `a[@] = v` bind: GNU diagnoses `a[@]: bad array
+                // subscript` once and stores nothing (rubash#1136).
+                self.diags
+                    .push(ArithEvalDiag::BadSubscript(display.clone()));
             }
             ArithLValue::AssocEmptyKey { bind_display, .. } => {
                 // `C['']` on the bind side: GNU assign_array_element_internal
