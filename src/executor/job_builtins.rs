@@ -182,25 +182,82 @@ impl Executor {
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                 return Ok(1);
             }
-            if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name) {
-                let mut stderr = Vec::new();
-                writeln!(
-                    stderr,
-                    "{}wait: {name}: cannot unset: readonly variable",
-                    self.diagnostic_prefix()
-                )?;
-                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                return Ok(1);
+            // GNU builtins/common.c:1021 builtin_unbind_variable: the
+            // operand is looked up with find_variable (variables.c:2363),
+            // which resolves the nameref chain — the readonly and
+            // non-unsettable gates test the REFERENT while the diagnostics
+            // still name the operand. A chain that resolves to nothing
+            // (missing or element-form cell, circular, depth overflow) is
+            // v == 0: both gates are skipped and unbind_variable
+            // (variables.c:3788) makunbounds the operand itself. A
+            // bracketed operand is a literal name at this layer —
+            // makunbound("A[k]") never matches a stored cell, so no
+            // element is unbound and a readonly array cannot fail here
+            // (unlike `unset A[k]`, which parses the subscript).
+            let found = match self.nameref_resolution(&name) {
+                NamerefResolution::Target(target)
+                    if is_shell_name(&target) && self.variable_cell_exists(&target) =>
+                {
+                    Some(target)
+                }
+                NamerefResolution::NotNameref => {
+                    self.variable_cell_exists(&name).then(|| name.clone())
+                }
+                _ => None,
+            };
+            if let Some(var_name) = found.as_deref() {
+                if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, var_name) {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        stderr,
+                        "{}wait: {name}: cannot unset: readonly variable",
+                        self.diagnostic_prefix()
+                    )?;
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    return Ok(1);
+                }
+                // GNU variables.h:161 non_unsettable_p: the att_nounset
+                // dynamic variables (variables.c:1889-1893) refuse
+                // unbinding outright.
+                if matches!(
+                    var_name,
+                    "BASH_ARGC" | "BASH_ARGV" | "BASH_SOURCE" | "BASH_LINENO"
+                ) {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        stderr,
+                        "{}wait: {name}: cannot unset",
+                        self.diagnostic_prefix()
+                    )?;
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    return Ok(1);
+                }
             }
-            // builtin_unbind_variable: an element name unbinds just that
-            // element; a scalar name unbinds the whole variable.
-            if name.contains('[') {
-                // SET_VFLAGS bindflags: ASS_NOEXPAND (verbatim subscript)
-                // follows array_expand_once alone; W_ARRAYREF only adds
-                // ASS_ONEWORD.
-                self.unset_array_element(&name, expand_once);
-            } else {
-                self.shell_state.env_vars.remove(&name);
+            // GNU variables.c:3959 makunbound: the binding is disposed as
+            // a whole — mirror entry, typed cell, attribute bits — and the
+            // name leaves the export environment unconditionally
+            // (variables.c:3839). Dropping only the mirror entry leaves
+            // the inherited process-env copy to resurrect through
+            // exact_case_env_var, nounset boundness, and the spawn env
+            // base — the #943 residue class (#971). A local binding takes
+            // makunbound's invisible-mark branch (variables.c:3984-4005)
+            // instead of disappearing outright.
+            let unbind_name = found.unwrap_or(name);
+            if !self.unset_outer_local_variable(&unbind_name) {
+                self.shell_state.env_vars.remove(&unbind_name);
+                self.shell_state.variables.remove(&unbind_name);
+                crate::executor::local_helpers::unset_process_env(&unbind_name);
+                self.shell_state.env_vars.remove_unset_marks(&unbind_name);
+                // GNU: an unbound dynamic variable stays unbound for the
+                // shell's lifetime (the unset builtin's UNSET_DYNAMIC_VARS
+                // record).
+                if self.dynamic_parameter_is_set(&unbind_name) {
+                    mark_env_name(
+                        &mut self.shell_state.env_vars,
+                        UNSET_DYNAMIC_VARS,
+                        &unbind_name,
+                    );
+                }
             }
         }
         // GNU wait.def:193-206 first_pending_trap: a trapped signal already
@@ -735,12 +792,28 @@ impl Executor {
         result.map_err(ExecuteError::IoError)
     }
 
+    /// GNU variables.c:3959 makunbound's cell-existence test, read as
+    /// "find_variable returned a SHELL_VAR": a value in either store, or
+    /// any attribute bits (a valueless `declare -r x` cell still counts).
+    /// Local-scope cells are live in the env_vars mirror while their scope
+    /// is active.
+    fn variable_cell_exists(&self, name: &str) -> bool {
+        self.shell_state.env_vars.contains_key(name)
+            || self.shell_state.variables.get(name).is_some()
+            || !self.shell_state.env_vars.attr_of(name).is_empty()
+    }
+
     /// GNU execute_cmd.c:2450 coproc_unsetvars: unbind_variable_noref
     /// removes <c_name>_PID literally (no nameref follow, no readonly gate),
     /// then check_unbind_variable resolves c_name through namerefs and
     /// refuses readonly targets with `name: cannot unset: readonly
     /// variable`. Runs for every coproc name recorded at spawn, including
     /// names whose coproc_bind failed (invalid identifier, readonly).
+    /// Each makunbound drops the whole SHELL_VAR — mirror entry, typed
+    /// cell, every attribute bit (dispose_variable, variables.c:3973-4019)
+    /// — and the export-environment copy with it (variables.c:3839);
+    /// leaving the inherited process-env name behind lets the table-miss
+    /// fallbacks resurrect it (the #943 residue class, #971).
     fn coproc_unset_vars(&mut self, pid: u32) {
         let Some(name) = self.shell_state.coproc_names.remove(&pid) else {
             return;
@@ -748,15 +821,16 @@ impl Executor {
         let pid_name = format!("{name}_PID");
         self.shell_state.env_vars.remove(&pid_name);
         self.shell_state.variables.remove(&pid_name);
-        for marker in [
-            READONLY_VARS,
-            NAMEREF_VARS,
-            ARRAY_VARS,
-            ASSOC_VARS,
-            ASSOC_128_VARS,
-            DECLARED_UNSET_VARS,
+        crate::executor::local_helpers::unset_process_env(&pid_name);
+        self.shell_state.env_vars.remove_unset_marks(&pid_name);
+        // The __RUBASH_COPROC_{STDIN,STDOUT}_<pid> bookkeeping keys written
+        // at bind are this coproc's fd-channel state — same drop rule.
+        for key in [
+            format!("__RUBASH_COPROC_STDIN_{pid}"),
+            format!("__RUBASH_COPROC_STDOUT_{pid}"),
         ] {
-            unmark_env_name(&mut self.shell_state.env_vars, marker, &pid_name);
+            self.shell_state.env_vars.remove(&key);
+            crate::executor::local_helpers::unset_process_env(&key);
         }
         let unbind_name = self
             .resolved_variable_name(&name)
@@ -771,9 +845,8 @@ impl Executor {
         }
         self.shell_state.env_vars.remove(&unbind_name);
         self.shell_state.variables.remove(&unbind_name);
-        for marker in [ARRAY_VARS, ASSOC_VARS, ASSOC_128_VARS, DECLARED_UNSET_VARS] {
-            unmark_env_name(&mut self.shell_state.env_vars, marker, &unbind_name);
-        }
+        crate::executor::local_helpers::unset_process_env(&unbind_name);
+        self.shell_state.env_vars.remove_unset_marks(&unbind_name);
     }
 
     fn retire_completed_coproc(&mut self, pid: u32) {
@@ -810,13 +883,19 @@ impl Executor {
             .collect::<Vec<_>>();
         for fd in endpoint_fds {
             self.fd_table.close(fd);
-            self.shell_state.env_vars.remove(&fd_stdin_key(fd));
-            self.shell_state.env_vars.remove(&fd_stdin_offset_key(fd));
-            self.shell_state.env_vars.remove(&fd_dynamic_input_key(fd));
-            self.shell_state.env_vars.remove(&fd_output_key(fd));
-            self.shell_state
-                .env_vars
-                .remove(&fd_output_process_substitution_key(fd));
+            // The fd bookkeeping keys are __RUBASH_-prefixed, so a parent
+            // mirror write can leave an inherited process-env copy behind;
+            // drop it with the table entry (#971).
+            for key in [
+                fd_stdin_key(fd),
+                fd_stdin_offset_key(fd),
+                fd_dynamic_input_key(fd),
+                fd_output_key(fd),
+                fd_output_process_substitution_key(fd),
+            ] {
+                self.shell_state.env_vars.remove(&key);
+                crate::executor::local_helpers::unset_process_env(&key);
+            }
             self.shell_state
                 .env_vars
                 .insert(fd_closed_key(fd), "1".to_string());
@@ -825,8 +904,12 @@ impl Executor {
 
         let coproc_prefix = format!("{FD_COPROC_STDIN_TARGET_PREFIX}{pid}");
         self.shell_state.env_vars.retain(|key, value| {
-            !((key.starts_with(FD_STDIN_PREFIX) || key.starts_with(FD_OUTPUT_PREFIX))
-                && value == &coproc_prefix)
+            let dropped = (key.starts_with(FD_STDIN_PREFIX) || key.starts_with(FD_OUTPUT_PREFIX))
+                && value == &coproc_prefix;
+            if dropped {
+                crate::executor::local_helpers::unset_process_env(key);
+            }
+            !dropped
         });
     }
 
