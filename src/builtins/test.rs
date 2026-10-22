@@ -694,7 +694,12 @@ fn parse_int(value: &str) -> Result<i64, String> {
 /// All `Some` results agree with `valid_number` (<=18 digits always fit
 /// i64: max 999999999999999999 < 9223372036854775807), and `-0` maps to
 /// `0`, equal under every comparison.
-fn fast_decimal(s: &str) -> Option<i64> {
+///
+/// `pub(crate)` so the `[ $VAR -op N ]` expansion fast path
+/// (`command_prepare.rs`) can gate on the same canonical shape instead
+/// of a second copy (a `$VAR` operand that is not canonical keeps the
+/// slow pipeline, where `valid_number` owns the diagnostics).
+pub(crate) fn fast_decimal(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
         return None;
