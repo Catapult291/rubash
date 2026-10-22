@@ -254,7 +254,7 @@ impl Executor {
                 self.mark_parse_error();
                 eprintln!(
                     "{}syntax error in command substitution",
-                    self.parser_diagnostic_prefix()
+                    self.parser_error_prefix()
                 );
                 self.exit_code = 2;
                 self.last_command_substitution_status.set(None);
@@ -407,10 +407,13 @@ impl Executor {
                 if !super::ast_exec::is_closed_output_io_error(&error) =>
             {
                 let mut stderr = Vec::new();
+                // GNU redir.c:135 redirection_error is internal_error
+                // (error.c:149-176) via error_prolog: the prefix honors
+                // gnu_errfmt (rubash#1038).
                 writeln!(
                     &mut stderr,
                     "{}{}",
-                    self.diagnostic_prefix(),
+                    self.error_prefix(),
                     crate::posix_errors::message(&error)
                 )?;
                 self.write_redirect_diagnostic_routed(&cmd, &stderr)?;
@@ -488,10 +491,7 @@ impl Executor {
 
         if let Some(message) = cmd.get_assignment("__RUBASH_COMPOUND_SYNTAX_ERROR__") {
             let message = bash_style_unexpected_token_message(message);
-            eprintln!(
-                "{}syntax error near {message}",
-                self.parser_diagnostic_prefix()
-            );
+            eprintln!("{}syntax error near {message}", self.parser_error_prefix());
             // GNU error.c:324-327: parser_error under live errexit prints
             // only the first line and exit_shell(2)s (rubash#306).
             if self.errexit_active_at_diagnostic() {
@@ -502,7 +502,7 @@ impl Executor {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
                     eprintln!(
                         "{}`{}'",
-                        self.parser_diagnostic_prefix(),
+                        self.parser_error_prefix(),
                         parse_error_source_display(source)
                     );
                 }
@@ -518,7 +518,7 @@ impl Executor {
             // at the parser_error (probe: `set -e; bad=(' exits 2 while
             // plain `bad=(' exits 1).
             self.mark_parse_error();
-            eprintln!("{}{}", self.parser_diagnostic_prefix(), message);
+            eprintln!("{}{}", self.parser_error_prefix(), message);
             if self.errexit_active_at_diagnostic() {
                 self.exit_code = 2;
                 return Err(ExecuteError::ExitCode(2));
@@ -569,12 +569,12 @@ impl Executor {
                     .unwrap_or(1);
                 eprintln!(
                     "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')",
-                    self.diagnostic_prefix_for_line(warn_line)
+                    self.error_prefix_for_line(warn_line)
                 );
             }
             eprintln!(
                 "{}syntax error: unexpected end of file from `{compound_name}' command on line {open_line}",
-                self.parser_diagnostic_prefix_for_line(eof_line)
+                self.parser_error_prefix_for_line(eof_line)
             );
             // GNU error.c:324-327: parser_error + live errexit exits the
             // shell immediately (rubash#306).
@@ -601,11 +601,7 @@ impl Executor {
                     .split_once('\u{1}')
                     .map(|(line, msg)| (line.parse::<usize>().unwrap_or(1), msg))
                     .unwrap_or((1, field));
-                eprintln!(
-                    "{}{}",
-                    self.parser_diagnostic_prefix_for_line(line),
-                    message
-                );
+                eprintln!("{}{}", self.parser_error_prefix_for_line(line), message);
                 // GNU error.c:324-327: every one of these lines is a
                 // parser_error; with live errexit the first one already
                 // exit_shell(2)ed (rubash#306).
@@ -617,7 +613,7 @@ impl Executor {
             if shape == "eof" {
                 eprintln!(
                     "{}syntax error: unexpected end of file from `[[' command on line {aux_a}",
-                    self.parser_diagnostic_prefix_for_line(aux_b)
+                    self.parser_error_prefix_for_line(aux_b)
                 );
                 self.errexit_active_at_diagnostic();
             } else if shape == "bare" {
@@ -627,7 +623,7 @@ impl Executor {
             } else {
                 eprintln!(
                     "{}syntax error near `{aux_a}'",
-                    self.parser_diagnostic_prefix_for_line(aux_b)
+                    self.parser_error_prefix_for_line(aux_b)
                 );
                 if self.errexit_active_at_diagnostic() {
                     self.exit_code = 2;
@@ -639,7 +635,7 @@ impl Executor {
                     if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
                         eprintln!(
                             "{}`{}'",
-                            self.parser_diagnostic_prefix_for_line(aux_b),
+                            self.parser_error_prefix_for_line(aux_b),
                             parse_error_source_display(source)
                         );
                     }
@@ -725,12 +721,12 @@ impl Executor {
                     .unwrap_or(1);
                 eprintln!(
                     "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delimiter}')",
-                    self.diagnostic_prefix_for_line(warn_line)
+                    self.error_prefix_for_line(warn_line)
                 );
             }
             eprintln!(
                 "{}syntax error near unexpected token `{token}'",
-                self.parser_diagnostic_prefix_for_line(line)
+                self.parser_error_prefix_for_line(line)
             );
             // GNU error.c:324-327: with exit_immediately_on_error live, the
             // offending-line echo (parse.y:6814 print_offending_line) never
@@ -746,11 +742,7 @@ impl Executor {
             // parse.y:6865: no offending-line echo in an interactive shell.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!(
-                        "{}`{}'",
-                        self.parser_diagnostic_prefix_for_line(line),
-                        source
-                    );
+                    eprintln!("{}`{}'", self.parser_error_prefix_for_line(line), source);
                 }
             }
             self.exit_code = 2;
@@ -765,7 +757,7 @@ impl Executor {
             let eof_line = cmd.line.map(|line| line + 1).unwrap_or(1);
             eprintln!(
                 "{}syntax error: unexpected end of file",
-                self.parser_diagnostic_prefix_for_line(eof_line)
+                self.parser_error_prefix_for_line(eof_line)
             );
             // Single-line parser_error: GNU error.c:324-327 still
             // exit_shell(2)s right after it under live errexit — record
@@ -861,7 +853,7 @@ impl Executor {
                         self.mark_parse_error();
                         eprintln!(
                             "{}maximum here-document count exceeded",
-                            self.parser_diagnostic_prefix_for_line(line)
+                            self.parser_error_prefix_for_line(line)
                         );
                         self.exit_code = 2;
                         return Err(ExecuteError::ExitCode(2));
@@ -891,7 +883,7 @@ impl Executor {
             self.mark_parse_error();
             eprintln!(
                 "{}syntax error near unexpected token `('",
-                self.parser_diagnostic_prefix()
+                self.parser_error_prefix()
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));
@@ -911,7 +903,7 @@ impl Executor {
             self.mark_parse_error();
             eprintln!(
                 "{}syntax error near unexpected token `('",
-                self.parser_diagnostic_prefix()
+                self.parser_error_prefix()
             );
             self.exit_code = 2;
             return Err(ExecuteError::ExitCode(2));

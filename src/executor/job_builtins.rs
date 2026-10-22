@@ -299,7 +299,12 @@ impl Executor {
                         candidates.push(pid);
                     }
                 } else {
-                    write_wait_operand_error(operand, &self.diagnostic_prefix(), &mut stderr)?;
+                    write_wait_operand_error(
+                        operand,
+                        &self.diagnostic_prefix(),
+                        &self.error_prefix(),
+                        &mut stderr,
+                    )?;
                 }
             }
             if !request.operands.is_empty() && candidates.is_empty() {
@@ -443,6 +448,7 @@ impl Executor {
         let status = crate::builtins::wait::execute_with_io(
             &cmd.words[1..],
             &self.diagnostic_prefix(),
+            &self.error_prefix(),
             &mut stderr,
         )?;
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
@@ -557,8 +563,12 @@ impl Executor {
 
         for (operand, pid) in resolved {
             let Some(pid) = pid else {
-                status =
-                    write_wait_operand_error(&operand, &self.diagnostic_prefix(), &mut stderr)?;
+                status = write_wait_operand_error(
+                    &operand,
+                    &self.diagnostic_prefix(),
+                    &self.error_prefix(),
+                    &mut stderr,
+                )?;
                 last_pid = None;
                 continue;
             };
@@ -572,8 +582,12 @@ impl Executor {
                     last_pid = Some(pid);
                 }
                 WaitPidOutcome::NotFound => {
-                    status =
-                        write_wait_operand_error(&operand, &self.diagnostic_prefix(), &mut stderr)?;
+                    status = write_wait_operand_error(
+                        &operand,
+                        &self.diagnostic_prefix(),
+                        &self.error_prefix(),
+                        &mut stderr,
+                    )?;
                     last_pid = None;
                 }
             }
@@ -2683,23 +2697,48 @@ impl Executor {
                         // complete.def:693-696: builtin_error warning, no
                         // usage line. GNU's builtin_error reaches stderr
                         // BEFORE the -F function / -C command runs, so
-                        // flush it through the buffered-output path (which
-                        // honors this command's redirects) before the
-                        // function produces its own output (rubash#1090).
+                        // when one will actually execute, flush it through
+                        // the buffered-output path (which honors this
+                        // command's redirects) before it produces its own
+                        // output (rubash#1090). A missing -F function has
+                        // no run to order against — leave the warning
+                        // buffered so it and the not-found diagnostic land
+                        // in the SAME end-of-builtin flush; each buffered
+                        // flush re-applies `>`/`2>` opens, and a second
+                        // flush would truncate the first's content
+                        // (rubash#1041).
                         let which = if parsed.funcname.is_some() { 'F' } else { 'C' };
                         writeln!(
                             stderr,
                             "{diagnostic_prefix}compgen: warning: -{which} option may not work as you expect"
                         )?;
-                        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
-                        stdout.clear();
-                        stderr.clear();
+                        let will_run = parsed.command.is_some()
+                            || parsed
+                                .funcname
+                                .as_deref()
+                                .is_some_and(|funcname| self.has_function(funcname));
+                        if will_run {
+                            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                            stdout.clear();
+                            stderr.clear();
+                        }
                     }
                     let word = parsed.word().to_string();
                     let mut resolved = crate::builtins::complete::CompgenDynamic::default();
                     if let Some(funcname) = parsed.funcname.as_deref() {
-                        resolved.function_candidates =
-                            self.run_compgen_completion_function(funcname, "compgen", &word);
+                        // GNU pcomplete.c:1058-1066 gen_shell_function_matches:
+                        // a missing -F function is internal_error
+                        // (error_prolog family, so gnu_errfmt-gated) printed
+                        // to the builtin's stderr — the command's redirects
+                        // apply, and it follows the -F/-C warning in order.
+                        let error_prefix = self.error_prefix();
+                        resolved.function_candidates = self.run_compgen_completion_function(
+                            funcname,
+                            "compgen",
+                            &word,
+                            &error_prefix,
+                            &mut stderr,
+                        );
                     }
                     if let Some(command) = parsed.command.as_deref() {
                         resolved.command_candidates =
@@ -2779,12 +2818,17 @@ impl Executor {
         funcname: &str,
         cmd: &str,
         word: &str,
+        error_prefix: &str,
+        stderr: &mut Vec<u8>,
     ) -> Vec<String> {
         if !self.has_function(funcname) {
-            // pcomplete.c:1058-1066: internal_error, no candidates.
-            eprintln!(
-                "{}completion: function `{funcname}' not found",
-                self.diagnostic_prefix()
+            // pcomplete.c:1058-1066: internal_error, no candidates. Route
+            // through the caller's stderr buffer (not eprintln!): GNU runs
+            // the compgen builtin under its redirects, so the diagnostic
+            // lands in `2>file` with the warning, in order (rubash#1041).
+            let _ = writeln!(
+                stderr,
+                "{error_prefix}completion: function `{funcname}' not found",
             );
             return Vec::new();
         }
@@ -3115,6 +3159,7 @@ fn wait_assign_var(words: &[String]) -> Option<(String, usize)> {
 fn write_wait_operand_error<E>(
     operand: &str,
     diagnostic_prefix: &str,
+    error_prefix: &str,
     stderr: &mut E,
 ) -> Result<i32, ExecuteError>
 where
@@ -3126,9 +3171,13 @@ where
     }
 
     if !operand.is_empty() && operand.chars().all(|ch| ch.is_ascii_digit()) {
+        // GNU jobs.c:2753-2754 wait_for_single_pid JWAIT_PERROR: the
+        // pid-not-a-child report is internal_error (error_prolog family),
+        // so it honors gnu_errfmt while the sibling builtin_error lines
+        // keep `line N:`.
         writeln!(
             stderr,
-            "{diagnostic_prefix}wait: pid {operand} is not a child of this shell"
+            "{error_prefix}wait: pid {operand} is not a child of this shell"
         )?;
         return Ok(127);
     }

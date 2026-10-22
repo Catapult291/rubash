@@ -827,7 +827,7 @@ impl Executor {
                                         "{expression}: arithmetic syntax error in expression (error token is \"{expression}\")"
                                     )
                                 });
-                                eprintln!("{}{message}", self.diagnostic_prefix());
+                                eprintln!("{}{message}", self.error_prefix());
                             }
                         }
                         continue;

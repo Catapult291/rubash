@@ -790,7 +790,7 @@ impl Executor {
                 + 1;
             eprintln!(
                 "{}unexpected EOF while looking for matching `)'",
-                self.comsub_eof_diagnostic(eof_line)
+                self.comsub_eof_error_diagnostic(eof_line)
             );
             return String::new();
         }
@@ -889,7 +889,7 @@ impl Executor {
                 + 1;
             eprintln!(
                 "{}unexpected EOF while looking for matching `)'",
-                self.comsub_eof_diagnostic(eof_line)
+                self.comsub_eof_error_diagnostic(eof_line)
             );
             return String::new();
         }
@@ -1082,7 +1082,7 @@ impl Executor {
             ) {
                 return Some(format!(
                     "{}{target}: No such file or directory",
-                    self.diagnostic_prefix()
+                    self.error_prefix()
                 ));
             }
             return None;
@@ -1126,7 +1126,7 @@ impl Executor {
             Ok(_) => None,
             Err(error) => Some(format!(
                 "{}{target}: {}",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 crate::posix_errors::message(&error)
             )),
         }

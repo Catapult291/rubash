@@ -13,6 +13,7 @@ const EXECUTION_NOTFOUND: i32 = 127;
 pub fn execute_with_io<E>(
     args: &[String],
     diagnostic_prefix: &str,
+    error_prefix: &str,
     stderr: &mut E,
 ) -> io::Result<i32>
 where
@@ -83,9 +84,11 @@ where
             writeln!(stderr, "{diagnostic_prefix}wait: {operand}: no such job")?;
             status = EXECUTION_NOTFOUND;
         } else if !operand.is_empty() && operand.chars().all(|ch| ch.is_ascii_digit()) {
+            // GNU jobs.c:2753-2754 wait_for_single_pid JWAIT_PERROR:
+            // internal_error (error_prolog family) honors gnu_errfmt.
             writeln!(
                 stderr,
-                "{diagnostic_prefix}wait: pid {operand} is not a child of this shell"
+                "{error_prefix}wait: pid {operand} is not a child of this shell"
             )?;
             status = EXECUTION_NOTFOUND;
         } else {

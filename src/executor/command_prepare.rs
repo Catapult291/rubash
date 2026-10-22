@@ -168,7 +168,7 @@ impl Executor {
             writeln!(
                 &mut stderr,
                 "{}{}: bad substitution",
-                self.diagnostic_prefix_for_line(diag_line),
+                self.error_prefix_for_line(diag_line),
                 bad_word
             )?;
             self.write_default_stderr(&stderr)?;
@@ -400,7 +400,7 @@ impl Executor {
             return Ok(());
         }
         if let Some((name, message)) = self.parameter_assignment_error(cmd) {
-            let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+            let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_redirected_command_stderr(cmd, line.as_bytes())?;
             // rubash#402: the two arms leave different statuses behind.
             // GNU subst.c:8158-8166: a readonly target under `=`/`:=`
@@ -437,7 +437,7 @@ impl Executor {
         // substitution, so the 5.2-era whole-word `bad substitution`
         // pre-check no longer applies.
         if let Some((name, message, status)) = self.parameter_expansion_error(cmd) {
-            let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+            let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_redirected_command_stderr(cmd, line.as_bytes())?;
             if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
                 // Interactive shells take the error branch, not the fatal:
@@ -733,14 +733,14 @@ impl Executor {
                     writeln!(
                         &mut stderr,
                         "{}{}: No such file or directory",
-                        self.diagnostic_prefix(),
+                        self.error_prefix(),
                         target
                     )?;
                 } else {
                     writeln!(
                         &mut stderr,
                         "{}{}",
-                        self.diagnostic_prefix(),
+                        self.error_prefix(),
                         crate::posix_errors::message(&error)
                     )?;
                 }
@@ -771,7 +771,7 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
         if let Some((name, message)) = self.parameter_assignment_error(cmd) {
-            let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+            let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_redirected_command_stderr(cmd, line.as_bytes())?;
             // Same GNU DISCARD class and same two-arm status split as
             // execute_empty_words_command above (rubash#402): readonly
@@ -799,7 +799,7 @@ impl Executor {
         // substitution, so the 5.2-era whole-word `bad substitution`
         // pre-check no longer applies.
         if let Some((name, message, status)) = self.parameter_expansion_error(cmd) {
-            let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+            let line = format!("{}{}: {}\n", self.error_prefix(), name, message);
             self.write_redirected_command_stderr(cmd, line.as_bytes())?;
             if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
                 // Same subst.c:10416-10418 interactivity branch as
@@ -2058,7 +2058,7 @@ impl Executor {
                         "{expression}: arithmetic syntax error in expression (error token is \"{expression}\")"
                     )
                 });
-                eprintln!("{}{message}", self.diagnostic_prefix());
+                eprintln!("{}{message}", self.error_prefix());
             }
             // GNU expr.c raises evalerror from the actual evaluation;
             // classify from the recorded real-environment category.

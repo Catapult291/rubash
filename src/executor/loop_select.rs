@@ -182,7 +182,7 @@ impl Executor {
                 ) {
                     eprintln!(
                         "{}{}: readonly variable",
-                        self.diagnostic_prefix(),
+                        self.error_prefix(),
                         for_command.variable
                     );
                     // POSIX-mode notes item 37: assigning to a readonly

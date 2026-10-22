@@ -2998,7 +2998,7 @@ impl Executor {
                                         ) {
                                             eprintln!(
                                                 "{}{}: readonly variable",
-                                                self.diagnostic_prefix(),
+                                                self.error_prefix(),
                                                 array_name
                                             );
                                             can_bind = false;
@@ -3024,7 +3024,7 @@ impl Executor {
                                 // plain variable (readonly check still applies).
                                 eprintln!(
                                     "{}warning: {}: removing nameref attribute",
-                                    self.diagnostic_prefix(),
+                                    self.error_prefix(),
                                     array_name
                                 );
                                 unmark_env_name(
@@ -3039,7 +3039,7 @@ impl Executor {
                                 ) {
                                     eprintln!(
                                         "{}{}: readonly variable",
-                                        self.diagnostic_prefix(),
+                                        self.error_prefix(),
                                         array_name
                                     );
                                     can_bind = false;
@@ -3053,7 +3053,7 @@ impl Executor {
                                 ) {
                                     eprintln!(
                                         "{}{}: readonly variable",
-                                        self.diagnostic_prefix(),
+                                        self.error_prefix(),
                                         array_name
                                     );
                                     can_bind = false;

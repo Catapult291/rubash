@@ -46,12 +46,12 @@ impl Executor {
                 .unwrap_or(1);
             eprintln!(
                 "{}syntax error near unexpected token `{token}'",
-                self.parser_diagnostic_prefix_for_line(line)
+                self.parser_error_prefix_for_line(line)
             );
             // parse.y:6865: no offending-line echo in an interactive shell.
             if self.offending_line_echo_enabled() {
                 if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
-                    eprintln!("{}`{source}'", self.parser_diagnostic_prefix_for_line(line));
+                    eprintln!("{}`{source}'", self.parser_error_prefix_for_line(line));
                 }
             }
             self.exit_code = 2;
@@ -320,7 +320,7 @@ impl Executor {
             if self.shell_state.function_depth >= nesting_limit {
                 eprintln!(
                     "{}{}: maximum function nesting level exceeded ({})",
-                    self.diagnostic_prefix(),
+                    self.error_prefix(),
                     name,
                     nesting_limit
                 );

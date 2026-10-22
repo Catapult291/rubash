@@ -1015,15 +1015,25 @@ fn run_history_group(
                 // location to this entry's physical line, not the last
                 // executed command's line.
                 executor.set_current_line_value(line_no);
+                // GNU error.c error_prolog gate: history-expansion failures
+                // are internal_error-class, so the ` line N` segment honors
+                // gnu_errfmt like every other error_prefix site.
+                let gnu_errfmt = executor.gnu_error_format_enabled();
                 let prefix = match (
                     executor.get_env("__RUBASH_SCRIPT_NAME"),
                     executor.get_env("__RUBASH_CURRENT_LINE"),
                 ) {
                     (Some(script), Some(line)) => {
-                        if executor.get_env("__RUBASH_EVAL_CONTEXT").is_some() {
-                            format!("{script}: eval: line {line}: ")
+                        let line: usize = line.parse().unwrap_or(1);
+                        let head = if executor.get_env("__RUBASH_EVAL_CONTEXT").is_some() {
+                            format!("{script}: eval")
                         } else {
-                            format!("{script}: line {line}: ")
+                            script.to_string()
+                        };
+                        if gnu_errfmt {
+                            format!("{head}:{line}: ")
+                        } else {
+                            format!("{head}: line {line}: ")
                         }
                     }
                     _ => "bash: ".to_string(),
@@ -2494,7 +2504,7 @@ fn report_heredoc_overflow_fatal(
     executor.mark_parse_error();
     eprintln!(
         "{}maximum here-document count exceeded",
-        executor.parser_diagnostic_prefix_for_line(line + line_offset)
+        executor.parser_error_prefix_for_line(line + line_offset)
     );
     2
 }
@@ -2548,7 +2558,7 @@ fn run_source_impl(
             executor.mark_parse_error();
             eprintln!(
                 "{}unexpected EOF while looking for matching `{quote}'",
-                executor.parser_diagnostic_prefix_for_line(open_line + line_offset)
+                executor.parser_error_prefix_for_line(open_line + line_offset)
             );
             return 2;
         }
@@ -2624,7 +2634,7 @@ fn run_source_impl(
             executor.mark_parse_error();
             eprintln!(
                 "{}unexpected EOF while looking for matching `{closer}'",
-                executor.parser_diagnostic_prefix_for_line(open_line + line_offset)
+                executor.parser_error_prefix_for_line(open_line + line_offset)
             );
             // GNU exits 1 when the subscript opened inside a compound array
             // assignment (parse_compound_assignment EOF family) and 2 for a
@@ -2672,7 +2682,7 @@ fn run_source_impl(
             executor.mark_parse_error();
             eprintln!(
                 "{}unexpected EOF while looking for matching `{closure}'",
-                executor.parser_diagnostic_prefix_for_line(eof.report_line + line_offset),
+                executor.parser_error_prefix_for_line(eof.report_line + line_offset),
                 closure = eof.closer
             );
             executor.errexit_live_at_diagnostic();
@@ -2748,7 +2758,7 @@ fn run_source_impl(
                     )) = crate::lexer::unclosed_comsub_eof_shape(input)
                     {
                         let report = line + line_offset;
-                        let prefix = executor.parser_diagnostic_prefix_for_line(report);
+                        let prefix = executor.parser_error_prefix_for_line(report);
                         eprintln!("{prefix}syntax error near unexpected token `{token}'");
                         // error.c print_offending_line is non-interactive
                         // only (parse.y:6865) — the same gate the parser's
@@ -2790,7 +2800,7 @@ fn run_source_impl(
                     if crate::lexer::dparen_arith_group_never_closes(input, open_line) {
                         eprintln!(
                             "{}unexpected EOF while looking for matching `)'",
-                            executor.parser_diagnostic_prefix_for_line(global_open)
+                            executor.parser_error_prefix_for_line(global_open)
                         );
                         executor.errexit_live_at_diagnostic();
                         return 2;
@@ -2806,7 +2816,7 @@ fn run_source_impl(
                     if crate::lexer::dparen_subshell_reparse_compound_eof(input, open_line) {
                         eprintln!(
                             "{}unexpected EOF while looking for matching `)'",
-                            executor.parser_diagnostic_prefix_for_line(global_open)
+                            executor.parser_error_prefix_for_line(global_open)
                         );
                         if executor.errexit_live_at_diagnostic() {
                             return 2;
@@ -2815,13 +2825,13 @@ fn run_source_impl(
                     }
                     eprintln!(
                         "{}syntax error: unexpected end of file from `(' command on line {global_open}",
-                        executor.parser_diagnostic_prefix_for_line(global_eof)
+                        executor.parser_error_prefix_for_line(global_eof)
                     );
                 } else {
                     let reported = if report_open { global_open } else { global_eof };
                     eprintln!(
                         "{}unexpected EOF while looking for matching `{close}'",
-                        executor.parser_diagnostic_prefix_for_line(reported)
+                        executor.parser_error_prefix_for_line(reported)
                     );
                 }
                 // GNU exits 1 for an unterminated `name=(` array list —

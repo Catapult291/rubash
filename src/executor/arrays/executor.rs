@@ -423,7 +423,7 @@ impl Executor {
                                         "{expr}: arithmetic syntax error in expression (error token is \"{expr}\")"
                                     )
                                 });
-                            eprintln!("{}{message}", self.diagnostic_prefix());
+                            eprintln!("{}{message}", self.error_prefix());
                         }
                         return None;
                     }
@@ -477,11 +477,7 @@ impl Executor {
                 Some(element) => return Some(element),
                 None => {
                     if index < 0 {
-                        eprintln!(
-                            "{}{}: bad array subscript",
-                            self.diagnostic_prefix(),
-                            array_name
-                        );
+                        eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
                     }
                     return None;
                 }
@@ -576,11 +572,7 @@ impl Executor {
             return None;
         }
         let Some(index) = resolve_indexed_array_subscript(&storage, index) else {
-            eprintln!(
-                "{}{}: bad array subscript",
-                self.diagnostic_prefix(),
-                array_name
-            );
+            eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
             return None;
         };
         let result = array_value_at(&storage, index);

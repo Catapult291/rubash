@@ -233,7 +233,7 @@ where
                         .unwrap_or_else(|| "/".to_string());
                     stack.swap(0, 1);
                     let new_pwd = stack[0].clone();
-                    if bindpwd_write(env_vars, &old_pwd, &new_pwd, diagnostic_prefix, stderr)? {
+                    if bindpwd_write(env_vars, &old_pwd, &new_pwd, stderr)? {
                         save_stack(env_vars, &stack);
                         return Ok(EXECUTION_FAILURE);
                     }
@@ -284,7 +284,7 @@ where
                         .unwrap_or_else(|| "/".to_string());
                     stack.rotate_left(index);
                     let new_pwd = stack[0].clone();
-                    if bindpwd_write(env_vars, &old_pwd, &new_pwd, diagnostic_prefix, stderr)? {
+                    if bindpwd_write(env_vars, &old_pwd, &new_pwd, stderr)? {
                         save_stack(env_vars, &stack);
                         return Ok(EXECUTION_FAILURE);
                     }
@@ -375,13 +375,7 @@ where
                         // never runs. The chdir itself stands — GNU's cwd
                         // moved to the operand — so the display's cwd slot
                         // follows it, the same verdict popd inherits.
-                        if bindpwd_write(
-                            env_vars,
-                            &old_pwd,
-                            &resolved_dir,
-                            diagnostic_prefix,
-                            stderr,
-                        )? {
+                        if bindpwd_write(env_vars, &old_pwd, &resolved_dir, stderr)? {
                             if stack.is_empty() {
                                 stack.push(resolved_dir);
                             } else {
@@ -467,8 +461,7 @@ where
                 // while the stack keeps both entries and nothing prints
                 // (GNU 5.3.0: `readonly OLDPWD; popd` -> rc 1, dirs shows
                 // "<new top> <new top>", $PWD already the target).
-                let bind_failed =
-                    bindpwd_write(env_vars, &old_pwd, &target, diagnostic_prefix, stderr)?;
+                let bind_failed = bindpwd_write(env_vars, &old_pwd, &target, stderr)?;
                 match chdir {
                     // A real chdir drops the physical-pwd override so
                     // `pwd -P` follows the real process cwd (cd.rs does the
@@ -551,18 +544,34 @@ fn bindpwd_write<E: Write>(
     env_vars: &mut crate::shell::var_table::VarTable,
     old_pwd: &str,
     new_pwd: &str,
-    diagnostic_prefix: &str,
     stderr: &mut E,
 ) -> io::Result<bool> {
+    // GNU error.c:453 err_readonly (report_error family): the bare
+    // `VAR: readonly variable` bind diagnostic honors gnu_errfmt
+    // (rubash#1038), unlike the builtin_error lines sharing this file.
+    // The no-script fallback matches the executor-supplied
+    // diagnostic_prefix ("bash: "), not this file's local "rubash: ".
+    let error_prefix = if let (Some(script), Some(line)) = (
+        env_vars.get("__RUBASH_SCRIPT_NAME"),
+        env_vars.get("__RUBASH_CURRENT_LINE"),
+    ) {
+        if crate::builtins::shopt::option_enabled(env_vars, "gnu_errfmt") {
+            format!("{script}:{line}: ")
+        } else {
+            format!("{script}: line {line}: ")
+        }
+    } else {
+        "bash: ".to_string()
+    };
     let mut failed = false;
     if var_is_readonly(env_vars, "OLDPWD") {
-        writeln!(stderr, "{diagnostic_prefix}OLDPWD: readonly variable")?;
+        writeln!(stderr, "{error_prefix}OLDPWD: readonly variable")?;
         failed = true;
     } else {
         env_vars.insert("OLDPWD".to_string(), old_pwd.to_string());
     }
     if var_is_readonly(env_vars, "PWD") {
-        writeln!(stderr, "{diagnostic_prefix}PWD: readonly variable")?;
+        writeln!(stderr, "{error_prefix}PWD: readonly variable")?;
         failed = true;
     } else {
         env_vars.insert("PWD".to_string(), new_pwd.to_string());

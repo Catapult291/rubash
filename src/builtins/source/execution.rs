@@ -174,7 +174,7 @@ fn run_source_groups(
             executor.mark_parse_error();
             eprintln!(
                 "{}maximum here-document count exceeded",
-                executor.parser_diagnostic_prefix_for_line(line)
+                executor.parser_error_prefix_for_line(line)
             );
             executor.set_exit_code(2);
             return Ok(());

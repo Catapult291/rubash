@@ -347,7 +347,7 @@ impl Executor {
                                 // token named, plus the offending source
                                 // line, all at the paren's line.
                                 let report = caller_line + line - 1;
-                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let prefix = self.parser_error_prefix_for_line(report);
                                 let offending =
                                     source.lines().nth(line - 1).unwrap_or_default().to_string();
                                 format!(
@@ -356,7 +356,7 @@ impl Executor {
                             }
                             crate::lexer::UnclosedComsubShape::ComsubEof { line } => format!(
                                 "{}unexpected EOF while looking for matching `)'\n",
-                                self.parser_diagnostic_prefix_for_line(caller_line + line)
+                                self.parser_error_prefix_for_line(caller_line + line)
                             ),
                             crate::lexer::UnclosedComsubShape::PlainSubshellEof {
                                 line,
@@ -371,7 +371,7 @@ impl Executor {
                                 // message text.
                                 format!(
                                     "{}syntax error: unexpected end of file from `(' command on line {}\n",
-                                    self.parser_diagnostic_prefix_for_line(caller_line + line),
+                                    self.parser_error_prefix_for_line(caller_line + line),
                                     caller_line + open_line - 1
                                 )
                             }
@@ -384,7 +384,7 @@ impl Executor {
                                 // the comsub class but WITHOUT the
                                 // "while looking for matching" suffix.
                                 let report = caller_line + line - 1;
-                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let prefix = self.parser_error_prefix_for_line(report);
                                 let offending =
                                     source.lines().nth(line - 1).unwrap_or_default().to_string();
                                 format!(
@@ -395,7 +395,7 @@ impl Executor {
                                 // parse.y:7141-7151: the compound-assignment
                                 // word list rejects the `(' itself.
                                 let report = caller_line + line - 1;
-                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let prefix = self.parser_error_prefix_for_line(report);
                                 let offending =
                                     source.lines().nth(line - 1).unwrap_or_default().to_string();
                                 format!(
@@ -536,7 +536,7 @@ impl Executor {
                         // (rubash#167 family, seen from rubash#190).
                         let diagnostic = format!(
                             "{}unexpected EOF while looking for matching `{close}'\n",
-                            self.parser_diagnostic_prefix_for_line(caller_line + internal)
+                            self.parser_error_prefix_for_line(caller_line + internal)
                         );
                         self.write_buffered_builtin_output(cmd, &[], diagnostic.as_bytes())?;
                         match saved_eval_context {
@@ -2637,10 +2637,12 @@ impl Executor {
                     Ok(_) => {}
                     Err(ExecuteError::IoError(error)) => {
                         let mut stderr = Vec::new();
+                        // GNU redir.c redirection_error (internal_error
+                        // family) honors gnu_errfmt (rubash#1038).
                         writeln!(
                             &mut stderr,
                             "{}{}",
-                            self.diagnostic_prefix(),
+                            self.error_prefix(),
                             crate::posix_errors::message(&error)
                         )?;
                         self.write_default_stderr(&stderr)?;

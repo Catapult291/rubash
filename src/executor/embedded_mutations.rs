@@ -1119,7 +1119,7 @@ impl Executor {
                                                 &self.shell_state.env_vars,
                                             )
                                         {
-                                            eprintln!("{}{}", self.diagnostic_prefix(), message);
+                                            eprintln!("{}{}", self.error_prefix(), message);
                                         }
                                     }
                                 } else {
@@ -1168,7 +1168,7 @@ impl Executor {
                             + source.lines().count().saturating_sub(1);
                         eprintln!(
                             "{}unexpected EOF while looking for matching `)'",
-                            self.comsub_eof_diagnostic(eof_line)
+                            self.comsub_eof_error_diagnostic(eof_line)
                         );
                         self.shell_state.arithmetic_fatal_error.set(true);
                         self.shell_state.arithmetic_expansion_error.set(true);
@@ -1228,7 +1228,7 @@ impl Executor {
                                         &self.shell_state.env_vars,
                                     )
                                 {
-                                    eprintln!("{}{}", self.diagnostic_prefix(), message);
+                                    eprintln!("{}{}", self.error_prefix(), message);
                                 }
                             }
                         }

@@ -204,9 +204,9 @@ impl Executor {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(1);
             let prefix = if self.backtick_body_diagnostic.get() {
-                self.comsub_eof_diagnostic(eof_line)
+                self.comsub_eof_error_diagnostic(eof_line)
             } else {
-                self.parser_diagnostic_prefix_for_line(eof_line)
+                self.parser_error_prefix_for_line(eof_line)
             };
             eprintln!(
                 "{prefix}syntax error: unexpected end of file from `{compound_name}' command on line {_open_line}"
@@ -230,9 +230,11 @@ impl Executor {
         // — the enclosing script's prefix is the `$(`-body shape, where the
         // outer parse owns the diagnostic (issue #515).
         let prefix = match cmd.line {
-            Some(line) if self.backtick_body_diagnostic.get() => self.comsub_eof_diagnostic(line),
-            Some(line) => self.parser_diagnostic_prefix_for_line(line),
-            None => self.parser_diagnostic_prefix(),
+            Some(line) if self.backtick_body_diagnostic.get() => {
+                self.comsub_eof_error_diagnostic(line)
+            }
+            Some(line) => self.parser_error_prefix_for_line(line),
+            None => self.parser_error_prefix(),
         };
         if message.starts_with("syntax error:") || message.starts_with("arithmetic syntax error:") {
             eprintln!("{prefix}{message}");
@@ -284,7 +286,7 @@ impl Executor {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or_else(|| cmd.line.unwrap_or(1));
-            let prefix = self.parser_diagnostic_prefix_for_line(line);
+            let prefix = self.parser_error_prefix_for_line(line);
             eprintln!("{prefix}syntax error near unexpected token `{token}'");
             // parse.y:6865: the offending-line echo is non-interactive only.
             if self.offending_line_echo_enabled() {
@@ -1384,6 +1386,13 @@ impl Executor {
     }
 
     pub fn diagnostic_prefix(&self) -> String {
+        // GNU builtins/common.c:83-110 (builtin_error_prolog): builtin
+        // errors (`cd`, `jobs`, `compgen: warning`, ...) print
+        // `name: line N: cmd: ...` UNCONDITIONALLY — the gnu_errfmt gate
+        // lives only in error.c error_prolog/parser_error, never here.
+        // This is the builtin (ungated) shape; error_prolog-family
+        // diagnostics (command not found, arithmetic, redirection,
+        // completion-function lookup) use error_prefix() instead.
         // GNU error.c:75-86 (report_prolog): runtime errors (command not
         // found, file not found, etc.) use only get_name_for_error() —
         // BASH_SOURCE[0] or dollar_vars[0] — as the prolog name, with no
@@ -1425,6 +1434,62 @@ impl Executor {
                 // suites normalize the baseline's invoked path to the same name.
                 "bash: ".to_string()
             }
+        }
+    }
+
+    /// Whether `shopt -s gnu_errfmt` is active (GNU error.c:71
+    /// `gnu_error_format`, bound in builtins/shopt.def:226). It gates the
+    /// ` line N` segment of the error_prolog/parser_error families
+    /// (report_error, internal_error, internal_warning, parser_error) to
+    /// the bare `:N` form. The builtin_error family
+    /// (builtins/common.c:83-110 builtin_error_prolog) never gates.
+    pub(crate) fn gnu_error_format_enabled(&self) -> bool {
+        crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "gnu_errfmt")
+    }
+
+    /// Gated `head: line N: ` vs `head:N: ` shared by the
+    /// error_prolog/parser_error families (GNU error.c:83
+    /// `gnu_error_format ? "" : _(" line ")`).
+    fn gnu_error_line(&self, head: &str, line: usize) -> String {
+        if self.gnu_error_format_enabled() {
+            format!("{head}:{line}: ")
+        } else {
+            format!("{head}: line {line}: ")
+        }
+    }
+
+    /// GNU error.c:75-86 error_prolog (report_error, internal_error,
+    /// internal_warning): same branches as diagnostic_prefix, but the line
+    /// segment honors gnu_errfmt (`script:2: `, `bash:1: `). Callers are the
+    /// error_prolog family only — command-not-found, arithmetic evalerror,
+    /// redirection_error, completion-function lookup, wait's pid error.
+    /// Builtin errors (builtin_error_prolog, no gate) keep
+    /// diagnostic_prefix().
+    pub fn error_prefix(&self) -> String {
+        if self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_INTERACTIVE")
+        {
+            // Interactive: no line segment in either family (error.c:80).
+            return format!(
+                "{}: ",
+                Self::interactive_shell_basename(&self.shell_state.env_vars)
+            );
+        }
+
+        let line = self.shell_state.env_vars.get("__RUBASH_CURRENT_LINE");
+        let script = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME");
+        match (script, line) {
+            (Some(script), Some(line)) => {
+                let line: usize = line.parse().unwrap_or(1);
+                self.gnu_error_line(script, line)
+            }
+            (None, Some(line)) => {
+                let line: usize = line.parse().unwrap_or(1);
+                self.gnu_error_line("bash", line)
+            }
+            _ => "bash: ".to_string(),
         }
     }
 
@@ -1496,6 +1561,38 @@ impl Executor {
         "bash: ".to_string()
     }
 
+    /// GNU error.c:300-316 parser_error gated twin of
+    /// parser_diagnostic_prefix: the ` line N` segment honors gnu_errfmt
+    /// (`script:2: `, `script: -c:2: `, `script: eval:2: `).
+    pub(crate) fn parser_error_prefix(&self) -> String {
+        let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
+        if let (Some(script), Some(line)) = (
+            self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME"),
+            self.shell_state.env_vars.get("__RUBASH_CURRENT_LINE"),
+        ) {
+            let line: usize = line.parse().unwrap_or(1);
+            if self
+                .shell_state
+                .env_vars
+                .contains_key("__RUBASH_EVAL_CONTEXT")
+            {
+                return self.gnu_error_line(&format!("{script}: eval"), line);
+            }
+            if is_c {
+                return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            return self.gnu_error_line(script, line);
+        }
+        if is_c {
+            if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+                return self.gnu_error_line(&format!("{script}: -c"), 1);
+            }
+            return self.gnu_error_line("bash: -c", 1);
+        }
+
+        "bash: ".to_string()
+    }
+
     /// GNU parser_error (error.c:300-316) with yy_input_name() ==
     /// "command substitution" (parse_and_execute's `whom`, subst.c:7413):
     /// `script: command substitution: line N: `. The comsub parse inherits
@@ -1549,9 +1646,41 @@ impl Executor {
         format!("{name}: command substitution: line {line}: ")
     }
 
+    /// GNU error.c:300-316 parser_error gated twin of comsub_eof_diagnostic:
+    /// `script: command substitution:2: ` under gnu_errfmt.
+    pub(in crate::executor) fn comsub_eof_error_diagnostic(&self, line: usize) -> String {
+        if self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_INTERACTIVE")
+        {
+            return format!(
+                "{}: ",
+                Self::interactive_shell_basename(&self.shell_state.env_vars)
+            );
+        }
+        let name = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_SCRIPT_NAME")
+            .cloned()
+            .unwrap_or_else(|| "bash".to_string());
+        self.gnu_error_line(&format!("{name}: command substitution"), line)
+    }
+
     pub fn diagnostic_prefix_for_line(&self, line: usize) -> String {
         if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
             return format!("{script}: line {line}: ");
+        }
+
+        "bash: ".to_string()
+    }
+
+    /// error_prolog-family (report_error/internal_error/internal_warning)
+    /// twin of diagnostic_prefix_for_line: `script:2: ` under gnu_errfmt.
+    pub fn error_prefix_for_line(&self, line: usize) -> String {
+        if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+            return self.gnu_error_line(script, line);
         }
 
         "bash: ".to_string()
@@ -1603,6 +1732,34 @@ impl Executor {
         "bash: ".to_string()
     }
 
+    /// GNU error.c:300-316 parser_error gated twin of
+    /// parser_diagnostic_prefix_for_line (`script:2: `,
+    /// `script: eval:2: `, `bash: -c:2: ` under gnu_errfmt).
+    pub fn parser_error_prefix_for_line(&self, line: usize) -> String {
+        let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
+        if self
+            .shell_state
+            .env_vars
+            .contains_key("__RUBASH_EVAL_CONTEXT")
+        {
+            if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+                return self.gnu_error_line(&format!("{script}: eval"), line);
+            }
+            return self.gnu_error_line("bash: eval", line);
+        }
+        if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+            if is_c {
+                return self.gnu_error_line(&format!("{script}: -c"), line);
+            }
+            return self.gnu_error_line(script, line);
+        }
+        if is_c {
+            return self.gnu_error_line("bash: -c", line);
+        }
+
+        "bash: ".to_string()
+    }
+
     pub(in crate::executor) fn report_unterminated_heredoc(&self, cmd: &CommandNode) {
         // GNU parse.y:3130/make_cmd.c:627: `lineno` is the parser's
         // line_number when gather_here_documents ran make_here_document —
@@ -1626,7 +1783,7 @@ impl Executor {
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
         eprintln!(
             "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.diagnostic_prefix_for_line(warning_line)
+            self.error_prefix_for_line(warning_line)
         );
     }
 
@@ -1652,7 +1809,7 @@ impl Executor {
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
         eprintln!(
             "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.diagnostic_prefix_for_line(delimiter_line)
+            self.error_prefix_for_line(delimiter_line)
         );
     }
 
@@ -1700,13 +1857,13 @@ impl Executor {
             for (delim, at_line) in pending {
                 eprintln!(
                     "{}warning: here-document at line {at_line} delimited by end-of-file (wanted `{delim}')",
-                    self.diagnostic_prefix_for_line(last_line)
+                    self.error_prefix_for_line(last_line)
                 );
             }
         }
         eprintln!(
             "{}unexpected EOF while looking for matching `)'",
-            self.parser_diagnostic_prefix_for_line(last_line + 1)
+            self.parser_error_prefix_for_line(last_line + 1)
         );
     }
 
@@ -1724,7 +1881,7 @@ impl Executor {
         let syntax_line = warning_line + 1;
         eprintln!(
             "{}syntax error: unexpected end of file from `(' command on line {start_line}",
-            self.parser_diagnostic_prefix_for_line(syntax_line)
+            self.parser_error_prefix_for_line(syntax_line)
         );
     }
 }

@@ -257,7 +257,7 @@ impl Executor {
                 if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, base_name) {
                     let line = format!(
                         "{}{base_name}: readonly variable\n",
-                        self.assignment_diagnostic_prefix()
+                        self.assignment_readonly_prefix()
                     );
                     self.emit_assignment_diag(line);
                     assignments_failed = true;
@@ -286,7 +286,7 @@ impl Executor {
                 if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, base_name) {
                     let line = format!(
                         "{}{base_name}: readonly variable\n",
-                        self.assignment_diagnostic_prefix()
+                        self.assignment_readonly_prefix()
                     );
                     self.emit_assignment_diag(line);
                     assignments_failed = true;
@@ -419,7 +419,7 @@ impl Executor {
             let line = format!(
                 "{}warning: {elem_base}: removing nameref attribute
 ",
-                self.assignment_diagnostic_prefix()
+                self.assignment_error_prefix()
             );
             self.emit_assignment_diag(line);
             unmark_env_name(&mut self.shell_state.env_vars, NAMEREF_VARS, elem_base);
@@ -622,7 +622,7 @@ impl Executor {
             )
         });
         if let Some(message) = message {
-            let line = format!("{}{}\n", self.assignment_diagnostic_prefix(), message);
+            let line = format!("{}{}\n", self.assignment_error_prefix(), message);
             self.emit_assignment_diag(line);
         }
         // Do NOT set arithmetic_expansion_error here: every caller maps the
@@ -668,6 +668,29 @@ impl Executor {
         match &self.assignment_command_name {
             Some(command) => format!("{}{command}: ", self.diagnostic_prefix()),
             None => self.diagnostic_prefix(),
+        }
+    }
+
+    /// GNU error.c:453 err_readonly (report_error family) twin of
+    /// assignment_diagnostic_prefix: a bare bind-layer `name: readonly
+    /// variable` honors gnu_errfmt (rubash#1038); a builtin-command
+    /// context (`declare: name: ...`) is sh_readonly (builtin_error, no
+    /// gate) and keeps the ungated shape.
+    fn assignment_readonly_prefix(&self) -> String {
+        match &self.assignment_command_name {
+            Some(command) => format!("{}{command}: ", self.diagnostic_prefix()),
+            None => self.error_prefix(),
+        }
+    }
+
+    /// error_prolog-family twin of assignment_diagnostic_prefix (evalerror,
+    /// err_badarraysub, internal_warning): the line segment honors
+    /// gnu_errfmt in both arms — an evalerror under a builtin still gates
+    /// (`declare: 1/0: ...`, rubash#1038).
+    fn assignment_error_prefix(&self) -> String {
+        match &self.assignment_command_name {
+            Some(command) => format!("{}{command}: ", self.error_prefix()),
+            None => self.error_prefix(),
         }
     }
 
@@ -747,7 +770,7 @@ impl Executor {
                 if self.nameref_circular_fallback_name(base_name).is_some() {
                     let line = format!(
                         "{}warning: {}: maximum nameref depth (8) exceeded\n",
-                        self.assignment_diagnostic_prefix(),
+                        self.assignment_error_prefix(),
                         base_name
                     );
                     self.emit_assignment_diag(line);
@@ -759,7 +782,7 @@ impl Executor {
                 // warning fires and the assignment fails.
                 let line = format!(
                     "{}warning: {}: circular name reference\n",
-                    self.assignment_diagnostic_prefix(),
+                    self.assignment_error_prefix(),
                     base_name
                 );
                 self.emit_assignment_diag(line);
@@ -771,7 +794,7 @@ impl Executor {
                 // internal_warning, so the assignment fails with status 1.
                 let line = format!(
                     "{}warning: {}: maximum nameref depth (8) exceeded\n",
-                    self.assignment_diagnostic_prefix(),
+                    self.assignment_error_prefix(),
                     base_name
                 );
                 self.emit_assignment_diag(line);
@@ -893,11 +916,8 @@ impl Executor {
                         "__RUBASH_READONLY_VARS",
                         elem_base,
                     ) {
-                        let line = format!(
-                            "{}{}: readonly variable\n",
-                            self.diagnostic_prefix(),
-                            elem_base
-                        );
+                        let line =
+                            format!("{}{}: readonly variable\n", self.error_prefix(), elem_base);
                         self.emit_assignment_diag(line);
                         self.exit_code = 1;
                         return false;
@@ -933,10 +953,12 @@ impl Executor {
                     return false;
                 }
                 if subscript.is_empty() || subscript == "@" || subscript == "*" {
+                    // GNU arrayfunc err_badarraysub (report_error family):
+                    // honors gnu_errfmt (rubash#1038).
                     let line = format!(
                         "{}{}: bad array subscript
 ",
-                        self.assignment_diagnostic_prefix(),
+                        self.assignment_error_prefix(),
                         base_name
                     );
                     self.emit_assignment_diag(line);
@@ -953,11 +975,8 @@ impl Executor {
                         // bind-layer diagnostic is `name: readonly variable`
                         // with no builtin-name segment (read.def:1155
                         // bind_read_variable -> variables.c bind_variable).
-                        let line = format!(
-                            "{}{}: readonly variable\n",
-                            self.diagnostic_prefix(),
-                            elem_base
-                        );
+                        let line =
+                            format!("{}{}: readonly variable\n", self.error_prefix(), elem_base);
                         self.emit_assignment_diag(line);
                         self.exit_code = 1;
                         return false;
@@ -982,11 +1001,7 @@ impl Executor {
             "__RUBASH_READONLY_VARS",
             base_name,
         ) {
-            let line = format!(
-                "{}{}: readonly variable\n",
-                self.diagnostic_prefix(),
-                base_name
-            );
+            let line = format!("{}{}: readonly variable\n", self.error_prefix(), base_name);
             self.emit_assignment_diag(line);
             self.exit_code = 1;
             return false;
@@ -1323,10 +1338,12 @@ impl Executor {
             // subscript` but does NOT set any_failed — the pair is skipped
             // and the assignment still succeeds.
             for word in &empty_keys {
+                // GNU arrayfunc.c:644-650 err_badarraysub (report_error
+                // family): honors gnu_errfmt (rubash#1038).
                 let line = format!(
                     "{}{}: bad array subscript
 ",
-                    self.assignment_diagnostic_prefix(),
+                    self.assignment_error_prefix(),
                     word
                 );
                 self.emit_assignment_diag(line);
@@ -1525,11 +1542,9 @@ impl Executor {
             // `raise_evalerror_abort` is the same DISCARD jump the plain
             // `a[-2]=q` path makes: function frames unwind, a subshell ends
             // just itself, and a top-level list ends the noninteractive run.
-            let line = format!(
-                "{}{}: bad array subscript\n",
-                self.diagnostic_prefix(),
-                word
-            );
+            // GNU arrayfunc err_badarraysub (report_error family): honors
+            // gnu_errfmt (rubash#1038).
+            let line = format!("{}{}: bad array subscript\n", self.error_prefix(), word);
             self.emit_assignment_diag(line);
             self.exit_code = 1;
             // Bad-subscript class for the eval boundary (rubash#637), armed

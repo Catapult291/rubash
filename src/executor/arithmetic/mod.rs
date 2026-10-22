@@ -631,7 +631,7 @@ impl Executor {
                 *self.arithmetic_last_eval_input.borrow_mut() = expression.to_string();
                 self.shell_state.arithmetic_nounset_error.set(true);
                 if !self.shell_state.arithmetic_expansion_error.replace(true) {
-                    eprintln!("{}{}: unbound variable", self.diagnostic_prefix(), name);
+                    eprintln!("{}{}: unbound variable", self.error_prefix(), name);
                     use std::io::Write;
                     let _ = std::io::stderr().flush();
                 }
@@ -776,11 +776,9 @@ impl Executor {
                     self.diagnostic_prefix(),
                     display
                 ),
-                (ArithEvalDiag::BadSubscript(display), _) => eprintln!(
-                    "{}{}: bad array subscript",
-                    self.diagnostic_prefix(),
-                    display
-                ),
+                (ArithEvalDiag::BadSubscript(display), _) => {
+                    eprintln!("{}{}: bad array subscript", self.error_prefix(), display)
+                }
             }
             printed = true;
         }
@@ -899,7 +897,7 @@ impl Executor {
                 *self.arithmetic_last_eval_input.borrow_mut() = expression.to_string();
                 self.shell_state.arithmetic_nounset_error.set(true);
                 if !self.shell_state.arithmetic_expansion_error.replace(true) {
-                    eprintln!("{}{}: unbound variable", self.diagnostic_prefix(), name);
+                    eprintln!("{}{}: unbound variable", self.error_prefix(), name);
                     use std::io::Write;
                     let _ = std::io::stderr().flush();
                 }
@@ -1022,12 +1020,12 @@ impl Executor {
         // The subscript's nested evalexp recorded the real evalerror state —
         // its frame expression IS the subscript text, with lasttp inside it.
         if let Some(record) = take_arith_eval_error() {
-            eprintln!("{}{}", self.diagnostic_prefix(), record.render());
+            eprintln!("{}{}", self.error_prefix(), record.render());
         } else {
             let token = indexed_noexpand_error_token(resolved);
             eprintln!(
                 "{}{}: arithmetic syntax error: operand expected (error token is \"{}\")",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 resolved,
                 token
             );
@@ -1060,7 +1058,9 @@ impl Executor {
         if expression_has_unterminated_parameter_brace(expression) {
             self.shell_state.arithmetic_nonfatal_error.set(true);
             if !self.shell_state.arithmetic_expansion_error.replace(true) {
-                eprintln!("{}{expression}: bad substitution", self.diagnostic_prefix());
+                // GNU subst.c report_error (error_prolog family): honors
+                // gnu_errfmt (rubash#1038).
+                eprintln!("{}{expression}: bad substitution", self.error_prefix());
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
@@ -1081,7 +1081,7 @@ impl Executor {
             {
                 self.shell_state.arithmetic_nounset_error.set(true);
                 if !self.shell_state.arithmetic_expansion_error.replace(true) {
-                    eprintln!("{}{}: unbound variable", self.diagnostic_prefix(), name);
+                    eprintln!("{}{}: unbound variable", self.error_prefix(), name);
                     use std::io::Write;
                     let _ = std::io::stderr().flush();
                 }
@@ -1132,7 +1132,7 @@ impl Executor {
             return;
         };
         if !self.shell_state.arithmetic_expansion_error.replace(true) {
-            eprintln!("{}{}: readonly variable", self.diagnostic_prefix(), name);
+            eprintln!("{}{}: readonly variable", self.error_prefix(), name);
             use std::io::Write;
             let _ = std::io::stderr().flush();
         }

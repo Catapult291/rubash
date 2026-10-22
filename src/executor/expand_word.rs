@@ -700,7 +700,7 @@ impl Executor {
                 if let Some(name) = arithmetic_unbound_variable(&expression, &overlaid) {
                     if !self.shell_state.arithmetic_expansion_error.replace(true) {
                         self.write_diagnostic_fd2(
-                            format!("{}{}: unbound variable\n", self.diagnostic_prefix(), name)
+                            format!("{}{}: unbound variable\n", self.error_prefix(), name)
                                 .as_bytes(),
                         );
                     }
@@ -758,7 +758,7 @@ impl Executor {
             }
             if !self.shell_state.arithmetic_expansion_error.replace(true) {
                 self.write_diagnostic_fd2(
-                    format!("{}{}\n", self.diagnostic_prefix(), message).as_bytes(),
+                    format!("{}{}\n", self.error_prefix(), message).as_bytes(),
                 );
             }
         }

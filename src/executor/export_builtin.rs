@@ -35,7 +35,7 @@ impl Executor {
         let mut stderr = Vec::new();
         if let Some(message) = &arith_eval_failure {
             if !message.is_empty() {
-                writeln!(stderr, "{}export: {message}", self.diagnostic_prefix())?;
+                writeln!(stderr, "{}export: {message}", self.error_prefix())?;
             }
             self.raise_evalerror_abort();
         }

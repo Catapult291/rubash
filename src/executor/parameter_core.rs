@@ -303,7 +303,7 @@ impl Executor {
                         )
                     });
                     self.write_diagnostic_fd2(
-                        format!("{}{}\n", self.diagnostic_prefix(), message).as_bytes(),
+                        format!("{}{}\n", self.error_prefix(), message).as_bytes(),
                     );
                 }
                 return String::new();
@@ -900,7 +900,7 @@ impl Executor {
                 }
             }
             self.write_diagnostic_fd2(
-                format!("{}{}: {}\n", self.diagnostic_prefix(), var_name, message).as_bytes(),
+                format!("{}{}: {}\n", self.error_prefix(), var_name, message).as_bytes(),
             );
             use std::io::Write;
             let _ = std::io::stderr().flush();
@@ -919,7 +919,7 @@ impl Executor {
             self.write_diagnostic_fd2(
                 format!(
                     "{}{}: {}: arithmetic syntax error: operand expected (error token is \"{}\")\n",
-                    self.diagnostic_prefix(),
+                    self.error_prefix(),
                     var_name,
                     span,
                     span

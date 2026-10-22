@@ -52,16 +52,21 @@ impl Executor {
         // list abort; DISCARD is chosen only by array_expand_index /
         // make_variable_value / word-expansion callers.
         if let Some(record) = crate::executor::arithmetic::take_arith_eval_error() {
+            // GNU expr.c:1528 evalerror is internal_error (error_prolog
+            // family): the prefix honors gnu_errfmt (rubash#1038). The
+            // routing is the fd-2 dispatch (rubash#1127): pre-redirect the
+            // bound fd 2 IS the session stderr, so expansion-phase errors
+            // still land where GNU's error.c would put them.
             self.arith_diag(&format!(
                 "{}{}: {}\n",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 label,
                 record.render()
             ));
         } else if let Some(token) = arithmetic_division_by_zero_token(expression) {
             self.arith_diag(&format!(
                 "{}{}: {expression}: division by 0 (error token is \"{token}\")\n",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 label
             ));
         } else if let Some(token) = self.undefined_var_operand_token(expression) {
@@ -70,18 +75,14 @@ impl Executor {
             // original $var token (e.g. `jv += $iv` -> token "$iv").
             self.arith_diag(&format!(
                 "{}{}: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")\n",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 label
             ));
         } else if let Some(message) = crate::executor::arithmetic::arithmetic_command_error_message(
             expression,
             trailing_space,
         ) {
-            self.arith_diag(&format!(
-                "{}{}: {message}\n",
-                self.diagnostic_prefix(),
-                label
-            ));
+            self.arith_diag(&format!("{}{}: {message}\n", self.error_prefix(), label));
         }
     }
 
@@ -188,14 +189,14 @@ impl Executor {
         let record_opt = crate::executor::arithmetic::take_arith_eval_error();
         if let Some(record) = record_opt {
             let rendered = record.render();
-            self.arith_diag(&format!("{}((: {}\n", self.diagnostic_prefix(), rendered));
+            self.arith_diag(&format!("{}((: {}\n", self.error_prefix(), rendered));
             return;
         }
         let display = raw_display.trim_start_matches([' ', '\t']);
         if let Some(message) =
             crate::executor::arithmetic::arithmetic_command_error_message(display, false)
         {
-            self.arith_diag(&format!("{}((: {message}\n", self.diagnostic_prefix()));
+            self.arith_diag(&format!("{}((: {message}\n", self.error_prefix()));
         }
     }
 
@@ -207,7 +208,7 @@ impl Executor {
         self.raise_evalerror_abort();
         self.arith_diag(&format!(
             "{}((: {display}: division by 0 (error token is \"{token}\")\n",
-            self.diagnostic_prefix()
+            self.error_prefix()
         ));
     }
 
@@ -235,7 +236,7 @@ impl Executor {
             if let Some(token) = dollar_var_operand_token(expression) {
                 self.arith_diag(&format!(
                     "{}let: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")\n",
-                    self.diagnostic_prefix()
+                    self.error_prefix()
                 ));
                 return;
             }
@@ -313,9 +314,11 @@ impl Executor {
             // DISCARD at execute_cmd.c:3937's expansion step); a marker
             // would leak into the NEXT command's expansion and discard it.
             if !self.shell_state.arithmetic_expansion_error.replace(true) {
+                // GNU subst.c report_error (error_prolog family): honors
+                // gnu_errfmt (rubash#1038).
                 self.arith_diag(&format!(
                     "{}{eval_input_expr}: bad substitution\n",
-                    self.diagnostic_prefix()
+                    self.error_prefix()
                 ));
             }
             return 1;

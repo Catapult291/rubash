@@ -725,7 +725,7 @@ impl Executor {
         let delimiter = command.heredoc_delimiter.as_deref().unwrap_or("");
         eprintln!(
             "{}warning: here-document at line {start_line} delimited by end-of-file (wanted `{delimiter}')",
-            self.diagnostic_prefix_for_line(warning_line)
+            self.error_prefix_for_line(warning_line)
         );
     }
 
