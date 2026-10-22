@@ -537,6 +537,12 @@ impl Executor {
             .commands
             .iter()
             .any(|command| command.has_assignment("__RUBASH_PARSE_ERROR__"));
+        // rubash#1013: an eval string that parses to no commands at all
+        // (empty, blanks, or comments only) succeeds — GNU evalstring.c
+        // parse_and_execute on an empty string leaves eval_builtin
+        // returning EXECUTION_SUCCESS, so the caller's $? must not
+        // survive it (`false; eval ""; echo $?` -> 0).
+        let no_commands = ast.commands.is_empty();
         let saved_eval_context = self
             .shell_state
             .env_vars
@@ -589,7 +595,7 @@ impl Executor {
         // parse_and_execute's containment could see it. Such an error is a
         // real shell exit, not eval's rc=2.
         let parser_error_errexited = self.parser_error_errexited.take();
-        match result {
+        let eval_result = match result {
             Err(ExecuteError::ExitCode(code))
                 if code == 2
                     && !parser_error_errexited
@@ -682,7 +688,13 @@ impl Executor {
                 }
                 other
             }
+        };
+        // rubash#1013: see `no_commands` above — an empty eval string
+        // that ran without error reports success, not the stale status.
+        if eval_result.is_ok() && no_commands {
+            self.exit_code = 0;
         }
+        eval_result
     }
 
     pub fn run_exit_trap(&mut self) -> Result<i32, ExecuteError> {
