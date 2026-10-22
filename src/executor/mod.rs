@@ -971,6 +971,19 @@ pub struct Executor {
     /// (command_substitute has no :1831-equivalent); the flat-command loop
     /// clears it between top-level commands as a backstop. rubash#846.
     pub(crate) compound_redirect_failed: Cell<bool>,
+    /// rubash#1025: expanded targets a compound command's prepare phase
+    /// (apply_compound_*_arm / apply_brace_group_redirects) already
+    /// created through the noclobber O_EXCL open in
+    /// create_redirect_output_prepared. The bind phase
+    /// (open_compound_output_redirects) opens the SAME redirect again to
+    /// bind the fd table; without this record its O_EXCL open fails on
+    /// the file the prepare phase just created, so
+    /// `set -C; { :; } > fresh` wrongly reports "cannot overwrite
+    /// existing file" for a file that did not exist before the command.
+    /// The bind phase consumes (removes) the record, a genuinely
+    /// pre-existing file still fails in the prepare phase itself, and
+    /// simple commands never consult the set.
+    pub(crate) noclobber_prepared_targets: std::cell::RefCell<std::collections::HashSet<String>>,
     /// The group's execute_ast ended by unwinding (`exit`, errexit, POSIX
     /// special-builtin failure, fatal expansion — GNU's
     /// jump_to_top_level(EXITPROG/ERREXIT/FORCE_EOF)). run_source converts

@@ -1588,6 +1588,7 @@ impl Executor {
             // starts clean and anything it sets stays inside (separate
             // Executor); the parent never observes it.
             compound_redirect_failed: Cell::new(false),
+            noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
             exit_jump_pending: Cell::new(false),
             special_builtin_failed: Cell::new(false),
             last_builtin_write_failed: Cell::new(false),

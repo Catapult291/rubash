@@ -295,6 +295,37 @@ impl Executor {
         File::create(path).map_err(|e| crate::posix_errors::path_error(&target, e))
     }
 
+    /// rubash#1025: prepare-phase variant of [`Self::create_redirect_output`]
+    /// for compound commands. GNU do_redirection_internal opens a
+    /// compound's redirect ONCE; rubash's prepare phase (create/truncate
+    /// here, splice appends into the body) and bind phase
+    /// (open_compound_output_redirects) open it twice, so a successful
+    /// noclobber O_EXCL create is recorded here and the bind phase
+    /// consumes the record instead of failing on the file this same
+    /// command just created.
+    pub(in crate::executor) fn create_redirect_output_prepared(
+        &self,
+        target: &str,
+        clobber: bool,
+    ) -> io::Result<File> {
+        let file = self.create_redirect_output(target, clobber)?;
+        if !clobber
+            && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
+        {
+            self.noclobber_prepared_targets
+                .borrow_mut()
+                .insert(target.to_string());
+        }
+        Ok(file)
+    }
+
+    /// Consume a prepare-phase noclobber record (rubash#1025): true when
+    /// `target` was already created by the current compound's prepare
+    /// phase, so the bind phase must not run the O_EXCL open again.
+    pub(in crate::executor) fn take_noclobber_prepared_target(&self, target: &str) -> bool {
+        self.noclobber_prepared_targets.borrow_mut().remove(target)
+    }
+
     pub(in crate::executor) fn redirect_output_path_target(&self, target: &str) -> String {
         if self.posix_mode_enabled() {
             return target.to_string();

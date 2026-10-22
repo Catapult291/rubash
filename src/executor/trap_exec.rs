@@ -1693,7 +1693,7 @@ impl Executor {
                     && !is_closed_redirect_target(&expanded)
                     && redirect_target_fd(&expanded).is_none()
                 {
-                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&expanded, redirect.clobber)?;
                 }
                 let target = self.anchor_compound_redirect_target(&expanded);
                 let append_redirect = Redirect {
@@ -1781,7 +1781,7 @@ impl Executor {
                     && redirect_target_fd(&expanded).is_none()
                     && !is_null_device(&expanded)
                 {
-                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&expanded, redirect.clobber)?;
                 }
                 let target = self.anchor_compound_redirect_target(&expanded);
                 let append_redirect = Redirect {

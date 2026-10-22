@@ -865,7 +865,7 @@ impl Executor {
             {
                 let target = self.expand_redirect_target(redirect);
                 if redirect_target_fd(&target).is_none() {
-                    self.create_redirect_output(&target, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&target, redirect.clobber)?;
                 }
                 let mut append_redirect = redirect.clone();
                 append_redirect.target = target;
@@ -894,7 +894,7 @@ impl Executor {
         {
             let target = self.expand_redirect_target(redirect);
             if redirect_target_fd(&target).is_none() && !is_null_device(&target) {
-                self.create_redirect_output(&target, redirect.clobber)?;
+                self.create_redirect_output_prepared(&target, redirect.clobber)?;
             }
             let mut append_redirect = redirect.clone();
             append_redirect.target = target;
