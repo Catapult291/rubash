@@ -230,6 +230,16 @@ where
     };
 
     let rendered = render(format, &args[index + 1..], env_vars);
+    // GNU printf.def: diagnostics go through builtin_error (unbuffered
+    // stderr) while the converted output accumulates in stdout's stdio
+    // buffer and flushes when the builtin returns — in a merged 2>&1
+    // stream every diagnostic of this invocation therefore precedes its
+    // output (`printf '%d\n' abc` prints the diagnostic, then `0`;
+    // rubash#1134). Emit the errors first; with separate streams the
+    // relative order is unobservable.
+    for error in rendered.errors {
+        writeln!(stderr, "{error}")?;
+    }
     let mut assign_status = None;
     if let Some(name) = output_var {
         assign_status = assign_printf_output(
@@ -241,10 +251,6 @@ where
         )?;
     } else {
         stdout.write_all(&escape::raw_bytes(&rendered.output))?;
-    }
-
-    for error in rendered.errors {
-        writeln!(stderr, "{error}")?;
     }
 
     Ok(assign_status.unwrap_or(rendered.status))

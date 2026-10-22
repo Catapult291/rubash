@@ -939,6 +939,20 @@ impl Executor {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Result<bool, ExecuteError> {
+        self.route_builtin_buffered_output_ordered(cmd, stdout, stderr, false)
+    }
+
+    /// `stderr_first` swaps the final ordered walk: printf's GNU model
+    /// emits builtin_error diagnostics unbuffered while its converted
+    /// output flushes only when the builtin returns, so in a merged
+    /// stream the diagnostics precede the output (rubash#1134).
+    pub(in crate::executor) fn route_builtin_buffered_output_ordered(
+        &mut self,
+        cmd: &CommandNode,
+        stdout: &[u8],
+        stderr: &[u8],
+        stderr_first: bool,
+    ) -> Result<bool, ExecuteError> {
         self.last_builtin_write_failed.set(false);
         let mut state = self.command_output_fd_state();
         if !self.apply_ordered_output_redirects(cmd, &mut state)? {
@@ -1009,8 +1023,13 @@ impl Executor {
         // untouched. GNU builtins/common.c:320 sh_chkwrite folds only
         // stdout's ferror into the builtin status; builtin_error's failed
         // fd-2 write is lost.
-        self.write_state_output_or_diagnostic(cmd, &state, 1, stdout)?;
-        self.write_state_output_or_diagnostic(cmd, &state, 2, stderr)?;
+        if stderr_first {
+            self.write_state_output_or_diagnostic(cmd, &state, 2, stderr)?;
+            self.write_state_output_or_diagnostic(cmd, &state, 1, stdout)?;
+        } else {
+            self.write_state_output_or_diagnostic(cmd, &state, 1, stdout)?;
+            self.write_state_output_or_diagnostic(cmd, &state, 2, stderr)?;
+        }
         Ok(true)
     }
 
