@@ -88,11 +88,19 @@ fn test_jobs_x_uses_command_status() {
 }
 
 #[test]
-fn test_jobs_x_replaces_jobspec_with_background_pid() {
+fn test_jobs_x_replaces_jobspec_with_process_group_id() {
+    // GNU builtins/jobs.def execute_list_with_replacements substitutes
+    // `itos (j->pgrp)` — the process-GROUP id (jobs.c:649), not the job
+    // pid (rubash#1096). Without job control every job shares the shell's
+    // own pgrp, so two concurrent jobs substitute the SAME value, distinct
+    // from both job pids. (Non-unix has no pgrp concept and keeps the
+    // per-job pid substitution.)
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-jobs-x-jobspec-output.txt";
     let _ = fs::remove_file(output_path);
-    let input = format!("true & pid=$!; jobs -x echo %1 \"$pid\" > {output_path}; disown \"$pid\"");
+    let input = format!(
+        "true & p1=$!; true & p2=$!; jobs -x echo %1 %2 \"$p1\" \"$p2\" > {output_path}; wait"
+    );
     let tokens = tokenize(&input);
     let ast = parse(&tokens);
     let mut executor = Executor::new();
@@ -103,22 +111,41 @@ fn test_jobs_x_replaces_jobspec_with_background_pid() {
     assert_eq!(executor.last_exit_code(), 0);
     let output = fs::read_to_string(output_path).unwrap();
     let mut parts = output.split_whitespace();
-    let expanded = parts.next().unwrap();
-    let launched = parts.next().unwrap();
+    let first = parts.next().unwrap();
+    let second = parts.next().unwrap();
+    let pid1 = parts.next().unwrap();
+    let pid2 = parts.next().unwrap();
     assert!(parts.next().is_none());
-    assert!(expanded.parse::<u32>().is_ok());
-    assert_eq!(expanded, launched);
+    for part in [first, second, pid1, pid2] {
+        assert!(part.parse::<u32>().is_ok());
+    }
+    #[cfg(unix)]
+    {
+        assert_eq!(first, second);
+        assert_ne!(first, pid1);
+        assert_ne!(first, pid2);
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(first, pid1);
+        assert_eq!(second, pid2);
+    }
     let _ = fs::remove_file(output_path);
 }
 
 #[test]
-fn test_jobs_x_unknown_jobspec_reports_failure() {
+fn test_jobs_x_unknown_jobspec_passes_through() {
+    // GNU execute_list_with_replacements: INVALID_JOB specs are not errors
+    // — the word passes through unchanged and the command still runs with
+    // its own status (rubash#1096).
     let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-jobs-x-unknown-output.txt";
     let error_path = "target/rubash-jobs-x-unknown-error.txt";
     let status_path = "target/rubash-jobs-x-unknown-status.txt";
+    let _ = fs::remove_file(output_path);
     let _ = fs::remove_file(error_path);
     let _ = fs::remove_file(status_path);
-    let input = format!("jobs -x echo %1 2> {error_path}; echo $? > {status_path}");
+    let input = format!("jobs -x echo %1 > {output_path} 2> {error_path}; echo $? > {status_path}");
     let tokens = tokenize(&input);
     let ast = parse(&tokens);
     let mut executor = Executor::new();
@@ -127,10 +154,10 @@ fn test_jobs_x_unknown_jobspec_reports_failure() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
-    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
-    assert!(fs::read_to_string(error_path)
-        .unwrap()
-        .contains("jobs: %1: no such job"));
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "%1\n");
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "0\n");
+    assert!(fs::read_to_string(error_path).unwrap().is_empty());
+    let _ = fs::remove_file(output_path);
     let _ = fs::remove_file(error_path);
     let _ = fs::remove_file(status_path);
 }

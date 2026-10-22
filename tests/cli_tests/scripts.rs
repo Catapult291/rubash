@@ -699,3 +699,76 @@ fn script_assignment_command_substitution_captures_function_output() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world\n");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
+
+/// rubash#1097: GNU builtins/suspend.def suspend_builtin stops its own
+/// process group on `-f` (`killpg (shell_pgrp, SIGSTOP)`), returning
+/// SUCCESS once continued. The child runs detached via setsid (own session
+/// and pgrp — stopping the shared group would freeze the test runner),
+/// the test observes the T state with ps, then CONTs it and expects rc 0.
+/// Linux-only: needs setsid/ps/kill and a kernel SIGSTOP.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn suspend_force_stops_own_group_until_continued() {
+    use std::time::{Duration, Instant};
+
+    let script_path = Path::new("target").join("rubash-cli-suspend-f.sh");
+    fs::create_dir_all("target").unwrap();
+    fs::write(&script_path, "suspend -f\necho \"rc=$?\"\n").unwrap();
+
+    let mut child = std::process::Command::new("setsid")
+        .arg(env!("CARGO_BIN_EXE_rubash"))
+        .arg(crate::shell_test_path(&script_path))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn detached rubash");
+    let pid = child.id();
+
+    // Poll for the stopped state; an immediate exit means -f was a no-op.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stopped = false;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            panic!("suspend -f child exited early with {status} (never stopped)");
+        }
+        let ps = std::process::Command::new("ps")
+            .arg("-o")
+            .arg("stat=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .expect("run ps");
+        if String::from_utf8_lossy(&ps.stdout)
+            .trim_start()
+            .starts_with(['T', 't'])
+        {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(stopped, "suspend -f child never entered stopped state");
+
+    let cont = std::process::Command::new("kill")
+        .arg("-CONT")
+        .arg(pid.to_string())
+        .status()
+        .expect("send CONT");
+    assert!(cont.success());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("suspend -f child did not exit after CONT");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect child output");
+    let _ = fs::remove_file(&script_path);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rc=0\n");
+}

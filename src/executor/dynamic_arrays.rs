@@ -832,11 +832,15 @@ impl Executor {
     pub(in crate::executor) fn bashpid_value(&self) -> u32 {
         let pid = std::process::id();
         let depth = self.shell_state.subshell_depth.get();
-        if depth == 0 {
-            pid
-        } else {
-            pid.saturating_add(u32::try_from(depth).unwrap_or(u32::MAX))
-        }
+        // rubash#1095: `origin` is the subshell level realized by this
+        // process's own spawn (0 for ordinary shells): deeper in-process
+        // levels fake fork-distinctness with pid + offset, while the
+        // spawn-realized level and below report the bare pid — GNU
+        // variables.c:1511 get_bashpid is getpid(), and the async wrapper
+        // spawn already is the fork whose pid is the parent's $!.
+        pid.saturating_add(
+            u32::try_from(depth.saturating_sub(self.bashpid_origin_depth)).unwrap_or(u32::MAX),
+        )
     }
 
     pub(in crate::executor) fn bash_aliases_storage(&self) -> String {

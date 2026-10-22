@@ -513,6 +513,15 @@ pub struct Executor {
     /// per shell process (bash_logout, exit.def:156-166).
     bash_logout_sourced: bool,
     shell_pid: u32,
+    /// rubash#1095: the subshell level this process's own pid answers for
+    /// $BASHPID. GNU variables.c:1511 get_bashpid is getpid() — every fork
+    /// level is a fresh pid. Rubash shares one pid across in-process
+    /// subshells and fakes distinctness with pid + depth, but a spawned
+    /// async wrapper (compound_exec.rs) already IS GNU's single
+    /// async/subshell fork (execute_cmd.c:701): its pid is the level the
+    /// spawn realized, so BASHPID = pid + depth.saturating_sub(origin)
+    /// with origin = 0 for ordinary shells.
+    bashpid_origin_depth: usize,
     owns_signal_mailbox: bool,
     /// startup21: true when this Executor is the process's outermost one
     /// AND the process exits immediately after it drops (main.rs sets it

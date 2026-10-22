@@ -93,10 +93,12 @@ impl Executor {
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     return Ok(1);
                 }
-                let Some(words) = self.expand_jobs_x_words(words, &mut stderr)? else {
-                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                    return Ok(1);
-                };
+                // GNU builtins/jobs.def execute_list_with_replacements: every
+                // leading-`%` word is replaced with `itos (j->pgrp)` — the
+                // process-GROUP ID (jobs.c:649), not the job pid — and a bad
+                // spec is NOT an error: it passes through unchanged and the
+                // command still runs (rubash#1096).
+                let words = self.expand_jobs_x_words(words);
                 let mut command = cmd.clone();
                 command.words = words;
                 self.execute_command(&command)?;
@@ -105,28 +107,32 @@ impl Executor {
         }
     }
 
-    fn expand_jobs_x_words(
-        &self,
-        words: Vec<String>,
-        stderr: &mut Vec<u8>,
-    ) -> Result<Option<Vec<String>>, ExecuteError> {
-        let mut expanded = Vec::with_capacity(words.len());
-        for word in words {
-            if word.starts_with('%') {
-                let Some(pid) = self.resolve_background_job(&word) else {
-                    writeln!(
-                        stderr,
-                        "{}jobs: {word}: no such job",
-                        self.diagnostic_prefix()
-                    )?;
-                    return Ok(None);
-                };
-                expanded.push(pid.to_string());
-            } else {
-                expanded.push(word);
-            }
-        }
-        Ok(Some(expanded))
+    fn expand_jobs_x_words(&self, words: Vec<String>) -> Vec<String> {
+        words
+            .into_iter()
+            .map(|word| {
+                if !word.starts_with('%') {
+                    return word;
+                }
+                // GNU only resolves live jobs here (get_job_by_jid over the
+                // jobs array — no bgpids/completed-status fallback, which is
+                // a wait-only path). INVALID_JOB passes through unchanged.
+                self.resolve_background_pgrp(&word)
+                    .map(|pgrp| pgrp.to_string())
+                    .unwrap_or(word)
+            })
+            .collect()
+    }
+
+    /// Resolve a `%`-spec to its job's recorded process-group ID
+    /// (jobs.c:649 j->pgrp), the value `jobs -x` substitutes.
+    fn resolve_background_pgrp(&self, spec: &str) -> Option<u32> {
+        let job_id = self.shell_state.job_table.resolve_jobspec(spec)?;
+        self.shell_state
+            .job_table
+            .jobs
+            .get(&job_id)
+            .map(|entry| entry.pgrp)
     }
 
     pub(in crate::executor) fn execute_wait(

@@ -25,6 +25,12 @@ pub struct JobEntry {
     pub id: JobId,
     pub pids: Vec<u32>,
     pub processes: BTreeMap<u32, ProcessEntry>,
+    /// GNU jobs.c:649 `newjob->pgrp = pipeline_pgrp` — the process-group ID
+    /// `jobs -x` substitutes (builtins/jobs.def execute_list_with_replacements
+    /// `itos (j->pgrp)`). With job control it is the first pipeline pid;
+    /// without job control every job shares the shell's own pgrp
+    /// (jobs.c:2459-2461 `pipeline_pgrp = shell_pgrp`).
+    pub pgrp: u32,
     pub command: String,
     pub state: ProcessState,
     pub exit_status: Option<i32>,
@@ -68,8 +74,9 @@ impl JobTable {
         pid: u32,
         command: impl Into<String>,
         background: bool,
+        pgrp: u32,
     ) -> JobId {
-        self.register_pipeline(vec![pid], command, background)
+        self.register_pipeline(vec![pid], command, background, pgrp)
     }
 
     pub fn register_pipeline(
@@ -77,6 +84,7 @@ impl JobTable {
         pids: Vec<u32>,
         command: impl Into<String>,
         background: bool,
+        pgrp: u32,
     ) -> JobId {
         // GNU jobs.c:586-614 alloc_job_entry: a non-interactive shell scans
         // forward from js.j_lastj and takes the first free slot — the job
@@ -109,6 +117,10 @@ impl JobTable {
         let entry = JobEntry {
             id,
             pids: pids.clone(),
+            // GNU jobs.c:649 `newjob->pgrp = pipeline_pgrp`, recorded at
+            // fork time by the caller (first pipeline pid with job
+            // control, else the shell's own pgrp).
+            pgrp,
             processes,
             command: command.into(),
             state: ProcessState::Running,
@@ -511,9 +523,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pipeline_pgrp_is_recorded_for_jobs_x_substitution() {
+        // GNU jobs.c:649 `newjob->pgrp = pipeline_pgrp`: `jobs -x` substitutes
+        // the recorded pgrp (builtins/jobs.def execute_list_with_replacements),
+        // not the job pid (rubash#1096).
+        let mut table = JobTable::default();
+        let job = table.register_pipeline(vec![10, 11], "producer | consumer", true, 99);
+        assert_eq!(table.jobs[&job].pgrp, 99);
+        let solo = table.register_process(42, "sleep", true, 42);
+        assert_eq!(table.jobs[&solo].pgrp, 42);
+    }
+
+    #[test]
     fn completion_can_be_waited_explicitly_after_reaping() {
         let mut table = JobTable::default();
-        table.register_process(42, "sleep", true);
+        table.register_process(42, "sleep", true, 42);
         table.reap_finished([(42, 7)]);
         assert_eq!(table.wait_pid(42), Some(7));
     }
@@ -521,8 +545,8 @@ mod tests {
     #[test]
     fn jobspecs_resolve_in_job_order() {
         let mut table = JobTable::default();
-        let first = table.register_process(1, "one", true);
-        let second = table.register_process(2, "two", true);
+        let first = table.register_process(1, "one", true, 1);
+        let second = table.register_process(2, "two", true, 2);
         assert_eq!(table.resolve_jobspec("%+"), Some(second));
         assert_eq!(table.resolve_jobspec("%-"), Some(first));
         assert_eq!(table.resolve_jobspec("%1"), Some(first));
@@ -531,7 +555,7 @@ mod tests {
     #[test]
     fn pipeline_state_waits_for_all_processes_and_uses_last_status() {
         let mut table = JobTable::default();
-        let job = table.register_pipeline(vec![10, 11], "producer | consumer", true);
+        let job = table.register_pipeline(vec![10, 11], "producer | consumer", true, 10);
         assert_eq!(table.jobs[&job].state, ProcessState::Running);
         table.mark_completed(10, 3);
         assert_eq!(table.jobs[&job].state, ProcessState::Running);
@@ -543,7 +567,7 @@ mod tests {
     #[test]
     fn stopped_and_continued_processes_update_job_state() {
         let mut table = JobTable::default();
-        let job = table.register_process(20, "sleep", true);
+        let job = table.register_process(20, "sleep", true, 20);
         table.mark_stopped(20);
         assert_eq!(table.jobs[&job].state, ProcessState::Stopped);
         table.mark_running(20);
@@ -553,8 +577,8 @@ mod tests {
     #[test]
     fn removing_a_job_clears_pid_and_current_previous_indexes() {
         let mut table = JobTable::default();
-        let first = table.register_process(30, "first", true);
-        table.register_process(31, "second", true);
+        let first = table.register_process(30, "first", true, 30);
+        table.register_process(31, "second", true, 31);
         assert!(table.remove_job_by_pid(31));
         assert!(!table.pid_to_job.contains_key(&31));
         assert_eq!(table.resolve_jobspec("%+"), Some(first));
@@ -566,7 +590,7 @@ mod tests {
     #[test]
     fn wait_minus_removes_job_but_retains_explicit_pid_status() {
         let mut table = JobTable::default();
-        let job = table.register_process(40, "false", true);
+        let job = table.register_process(40, "false", true, 40);
         table.mark_completed(40, 1);
         assert!(table.remove_job_by_pid_preserve_status(40));
         assert!(!table.jobs.contains_key(&job));

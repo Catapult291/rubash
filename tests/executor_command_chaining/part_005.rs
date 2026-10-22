@@ -160,6 +160,43 @@ fn test_bashpid_changes_in_command_substitution() {
 }
 
 #[test]
+fn test_async_subshell_bashpid_equals_dollar_bang() {
+    // GNU execute_cmd.c:701 runs an async `( list )` through a SINGLE
+    // make_child fork — the fork IS the subshell — so the child's BASHPID
+    // (variables.c:1511 get_bashpid = getpid) equals the parent's $!
+    // (rubash#1095). The async level also counts for $BASH_SUBSHELL
+    // (probed GNU 5.3.20: `(echo $BASH_SUBSHELL) &` and
+    // `{ echo $BASH_SUBSHELL; } &` both report 1).
+    let _cwd_guard = CwdGuard::take();
+    let child_path = "target/rubash-async-subshell-bashpid-child.txt";
+    let bang_path = "target/rubash-async-subshell-bashpid-bang.txt";
+    let subshell_path = "target/rubash-async-subshell-level.txt";
+    let _ = fs::remove_file(child_path);
+    let _ = fs::remove_file(bang_path);
+    let _ = fs::remove_file(subshell_path);
+    let input = format!(
+        "(echo $BASHPID > {child_path}) & pid=$!; wait $pid; echo $pid > {bang_path}; \
+         (echo $BASH_SUBSHELL > {subshell_path}) & wait"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let child = fs::read_to_string(child_path).unwrap();
+    let bang = fs::read_to_string(bang_path).unwrap();
+    assert_eq!(child.trim_end(), bang.trim_end());
+    assert!(child.trim_end().parse::<u32>().is_ok());
+    assert_eq!(fs::read_to_string(subshell_path).unwrap().trim_end(), "1");
+    let _ = fs::remove_file(child_path);
+    let _ = fs::remove_file(bang_path);
+    let _ = fs::remove_file(subshell_path);
+}
+
+#[test]
 fn test_current_shell_command_substitution_captures_stdout_and_keeps_side_effects() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-current-shell-command-substitution-output.txt";
