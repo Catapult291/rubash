@@ -63,12 +63,18 @@ fn err_trap_survives_the_function_boundary() {
 
 /// An ERR trap the body set itself is its own context (GNU: the body's
 /// trap fires for the body's failure and persists after return).
+/// Expectation corrected at the 2026-10-23 bulk integration: GNU bash
+/// 5.3.20 fires three times (the body's `false`, the failed call after
+/// return, and the final top-level `false` — the body-set trap is the
+/// visible one for all three, rubash#1163); the earlier two-fire
+/// expectation came from a WSL GNU 5.3.0 check and pre-dates the
+/// function-local ERR trap fix.
 #[test]
 fn body_set_err_trap_is_own_context() {
     let (stdout, stderr, _code) =
         rubash("trap \"echo OUTER\" ERR; f() { trap \"echo INNER\" ERR; false; }; f; false");
     assert_eq!(stderr, "");
-    assert_eq!(stdout, "INNER\nINNER\n");
+    assert_eq!(stdout, "INNER\nINNER\nINNER\n");
 }
 
 /// The DEBUG trap inheritance boundary is untouched: the call's own
