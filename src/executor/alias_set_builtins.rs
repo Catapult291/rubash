@@ -120,6 +120,20 @@ impl Executor {
             &mut stdout,
             &mut stderr,
         )?;
+        if cmd.words.len() == 1 {
+            // GNU set.def set_builtin with no arguments calls
+            // print_var_list over ALL variables — shell functions are
+            // variables in GNU's table and print after the scalars, in
+            // name order, through print_function_def (rubash#1056).
+            let mut names: Vec<&String> = self.shell_state.functions.keys().collect();
+            names.sort();
+            for name in names {
+                if let Some(body) = self.shell_state.functions.get(name) {
+                    let commands = body.commands.clone();
+                    self.write_function_definition(name, &commands, false, &mut stdout)?;
+                }
+            }
+        }
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         self.load_history_file_if_needed();
         // GNU set.def returns EX_USAGE (258 > EX_SHERRBASE) for invalid
