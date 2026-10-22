@@ -1324,14 +1324,102 @@ impl Executor {
         // failure against the RESOLVED pathname (findcmd.c file_to_lose_on
         // fallback included), not the typed word — `noexec.sh` found via
         // PATH prints the full candidate path (rubash#231).
+        //
+        // The status is NOT uniformly EX_NOEXEC: shell_execve sets
+        // last_command_exit_value = (errno == ENOENT) ? EX_NOTFOUND (127)
+        // : EX_NOEXEC (126) (execute_cmd.c:6143). A command the PATH walk
+        // resolved whose image the kernel then cannot load — an ELF whose
+        // PT_INTERP loader is missing is the common case — fails execve
+        // with ENOENT and must surface as a LOOKUP failure (127), not an
+        // exec refusal (126): scripts branch on 126-vs-127 (rubash#1172).
+        // The diagnostic follows the same switch: an existing executable
+        // file with a #! line names its interpreter ("bad interpreter",
+        // EX_NOEXEC); an existing executable non-#! file is "cannot
+        // execute: required file not found" (EX_NOTFOUND); anything else
+        // keeps the plain errno text via file_error.
+        let (message, status) = spawn_error_diagnostic(program, &error);
         writeln!(
             &mut stderr,
             "{}{}: {}",
             self.diagnostic_prefix(),
             program.display(),
-            crate::posix_errors::message(&error)
+            message
         )?;
-        self.finish_external_error(cmd, &stderr, 126)
+        self.finish_external_error(cmd, &stderr, status)
+    }
+}
+
+/// GNU shell_execve (execute_cmd.c:6126-6159) classification of a failed
+/// execve/spawn against the resolved program path. Returns the diagnostic
+/// body (the caller prepends the report prolog and the resolved pathname)
+/// and the exit status. Non-ENOENT failures are EX_NOEXEC with the plain
+/// errno text, exactly the historical behavior of this call site.
+fn spawn_error_diagnostic(program: &PathBuf, error: &io::Error) -> (String, i32) {
+    const EX_NOTFOUND: i32 = 127;
+    const EX_NOEXEC: i32 = 126;
+    if error.raw_os_error() != Some(libc::ENOENT) {
+        return (crate::posix_errors::message(error).to_string(), EX_NOEXEC);
+    }
+    // errno == ENOENT: the status is EX_NOTFOUND unless the file itself
+    // proves the #! bad-interpreter refusal (EX_NOEXEC).
+    let metadata = std::fs::metadata(program).ok();
+    let executable = metadata
+        .as_ref()
+        .is_some_and(|meta| meta.is_file() && file_has_exec_bit(meta));
+    if executable {
+        if let Ok(sample) = std::fs::read(program) {
+            if sample.len() >= 2 && sample[0] == b'#' && sample[1] == b'!' {
+                let line_end = sample
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .unwrap_or(sample.len());
+                let line = String::from_utf8_lossy(&sample[2..line_end]);
+                // GNU getinterp (execute_cmd.c) terminates the interpreter
+                // name at a blank or tab only — a CR stays part of the
+                // name (and is displayed as ^M below), so do not split on
+                // the full whitespace class here.
+                let interp = line.split([' ', '\t']).next().unwrap_or_default();
+                if !interp.is_empty() {
+                    // GNU getinterp + sys_error (execute_cmd.c:6170-6184):
+                    // a trailing CR in the interpreter name is displayed
+                    // as ^M (`#!/bin/sh\r` -> "/bin/sh^M").
+                    let interp = match interp.strip_suffix('\r') {
+                        Some(stem) => format!("{stem}^M"),
+                        None => interp.to_string(),
+                    };
+                    return (
+                        format!("{interp}: bad interpreter: No such file or directory"),
+                        EX_NOEXEC,
+                    );
+                }
+            }
+        }
+        // An executable file the kernel cannot load at all (missing
+        // PT_INTERP loader): execute_cmd.c:6188-6192 internal_error.
+        return (
+            "cannot execute: required file not found".to_string(),
+            EX_NOTFOUND,
+        );
+    }
+    (
+        crate::posix_errors::message(error).to_string(),
+        EX_NOTFOUND,
+    )
+}
+
+/// GNU executable_file (execute_cmd.c / findcmd.c file_status FS_EXECABLE):
+/// any execute permission bit set. Non-unix hosts have no mode bits; an
+/// existing regular file counts as executable there.
+fn file_has_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
     }
 }
 
