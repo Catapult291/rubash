@@ -254,6 +254,13 @@ fn embedded_procsub_close(chars: &[char], open: usize) -> Option<usize> {
 /// unquoted one is extracted by `extract_process_subst` (subst.c:1311) and
 /// executed by `process_substitute` (subst.c:6362).
 pub(crate) fn raw_word_has_unquoted_process_substitution(raw: &str) -> bool {
+    // Whitelist admission (rubash#117 discipline): the DFA below only
+    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
+    // can fire, so skip the char-collect + scan. A present pair runs the
+    // full quote-aware scan unchanged.
+    if !raw.contains("<(") && !raw.contains(">(") {
+        return false;
+    }
     let chars = raw.chars().collect::<Vec<_>>();
     let mut index = 0usize;
     let mut single = false;

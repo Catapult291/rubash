@@ -1157,9 +1157,25 @@ pub(in crate::executor) fn substitution_result_visible_text(value: &str) -> Stri
 }
 
 pub(in crate::executor) fn decode_command_substitution_payload(value: &str) -> String {
+    decode_command_substitution_payload_cow(value).into_owned()
+}
+
+/// Borrowing form for hot split-decision sites: a word carrying no
+/// substitution payload is returned borrowed, sparing one allocation +
+/// one scan per expanded operand. Marked words keep the exact old
+/// decoder.
+pub(in crate::executor) fn decode_command_substitution_payload_cow(
+    value: &str,
+) -> std::borrow::Cow<'_, str> {
     if !value.contains(COMSUB_PAYLOAD_SENTINEL) {
-        return value.to_string();
+        return std::borrow::Cow::Borrowed(value);
     }
+    // Tail of the legacy decoder below, factored so both spellings share
+    // one implementation (the owned wrapper above delegates here).
+    return std::borrow::Cow::Owned(decode_payload_slow(value));
+}
+
+fn decode_payload_slow(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {

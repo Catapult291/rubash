@@ -63,11 +63,15 @@ impl Executor {
                 if base.is_empty() {
                     continue;
                 }
-                if let Some(mirror) = self.shell_state.env_vars.get(base).cloned() {
+                // Borrow the mirror (no clone): both sync helpers take
+                // `&str`, and the attr probe below only reads the table.
+                // The clone here cost one String alloc per assignment
+                // operand on every loop iteration.
+                if let Some(mirror) = self.shell_state.env_vars.get(base) {
                     if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
-                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, &mirror);
+                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, mirror);
                     } else {
-                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, mirror);
                     }
                 }
             }

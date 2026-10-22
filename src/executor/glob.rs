@@ -150,6 +150,21 @@ pub(crate) fn pathname_expand_word(
     if word.is_empty() {
         return PathnameExpansion::NoMatch;
     }
+    // Whitelist admission (rubash#117 discipline): `unquoted_glob_pattern_p`
+    // below only reports a pattern when the word holds an unquoted glob
+    // metacharacter, and every one of its true arms needs one of these
+    // bytes present (`?*`, `[`, extglob `+@!` before `(` — the `]` arm
+    // needs a preceding `[`). Without any of them the word is provably
+    // pattern-free under every option combination (noglob/nullglob/
+    // failglob only matter for real patterns), so skip the seven option
+    // lookups + the quote-aware scan. A present byte runs the full
+    // pipeline unchanged.
+    if !word
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'(' | b'+' | b'@' | b'!'))
+    {
+        return PathnameExpansion::NoMatch;
+    }
     if crate::builtins::set::shell_option_enabled(env_vars, "noglob") {
         return PathnameExpansion::NoMatch;
     }

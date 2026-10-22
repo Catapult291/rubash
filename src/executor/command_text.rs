@@ -438,6 +438,80 @@ pub(in crate::executor) fn bash_command_sequence_text(commands: &[CommandNode]) 
     text
 }
 
+/// Whitelist raw-join render for BASH_COMMAND text (rubash#117
+/// discipline): the twin of `try_render_literal_command` for words that
+/// carry unquoted parameter expansions (`export BK_V$i=x`). When every
+/// word's cooked text is byte-identical to its raw source, no raw holds a
+/// `$(` span, no assignments/redirects/heredocs are present, and no
+/// compound command shape is set, the full `bash_command_source_text`
+/// pipeline provably returns `words.join(" ")`: the simple-command arm
+/// renders assignments (absent here) plus per-word `metadata.raw` (equal
+/// to the word by admission, and `canonicalize_comsub_spans` is the
+/// identity without `$(`), joined with single spaces, with no redirects
+/// to append and no compound-assignment overlay to apply. Any doubt falls
+/// through to the full renderer. Owned `String` in and out.
+pub(in crate::executor) fn try_render_raw_join_command(cmd: &CommandNode) -> Option<String> {
+    if cmd.for_command.is_some()
+        || cmd.pipeline_command.is_some()
+        || cmd.and_or_list.is_some()
+        || cmd.time_command.is_some()
+        || cmd.background_command.is_some()
+        || cmd.inverted_command.is_some()
+        || cmd.arithmetic_command.is_some()
+        || cmd.if_command.is_some()
+        || cmd.loop_command.is_some()
+        || cmd.conditional_command.is_some()
+        || cmd.subshell_command.is_some()
+        || cmd.select_command.is_some()
+        || cmd.case_command.is_some()
+        || cmd.coproc_command.is_some()
+        || cmd.function_command.is_some()
+        || cmd.brace_group.is_some()
+    {
+        return None;
+    }
+    if !cmd.assignments.is_empty()
+        || !cmd.compound_assignments.is_empty()
+        || cmd.redirect_in.is_some()
+        || cmd.redirect_out.is_some()
+        || cmd.append.is_some()
+        || cmd.redirect_err.is_some()
+        || cmd.redirect_err_append.is_some()
+        || !cmd.redirects.is_empty()
+        || cmd.heredoc.is_some()
+        || !cmd.heredoc_redirects.is_empty()
+        || cmd.here_string.is_some()
+    {
+        return None;
+    }
+    if cmd.words.is_empty() {
+        return None;
+    }
+    for (index, word) in cmd.words.iter().enumerate() {
+        // Mirror `command_word_source_text`'s own selection: the slow path
+        // renders `metadata.raw` only when the recorded cooked value still
+        // equals the word and the raw is non-empty; anything else takes the
+        // `shell_single_quote_assignment_value` fallback, which this join
+        // cannot reproduce.
+        let raw_matches = cmd.word_metadata.get(index).is_some_and(|metadata| {
+            !metadata.raw.is_empty() && metadata.raw == *word && metadata.value == *word
+        });
+        if !raw_matches {
+            return None;
+        }
+        // `canonicalize_comsub_spans` short-circuits without `$(` and
+        // leaves every other byte untouched, so the per-word slow-path
+        // text is exactly `raw` here. Backticks take the same no-op
+        // branch today, but admit strictly: a backtick span would still
+        // render byte-identically, yet keeping it out costs nothing and
+        // keeps the admission obviously sound.
+        if word.contains("$(") || word.contains('`') {
+            return None;
+        }
+    }
+    Some(cmd.words.join(" "))
+}
+
 /// Whitelist fast render for BASH_COMMAND text (rubash#117 discipline):
 /// when every word is fast-literal with `raw == word`, no compound command
 /// shape is set, and no expandable structure exists, the full
@@ -973,6 +1047,54 @@ mod literal_render_tests {
         // Admission requires raw == word for every word.
         for word in ["[", "1", "-eq", "2", "]", "true", "="] {
             assert!(is_expand_fast_literal_word(word), "{word:?} should admit");
+        }
+    }
+
+    /// The raw-join twin must agree byte-for-byte with the full renderer on
+    /// every admitted shape (unquoted `$name` words print as their raw
+    /// source), and must decline everything the full renderer could treat
+    /// specially (quotes, `$(`/backtick spans, assignments, redirects,
+    /// compound forms, raw/word mismatches).
+    #[test]
+    fn raw_join_render_matches_full_renderer() {
+        let admitted = [
+            "export BK_V$i=x",
+            "unset BK_V$i",
+            "export A$B C$D",
+            "echo a$b c",
+            "export X=1 Y=2",
+            "unset foo bar",
+        ];
+        for src in admitted {
+            let cmd = parse_one(src);
+            let fast =
+                try_render_raw_join_command(&cmd).unwrap_or_else(|| panic!("{src:?} should admit"));
+            assert_eq!(fast, bash_command_source_text(&cmd), "{src:?} fast != slow");
+        }
+        let declined = [
+            "echo a$b > out",
+            "A=1 true",
+            "echo $(date)",
+            "echo `date`",
+            "echo 'a b'",
+            "echo \"a b\"",
+            "for i in 1 2; do echo $i; done",
+            "echo a | cat",
+        ];
+        for src in declined {
+            let cmd = parse_one(src);
+            assert!(
+                try_render_raw_join_command(&cmd).is_none(),
+                "{src:?} should fall through"
+            );
+        }
+        // Subscript operands: whichever bucket they land in, the render
+        // must agree with the full renderer.
+        for src in ["export X[$i]=v", "unset 'a b'", "export A=\"x y\""] {
+            let cmd = parse_one(src);
+            if let Some(fast) = try_render_raw_join_command(&cmd) {
+                assert_eq!(fast, bash_command_source_text(&cmd), "{src:?} fast != slow");
+            }
         }
     }
 }

@@ -1285,6 +1285,14 @@ impl Executor {
         } else if let Some(literal) = crate::executor::command_text::try_render_literal_command(cmd)
         {
             literal
+        } else if let Some(joined) = crate::executor::command_text::try_render_raw_join_command(cmd)
+        {
+            // Raw-join twin of the literal render above (same whitelist
+            // discipline): words carrying unquoted `$name` expansions
+            // (`export BK_V$i=x`) still print as their raw source text —
+            // the full renderer would clone each raw and re-scan it for
+            // `$(` spans. Anything doubtful keeps the slow path below.
+            joined
         } else {
             bash_command_source_text(cmd)
         };
