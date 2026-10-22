@@ -301,6 +301,39 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+thread_local! {
+    /// Frozen results of pure `${}` fragments that precede a `:=`/`=`
+    /// assignment to a variable they read, in the same word (rubash#1169).
+    /// GNU subst.c:9777 parameter_brace_expand evaluates a word's
+    /// fragments strictly left-to-right, so `${e:-d}` in
+    /// `"${e:-d}/${e:=x}"` resolves against the PRE-assignment value of
+    /// `e`. Rubash's layered passes apply every `:=` in the word during
+    /// the pre-scan, before the real pass evaluates any fragment, so an
+    /// earlier fragment re-derived from live env saw the assigned value
+    /// (the leak). The pre-scan — which itself walks fragments in order —
+    /// freezes the earlier fragment's resolved value under its site key
+    /// at the moment just before the first later assignment to a variable
+    /// it reads; the real pass (expand_braced_parameter_word) consults
+    /// this map first. Only side-effect-free fragments are frozen (no
+    /// `$(`, no backticks), so computing the value during the pre-scan
+    /// cannot execute anything twice. Same lifecycle as ASSIGN_APPLIED:
+    /// cleared when a fresh outermost word context installs.
+    static FROZEN_FRAGMENTS: std::cell::RefCell<HashMap<(SubSite, String), String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Consult the frozen-fragment map (rubash#1169).
+pub(in crate::executor) fn frozen_fragment_lookup(key: &(SubSite, String)) -> Option<String> {
+    FROZEN_FRAGMENTS.with(|map| map.borrow().get(key).cloned())
+}
+
+/// Record one frozen fragment result (rubash#1169).
+pub(in crate::executor) fn frozen_fragment_store(key: (SubSite, String), resolved: String) {
+    FROZEN_FRAGMENTS.with(|map| {
+        map.borrow_mut().insert(key, resolved);
+    });
+}
+
 /// Consult the `:=`-application memo.
 pub(in crate::executor) fn assign_applied_lookup(key: &(SubSite, String)) -> Option<String> {
     ASSIGN_APPLIED.with(|map| map.borrow().get(key).cloned())
@@ -315,6 +348,7 @@ pub(in crate::executor) fn assign_applied_store(key: (SubSite, String), resolved
 /// context installs, so entries never outlive their word.
 pub(in crate::executor) fn assign_applied_clear() {
     ASSIGN_APPLIED.with(|map| map.borrow_mut().clear());
+    FROZEN_FRAGMENTS.with(|map| map.borrow_mut().clear());
 }
 
 pub(in crate::executor) fn sub_idx_lookup(
