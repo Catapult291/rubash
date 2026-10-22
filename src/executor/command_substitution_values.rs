@@ -551,6 +551,40 @@ impl Executor {
         Some(values)
     }
 
+    /// Resolve an `@`-slice segment inner body (`a[@]:off[:len]` or
+    /// `@:off[:len]`) to the sliced element list (rubash#1011). Same helpers
+    /// as the standalone paths — `array_subscript_range_values` (what
+    /// `array_at_word_values` uses for `"${a[@]:1:2}"`) and
+    /// `positional_parameter_substring_with_zero` (what
+    /// `quoted_positional_at_word_values` uses for `"${@:2:2}"`) — so
+    /// embedded and standalone slices share byte-identical slicing
+    /// semantics (GNU subst.c:9050 parameter_brace_substring).
+    pub(in crate::executor) fn at_slice_segment_values(&self, inner: &str) -> Vec<String> {
+        let Some((var_name, offset, length)) = self.parse_parameter_substring(inner) else {
+            return Vec::new();
+        };
+        if var_name == "@" {
+            return positional_parameter_substring_with_zero(
+                self.shell_state.positional_window(),
+                &self.script_name_value(),
+                offset,
+                length,
+            );
+        }
+        if let Some(base) = var_name.strip_suffix("[@]") {
+            if is_shell_name(base) {
+                return self
+                    .array_subscript_range_values(
+                        base,
+                        offset,
+                        length.and_then(|length| usize::try_from(length).ok()),
+                    )
+                    .unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
+
     pub(in crate::executor) fn quoted_positional_at_word_values_with_raw(
         &self,
         word: &str,
@@ -579,6 +613,10 @@ impl Executor {
                         QuotedPositionalAtSegment::ArrayAt(name, _) => self
                             .array_subscript_range_values(name, 0, None)
                             .unwrap_or_default(),
+                        QuotedPositionalAtSegment::ArrayAtSlice(inner, _)
+                        | QuotedPositionalAtSegment::PositionalAtSlice(inner, _) => {
+                            self.at_slice_segment_values(inner)
+                        }
                         // GNU string_list_dollar_star: `[*]` joins the
                         // elements with IFS[0] into one word.
                         QuotedPositionalAtSegment::ArrayStar(name, _) => vec![self
@@ -1092,6 +1130,19 @@ enum QuotedPositionalAtSegment {
     /// expand_word_internal). `quoted` carries the same split rule as
     /// `PositionalAt`.
     ArrayAt(String, bool),
+    /// An `@`-slice span — `"${name[@]:off[:len]}"`/`${name[@]:off[:len]}`
+    /// or `"${@:off[:len]}"`/`${@:off[:len]}`: GNU subst.c:9050
+    /// parameter_brace_substring (VT_ARRAYVAR/VT_POSPARMS arms,
+    /// subst.c:9101-9136) keeps the @-list word boundaries
+    /// (array_subrange/string_list_pos_params), so the slice fans out
+    /// exactly like the unsliced list with affixes on the first/last
+    /// element word. Carries the inner `${...}` body plus the `quoted`
+    /// split rule; resolution reuses the standalone-slice helpers.
+    ArrayAtSlice(String, bool),
+    /// A `"${@:off[:len]}"`/`${@:off[:len]}` span: positional slice of the
+    /// same GNU parameter_brace_substring arm. Same fan-out contract as
+    /// `ArrayAtSlice`.
+    PositionalAtSlice(String, bool),
     /// A `"${name[*]}"`-class span reached through indirection (`${!name}`
     /// whose value is `arr[*]`, or a `$ref` nameref to `arr[*]`): GNU
     /// joins the elements with IFS[0] into one word (subst.c
@@ -1133,6 +1184,63 @@ fn nameref_array_target(
     target
         .strip_suffix("[*]")
         .map(|base| (base.to_string(), true))
+}
+
+/// Word-list target of an `@`-slice span for the segment scanners below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtSliceTarget {
+    /// `name[@]:off[:len]` — slice of array `name`'s elements.
+    Array,
+    /// `@:off[:len]` — slice of the positional parameters.
+    Positional,
+}
+
+/// Validate an `${...}` inner body as an `@`-slice word-list source for the
+/// raw-word segment scanners (`name[@]:off[:len]` or `@:off[:len]`, rubash#1011).
+///
+/// GNU anchor — subst.c:10119-10128 parameter_brace_expand calls chk_atstar
+/// (subst.c:7635-7639) on every valid array reference BEFORE the operator
+/// switch, so a quoted `[@]`/`@` marks quoted_dollar_at even with the `:`
+/// substring operator present; subst.c:9050 parameter_brace_substring then
+/// keeps the @-list word boundaries (VT_ARRAYVAR/VT_POSPARMS arms,
+/// subst.c:9101-9136: array_subrange/string_list_pos_params). The slice
+/// therefore splits the enclosing word exactly like the unsliced list, with
+/// affixes on the first/last element word.
+///
+/// Admission is a whitelist (rubash#117 discipline): anything this declines
+/// stays on the pre-existing path byte-for-byte. Declined: `[*]` slices
+/// (GNU string_list_dollar_star joins those into one word, which the String
+/// path already produces), `!`-indirect forms (different GNU arm,
+/// subst.c:10017 parameter_brace_expand_indir/keys), operator-looking rests
+/// (`:-`/`:=`/`:+`/`:?` belong to the operator paths, never the substring
+/// path — parse_parameter_substring rejects them the same way), and spans
+/// whose slice region contains `$(` or a backtick (offsets evaluated by the
+/// `&self` segment resolver cannot execute command substitutions; those
+/// stay on the `&mut` generic path).
+fn at_slice_segment_body(inner: &str) -> Option<AtSliceTarget> {
+    if let Some(rest) = inner.strip_prefix("@:") {
+        return at_slice_rest_admitted(rest).then_some(AtSliceTarget::Positional);
+    }
+    let (name, rest) = inner.split_once("[@]:")?;
+    if !is_shell_name(name) {
+        return None;
+    }
+    at_slice_rest_admitted(rest).then_some(AtSliceTarget::Array)
+}
+
+/// Shared admission for the offset/length region after `@:`/`[@]:` — see
+/// `at_slice_segment_body` for the rationale per clause.
+fn at_slice_rest_admitted(rest: &str) -> bool {
+    if rest.is_empty() {
+        return false;
+    }
+    if matches!(rest.as_bytes()[0], b'=' | b'+' | b'?' | b'-') {
+        return false;
+    }
+    if rest.contains("$(") || rest.contains('`') {
+        return false;
+    }
+    true
 }
 
 fn quoted_positional_at_segments(
@@ -1330,6 +1438,34 @@ fn quoted_positional_at_segments(
                                 continue;
                             }
                         }
+                        // `@`-slice word-list source (rubash#1011): `inner`
+                        // is already brace-aware delimited by
+                        // matching_parameter_brace above, so the validator
+                        // sees the true span. Unquoted slices field-split
+                        // like the unsliced list (same `quoted == false`
+                        // contract as `ArrayAt` above).
+                        if let Some(target) =
+                            at_slice_segment_body(&inner.iter().collect::<String>())
+                        {
+                            push_quoted_positional_literal_segment(
+                                &mut segments,
+                                &chars[literal_start..index],
+                                false,
+                            )?;
+                            let inner_body: String = inner.iter().collect();
+                            segments.push(match target {
+                                AtSliceTarget::Array => {
+                                    QuotedPositionalAtSegment::ArrayAtSlice(inner_body, false)
+                                }
+                                AtSliceTarget::Positional => {
+                                    QuotedPositionalAtSegment::PositionalAtSlice(inner_body, false)
+                                }
+                            });
+                            saw_positional_at = true;
+                            index = raw[..=close_byte].chars().count();
+                            literal_start = index;
+                            continue;
+                        }
                         index = raw[..=close_byte].chars().count();
                         continue;
                     }
@@ -1484,6 +1620,37 @@ fn quoted_body_positional_at_segments(
                     let rest: String = body[index + 2..].iter().collect();
                     match super::parameter_ops::matching_parameter_brace(&rest) {
                         Some(end_byte) => {
+                            // `@`-slice word-list source inside the quoted
+                            // body (`"A|${a[@]:1:2}|B"`, rubash#1011): the
+                            // brace-aware true inner keeps the @-list
+                            // boundaries (subst.c:9050
+                            // parameter_brace_substring), so affixes attach
+                            // to the first/last element word. The naive `}`
+                            // above may sit inside a nested expansion in the
+                            // offset (`${a[@]:${i}}`), hence the re-scan —
+                            // the shape gate below runs on the true span.
+                            let true_inner = &rest[..end_byte];
+                            if let Some(target) = at_slice_segment_body(true_inner) {
+                                push_body_piece(&mut segments, &body[piece_start..index])?;
+                                segments.push(match target {
+                                    AtSliceTarget::Array => {
+                                        QuotedPositionalAtSegment::ArrayAtSlice(
+                                            true_inner.to_string(),
+                                            true,
+                                        )
+                                    }
+                                    AtSliceTarget::Positional => {
+                                        QuotedPositionalAtSegment::PositionalAtSlice(
+                                            true_inner.to_string(),
+                                            true,
+                                        )
+                                    }
+                                });
+                                saw_positional_at = true;
+                                index += 2 + rest[..=end_byte].chars().count();
+                                piece_start = index;
+                                continue;
+                            }
                             index += 2 + rest[..=end_byte].chars().count();
                         }
                         None => return None,
@@ -1674,6 +1841,8 @@ where
                         segments.get(segment_index - 1),
                         Some(QuotedPositionalAtSegment::PositionalAt(_))
                             | Some(QuotedPositionalAtSegment::ArrayAt(..))
+                            | Some(QuotedPositionalAtSegment::ArrayAtSlice(..))
+                            | Some(QuotedPositionalAtSegment::PositionalAtSlice(..))
                     )
                 {
                     // Only an unquoted literal directly after $@ emulates the
@@ -1688,6 +1857,8 @@ where
             }
             QuotedPositionalAtSegment::PositionalAt(quoted)
             | QuotedPositionalAtSegment::ArrayAt(_, quoted)
+            | QuotedPositionalAtSegment::ArrayAtSlice(_, quoted)
+            | QuotedPositionalAtSegment::PositionalAtSlice(_, quoted)
             | QuotedPositionalAtSegment::ArrayStar(_, quoted) => {
                 saw_positional_at = true;
                 let mut values = resolve_list(segment);
