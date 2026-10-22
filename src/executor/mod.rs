@@ -1091,3 +1091,6 @@ pub struct Executor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod splits_gate;
