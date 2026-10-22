@@ -317,7 +317,15 @@ where
 
     if matches!(first, "-l" | "-L") {
         if args.len() == 1 || args.get(1).is_some_and(|value| value == "-1") {
-            write_signal_list(stdout)?;
+            // POSIX mode (bash posix-mode notes / kill.def list_signals
+            // under POSIX_MODE): the bare list is ONE line of bare signal
+            // names, space-separated, no numbers and no SIG prefix
+            // (rubash#1054).
+            if posix {
+                write_signal_list_posix(stdout)?;
+            } else {
+                write_signal_list(stdout)?;
+            }
             return Ok(0);
         }
         let mut status = 0;
@@ -1283,6 +1291,17 @@ where
         }
     }
     writeln!(stdout)?;
+    Ok(())
+}
+
+/// POSIX-mode `kill -l` with no operand (rubash#1054): one line, bare
+/// names in signal-number order, single-space separated.
+fn write_signal_list_posix<W>(stdout: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    let names: Vec<&str> = SIGNALS.iter().map(|(_, _, name)| *name).collect();
+    writeln!(stdout, "{}", names.join(" "))?;
     Ok(())
 }
 

@@ -408,7 +408,13 @@ where
         } else {
             Some(signals.signals.as_slice())
         };
-        print_traps(env_vars, selected, stdout, print_actions)?;
+        print_traps(
+            env_vars,
+            selected,
+            stdout,
+            print_actions,
+            print_trap_commands,
+        )?;
         return Ok(i32::from(signals.invalid));
     }
 
@@ -861,6 +867,7 @@ fn print_traps<W>(
     selected: Option<&[String]>,
     stdout: &mut W,
     actions_only: bool,
+    print_commands: bool,
 ) -> io::Result<()>
 where
     W: Write,
@@ -871,8 +878,15 @@ where
     // an unselected listing prints EXIT first, then every set signal trap in
     // numeric order, then DEBUG/ERROR/RETURN.
     let posix = crate::builtins::set::shell_option_enabled(env_vars, "posix");
+    // POSIX mode `trap -p` with no signal operands lists EVERY signal
+    // (trap.def display_traps under POSIX_MODE iterates the whole table,
+    // printing `trap -- - NAME` for dispositions at SIG_DFL) — 68 lines
+    // on this platform (rubash#1054). Bare `trap` keeps the trapped-only
+    // listing in both modes.
+    let list_all = posix && print_commands && selected.is_none();
     let signals: Vec<String> = match selected {
         Some(signals) => signals.to_vec(),
+        None if list_all => canonical_trap_order(),
         None => canonical_trap_order()
             .into_iter()
             .filter(|signal| trap_list(env_vars).contains(signal))
@@ -898,13 +912,13 @@ where
                     display_signal_name(&signal, posix)
                 )?;
             }
-        } else if posix && selected.is_some() {
-            // GNU trap.def display_traps (POSIX_MODE): an explicitly selected
-            // signal with no trap still lists as `trap -- - NAME` (bash
-            // posix-mode notes: `trap -p` shows signals whose disposition is
-            // SIG_DFL, not only trapped ones). The unselected listing keeps
-            // printing trapped signals only, and the default (non-posix)
-            // display never grows entries.
+        } else if posix && (selected.is_some() || list_all) {
+            // GNU trap.def display_traps (POSIX_MODE): a signal with no
+            // trap still lists as `trap -- - NAME` (bash posix-mode notes:
+            // `trap -p` shows signals whose disposition is SIG_DFL, not
+            // only trapped ones) — for explicitly selected signals and for
+            // the whole-table `-p` listing (rubash#1054). The default
+            // (non-posix) display never grows entries.
             writeln!(stdout, "trap -- - {}", display_signal_name(&signal, posix))?;
         }
     }
@@ -928,12 +942,17 @@ fn display_signal_name(signal: &str, posix: bool) -> &str {
 /// (rubash keys the ERR trap as "ERR").
 fn canonical_trap_order() -> Vec<String> {
     std::iter::once("EXIT".to_string())
-        .chain(
-            SIGNALS
-                .iter()
-                .filter(|signal| !signal.is_empty())
-                .map(|signal| signal.to_string()),
-        )
+        .chain(SIGNALS.iter().enumerate().map(|(index, signal)| {
+            // Slots 32/33 have no glibc name (SIGNALS holds ""); GNU's
+            // whole-table listings print them as bare numbers
+            // (`trap -- - 32`), so the order keeps them under their
+            // signal number (rubash#1054).
+            if signal.is_empty() {
+                (index + 1).to_string()
+            } else {
+                signal.to_string()
+            }
+        }))
         .chain(["DEBUG", "ERR", "RETURN"].iter().map(|s| s.to_string()))
         .collect()
 }
