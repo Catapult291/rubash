@@ -164,11 +164,13 @@ impl crate::executor::Executor {
             Some(session) => {
                 crate::script_driver::run_script_with_history_in_tracked(self, text, session, None)
             }
+            // No live session: the scratch must install only when no host
+            // provider owns the interactive list — a provider IS
+            // the_history_list, and a per-prompt scratch installing over it
+            // emptied `history`/`fc` for the rest of the session
+            // (unixwin/niubash#508).
             None => {
-                let fresh = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::history::SessionHistory::new(),
-                ));
-                crate::script_driver::run_script_with_history_in_tracked(self, text, fresh, None)
+                crate::script_driver::run_script_with_fresh_history_in_tracked(self, text, None)
             }
         };
         self.remove_env("__RUBASH_INTERACTIVE_FLAG_OFF");

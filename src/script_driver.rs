@@ -125,12 +125,21 @@ pub fn run_script_with_history_at_line_offset(
     redirect_cmd: Option<&CommandNode>,
 ) -> i32 {
     let session = Rc::new(RefCell::new(SessionHistory::new()));
-    run_script_with_history_in_tracked_at_line_offset(
+    // builtins/history.def operates on the shell's ONE history list. When
+    // the host owns that list through a HistoryProvider (niubash's REPL —
+    // execute_history's provider precedence already encodes it), a
+    // per-read scratch must not be installed over it: the batch's
+    // `history`/`fc` keep resolving to the provider and the list survives
+    // the read (unixwin/niubash#508). Without a provider the scratch
+    // installs like GNU's fresh per-shell list.
+    let install_session = !executor.has_history_provider();
+    run_script_grouped_at_line_offset(
         executor,
         contents,
         session,
         redirect_cmd,
         line_offset,
+        install_session,
     )
     .0
 }
@@ -174,17 +183,45 @@ pub(crate) fn run_script_with_history_in_tracked(
     session: Rc<RefCell<SessionHistory>>,
     redirect_cmd: Option<&CommandNode>,
 ) -> (i32, bool) {
-    run_script_with_history_in_tracked_at_line_offset(executor, contents, session, redirect_cmd, 0)
+    run_script_grouped_at_line_offset(executor, contents, session, redirect_cmd, 0, true)
 }
 
-fn run_script_with_history_in_tracked_at_line_offset(
+/// Fresh-scratch tracked run for engine-internal readers that hold no
+/// session list (the PROMPT_COMMAND runner's empty-session arm). The
+/// scratch installs as the executor's session history only when no host
+/// HistoryProvider owns the interactive list — an installed provider IS
+/// the_history_list (builtins/history.def reads the shell's one list;
+/// execute_history's provider precedence encodes it), so a per-prompt
+/// scratch must neither shadow it nor survive the run as an empty
+/// replacement (unixwin/niubash#508).
+pub(crate) fn run_script_with_fresh_history_in_tracked(
+    executor: &mut Executor,
+    contents: &str,
+    redirect_cmd: Option<&CommandNode>,
+) -> (i32, bool) {
+    let session = Rc::new(RefCell::new(SessionHistory::new()));
+    let install_session = !executor.has_history_provider();
+    run_script_grouped_at_line_offset(
+        executor,
+        contents,
+        session,
+        redirect_cmd,
+        0,
+        install_session,
+    )
+}
+
+fn run_script_grouped_at_line_offset(
     executor: &mut Executor,
     contents: &str,
     session: Rc<RefCell<SessionHistory>>,
     redirect_cmd: Option<&CommandNode>,
     line_offset: usize,
+    install_session: bool,
 ) -> (i32, bool) {
-    executor.set_session_history(Some(session.clone()));
+    if install_session {
+        executor.set_session_history(Some(session.clone()));
+    }
     let raw_lines: Vec<&str> = contents.split_inclusive('\n').collect();
     let mut index = 0usize;
     while index < raw_lines.len() {
@@ -4166,7 +4203,10 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
 /// Hosts (niu) call this before run_interactive_stdin when a forced
 /// interactive shell has no terminal to drive their own REPL on.
 pub fn prepare_interactive_history(executor: &mut Executor) {
-    if executor.get_session_history().is_none() {
+    // An installed HistoryProvider IS the shell's one list (same rule the
+    // grouped readers and execute_history follow, unixwin/niubash#508): no
+    // engine session may be created over it.
+    if executor.get_session_history().is_none() && !executor.has_history_provider() {
         let session = std::rc::Rc::new(std::cell::RefCell::new(
             crate::history::SessionHistory::new(),
         ));
