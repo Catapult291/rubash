@@ -1554,6 +1554,10 @@ impl Executor {
             subshell_fork_collapse: std::cell::Cell::new(false),
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
+            // A forked child is a fresh GNU process image: the parent's
+            // exec-replacement latch never propagates (a post-reset exec
+            // always exits its own frame, so a live parent cannot carry it).
+            exec_replaced: false,
             source_nest_depth: 0,
             sigchld_notifications_pending: std::cell::Cell::new(0),
             // jobs.c:4607-4612: a comsub child (startup_state 2 +

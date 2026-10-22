@@ -226,7 +226,7 @@ where
     Ok(EXECUTION_SUCCESS)
 }
 
-fn command_operand_index(args: &[String]) -> Option<usize> {
+pub(crate) fn command_operand_index(args: &[String]) -> Option<usize> {
     let mut clean_env = false;
     let mut login = false;
     let mut argv0 = None;
