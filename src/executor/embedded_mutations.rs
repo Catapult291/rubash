@@ -929,8 +929,33 @@ impl Executor {
                         } else {
                             output.push_str(&value);
                         }
-                    } else if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
-                        && self.posix_mode_enabled()
+                    } else if self.posix_mode_enabled()
+                        // rubash#1109 item 2: the Interp 221 literal-quote
+                        // rule applies only above compat 42 — at <= 42 a
+                        // single quote inside ${...} quotes again, even in
+                        // POSIX mode (GNU parse.y compat gate).
+                        && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+                        && (matches!(
+                            context,
+                            SubstitutionQuoteContext::DoubleQuoted
+                                | SubstitutionQuoteContext::HereDocument
+                        ) || in_double
+                            // The lexer already applied the rule when it
+                            // tokenized the word: it early-closed the span
+                            // and marked the tail's quote as DATA_SQUOTE,
+                            // but stripped the quote context, so the word
+                            // arrives Unquoted. That marker immediately
+                            // after the in-context close is the lexer's own
+                            // boundary decision surfacing in the token —
+                            // honor it instead of re-pairing the quotes.
+                            || {
+                                let remainder: String = chars.clone().collect();
+                                matching_parameter_brace_in_context(&remainder, true, true)
+                                    .is_some_and(|close| {
+                                        remainder.chars().nth(close + 1)
+                                            == Some(crate::executor::markers::DATA_SQUOTE)
+                                    })
+                            })
                     {
                         let remainder: String = chars.clone().collect();
                         if let Some(close) =

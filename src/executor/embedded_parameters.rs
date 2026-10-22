@@ -566,6 +566,57 @@ impl Executor {
                             }
                         }
                     }
+                    // POSIX mode, compat level > 42 (subst.c Interp 221):
+                    // inside double quotes a single quote inside ${...} is
+                    // literal data, so the first unquoted } closes the
+                    // expansion and the rest of the word is literal text.
+                    // Heredoc bodies expand under the same double-quote-like
+                    // rules. Without this, the body collector below pairs
+                    // the quote and swallows the tail into the default word.
+                    if self.posix_mode_enabled()
+                        && crate::executor::support_names::shell_compatibility_level_flag_aware(
+                            &self.shell_state.env_vars,
+                        ) > 42
+                        && (in_double
+                            || double_quoted
+                            || heredoc
+                            // Lexer-marked early close (see the mutable
+                            // walker's matching branch): the tail quote was
+                            // encoded as DATA_SQUOTE when the enclosing
+                            // quote context was stripped.
+                            || {
+                                let remainder: String = chars.clone().collect();
+                                crate::executor::parameter_ops::matching_parameter_brace_in_context(
+                                    &remainder, true, true,
+                                )
+                                .is_some_and(|close| {
+                                    remainder.chars().nth(close + 1)
+                                        == Some(crate::executor::markers::DATA_SQUOTE)
+                                })
+                            })
+                    {
+                        let remainder: String = chars.clone().collect();
+                        if let Some(close) =
+                            crate::executor::parameter_ops::matching_parameter_brace_in_context(
+                                &remainder, true, true,
+                            )
+                        {
+                            let body: String = remainder.chars().take(close).collect();
+                            for _ in 0..=close {
+                                chars.next();
+                            }
+                            let value = crate::executor::expand_word::with_pending_diagnostic_word(
+                                word,
+                                || self.expand_word(&format!("${{{body}}}")),
+                            );
+                            if preserve_quotes {
+                                push_preserved_expansion_output(&mut output, &value, in_double);
+                            } else {
+                                output.push_str(&value);
+                            }
+                            continue;
+                        }
+                    }
                     // GNU param_expand resolves one `${}` expansion once:
                     // memoize array-element fetches for this fragment so a
                     // subscript's side effects run once (AEPV_MEMO).
