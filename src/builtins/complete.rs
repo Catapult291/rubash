@@ -153,7 +153,6 @@ const READLINE_BINDINGS: &[&str] = &[
     "old-menu-complete",
     "operate-and-get-next",
     "overwrite-mode",
-    "paste-from-clipboard",
     "possible-completions",
     "previous-history",
     "previous-screen-line",
@@ -181,10 +180,11 @@ const READLINE_BINDINGS: &[&str] = &[
     "vi-append-eol",
     "vi-append-mode",
     "vi-arg-digit",
+    "vi-bWord",
     "vi-back-to-indent",
     "vi-backward-bigword",
     "vi-backward-word",
-    "vi-bWord",
+    "vi-bword",
     "vi-change-case",
     "vi-change-char",
     "vi-change-to",
@@ -193,11 +193,13 @@ const READLINE_BINDINGS: &[&str] = &[
     "vi-complete",
     "vi-delete",
     "vi-delete-to",
+    "vi-eWord",
     "vi-editing-mode",
     "vi-end-bigword",
     "vi-end-word",
     "vi-eof-maybe",
-    "vi-eWord",
+    "vi-eword",
+    "vi-fWord",
     "vi-fetch-history",
     "vi-first-print",
     "vi-forward-bigword",
@@ -841,12 +843,10 @@ pub(crate) fn apply_completion_actions(
             "group" => candidates.extend(group_completion_candidates(env_vars)),
             "job" | "running" => candidates.extend(job_completion_candidates(job_names)),
             "keyword" => candidates.extend(SHELL_KEYWORDS.iter().map(|s| s.to_string())),
-            "service" => candidates.extend(service_completion_candidates(env_vars)),
+            "service" => candidates.extend(service_completion_candidates(env_vars, word)),
             "setopt" => candidates.extend(SETOPT_COMPLETIONS.iter().map(|s| s.to_string())),
             "shopt" => candidates.extend(SHOPT_COMPLETIONS.iter().map(|s| s.to_string())),
-            "signal" => {
-                candidates.extend(crate::builtins::trap::SIGNALS.iter().map(|s| s.to_string()))
-            }
+            "signal" => candidates.extend(signal_completion_candidates()),
             "stopped" => {}
             "user" => candidates.extend(user_completion_candidates(env_vars)),
             "variable" => candidates.extend(variable_completion_candidates(env_vars)),
@@ -1205,7 +1205,48 @@ fn disabled_builtin_completion_candidates(env_vars: &HashMap<String, String>) ->
     candidates
 }
 
+/// pcomplete.c:606 it_init_signals builds the CA_SIGNAL list from GNU's
+/// signal_names[] (support/mksignames.c): index 0 is the pseudo-signal
+/// EXIT, unnamed slots render as `SIGJUNK(n)`, and DEBUG/ERR/RETURN close
+/// the list (rubash#1043). The trap table's empty slots are exactly the
+/// unnamed numbers, so map them through the SIGJUNK form instead of
+/// emitting blank candidates.
+fn signal_completion_candidates() -> Vec<String> {
+    let mut candidates = Vec::with_capacity(crate::builtins::trap::SIGNALS.len() + 4);
+    candidates.push("EXIT".to_string());
+    for (index, name) in crate::builtins::trap::SIGNALS.iter().enumerate() {
+        if name.is_empty() {
+            candidates.push(format!("SIGJUNK({})", index + 1));
+        } else {
+            candidates.push((*name).to_string());
+        }
+    }
+    candidates.push("DEBUG".to_string());
+    candidates.push("ERR".to_string());
+    candidates.push("RETURN".to_string());
+    candidates
+}
+
 fn hostname_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
+    // GNU bashline.c:795 snarf_hosts_from_file (reached through
+    // get_hostname_list for CA_HOSTNAME): parse $HOSTFILE (default
+    // /etc/hosts) line by line — skip blank/comment lines, follow
+    // `$include <file>`, skip the leading address token only when it
+    // starts with a digit, then take every whitespace-separated name up
+    // to a `#` comment. Order and duplicates are preserved (the kept
+    // list is append-only). rubash#1052.
+    #[cfg(unix)]
+    {
+        let hosts_file = env_vars
+            .get("HOSTFILE")
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "/etc/hosts".to_string());
+        let mut candidates = Vec::new();
+        if snarf_hosts_from_file(&hosts_file, &mut candidates, 0) {
+            return candidates;
+        }
+    }
     let mut candidates = ["HOSTNAME", "COMPUTERNAME"]
         .iter()
         .filter_map(|name| env_vars.get(*name))
@@ -1215,6 +1256,64 @@ fn hostname_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+/// bashline.c:795 snarf_hosts_from_file, recursive for `$include` lines
+/// (depth-capped so a self-including file cannot loop forever).
+#[cfg(unix)]
+fn snarf_hosts_from_file(path: &str, out: &mut Vec<String>, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    for line in contents.lines() {
+        let line = line.trim_end_matches('\r');
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'#' {
+            continue;
+        }
+        if line[i..].starts_with("$include ") {
+            let rest = line[i + 9..].trim_start();
+            let incfile: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '\r' && *c != '\n')
+                .collect();
+            if !incfile.is_empty() {
+                snarf_hosts_from_file(&incfile, out, depth + 1);
+            }
+            continue;
+        }
+        // Skip the internet address only when it starts with a digit —
+        // an IPv6 address (leading `:`/hex letter) is kept as a name,
+        // exactly as GNU's DIGIT check behaves.
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+        }
+        while i < bytes.len() {
+            while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] == b'#' {
+                break;
+            }
+            let start = i;
+            while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+            if i > start {
+                out.push(line[start..i].to_string());
+            }
+        }
+    }
+    true
 }
 
 fn user_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
@@ -1241,7 +1340,41 @@ fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String
     candidates
 }
 
-fn service_completion_candidates(env_vars: &crate::shell::var_table::VarTable) -> Vec<String> {
+fn service_completion_candidates(
+    env_vars: &crate::shell::var_table::VarTable,
+    word: &str,
+) -> Vec<String> {
+    // GNU bashline.c:2668 bash_servicename_completion_function walks
+    // getservent() entries in database order: an entry contributes its
+    // primary s_name when the name matches the word prefix; only when
+    // the name does NOT match may the entry contribute a matching
+    // alias instead — never both, and duplicates (tcp/udp pairs) are
+    // kept. On a files-backed NSS the database is /etc/services (name =
+    // first field, port/proto second, aliases after, `#` comments).
+    // rubash#1044.
+    #[cfg(unix)]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/etc/services") {
+            let mut candidates = Vec::new();
+            for raw_line in contents.lines() {
+                let line = raw_line.split('#').next().unwrap_or("");
+                let mut fields = line.split_whitespace();
+                let Some(name) = fields.next() else {
+                    continue;
+                };
+                // field 2 is port/proto; the rest are aliases.
+                let _ = fields.next();
+                if name.starts_with(word) {
+                    candidates.push(name.to_string());
+                } else if let Some(alias) = fields.find(|alias| alias.starts_with(word)) {
+                    candidates.push(alias.to_string());
+                }
+            }
+            if !candidates.is_empty() {
+                return candidates;
+            }
+        }
+    }
     let mut candidates = ["SERVICE", "SERVICENAME"]
         .iter()
         .filter_map(|name| env_vars.get(*name))
@@ -1258,11 +1391,38 @@ fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
     // GNU variables.c:511-526 (initialize_shell_variables): invalid-name
     // environment entries live in the invisible invalid_env table and are
     // never shell variables, so they are not completion candidates either.
+    // pcomplete.c:620 it_init_variables lists all_visible_variables():
+    // rubash's `__RUBASH_*` env entries are engine transport, not shell
+    // variables, so they never list (rubash#1045); the dynamic variables
+    // GNU registers as hash-table cells (variables.c initialize_dynamic_
+    // variables) list even though rubash computes them at read time
+    // instead of storing them in the env map. FUNCNAME carries
+    // att_invisible outside a function (variables.c:1812) and HISTCMD is
+    // not implemented by this engine, so neither is added here.
     let mut candidates: Vec<String> = env_vars
         .keys()
         .filter(|name| valid_identifier(name))
+        .filter(|name| !name.starts_with("__RUBASH_"))
+        .filter(|name| name.as_str() != "FUNCNAME")
         .cloned()
         .collect();
+    candidates.extend(
+        [
+            "BASHPID",
+            "BASH_COMMAND",
+            "BASH_SUBSHELL",
+            "EPOCHREALTIME",
+            "EPOCHSECONDS",
+            "GROUPS",
+            "LINENO",
+            "PIPESTATUS",
+            "RANDOM",
+            "SECONDS",
+            "SRANDOM",
+        ]
+        .iter()
+        .map(|name| name.to_string()),
+    );
     candidates.sort();
     candidates.dedup();
     candidates
@@ -1271,9 +1431,19 @@ fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<Str
 fn array_variable_completion_candidates(
     env_vars: &crate::shell::var_table::VarTable,
 ) -> Vec<String> {
+    // GNU pcomplete.c it_init_arrayvariables lists visible array/assoc
+    // variables. GROUPS is a dynamic array cell (variables.c get_
+    // groupset) that rubash computes at read time, so it is never in
+    // the ARRAY_VARS marks — add it explicitly (rubash#1046). FUNCNAME
+    // is att_invisible at the top level and PIPESTATUS's cell is only
+    // materialized by a completed pipeline; the marks carry both from
+    // engine init, so drop them to match the top-level listing.
     let mut candidates = BTreeSet::new();
     candidates.extend(env_vars.marked_names(ARRAY_VARS));
     candidates.extend(env_vars.marked_names(ASSOC_VARS));
+    candidates.remove("FUNCNAME");
+    candidates.remove("PIPESTATUS");
+    candidates.insert("GROUPS".to_string());
     candidates.into_iter().collect()
 }
 
