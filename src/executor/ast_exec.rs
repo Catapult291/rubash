@@ -690,6 +690,10 @@ impl Executor {
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
+                // rubash#1115: the forked child reseeds RANDOM
+                // (variables.c:1418-1423 get_random_number); the saved
+                // parent state above keeps the parent's sequence intact.
+                self.shell_state.random_state.reseed_fresh();
                 // rubash#720 form 1: a single-subshell-command region body is
                 // the body GNU's execute_in_subshell marks CMD_NO_FORK
                 // (execute_cmd.c:1799-1806) and runs in place via

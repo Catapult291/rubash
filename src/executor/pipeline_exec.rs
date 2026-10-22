@@ -949,7 +949,15 @@ impl Executor {
         // kills only the element (stage status 127), never the enclosing
         // script (issue #67).
         let saved = self.snapshot_arithmetic_error_flags();
+        // rubash#1115: the speculative producer expansion must not draw
+        // from the parent's RANDOM sequence — a pipeline element is a
+        // forked child (variables.c:1418-1423 reseeds), and when this
+        // fast path declines, the sequential stage loop re-expands the
+        // words itself. Snapshot, reseed for the attempt, restore.
+        let saved_random = self.shell_state.random_state.clone_state();
+        self.shell_state.random_state.reseed_fresh();
         let result = self.execute_timed_read_pipeline_inner(commands);
+        self.shell_state.random_state.restore_state(&saved_random);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match (result, nounset_hit) {
             (Ok(Some(())), true) => {
@@ -2879,6 +2887,18 @@ impl Executor {
         // this idempotent pass covers the recursion entry points that bypass
         // the gather (the `time` prefix arm and the timed-read followup).
         let command = &normalize_pipeerr_stage(command);
+        // rubash#1115: GNU forks every pipeline element
+        // (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
+        // in the child), so the element's word expansion and body draw
+        // from a RESEEDED generator (variables.c:1418-1423
+        // get_random_number) and never advance the parent's sequence.
+        // The stage runs in place on the shared executor here, so
+        // bracket it: snapshot the parent's generator, reseed for the
+        // stage's duration, restore on exit. (lastpipe's last element
+        // runs through execute_lastpipe_stage instead — it IS the
+        // current shell and keeps the parent sequence.)
+        let saved_random = self.shell_state.random_state.clone_state();
+        self.shell_state.random_state.reseed_fresh();
         // A pipeline element runs in its own subshell: an expansion error
         // raised while expanding the element's words on the shared executor
         // (notably `set -u` unbound in `$(( ))`) terminates only that
@@ -2988,6 +3008,7 @@ impl Executor {
             FUNCTION_STDIN_OFFSET,
             old_stdin_offset,
         );
+        self.shell_state.random_state.restore_state(&saved_random);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match result {
             Ok(Some((output, stderr, _status))) if nounset_hit => {

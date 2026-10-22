@@ -1466,6 +1466,10 @@ impl Executor {
         shell_state
             .subshell_depth
             .set(self.shell_state.subshell_depth.get() + 1);
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number) — on the CLONE, so
+        // the parent's sequence is untouched.
+        shell_state.random_state.reseed_fresh();
         shell_state.in_command_substitution.set(true);
         // Mid-expansion error latches belong to the parent's in-flight word
         // expansion; the forked child starts with a clean slate (same as a

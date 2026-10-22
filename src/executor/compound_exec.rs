@@ -2096,6 +2096,10 @@ impl Executor {
         let saved_exec_replaced = self.exec_replaced;
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
+        // rubash#1115: the forked child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for the wholesale restore.
+        self.shell_state.random_state.reseed_fresh();
         self.shell_state.loop_depth = 0;
         // execute_in_subshell resets loop_level (execute_cmd.c:1642), so
         // fork-inherited depth does not cross a `( )` boundary either.

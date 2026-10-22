@@ -936,14 +936,43 @@ impl RandomGen {
         }
     }
 
-    /// Command/process substitution clones carry the seeds over (GNU
-    /// reseeds from genseed on pid change, which rubash cannot observe).
+    /// Command/process substitution clones carry the seeds over; the
+    /// subshell boundary itself reseeds (see `reseed_fresh`).
     pub(crate) fn clone_state(&self) -> Self {
         Self {
             rseed: Cell::new(self.rseed.get()),
             last_value: Cell::new(self.last_value.get()),
             rseed32: Cell::new(self.rseed32.get()),
         }
+    }
+
+    /// Restore a snapshot taken by `clone_state` (pipeline-stage bracket:
+    /// the stage's reseeded generator must not leak back to the parent).
+    pub(crate) fn restore_state(&self, saved: &Self) {
+        self.rseed.set(saved.rseed.get());
+        self.last_value.set(saved.last_value.get());
+        self.rseed32.set(saved.rseed32.get());
+    }
+
+    /// GNU variables.c:1418-1423 get_random_number: entering a subshell
+    /// environment under a new pid reseeds via seedrand() — lib/sh/
+    /// random.c:122-129, whose genseed (random.c:88-96) mixes time, pid,
+    /// ppid and uid — and sbrand resets last_random_value to 0
+    /// (random.c:117-121). Rubash subshells are in-process, so the entry
+    /// points call this eagerly where GNU's fork would change the pid:
+    /// the observable contract is identical (a fresh, run-varying
+    /// sequence inside the subshell; the parent's state untouched, since
+    /// every entry here sits behind a clone/save boundary). The counter
+    /// keeps sibling entries within the same microsecond distinct.
+    pub(crate) fn reseed_fresh(&self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ENTRY_COUNTER: AtomicU32 = AtomicU32::new(0);
+        let tick = ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = (current_epoch_micros() as u32)
+            ^ std::process::id().rotate_left(7)
+            ^ tick.wrapping_mul(0x9e37_79b9);
+        self.rseed.set(seed);
+        self.last_value.set(0);
     }
 }
 

@@ -2055,6 +2055,10 @@ impl Executor {
         self.shell_state
             .subshell_depth
             .set(saved_state.subshell_depth.get() + 1);
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for the restore.
+        self.shell_state.random_state.reseed_fresh();
         self.shell_state.in_command_substitution.set(true);
 
         let saved_capture = self.stdout_capture.take();
@@ -2236,6 +2240,10 @@ impl Executor {
         // forked child in GNU — so variable/scope/job mutations of the call
         // die with the substitution. Whole-state clone, not a field list.
         let saved_state = self.shell_state.clone_for_child_save();
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for restore_flat_subshell.
+        self.shell_state.random_state.reseed_fresh();
         let saved_dir = env::current_dir().ok();
         let saved_capture = self.stdout_capture.take();
         self.stdout_capture = Some(Vec::new());
