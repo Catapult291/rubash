@@ -529,6 +529,13 @@ impl Executor {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
         env_map.insert("__RUBASH_SHELL_PID".to_string(), self.shell_pid.to_string());
+        // rubash#1074: the wrapper child is one subshell level deeper than
+        // this shell (execute_in_subshell's subshell_level++); carry the
+        // target depth so the child's BASH_SUBSHELL starts at parent + 1.
+        env_map.insert(
+            "__RUBASH_SUBSHELL_DEPTH".to_string(),
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
         // GNU execute_cmd.c:1761 (execute_in_subshell): a forked async
         // subshell keeps the parent's $0 and line number, so diagnostics
         // inside `xcase &` print `./script: line N:` rather than `bash:`. The
@@ -2090,6 +2097,9 @@ impl Executor {
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
         self.shell_state.loop_depth = 0;
+        // execute_in_subshell resets loop_level (execute_cmd.c:1642), so
+        // fork-inherited depth does not cross a `( )` boundary either.
+        self.shell_state.inherited_loop_depth = 0;
 
         // RESTRICTED_SHELL (#804): the subshell's redirects apply inside
         // the child before the body (do_redirections precedes the list), so
@@ -2783,6 +2793,13 @@ impl Executor {
         // blocked read cannot consume the shell signal mailbox.
         child.env(INHERIT_PROCESS_STDIN, "1");
         child.env("__RUBASH_COPROC_CHILD", "1");
+        // rubash#1074: the coproc body runs in a forked subshell
+        // (execute_in_subshell: subshell_level++), so the child's
+        // BASH_SUBSHELL starts at this shell's depth + 1.
+        child.env(
+            "__RUBASH_SUBSHELL_DEPTH",
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
 
         // Create pipes for bidirectional communication
         let stdin_result = std::io::pipe();
