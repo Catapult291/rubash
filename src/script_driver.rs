@@ -2219,7 +2219,7 @@ fn command_tree_has_pre_eof_event_marker(command: &CommandNode) -> bool {
 /// stages, and-or lists, compound bodies, clause bodies), carries one of
 /// the parser's error markers. Mirrors the marker set the executor's
 /// diagnostics read (command_execute.rs `__RUBASH_PARSE_ERROR*` arms).
-fn command_tree_has_parse_error(command: &CommandNode) -> bool {
+pub(crate) fn command_tree_has_parse_error(command: &CommandNode) -> bool {
     if command
         .assignments
         .iter()
@@ -2297,6 +2297,137 @@ fn command_tree_walk_nested(command: &CommandNode, predicate: fn(&CommandNode) -
             .coproc_command
             .as_ref()
             .is_some_and(|coproc| coproc.body.as_ref().is_some_and(|body| nested(body)))
+}
+
+/// First node in `command`'s tree carrying a `__RUBASH_PARSE_ERROR*`
+/// marker, in the descent order of [`command_tree_walk_nested`] (the
+/// command itself first, then nested bodies). Used to report a parked
+/// syntax error without executing the broken reader unit around it
+/// (rubash#1138).
+pub(crate) fn first_parse_error_node(command: &CommandNode) -> Option<CommandNode> {
+    // The parser propagates a body's error marker up onto the compound
+    // carrier, but executing the carrier would run its valid body
+    // commands before the walker reaches the marked node — the report
+    // must go through the INNERMOST marked node, whose execute_command
+    // marker arm fires before any dispatch. Only a node whose marker
+    // is its own (no marked descendant) reports itself.
+    let mut bodies: Vec<&[CommandNode]> = Vec::new();
+    if let Some(pipeline) = &command.pipeline_command {
+        bodies.push(&pipeline.stages);
+    }
+    if let Some(list) = &command.and_or_list {
+        bodies.push(&list.commands);
+    }
+    if let Some(for_command) = &command.for_command {
+        bodies.push(&for_command.body);
+    }
+    if let Some(select) = &command.select_command {
+        bodies.push(&select.body);
+    }
+    if let Some(if_command) = &command.if_command {
+        bodies.push(&if_command.condition);
+        bodies.push(&if_command.then_body);
+        for branch in &if_command.elif_branches {
+            bodies.push(&branch.condition);
+            bodies.push(&branch.body);
+        }
+        if let Some(else_body) = &if_command.else_body {
+            bodies.push(else_body);
+        }
+    }
+    if let Some(loop_command) = &command.loop_command {
+        bodies.push(&loop_command.condition);
+        bodies.push(&loop_command.body);
+    }
+    if let Some(subshell) = &command.subshell_command {
+        bodies.push(&subshell.body);
+    }
+    if let Some(case_command) = &command.case_command {
+        for clause in &case_command.clauses {
+            bodies.push(&clause.body);
+        }
+    }
+    if let Some(function) = &command.function_command {
+        bodies.push(&function.body);
+    }
+    if let Some(brace_group) = &command.brace_group {
+        bodies.push(&brace_group.body);
+    }
+    for body in bodies {
+        for nested in body {
+            if let Some(found) = first_parse_error_node(nested) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(time) = &command.time_command {
+        if let Some(found) = first_parse_error_node(&time.command) {
+            return Some(found);
+        }
+    }
+    if let Some(background) = &command.background_command {
+        if let Some(found) = first_parse_error_node(&background.command) {
+            return Some(found);
+        }
+    }
+    if let Some(inverted) = &command.inverted_command {
+        if let Some(found) = first_parse_error_node(&inverted.command) {
+            return Some(found);
+        }
+    }
+    if let Some(coproc) = &command.coproc_command {
+        if let Some(body) = &coproc.body {
+            for nested in body {
+                if let Some(found) = first_parse_error_node(nested) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    if command
+        .assignments
+        .iter()
+        .any(|(name, _)| name.starts_with("__RUBASH_PARSE_ERROR"))
+    {
+        return Some(command.clone());
+    }
+    None
+}
+
+/// rubash#1138: GNU read_command parses one complete command — a
+/// whole line's list, multi-line compounds included — before executing
+/// any of it, so a syntax error anywhere in that reader unit voids the
+/// ENTIRE unit (`echo hi; [[ a ==]]` runs nothing; in `echo a` /
+/// `echo b; [[ a ==]]` only the first line runs). Rubash's parser
+/// parks the error as a marker node inside the AST and execute_ast
+/// would run the unit's valid prefix first. Rewrite the command list
+/// to the commands from earlier units (starting on earlier lines)
+/// plus the innermost marked node itself: executing that node reports
+/// the diagnostic through execute_command's parse-error arms and
+/// returns ExitCode(2), with none of its unit-mates running. Returns
+/// true when a parse error was found (and the list rewritten).
+pub(crate) fn apply_parse_error_unit_voiding(ast: &mut crate::parser::Ast) -> bool {
+    let Some(err_pos) = ast
+        .commands
+        .iter()
+        .position(|command| command_tree_has_parse_error(command))
+    else {
+        return false;
+    };
+    let error_node = first_parse_error_node(&ast.commands[err_pos])
+        .unwrap_or_else(|| ast.commands[err_pos].clone());
+    // Compound carriers (a brace group) may carry no line of their own;
+    // the marked node's line is the unit's start for grouping purposes.
+    let Some(unit_line) = ast.commands[err_pos].line.or(error_node.line) else {
+        return false;
+    };
+    let cut = ast.commands[..err_pos]
+        .iter()
+        .position(|command| command.line.is_some_and(|line| line >= unit_line))
+        .unwrap_or(err_pos);
+    ast.commands.truncate(cut);
+    ast.commands.push(error_node);
+    true
 }
 
 pub fn run_source_with_line_offset(
@@ -2777,6 +2908,13 @@ fn run_source_impl(
             eprintln!("{error}");
             return 1;
         }
+    }
+
+    // rubash#1138: a syntax error voids its whole reader unit — see
+    // apply_parse_error_unit_voiding. Interactive readers keep their
+    // own per-line error reporting.
+    if !interactive {
+        apply_parse_error_unit_voiding(&mut ast);
     }
 
     match executor.execute_ast(&ast) {
