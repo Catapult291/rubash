@@ -538,7 +538,17 @@ impl Executor {
         }
         env_vars
             .entry("SHELL".to_string())
-            .or_insert_with(shell_path_value);
+            .or_insert_with(login_shell_value);
+        // GNU variables.c:550 initialize_shell_variables:
+        // set_if_not("PATH", DEFAULT_PATH_VALUE) with config-top.h:60-61
+        // DEFAULT_PATH_VALUE "/usr/local/bin:/usr/local/sbin:/usr/bin:
+        // /usr/sbin:/bin:/sbin:." — a shell started with no PATH in its
+        // environment (env -i) still resolves the standard utilities; a
+        // PATH that is present but empty is imported verbatim (rubash#1129).
+        #[cfg(unix)]
+        env_vars.entry("PATH".to_string()).or_insert_with(|| {
+            "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.".to_string()
+        });
         // GNU test scripts use ${THIS_SH} to invoke the shell under test
         // (e.g. `${THIS_SH} -c '...'`). Rubash is always the shell under
         // test, so the auto-detected executable path must OVERRIDE any
