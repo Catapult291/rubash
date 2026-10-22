@@ -1,6 +1,92 @@
 use super::*;
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
+/// rubash#1166: rebase a trap action's parsed line numbers onto the line
+/// the trap fired at. GNU parses the action string with line_number
+/// starting at the triggering command's line (trap.c _run_trap_internal
+/// via parse_and_execute), so EVERY node in the action — nested bodies
+/// included — reports trigger_line + (its action-relative line − 1). The
+/// old per-runner stamping rewrote only the top-level nodes' `line`,
+/// leaving nested commands (a `return` inside an `if` in the action) at
+/// their action-relative lines, so diagnostics cited the trap's own
+/// definition line instead of the triggering line. `delta` is signed
+/// because the DEBUG action cache reuses one parse across firings at
+/// different lines.
+pub(crate) fn shift_trap_action_lines(commands: &mut [CommandNode], delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    fn shift_slot(slot: &mut Option<usize>, delta: i64) {
+        if let Some(value) = slot {
+            *value = (*value as i64 + delta).max(1) as usize;
+        }
+    }
+    fn shift_node(node: &mut CommandNode, delta: i64) {
+        shift_slot(&mut node.line, delta);
+        shift_slot(&mut node.logical_line, delta);
+        shift_slot(&mut node.end_line, delta);
+        shift_slot(&mut node.heredoc_gather_line, delta);
+        if let Some(pipeline) = &mut node.pipeline_command {
+            shift_trap_action_lines(&mut pipeline.stages, delta);
+        }
+        if let Some(list) = &mut node.and_or_list {
+            shift_trap_action_lines(&mut list.commands, delta);
+        }
+        if let Some(wrapper) = &mut node.time_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(wrapper) = &mut node.background_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(wrapper) = &mut node.inverted_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(for_command) = &mut node.for_command {
+            shift_trap_action_lines(&mut for_command.body, delta);
+        }
+        if let Some(if_command) = &mut node.if_command {
+            shift_trap_action_lines(&mut if_command.condition, delta);
+            shift_trap_action_lines(&mut if_command.then_body, delta);
+            for branch in &mut if_command.elif_branches {
+                shift_trap_action_lines(&mut branch.condition, delta);
+                shift_trap_action_lines(&mut branch.body, delta);
+            }
+            if let Some(else_body) = &mut if_command.else_body {
+                shift_trap_action_lines(else_body, delta);
+            }
+        }
+        if let Some(loop_command) = &mut node.loop_command {
+            shift_trap_action_lines(&mut loop_command.condition, delta);
+            shift_trap_action_lines(&mut loop_command.body, delta);
+        }
+        if let Some(subshell) = &mut node.subshell_command {
+            shift_trap_action_lines(&mut subshell.body, delta);
+        }
+        if let Some(case_command) = &mut node.case_command {
+            for clause in &mut case_command.clauses {
+                shift_trap_action_lines(&mut clause.body, delta);
+            }
+        }
+        if let Some(select_command) = &mut node.select_command {
+            shift_trap_action_lines(&mut select_command.body, delta);
+        }
+        if let Some(function) = &mut node.function_command {
+            shift_trap_action_lines(&mut function.body, delta);
+        }
+        if let Some(group) = &mut node.brace_group {
+            shift_trap_action_lines(&mut group.body, delta);
+        }
+        if let Some(coproc) = &mut node.coproc_command {
+            if let Some(body) = &mut coproc.body {
+                shift_trap_action_lines(body, delta);
+            }
+        }
+    }
+    for command in commands {
+        shift_node(command, delta);
+    }
+}
+
 impl Executor {
     pub(in crate::executor) fn set_fd_input_text(&mut self, fd: u32, input: String, dynamic: bool) {
         // input is shell text: decode marker pairs back to the raw bytes
@@ -911,27 +997,32 @@ impl Executor {
         // out of the cache cell, re-stamped and executed, then put back —
         // no clone on the per-firing path.
         let action = self.comsub_body_alias_splice(action);
-        let mut ast = {
+        let (mut ast, ast_base) = {
             let taken = self.debug_trap_action_cache.borrow_mut().take();
             match taken {
-                Some((key, cached_ast)) if key == action => cached_ast,
+                Some((key, cached_ast, base)) if key == action => (cached_ast, base),
                 _ => {
                     let tokens = crate::lexer::tokenize(&action);
-                    crate::parser::parse(&tokens)
+                    (crate::parser::parse(&tokens), 1)
                 }
             }
         };
-        if let Some(call_line) = call_line {
-            for command in &mut ast.commands {
-                command.line = Some(call_line);
+        // rubash#1166: rebase the whole action onto this firing's line —
+        // nested nodes keep their action-relative offsets from it (see
+        // shift_trap_action_lines). The cache tracks the base the stored
+        // lines currently reflect, so reuse shifts by the delta only.
+        let ast_base = match call_line {
+            Some(line) => {
+                shift_trap_action_lines(&mut ast.commands, line as i64 - ast_base);
+                line as i64
             }
-        }
+            None => ast_base,
+        };
         let saved_alias_streamed = self.mark_alias_streamed();
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
-        // Cache the (re-stamped) AST under its spliced text for the next
-        // firing; the stamps are unconditionally overwritten by every
-        // firing's `command.line` walk above, so reuse is exact.
-        *self.debug_trap_action_cache.borrow_mut() = Some((action, ast));
+        // Cache the (re-based) AST under its spliced text for the next
+        // firing; the recorded base makes the next rebase exact.
+        *self.debug_trap_action_cache.borrow_mut() = Some((action, ast, ast_base));
         self.resume_alias_streamed(saved_alias_streamed);
         // rubash#546 (cell 2): when the firing happened inside a trap
         // action the frozen BASH_COMMAND belongs to the enclosing action —
@@ -984,9 +1075,9 @@ impl Executor {
             .get("__RUBASH_CURRENT_LINE")
             .and_then(|line| line.parse::<usize>().ok());
         if let Some(call_line) = call_line {
-            for command in &mut ast.commands {
-                command.line = Some(call_line);
-            }
+            // rubash#1166: rebase, don't just stamp the top level (see
+            // shift_trap_action_lines).
+            shift_trap_action_lines(&mut ast.commands, call_line as i64 - 1);
         }
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
         self.trap_saved_exit_value = prev_saved_exit;
@@ -1544,9 +1635,10 @@ impl Executor {
         let tokens = crate::lexer::tokenize(&action);
         let mut ast = crate::parser::parse(&tokens);
         if let Some(line) = failed_line {
-            for action_command in &mut ast.commands {
-                action_command.line = Some(line);
-            }
+            // rubash#1166: rebase the whole action onto the failed
+            // command's line, nested nodes included (see
+            // shift_trap_action_lines).
+            shift_trap_action_lines(&mut ast.commands, line as i64 - 1);
         }
         let saved_alias_streamed = self.mark_alias_streamed();
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
