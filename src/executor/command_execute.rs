@@ -416,6 +416,11 @@ impl Executor {
                 self.write_redirect_diagnostic_routed(&cmd, &stderr)?;
                 self.exit_code = 1;
                 if self.errexit_enabled() && self.errexit_is_active() {
+                    // rubash#1171 (same class): a redirect-failed simple
+                    // command is a failed command — GNU fires the ERR
+                    // trap before the ERREXIT jump; the Ok path below
+                    // lets the ast_exec loop fire instead.
+                    self.maybe_run_error_trap(&cmd)?;
                     return Err(ExecuteError::ExitCode(1));
                 }
                 Ok(())

@@ -288,6 +288,10 @@ impl Executor {
             return Err(ExecuteError::ExitCode(code));
         }
         if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+            // rubash#1171 (same class): a failing bare arithmetic command
+            // earns its ERR fire before the ERREXIT conversion, exactly
+            // like the assignment-only tail below.
+            self.maybe_run_error_trap(cmd)?;
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())
@@ -741,6 +745,16 @@ impl Executor {
         }
         self.exit_code = status;
         if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+            // rubash#1171: GNU fires the ERR trap inside
+            // execute_simple_command (run_error_trap, execute_cmd.c:1000)
+            // BEFORE the ERREXIT jump in execute_command_internal — an
+            // assignment-only command whose substitution failed
+            // (`set -e; trap 'echo T' ERR; x=$(false)`) prints T and then
+            // exits. Converting straight to ExitCode here bypassed the
+            // ast_exec loop's adjudication entirely. The non-errexit path
+            // still returns Ok and lets the loop fire, so fire only on
+            // this converting branch.
+            self.maybe_run_error_trap(cmd)?;
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())
