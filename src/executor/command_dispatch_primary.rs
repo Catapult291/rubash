@@ -149,8 +149,15 @@ impl Executor {
                     // sleep_interruptibly slices the wait so the Windows
                     // mailbox is observed with the same deferral semantics.
                     if let Some(seconds) = crate::builtins::sleep::total_duration(&cmd.words[1..]) {
-                        self.sleep_interruptibly(seconds)?;
-                        self.exit_code = 0;
+                        // rubash#1034: Some(sig) means the virtual child
+                        // was killed by a trapped terminating signal and
+                        // its trap already dispatched — the command's
+                        // status is the signal death 128+sig, like GNU
+                        // reaping a real sleep killed the same way.
+                        match self.sleep_interruptibly(seconds)? {
+                            Some(signal) => self.exit_code = 128 + signal,
+                            None => self.exit_code = 0,
+                        }
                     } else {
                         let (status, stderr) = crate::builtins::sleep::execute(&cmd.words[1..]);
                         if let Some(stderr) = stderr {

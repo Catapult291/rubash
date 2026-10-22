@@ -1320,16 +1320,65 @@ impl Executor {
     /// completes, an untrapped one kills the shell via SIG_DFL). The
     /// in-process fast path emulates that by slicing the sleep and running
     /// observe_signals_while_blocked between slices.
-    pub(crate) fn sleep_interruptibly(&mut self, seconds: f64) -> Result<(), ExecuteError> {
+    ///
+    /// rubash#1034: the emulation has one gap a real child does not —
+    /// a group-delivered terminating signal (^C, `kill` of the job)
+    /// kills GNU's real sleep instantly, wait_for returns, and the
+    /// shell's trap dispatches at once; the virtual child cannot die,
+    /// so the trap used to sit queued for the sleep's whole remainder.
+    /// When a pending delivery is a trapped signal from the kernel-
+    /// managed terminating set (HUP/INT/QUIT/TERM/USR1/USR2 — the set
+    /// a default-disposition child dies from), model the child as
+    /// killed by it: dispatch the pending traps now and end the sleep,
+    /// reporting the killing signal so the caller records 128+sig as
+    /// the command's status, exactly like a reaped signal death.
+    /// Non-terminating trapped signals (WINCH, CHLD...) keep GNU's
+    /// defer-to-completion semantics untouched.
+    pub(crate) fn sleep_interruptibly(
+        &mut self,
+        seconds: f64,
+    ) -> Result<Option<i32>, ExecuteError> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Ok(());
+                return Ok(None);
             }
             std::thread::sleep((deadline - now).min(SLICE));
             self.observe_signals_while_blocked()?;
+            // observe_signals_while_blocked re-queued any trapped
+            // deliveries; take them back for the virtual-child check
+            // and put back whatever does not abort the sleep.
+            let pending =
+                crate::builtins::kill::take_pending_signals_now(std::process::id())
+                    .unwrap_or_default();
+            if pending.is_empty() {
+                continue;
+            }
+            let abort = pending.iter().copied().find(|&signal| {
+                #[cfg(unix)]
+                {
+                    crate::builtins::kill::kernel_handler_installed(signal)
+                        && signal_trap_name(signal).is_some_and(|name| {
+                            crate::builtins::trap::get_trap_action(
+                                &self.shell_state.env_vars,
+                                &name,
+                            )
+                            .is_some_and(|action| !action.is_empty())
+                        })
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = signal;
+                    false
+                }
+            });
+            crate::builtins::kill::requeue_pending_signals(pending);
+            if let Some(signal) = abort {
+                self.run_pending_signal_traps()?;
+                return Ok(Some(signal));
+            }
         }
     }
 

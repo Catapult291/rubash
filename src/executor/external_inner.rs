@@ -787,6 +787,16 @@ impl Executor {
         }
         #[cfg(unix)]
         {
+            // GNU deferral is the correct model here (jobs.c:3064
+            // wait_for): while a real foreground child runs, a trapped
+            // signal is only RECORDED (trap.c trap_handler) and its
+            // trap dispatches at the command boundary when wait_for
+            // returns — which is immediate when the child itself dies
+            // from a group-delivered signal (rubash#1034's ^C case).
+            // Untrapped terminating signals stay SIG_DFL at the kernel
+            // and kill this process inside waitpid directly. So a
+            // blocking wait is faithful on unix; the sliced observer
+            // loop exists for platforms without kernel delivery.
             child.wait().map_err(ExecuteError::IoError)
         }
     }
