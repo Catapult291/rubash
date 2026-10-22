@@ -1847,6 +1847,54 @@ impl Executor {
     /// its subscript arithmetically before the element check, so an unset
     /// name inside the subscript reports that name even when the array
     /// itself is unset (nameref25.sub ok 4 reports `k`, not `r` or `a[k]`).
+    /// rubash#1168: for a `${subject<op>word}` fragment whose operator is
+    /// `-`/`=`/`+` (either `:`-prefixed or bare), decide whether GNU
+    /// would expand `word` at all, and if so scan it for unbound
+    /// references with the ordinary word scanner. Branch conditions follow
+    /// subst.c parameter_brace_expand check_nullness: the `:` forms test
+    /// unset-or-null, the bare forms test unset only; `-`/`=` expand the
+    /// word when the test FAILS the subject, `+` when it passes.
+    fn nounset_operator_word_unbound(
+        &self,
+        brace_core: &str,
+        operator_tail: &str,
+    ) -> Option<String> {
+        let (colon, op, word) = if let Some(rest) = operator_tail.strip_prefix(':') {
+            (true, rest.as_bytes().first().copied()?, &rest[1..])
+        } else {
+            (
+                false,
+                operator_tail.as_bytes().first().copied()?,
+                &operator_tail[1..],
+            )
+        };
+        if !matches!(op, b'-' | b'=' | b'+') || word.is_empty() {
+            return None;
+        }
+        let subject = &brace_core[..parameter_reference_len(brace_core)];
+        let value = self.parameter_operator_value(subject);
+        let word_expanded = match op {
+            b'-' | b'=' => {
+                if colon {
+                    value.as_deref().map_or(true, |v| v.is_empty())
+                } else {
+                    value.is_none()
+                }
+            }
+            _ => {
+                if colon {
+                    value.as_deref().map_or(false, |v| !v.is_empty())
+                } else {
+                    value.is_some()
+                }
+            }
+        };
+        if !word_expanded {
+            return None;
+        }
+        self.nounset_unbound_parameter(word)
+    }
+
     pub(in crate::executor) fn nounset_braced_parameter_is_unbound(
         &self,
         name: &str,
@@ -2053,11 +2101,23 @@ impl Executor {
                     Some(b'-') | Some(b'=') | Some(b'+') | Some(b'?')
                 ));
 
+        // GNU subst.c parameter_brace_expand: the default/assign/
+        // alternate operators shield the SUBJECT from the unbound check,
+        // but the operator's WORD is a fresh expansion context: when the
+        // branch that expands the word is taken, an unbound reference
+        // inside it (a bare `$u2` in `${u1:-$u2}`) reports exactly like a
+        // top-level one (rubash#1168). A nested `${u2:-deep}` stays
+        // shielded by its own operator — the recursive scan applies the
+        // same rule per fragment. `:?` is excluded: its word is only
+        // expanded on the error path itself.
+        if default_value_operator {
+            return self.nounset_operator_word_unbound(brace_core, operator_tail);
+        }
+
         if name.is_empty()
             || matches!(name, "#" | "@" | "*" | "?" | "$" | "-" | "0")
             || name.starts_with('!')
             || parse_parameter_error_operator(name, self.posix_mode_enabled()).is_some()
-            || default_value_operator
         {
             return None;
         }
