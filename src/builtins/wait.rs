@@ -40,7 +40,15 @@ where
                     }
                     index += 1;
                     if args.get(index).is_none() {
-                        return Ok(EXECUTION_SUCCESS);
+                        // GNU wait.def internal_getopt "fnp:": a dangling
+                        // `-p` is a getopt error -> usage + EX_USAGE
+                        // (rubash#1156).
+                        writeln!(
+                            stderr,
+                            "{diagnostic_prefix}wait: -p: option requires an argument"
+                        )?;
+                        writeln!(stderr, "wait: usage: wait [-fn] [-p var] [id ...]")?;
+                        return Ok(EX_USAGE);
                     }
                     break;
                 }

@@ -134,6 +134,21 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs()?;
+        // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
+        // `-p` (no joined text, no next word) is a getopt error, reported
+        // before any validation or waiting, and returns EX_USAGE
+        // (rubash#1156).
+        if wait_p_argument_missing(&cmd.words[1..]) {
+            let mut stderr = Vec::new();
+            writeln!(
+                stderr,
+                "{}wait: -p: option requires an argument",
+                self.diagnostic_prefix()
+            )?;
+            writeln!(stderr, "wait: usage: wait [-fn] [-p var] [id ...]")?;
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            return Ok(2);
+        }
         // GNU wait.def:139-152: a `-p name` option is validated and the
         // variable unbound before any waiting happens, in every wait form —
         // an invalid identifier or a readonly name fails immediately, and a
@@ -2710,6 +2725,39 @@ impl Executor {
     }
 }
 
+/// GNU wait.def wait_builtin(): options are scanned with
+/// internal_getopt "fnp:"; a `-p` at the end of a cluster with no joined
+/// text consumes the NEXT word as its argument. When no next word exists,
+/// getopt reports `-p: option requires an argument` and the builtin falls
+/// into its default case: usage + EX_USAGE (2). Returns true when the word
+/// list has such a dangling `-p` (rubash#1156 — the operand scanners below
+/// used to walk one word past the end and panic on the slice).
+fn wait_p_argument_missing(words: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word == "--" || !word.starts_with('-') || word == "-" {
+            break;
+        }
+        for (offset, option) in word[1..].char_indices() {
+            match option {
+                'n' | 'f' => {}
+                'p' => {
+                    let value_start = 1 + offset + option.len_utf8();
+                    if value_start < word.len() {
+                        // Joined form `-pNAME`: argument is in this word;
+                        // `-p` ends the cluster either way.
+                        break;
+                    }
+                    return words.get(index + 1).is_none();
+                }
+                _ => return false,
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 struct WaitAnyRequest {
     operands: Vec<String>,
     assign_var: Option<String>,
@@ -2803,9 +2851,12 @@ fn wait_background_operands(words: &[String]) -> Option<Vec<String>> {
     }
 
     // Jobspec operands keep no W_ARRAYREF consumer — strip the in-band
-    // flag so `wait: A[]]: ...` diagnostics print clean text.
+    // flag so `wait: A[]]: ...` diagnostics print clean text. A dangling
+    // `-p` walks `index` one past the end (its argument word is counted,
+    // then the option word itself); saturate instead of slicing past the
+    // end (rubash#1156).
     Some(
-        words[index..]
+        words[index.min(words.len())..]
             .iter()
             .map(|word| {
                 crate::builtins::arrayref::take_arrayref_flag(word)
