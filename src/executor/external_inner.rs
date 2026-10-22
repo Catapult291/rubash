@@ -461,6 +461,43 @@ impl Executor {
         }
 
         let Some(program) = self.find_scoped_user_command(&cmd.words[0]) else {
+            // GNU execute_cmd.c (execute_simple_command /
+            // command_not_found_handler): when the shell function
+            // `command_not_found_handle` is defined, it is invoked with
+            // the full command line as its arguments instead of the
+            // `command not found` diagnostic, and its exit status becomes
+            // the command's status. The executing_command_not_found_handler
+            // guard keeps a missing command inside the handler itself on
+            // the plain 127 path (rubash#1080).
+            if !cmd.words[0].contains('/')
+                && self
+                    .shell_state
+                    .functions
+                    .contains_key("command_not_found_handle")
+                && !self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_CNF_HANDLER_RUNNING")
+            {
+                self.shell_state.env_vars.insert(
+                    "__RUBASH_CNF_HANDLER_RUNNING".to_string(),
+                    "1".to_string(),
+                );
+                // GNU passes the whole command line: $1 is the missing
+                // command name, $2.. its arguments.
+                let args: Vec<String> = cmd.words.to_vec();
+                let mut handler_cmd = cmd.clone();
+                handler_cmd.words = std::iter::once("command_not_found_handle".to_string())
+                    .chain(cmd.words.iter().cloned())
+                    .collect();
+                let result =
+                    self.execute_function("command_not_found_handle", &args, &handler_cmd);
+                self.shell_state
+                    .env_vars
+                    .remove("__RUBASH_CNF_HANDLER_RUNNING");
+                result?;
+                return Ok(());
+            }
             let mut stderr = Vec::new();
             // GNU findcmd.c:385-386 (search_for_command): a name containing
             // a slash is never PATH-searched — it goes straight to execve,
