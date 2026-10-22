@@ -4,6 +4,26 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.4.3] - 2026-10-22
+
+### 修复
+
+- **命令词干大小写折叠**（#998/#1000）：System32 的盘上真名全大写（`PING.EXE`/`NETSTAT.EXE`/`TRACERT.EXE`/`HOSTNAME.EXE`），#799 的词干字节精确契约使小写 `ping`/`netstat`/`tracert` 全部 `command not found`（`PING` 大写反而能跑、`which`/`command -v` 两张脸不一致）。fold 臂改为 stem ASCII 大小写折叠（字节相等仍优先；无扩展名盘名保持字节精确；解析拼写恒报盘上真名）——与 CMD/PowerShell/msys 全生态一致；#799 的 harvest 误抬面（小写 `r` 抬 `R.exe`）按 Windows 生态惯例重新接受。tests/issue799 套件改写为新契约并新增 System32 大写盘名回归。
+- **行编辑器 `${v^^}`/`${v:1:3}` 崩溃**（niubash#503，c143699c）：下标 walker 里不可达的 `LEX_WASDOL` `${` 臂被以裸 `{` 语义消费，交互输入含上述序列触发 6 GiB 分配失败（MSIX 与 NSIS 1.4.1 双复现）。删除该臂。
+- **cli_tests 与宿主 Winuxsh 安装面隔离**（#996）：测试 spawn 不再被宿主安装的环境变量污染。
+
+### 性能
+
+- **splits_unquoted no-IFS 短路重落地**（#995/#1002）：#992 门因空展开折叠语义回退（无引号空展开把一个字段折叠为零、词消失），重落地版加入 `!expanded.is_empty()` 准入；splits_gate 4 万对抗输入 × 5 IFS 态差分网兜底，Linux 13/13 upstream 套件与基线逐字节一致。
+- **assoc 交错访问固定成本**（#914）：`k[i]`/`k$i` 交错写读尾部的每操作固定开销削减；export/unset 交错循环二段身体削减（#984/#986/#920 后续）。
+- **信号提示事件每 8 个命令边界采样**（#682）：信号 hint event 从每命令一次降频。
+- **`[ $VAR -op N ]` 整数比较快展开**：测试面热路径。
+- **裸 `**` 全局排序、mapfile 批量拆分/存储、数组元素 quote 单分配**等 #607-#609/#661-#680 系列切片全部落定（详见下方各条）。
+
+### 新增
+
+- **仓库 logo**（#988）：青色 rotor-r 引擎标识。
+
 ## [Unreleased]
 
 ### 新增
@@ -71,6 +91,39 @@
 
 - **发行来源戳记补 dirty 工作树摘要**（#827 建议 3）：`--version` 的 `build:` 指纹此前只铸 `git rev-parse --short HEAD`——哈希诚实但不担保内容，v1.4.0 事故正是"banner 报某 commit、二进制实际编译了该 commit 加未提交改动"（#488 家族盲区：哈希可见、工作树内容不可验证）。现携带未提交改动的树铸 `<rev>-dirty-<8 hex>`，digest 为 `git diff HEAD --binary` 的 SHA-256 前 4 字节（暂存/未暂存改动皆入；未跟踪文件不置 dirty，同 `git describe --dirty`/`diff-index --quiet HEAD` 语义）：同内容同 digest，任何改动必改 banner，两个不同脏树不再可能印出同一戳。`RUBASH_BUILD_HASH` 显式钉值不能洗白脏树——钉值由 crate 侧 `option_env!` 直读（rustc dep-info 自带失效跟踪，改钉即重编），build.rs 把 git 派生戳发在独立变量 `RUBASH_GIT_STAMP`、脏半段单发 `RUBASH_GIT_DIRTY_SUFFIX`；钉值只赢修订半段，仓库在场时 `-dirty[-<digest>]` 仍追加。build.rs 不发任何 `cargo:rerun-if-*` 指令——任何一条（含 `rerun-if-env-changed`）都会让 cargo 退出默认整包扫描，增量重建即把陈旧戳烙进已变更的树（PR #939 评审复现的 #827 事故形：脏树增量构建仍印裸 HEAD）。`tests/build_rs_dirty.rs` 7 例 fixture（净树裸哈希、脏树 digest 稳定且随内容变、已暂存算脏、未跟踪不算脏、脏后缀恰为戳尾、源码级禁 rerun-if 守卫、还原恢复裸戳），与 niubash `tests/build_rs_dirty.rs` 同源。
 - **命令替换 pipeline-filter 死链删除**（#710）：`command_substitution_pipeline_filter` 的 8 条 filter 臂（sort/sed/tr/head/grep/wc/tail/uniq）连同其唯一调用链——`command_substitution_pipeline_output`、`timed_command_substitution_inner` 的 `|` 臂、`command_substitution_pipeline_first_stage`、孤儿助手 `split_pipeline_words`/`echo_raw_output`——自 rubash#117 平凡性 gate 之后不可达：gate 字节白名单拒绝 `|`，能抵达 filter 的替换体不可能含管线；且该链还只住在 `time` 前缀快捷方式内，进一步收窄。运行时复核：入口探针在 producer×filter 电池（含反引号、嵌套 comsub、alias 注入 `|`、`cat`/generic 首段、`time` 前缀形）上零命中；阳性对照（gate 临时放行 `|`）全部探针命中并复现休眠特征（`$(…|wc)` 默认单列 `1`，而活跃路径是三列）。`$( … | … )` 的可观测行为本就由真执行器管线（pipeline_exec）与外部二进制产出，删除零行为差；同步移除孤儿 doc-sync 测试与 `docs/builtins.md` 的 `substitution-fastpath-list` 机器块（审计 §2.5 加 resolution 注记）。新增 `tests/issue710_comsub_pipeline_reachability.rs` 钉住路由（wc 默认三列、echo 引导管线不吞、八 filter 走真执行器、time 前缀管线、末段状态语义），期望值与 WSL GNU 5.3.0 逐字节一致；全量失败集与基线双向一致。
+
+## [1.4.2] - 2026-10-21
+
+### 修复
+
+- **env unbind 丢弃继承的进程 env 副本**（#917 rework，#943）：unbind 面残留清理。
+- **read 对 fd-0 自 dup 走普通 fd-0 通道**（#975）。
+- **`${...}` IFS-mark 复制臂使用 cook 自身的 dolbrace span**（#977）：防逐臂特判回归。
+- Windows lane 补 `cargo test --lib`（#951），listing miss 以直查探针证明（#392 后续）。
+
+### 变更
+
+- **BASH_COMPAT 广告位跟随 vendored PATCHLEVEL 20**（#957/#895 链）。
+
+### 性能
+
+- expand 面：多字面量快路径镜像加固、walker 入口链去重、procsub 扫描白名单跳过；vartable P1a 脏写收口。
+
+## [1.4.1] - 2026-10-19
+
+### 修复
+
+- **patsub 替换管道中的用户 PUA 码点 E400 转义**（#843）。
+- **下标 ANSI-C 跨度的双引号态 + unset 操作数引号剥除**（#847）。
+- **pushd/popd 继承 cd 的 readonly bindpwd 裁决并指名真实的越界词**（#844/#848）。
+- **assoc 下标在 `((...))`/`let` 入口归一**（#828）。
+- **复合命令自身的重定向失败诊断走 fd 表且只发一次**（#826）。
+- `${var@P}` 命令替换状态括号、sudo 无 handler 路由钉死（#813 五项 CR 后续）。
+
+### 变更
+
+- crate 打包护栏：target 变体目录（如 target2-baseline，1.7GB 陈旧构建树）不得混入 cargo package（crates.io 上限 10MiB）。
+- `(A;B;)` 杂散闭括号族全模式钉到 GNU 5.3.0（#845）。
 
 ## [1.4.0] - 2026-10-10
 
