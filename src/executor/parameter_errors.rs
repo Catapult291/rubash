@@ -2030,6 +2030,19 @@ impl Executor {
         if self.dynamic_parameter_is_set(name) {
             return true;
         }
+        // GNU variables.c bind: att_invisible (rubash DECLARED_UNSET_VARS)
+        // means the cell carries no value — the name is unbound even when a
+        // stale typed-mirror cell or an inherited process-env residue
+        // exists (the same invariant the scalar value read applies at
+        // variable_state.rs — rubash#409; a `local NAME` declared-unset
+        // must report `NAME: unbound variable`, rubash#970). The
+        // contains_key conjunct keeps a leftover mark from masking a real
+        // binding the way a re-assignment leaves it.
+        if is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, name)
+            && !self.shell_state.env_vars.contains_key(name)
+        {
+            return false;
+        }
         // GNU variables.c find_variable returns the CELL, and the scalar
         // form reads element/key "0" of it:
         //   subst.c:7787-7790 parameter_brace_expand_word()

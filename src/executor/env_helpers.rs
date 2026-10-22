@@ -123,6 +123,27 @@ pub(in crate::executor) fn is_exportable_env_name(
         && !env_vars.is_marked(crate::executor::types::ASSOC_VARS, name)
 }
 
+/// Whether a LOCAL_EXPORT_ENV stash entry for `name` still applies to a
+/// child environment. The stash stands in for the shadowed outer
+/// binding's export-env slot while a local covers it; GNU
+/// variables.c:4336 export_environment_candidate collects candidates
+/// innermost-context-first and dedupes by name (variables.c:4149
+/// vlist_add), so the innermost visible exported binding wins and an
+/// invisible (declared-unset) or unexported local drops out — letting
+/// the shadowed outer value pass through. The stash therefore applies
+/// only while the live binding is NOT itself a live export candidate:
+/// bound in env_vars, marked exported, and of an exportable shape
+/// (rubash#970: `local FOO; FOO=localval` exports `localval`, not the
+/// inherited `parent`).
+pub(in crate::executor) fn local_export_env_entry_applies(
+    env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+) -> bool {
+    !(env_vars.is_marked(EXPORTED_VARS, name)
+        && is_exportable_env_name(env_vars, name)
+        && env_vars.get(name).is_some())
+}
+
 pub(in crate::executor) fn local_export_env_values(
     env_vars: &HashMap<String, String>,
 ) -> Vec<(String, String)> {

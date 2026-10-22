@@ -1580,6 +1580,17 @@ impl Executor {
                 }
             }
             self.shell_state.env_vars.remove(&name);
+            // GNU variables.c:2755 (make_local_variable): a value-less
+            // local carries att_invisible, so no inherited copy may feed
+            // reads either — drop the inherited process-env residue with
+            // the same existence-gated helper #943 used for `unset`
+            // (an inherited name predates the #916 write mirror and would
+            // otherwise resurrect through every table-miss fallback:
+            // exact_case_env_var bare-$NAME reads, nounset boundness —
+            // rubash#970). The shadowed binding's child-env contribution
+            // is preserved by the LOCAL_EXPORT_ENV stash above
+            // (export_environment_candidate, variables.c:4336).
+            crate::executor::local_helpers::unset_process_env(&name);
             // A fresh local shadows the outer variable in the typed owner too:
             // parameter expansion reads shell_state.variables first, so a
             // stale global scalar would keep leaking through (bash: `local X`
