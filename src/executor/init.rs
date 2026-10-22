@@ -187,6 +187,17 @@ impl Executor {
         let internal_respawn = env_vars.get("__RUBASH_COPROC_CHILD").map(String::as_str)
             == Some("1")
             || env_vars.contains_key("__RUBASH_SHELL_PID");
+        // rubash#1074: a respawned `&`/coproc child is GNU's forked subshell
+        // (execute_cmd.c:1576 execute_in_subshell: subshell_level++ in the
+        // child), so BASH_SUBSHELL inside it is parent_depth + 1, not 0.
+        // The spawn sites carry the target depth in this marker; consume it
+        // here so it never surfaces as a shell variable.
+        let respawned_subshell_depth = env_vars
+            .get("__RUBASH_SUBSHELL_DEPTH")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        env_vars.remove("__RUBASH_SUBSHELL_DEPTH");
+        env::remove_var("__RUBASH_SUBSHELL_DEPTH");
         // Rubash#234: a respawned `rubash -c` child is GNU's forked child —
         // it inherits the parent's job_control state and never re-runs
         // initialize_job_control. The env marker is stripped below, so
@@ -302,13 +313,14 @@ impl Executor {
                 local_typed_scopes: Vec::new(),
                 expanding_aliases: Vec::new(),
                 loop_depth: 0,
+                inherited_loop_depth: 0,
                 read_generation: 0,
                 read_generation_ceiling: 0,
                 command_number: 1,
                 function_depth: 0,
                 dollar_vars_changed_by_set: false,
                 random_state: RandomGen::seeded(),
-                subshell_depth: Cell::new(0),
+                subshell_depth: Cell::new(respawned_subshell_depth),
                 in_command_substitution: Cell::new(false),
                 stdin_redir: Cell::new(false),
                 xtrace_indirection_level: Cell::new(0),
@@ -615,6 +627,32 @@ impl Executor {
         env_vars
             .entry("IFS".to_string())
             .or_insert_with(|| " \t\n".to_string());
+        // GNU variables.c initialize_shell_variables binds these defaults
+        // for every fresh shell (an inherited value wins): OPTERR=1
+        // (getopts diagnostic default), PS4="+ " (xtrace prefix), and the
+        // compiled-in BASH_LOADABLES_PATH search list (rubash#1075,
+        // rubash#1076). They are ordinary (non-exported) variables, so
+        // introspection (`${OPTERR-unset}`, `declare -p PS4`) sees them
+        // exactly like GNU.
+        env_vars
+            .entry("OPTERR".to_string())
+            .or_insert_with(|| "1".to_string());
+        env_vars
+            .entry("PS4".to_string())
+            .or_insert_with(|| "+ ".to_string());
+        env_vars
+            .entry("BASH_LOADABLES_PATH".to_string())
+            .or_insert_with(|| {
+                "/usr/local/lib/bash:/usr/lib/bash:/opt/local/lib/bash:/usr/pkg/lib/bash:/opt/pkg/lib/bash:."
+                    .to_string()
+            });
+        // GNU shell.c/variables.c: at startup $_ falls back to the
+        // absolute pathname of the shell itself when the environment did
+        // not carry one (the invoking parent normally supplies it, and
+        // env -i script runs showed the binary path) — rubash#1076.
+        env_vars
+            .entry("_".to_string())
+            .or_insert_with(bash_path_value);
         env_vars.insert(
             SHELL_START_EPOCH.to_string(),
             current_epoch_seconds().to_string(),
@@ -627,6 +665,15 @@ impl Executor {
         // defaults. The rebuilds below overwrite the imported values, so the
         // inherited names must be applied first (invocation1.sub/2.sub child
         // inheritance).
+        // GNU variables.c:5820 + 6257 (sv_strict_posix in the special-var
+        // table, run by initialize_shell_variables): an IMPORTED
+        // POSIXLY_CORRECT — present with ANY value, even empty — turns
+        // posix mode on at startup (rubash#1054). This must run before
+        // the SHELLOPTS/BASHOPTS snapshots below so both list posix and
+        // the posix_vars walk results.
+        if env_vars.contains_key("POSIXLY_CORRECT") {
+            crate::builtins::set::set_shell_option(env_vars, "posix", true);
+        }
         if let Some(value) = env_vars.get("SHELLOPTS").cloned() {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::set::is_shell_option(name) {
