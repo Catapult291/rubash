@@ -392,9 +392,9 @@ impl Executor {
             [left, op, right, end]
                 if end == "]]"
                     && matches!(op.as_str(), "=" | "==" | "!=")
-                    && metadata
-                        .get(2)
-                        .is_some_and(|m| Self::conditional_rhs_word_is_quoted(&m.raw)) =>
+                    && metadata.get(2).is_some_and(|m| {
+                        Self::conditional_rhs_word_is_quoted(&m.raw) || m.raw.contains('\\')
+                    }) =>
             {
                 let left = self.expand_conditional_word(left);
                 let right = self.expand_conditional_word(right);
@@ -409,9 +409,9 @@ impl Executor {
             }
             [left, op, right]
                 if matches!(op.as_str(), "=" | "==" | "!=")
-                    && metadata
-                        .get(2)
-                        .is_some_and(|m| Self::conditional_rhs_word_is_quoted(&m.raw)) =>
+                    && metadata.get(2).is_some_and(|m| {
+                        Self::conditional_rhs_word_is_quoted(&m.raw) || m.raw.contains('\\')
+                    }) =>
             {
                 let left = self.expand_conditional_word(left);
                 let right = self.expand_conditional_word(right);
@@ -447,7 +447,24 @@ impl Executor {
 
     pub(super) fn conditional_string_binary(&mut self, left: &str, op: &str, right: &str) -> bool {
         let left = self.expand_conditional_word(left);
-        let right = self.expand_conditional_word(right);
+        // For the pattern operators the RHS backslashes are glob escape
+        // syntax, not quote-removal subjects (GNU cond.c: the pattern
+        // reaches patmatch with its backslashes intact — `a\\b` matches
+        // the literal `a\b`). The lexer's DATA_BACKSLASH carrier stands
+        // for ONE escaped backslash in the source; the pattern matcher
+        // needs it doubled so its own escape arm reads it as a literal
+        // backslash instead of an escape of the following character
+        // (rubash#1092). The metadata path (quote_aware_glob_rhs) handles
+        // the raw spelling directly; this is the no-metadata fallback.
+        let right = if matches!(op, "=" | "==" | "!=") {
+            let doubled = right.replace(
+                crate::executor::markers::DATA_BACKSLASH,
+                &crate::executor::markers::DATA_BACKSLASH.to_string().repeat(2),
+            );
+            self.expand_conditional_word(&doubled)
+        } else {
+            self.expand_conditional_word(right)
+        };
         self.xtrace_conditional_term(op, &left, Some(&right));
         let right_pattern = right.clone();
         let extglob = crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob")
