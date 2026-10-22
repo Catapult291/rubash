@@ -125,6 +125,17 @@ pub struct ShellState {
     /// `set -x`. rubash's base is 0 (indistinguishable from GNU's 1: both
     /// render the PS4 unchanged); each nested trap action adds one.
     pub(crate) xtrace_indirection_level: Cell<usize>,
+    /// print_cmd.c:445 indirection_level_string suspends xtrace while it
+    /// expands PS4 (`change_flag ('x', FLAG_OFF)` around
+    /// decode_prompt_string, restored afterwards). While suspended,
+    /// `xtrace_enabled()` reads false so command substitutions inside PS4
+    /// run untraced (rubash#1040), and `shell_option_flags()` omits `x`
+    /// so `$-` expanded in PS4 context has no `x` (rubash#1042) — both
+    /// match the C flag flip. A depth counter (not the env var itself)
+    /// so an inner `set -x` cannot re-enable tracing mid-expansion and
+    /// recurse unboundedly (a `PS4='$(set -x; ...)'` body hangs GNU 5.3
+    /// the same way; the gate terminates instead).
+    pub(crate) xtrace_suspended: Cell<usize>,
     /// execute_cmd.c:199 stdin_redir — the global recording whether the
     /// currently executing control structure redirected fd 0
     /// (execute_cmd.c:828 sets it from stdin_redirects, redir.c:1435).
@@ -247,6 +258,7 @@ pub(crate) struct InteriorSnapshot {
     subshell_depth: usize,
     in_command_substitution: bool,
     stdin_redir: bool,
+    xtrace_suspended: usize,
     arithmetic_expansion_error: bool,
     arithmetic_nonfatal_error: bool,
     arithmetic_fatal_error: bool,
@@ -299,6 +311,7 @@ impl ShellState {
             subshell_depth: self.subshell_depth.get(),
             in_command_substitution: self.in_command_substitution.get(),
             stdin_redir: self.stdin_redir.get(),
+            xtrace_suspended: self.xtrace_suspended.get(),
             arithmetic_expansion_error: self.arithmetic_expansion_error.get(),
             arithmetic_nonfatal_error: self.arithmetic_nonfatal_error.get(),
             arithmetic_fatal_error: self.arithmetic_fatal_error.get(),
@@ -334,6 +347,7 @@ impl ShellState {
         self.in_command_substitution
             .set(snapshot.in_command_substitution);
         self.stdin_redir.set(snapshot.stdin_redir);
+        self.xtrace_suspended.set(snapshot.xtrace_suspended);
         self.arithmetic_expansion_error
             .set(snapshot.arithmetic_expansion_error);
         self.arithmetic_nonfatal_error
@@ -388,6 +402,7 @@ impl Clone for ShellState {
             random_state: self.random_state.clone_state(),
             subshell_depth: Cell::new(self.subshell_depth.get()),
             xtrace_indirection_level: Cell::new(self.xtrace_indirection_level.get()),
+            xtrace_suspended: Cell::new(self.xtrace_suspended.get()),
             in_command_substitution: Cell::new(self.in_command_substitution.get()),
             stdin_redir: Cell::new(self.stdin_redir.get()),
             job_table: self.job_table.clone(),
