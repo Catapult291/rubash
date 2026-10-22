@@ -2786,7 +2786,7 @@ where
         return Ok(127);
     }
 
-    if operand.chars().all(|ch| ch.is_ascii_digit()) {
+    if !operand.is_empty() && operand.chars().all(|ch| ch.is_ascii_digit()) {
         writeln!(
             stderr,
             "{diagnostic_prefix}wait: pid {operand} is not a child of this shell"
