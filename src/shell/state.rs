@@ -89,6 +89,16 @@ pub struct ShellState {
     pub(crate) expanding_aliases: Vec<String>,
     /// execute_cmd.c loop_level — break/continue scope boundary.
     pub(crate) loop_depth: usize,
+    /// Loop depth inherited across a fork boundary (command substitution
+    /// body, simple pipeline/async element): GNU's fork copies loop_level
+    /// into the child, whose parse_and_execute is not wrapped by
+    /// execute_in_subshell, so break/continue there are meaningful and
+    /// silently end the child's own command list (builtins/break.def
+    /// check_loop_level sees loop_level > 0). Compound elements and `( )`
+    /// subshells DO pass execute_in_subshell, which resets loop_level to 0
+    /// (execute_cmd.c:1642, Posix interp 842), so those boundaries leave
+    /// this at 0 (rubash#1064, rubash#1065).
+    pub(crate) inherited_loop_depth: usize,
     /// rubash#817 read-unit identity for the executor-level alias same-read
     /// guard (arithmetic_aliases.rs alias_defined_on_current_line). GNU
     /// expands an alias use only when the definition was consumed by an
@@ -400,6 +410,7 @@ impl Clone for ShellState {
             local_typed_scopes: self.local_typed_scopes.clone(),
             expanding_aliases: self.expanding_aliases.clone(),
             loop_depth: self.loop_depth,
+            inherited_loop_depth: self.inherited_loop_depth,
             read_generation: self.read_generation,
             read_generation_ceiling: self.read_generation_ceiling,
             command_number: self.command_number,

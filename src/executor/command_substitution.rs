@@ -1447,10 +1447,21 @@ impl Executor {
         // subst.c:7143 command_substitute), so new semantic fields are
         // isolated automatically — no per-field list to maintain.
         let mut shell_state = self.shell_state.clone();
-        // GNU forks carry the parent's loop_level, but a `break` in a real
-        // child can only end the child. In-process the loop-break flag
-        // would reach the parent's live loop, so the boundary resets it —
-        // the same rule the flat `( )` region applies at entry.
+        // GNU forks carry the parent's loop_level into the child, and the
+        // substitution body / a simple pipeline element runs through
+        // parse_and_execute there — NOT execute_in_subshell — so a
+        // break/continue in the child is meaningful (no "only meaningful"
+        // diagnostic) and ends only the child's own command list
+        // (builtins/break.def check_loop_level; subst.c:7143
+        // command_substitute). The clone cannot unwind the parent's live
+        // loop frames, so the depth crosses as `inherited_loop_depth`:
+        // execute_loop_control validates against it and ends the child's
+        // list instead of raising Break into the parent (rubash#1064,
+        // rubash#1065). Compound boundaries that DO pass
+        // execute_in_subshell (execute_cmd.c:1642 resets loop_level) clear
+        // it again at their own entry.
+        shell_state.inherited_loop_depth =
+            self.shell_state.loop_depth + self.shell_state.inherited_loop_depth;
         shell_state.loop_depth = 0;
         shell_state
             .subshell_depth

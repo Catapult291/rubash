@@ -641,6 +641,11 @@ impl Executor {
         // like the unwind-protect does.
         let saved_loop_depth = self.shell_state.loop_depth;
         self.shell_state.loop_depth = 0;
+        // The fresh loop scope covers fork-inherited depth too: a function
+        // called from a comsub body inside a loop still hits
+        // check_loop_level's empty case (rubash#1064/#1065 boundary rule).
+        let saved_inherited_loop_depth = self.shell_state.inherited_loop_depth;
+        self.shell_state.inherited_loop_depth = 0;
         // GNU execute_cmd.c:5205 (execute_function) runs a copy of the
         // stored body command, and execute_command_internal:854 applies
         // the DEFINITION's redirect list when that body command runs —
@@ -726,6 +731,7 @@ impl Executor {
             self.resume_alias_streamed(saved_alias_streamed);
         }
         self.shell_state.loop_depth = saved_loop_depth;
+        self.shell_state.inherited_loop_depth = saved_inherited_loop_depth;
         // GNU execute_cmd.c:5269+ — the call's input redirections are
         // undone when the function returns.
         while let Some(binding) = fd0_bindings.pop() {

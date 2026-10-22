@@ -55,7 +55,13 @@ impl Executor {
         kind: LoopControlKind,
     ) -> Result<(), ExecuteError> {
         let mut stderr = Vec::new();
-        if self.shell_state.loop_depth == 0 {
+        // GNU loop_level as seen by this executor: loops executing HERE
+        // (loop_depth) plus the depth a fork boundary carried in
+        // (inherited_loop_depth — command substitution bodies and simple
+        // pipeline/async elements inherit it, rubash#1064/#1065).
+        let own_loop_depth = self.shell_state.loop_depth;
+        let total_loop_depth = own_loop_depth + self.shell_state.inherited_loop_depth;
+        if total_loop_depth == 0 {
             // GNU break.def check_loop_level (BREAK_COMPLAINS): the
             // out-of-loop diagnostic is suppressed in posix mode; the status
             // stays zero either way (func5.sub posix testfunc `break`).
@@ -77,7 +83,7 @@ impl Executor {
 
         match loop_control_level(&cmd.words[1..]) {
             Ok(level) => {
-                let level = level.min(self.shell_state.loop_depth);
+                let level = level.min(total_loop_depth);
                 // GNU break.def/continue.def return EXECUTION_SUCCESS for an
                 // in-range count — the builtin has no user-visible status of
                 // its own. Establish that status before unwinding (rubash#702):
@@ -90,6 +96,18 @@ impl Executor {
                 // `until false; do break; done` must leave $? = 0, and
                 // `until (exit 7); do break; done` must not leak the 7.
                 self.exit_code = 0;
+                if own_loop_depth == 0 {
+                    // Fork-boundary child (comsub body / simple pipeline or
+                    // async element): GNU's `breaking`/`continuing` unwind
+                    // only the child's own parse_and_execute list — the
+                    // clone has no live loop frames to receive a Break, so
+                    // end this executor's command list with the builtin's
+                    // success status. The boundary caller maps ExitCode to
+                    // the element/substitution status and the parent shell
+                    // (and its loop) carries on unaffected (rubash#1064,
+                    // rubash#1065).
+                    return Err(ExecuteError::ExitCode(0));
+                }
                 match kind {
                     LoopControlKind::Break => Err(ExecuteError::Break(level)),
                     LoopControlKind::Continue => Err(ExecuteError::Continue(level)),
@@ -103,8 +121,16 @@ impl Executor {
                     kind.name()
                 )?;
                 self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-                self.exit_code = 1;
-                Ok(())
+                // GNU builtins/common.c get_numeric_arg: "too many
+                // arguments" goes through the same fatal channel as a
+                // non-numeric count (sh_toomanyargs -> jump_to_top_level):
+                // a non-interactive shell exits 2 and the rest of the
+                // script never runs; interactive DISCARDs the list
+                // (rubash#1066 — it is NOT a per-iteration rc=1).
+                if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
+                    return Err(ExecuteError::ExpansionFailure(2));
+                }
+                Err(ExecuteError::ExitCode(2))
             }
             Err(LoopControlError::OutOfRange(value)) => {
                 writeln!(
@@ -127,6 +153,11 @@ impl Executor {
                 // cases return Break.
                 self.break_failure_status.set(Some(1));
                 self.exit_code = 1;
+                if own_loop_depth == 0 {
+                    // Fork-boundary child: `breaking = loop_level` ends the
+                    // child's list with the builtin's failure status (1).
+                    return Err(ExecuteError::ExitCode(1));
+                }
                 let level = self.shell_state.loop_depth;
                 Err(ExecuteError::Break(level))
             }

@@ -684,6 +684,9 @@ impl Executor {
                 subshell_fd_table = Some(self.fd_table.clone());
                 subshell_cwd = env::current_dir().ok();
                 self.shell_state.loop_depth = 0;
+                // execute_in_subshell resets loop_level (execute_cmd.c:1642):
+                // fork-inherited depth does not cross a `( )` region either.
+                self.shell_state.inherited_loop_depth = 0;
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
