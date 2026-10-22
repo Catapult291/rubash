@@ -478,6 +478,21 @@ impl ConditionalArithParser<'_> {
         op: &str,
         rhs: i128,
     ) -> Option<i128> {
+        self.assign_lvalue_precaptured(lvalue, op, rhs, None)
+    }
+
+    /// `precaptured` is the lvalue's value read BEFORE the RHS was parsed
+    /// (GNU expassign's expcond read, expr.c:511-626); compound assignment
+    /// must combine THAT value with the RHS, not a post-RHS re-read
+    /// (rubash#1113). Callers that evaluate the RHS before ever seeing the
+    /// lvalue pass None and keep the re-read.
+    pub(super) fn assign_lvalue_precaptured(
+        &mut self,
+        lvalue: &ArithLValue,
+        op: &str,
+        rhs: i128,
+        precaptured: Option<i128>,
+    ) -> Option<i128> {
         // GNU expr.c:607-615 expassign: the bind is skipped under noeval —
         // no readonly check, no current-value read, no write. The computed
         // value is still returned to the caller.
@@ -495,7 +510,10 @@ impl ConditionalArithParser<'_> {
             self.set_lvalue(&lvalue, rhs);
             return Some(rhs);
         }
-        let current = self.lvalue_value(&lvalue)?;
+        let current = match precaptured {
+            Some(value) => value,
+            None => self.lvalue_value(&lvalue)?,
+        };
         let value = match op {
             "+=" => bash_arith(current + rhs),
             "-=" => bash_arith(current - rhs),

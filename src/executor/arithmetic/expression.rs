@@ -39,6 +39,22 @@ impl ConditionalArithParser<'_> {
             if let Some(op) = self.consume_assignment_operator() {
                 self.note_op(op_start);
                 self.skip_ws();
+                // GNU expr.c:511-626 expassign: the LHS operand was
+                // evaluated by expcond BEFORE the recursive expassign call
+                // parses the RHS, so for OP_ASSIGN the saved lvalue value
+                // predates any RHS side effect on the same variable —
+                // `j=5; $((j+=j-=2))` is 5+3=8, not 3+3=6 (rubash#1113).
+                // Capture that read here, while the variable still holds
+                // its pre-RHS value (for non-`=` operators
+                // parse_lvalue_for_assignment has already evaluated the
+                // subscript, exactly like the STR token read). Plain `=`
+                // never reads the lvalue, and its deferred-subscript law
+                // (expr.c:1395-1401) stays untouched.
+                let precaptured = if op != "=" {
+                    Some(self.lvalue_value(&lvalue)?)
+                } else {
+                    None
+                };
                 let rhs_start = self.pos;
                 let rhs = self.parse_assignment()?;
                 // GNU expr.c:549-555: `a /= 0` / `a %= 0` evalerrors
@@ -48,7 +64,7 @@ impl ConditionalArithParser<'_> {
                 if matches!(op, "/=" | "%=") && rhs == 0 && self.noeval == 0 {
                     return self.fail("division by 0", rhs_start);
                 }
-                return self.assign_lvalue(&lvalue, op, rhs);
+                return self.assign_lvalue_precaptured(&lvalue, op, rhs, precaptured);
             }
         }
         self.pos = start;
