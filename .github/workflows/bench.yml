@@ -1,0 +1,51 @@
+name: Bench
+
+# Machine-readable perf sweep only. Deliberately decoupled from Release:
+# this workflow has no `needs:` on any release job, no release job depends
+# on it, and it never publishes, commits, or edits the site. It only runs
+# scripts/bench-full.sh and uploads the JSON/TSV sidecars as artifacts.
+# Android (Termux真机) numbers cannot come from here — no hosted runner
+# exists for the phone. They are produced manually: run bench-full.sh
+# on-device, paste the JSON/TSV into niubash#352, site promotion is manual.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # nightly UTC
+    - cron: "17 3 * * *"
+  pull_request:
+    types:
+      - labeled
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Full bench sweep (artifacts only)
+    # PRs run only when labeled `bench`; dispatch and schedule always run.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run bench-full.sh
+        run: bash scripts/bench-full.sh
+
+      - name: Upload bench JSON/TSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            target/bench-results/*.json
+            target/bench-results/*.tsv
