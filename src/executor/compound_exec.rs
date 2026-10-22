@@ -2059,6 +2059,12 @@ impl Executor {
         // `(x=${!bad})` still fires the parent's ERR trap.
         let saved_expansion_failed = self.command_expansion_failed.get();
         self.command_expansion_failed.set(false);
+        // rubash#1012: the body runs in place on this executor, but GNU
+        // forked it — an `exec` in the body replaces only the child's image
+        // (setting the child's exec_replaced latch), while the parent keeps
+        // its own EXIT trap. Save/restore the latch like the fd table so a
+        // subshell exec cannot disarm the parent's trap.
+        let saved_exec_replaced = self.exec_replaced;
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
         self.shell_state.loop_depth = 0;
@@ -2204,6 +2210,7 @@ impl Executor {
                 self.restore_flat_subshell(saved_state, saved_cwd);
                 self.fd_table = saved_fd_table;
                 self.command_expansion_failed.set(saved_expansion_failed);
+                self.exec_replaced = saved_exec_replaced;
                 return Err(error);
             }
             body_owned = Some(body_ast.commands);
@@ -2309,6 +2316,7 @@ impl Executor {
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
+                self.exec_replaced = saved_exec_replaced;
                 return Err(error);
             }
         };
@@ -2321,6 +2329,7 @@ impl Executor {
                 self.restore_flat_subshell(saved_state.clone(), saved_cwd.clone());
                 self.fd_table = saved_fd_table.clone();
                 self.command_expansion_failed.set(saved_expansion_failed);
+                self.exec_replaced = saved_exec_replaced;
                 return Err(error);
             }
             None => status,
@@ -2332,6 +2341,7 @@ impl Executor {
         self.restore_flat_subshell(saved_state, saved_cwd);
         self.fd_table = saved_fd_table;
         self.command_expansion_failed.set(saved_expansion_failed);
+        self.exec_replaced = saved_exec_replaced;
         let finish_result = self.finish_compound_output_process_substitutions(group_outputs);
         // rubash#846 (GNU execute_cmd.c:1808-1833 execute_in_subshell): the
         // forked child lifts CMD_INVERT_RETURN off the direct body and flips

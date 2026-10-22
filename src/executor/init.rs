@@ -358,6 +358,7 @@ impl Executor {
             subshell_fork_collapse: std::cell::Cell::new(false),
             trap_saved_exit_value: None,
             trap_saved_exit_context: 0,
+            exec_replaced: false,
             source_nest_depth: 0,
             sigchld_notifications_pending: std::cell::Cell::new(0),
             pending_signal_notices: std::cell::RefCell::new(Vec::new()),

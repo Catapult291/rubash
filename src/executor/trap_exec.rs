@@ -705,6 +705,15 @@ impl Executor {
         exit_status: i32,
         redirect_cmd: Option<&CommandNode>,
     ) -> Result<i32, ExecuteError> {
+        // rubash#1012 (GNU builtins/exec.def exec_builtin ->
+        // execute_cmd.c:6126 shell_execve): a successful `exec command`
+        // replaces the shell image with no exit path, and trap.c:1440
+        // reset_or_restore_signal_handlers cleared SIG_TRAPPED for the exit
+        // trap before a failing shell_execve — neither runs the EXIT trap.
+        // The exec-replacement unwind carries the exec_replaced latch.
+        if self.exec_replaced {
+            return Ok(exit_status);
+        }
         let Some(action) = crate::builtins::trap::take_exit_trap(&mut self.shell_state.env_vars)
         else {
             return Ok(exit_status);
@@ -3788,10 +3797,39 @@ impl Executor {
                 || self.shell_state.subshell_depth.get() > 0
                 || (!interactive && !execfail)
             {
+                // rubash#1012: only the pre-reset search failure keeps the
+                // EXIT trap (sh_notfound -> failed_exec -> exit_shell with
+                // SIG_TRAPPED still set). A resolved command — or any slash
+                // operand, which bypasses search — passed
+                // reset_signal_handlers before shell_execve, so the
+                // replacement unwind must not run the trap.
+                if self.exec_reached_post_reset(&cmd.words[1..]) {
+                    self.exec_replaced = true;
+                }
                 return Err(ExecuteError::ExitCode(status));
             }
         }
         Ok(())
+    }
+
+    /// Whether GNU exec_builtin would have passed reset_signal_handlers
+    /// (trap.c:1480) before attempting shell_execve — i.e. the command word
+    /// resolved to a non-null `command` (builtins/exec.def:151-169). A slash
+    /// anywhere in the name bypasses search_for_command (always post-reset);
+    /// otherwise only a successful PATH search reaches the reset. The
+    /// pre-reset search failure (sh_notfound -> failed_exec -> exit_shell)
+    /// keeps the EXIT trap; everything post-reset does not (rubash#1012).
+    fn exec_reached_post_reset(&self, args: &[String]) -> bool {
+        let Some(index) = crate::builtins::exec::command_operand_index(args) else {
+            return false;
+        };
+        let Some(command) = args.get(index) else {
+            return false;
+        };
+        if command.contains('/') || command.contains('\\') {
+            return true;
+        }
+        crate::executor::path::find_user_command(command, &self.shell_state.env_vars).is_some()
     }
 
     /// Run `exec env ...` through rubash's internal emulation of the

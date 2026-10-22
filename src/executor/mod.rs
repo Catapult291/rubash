@@ -610,6 +610,18 @@ pub struct Executor {
     /// GNU trap.c:383 trap_return_context — the function + source nesting
     /// depth at the moment the current trap action was fired.
     trap_saved_exit_context: usize,
+    /// GNU builtins/exec.def exec_builtin + execute_cmd.c:6126 shell_execve:
+    /// a successful `exec command` replaces the shell image and never takes
+    /// the exit path, so the EXIT trap does not run (shell.c:985 exit_shell
+    /// -> run_exit_trap is bypassed entirely). trap.c:1440
+    /// reset_or_restore_signal_handlers clears SIG_TRAPPED for the exit trap
+    /// (keeping the string) before shell_execve, so a post-reset execve
+    /// failure also exits without the trap — only the pre-reset search
+    /// failure (command == 0 -> sh_notfound -> failed_exec) keeps it.
+    /// Rubash cannot execve, so it spawns the replacement and unwinds with
+    /// its status; this latch tells the exit-trap choke point to skip the
+    /// action on that unwind (rubash#1012).
+    exec_replaced: bool,
     /// GNU execute_cmd.c:330 sourcenest — active `.`/source frames.
     source_nest_depth: usize,
     /// Child-death notifications that arrived while the SIGCHLD trap action
