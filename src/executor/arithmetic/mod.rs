@@ -174,6 +174,129 @@ pub(in crate::executor) fn literal_decimal_subscript(resolved: &str) -> Option<i
     text.parse::<i128>().ok()
 }
 
+/// Pure-variable indexed-subscript fast path: the resolved subscript is
+/// exactly one shell name whose current value is decimal-literal text (an
+/// empty or unset name reads as 0) — GNU arrayfunc.c:1353-1391
+/// array_expand_index -> evalexp evaluates the bare name with no nested
+/// expansion, so the whole pre-evaluation pipeline (re-expansion, the
+/// assoc-subscript scan, quote normalization, the nounset scan, the dynamic
+/// context snapshot, the full parse) is skippable. The loaded value reuses
+/// the existing decimal lane above, so octal-looking (`010`), signed
+/// (`-5`), expression or recursive values stay on the full pipeline with
+/// byte-identical GNU semantics. Whitelist admission, never a symptom
+/// guard — any doubt returns None and the caller runs the slow path:
+/// - non-name text (operators, `$`/quotes/brackets) is not a bare read;
+/// - `set -u` stays slow so the unbound diagnostic keeps its slow path;
+/// - dynamic spellings (RANDOM/SECONDS/.../BASHPID/..., `__RUBASH_*`)
+///   read live state and never constant-fold;
+/// - array/assoc/nameref marks bind through their own helpers, not the
+///   scalar read.
+pub(in crate::executor) fn plain_variable_subscript_index(
+    resolved: &str,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Option<i128> {
+    if !is_shell_name(resolved) || arith_parse_cache_is_dynamic(resolved) {
+        return None;
+    }
+    if is_marked_var(env_vars, ARRAY_VARS, resolved)
+        || is_marked_var(env_vars, ASSOC_VARS, resolved)
+        || is_marked_var(env_vars, ASSOC_128_VARS, resolved)
+        || is_marked_var(env_vars, NAMEREF_VARS, resolved)
+    {
+        return None;
+    }
+    if crate::builtins::set::shell_option_enabled(env_vars, "nounset") {
+        return None;
+    }
+    let value = env_vars
+        .get(resolved)
+        .cloned()
+        .or_else(|| std::env::var(resolved).ok())
+        .unwrap_or_default();
+    // GNU expr.c:271 subexpr on the variable's value: empty reads as 0
+    // (variable_value -> evaluate_variable_text's trim-empty arm).
+    if value.trim().is_empty() {
+        return Some(0);
+    }
+    // The existing decimal lane admits only non-zero-led digit text, so
+    // every other shape (octal, signs, nested expressions, self-recursion)
+    // keeps the slow evaluator's exact semantics.
+    literal_decimal_subscript(&value)
+}
+
+#[cfg(test)]
+mod variable_subscript_tests {
+    use super::plain_variable_subscript_index;
+    use crate::shell::var_table::VarTable;
+
+    fn table_with(pairs: &[(&str, &str)]) -> VarTable {
+        let mut table = VarTable::default();
+        for (name, value) in pairs {
+            table.insert((*name).to_string(), (*value).to_string());
+        }
+        table
+    }
+
+    #[test]
+    fn plain_decimal_values_read_directly() {
+        let table = table_with(&[
+            ("i", "42"),
+            ("zero", "0"),
+            ("empty", ""),
+            ("blank", "   "),
+            ("ws", "  7  "),
+        ]);
+        assert_eq!(plain_variable_subscript_index("i", &table), Some(42));
+        assert_eq!(plain_variable_subscript_index("zero", &table), Some(0));
+        // GNU expr.c:271 subexpr on the value: empty reads as 0.
+        assert_eq!(plain_variable_subscript_index("empty", &table), Some(0));
+        assert_eq!(plain_variable_subscript_index("blank", &table), Some(0));
+        assert_eq!(plain_variable_subscript_index("ws", &table), Some(7));
+        // Unset names read as 0 (nounset off).
+        assert_eq!(
+            plain_variable_subscript_index("never_set_xyz", &table),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn doubt_falls_through_to_slow() {
+        let table = table_with(&[
+            ("oct", "010"),
+            ("neg", "-1"),
+            ("plus", "+2"),
+            ("expr", "1+1"),
+            ("name", "j"),
+            ("hex", "0x10"),
+        ]);
+        // Non-decimal values keep the full evaluator (octal, signs,
+        // nested expressions, recursion).
+        for subscript in ["oct", "neg", "plus", "expr", "name", "hex"] {
+            assert_eq!(
+                plain_variable_subscript_index(subscript, &table),
+                None,
+                "{subscript} must stay slow"
+            );
+        }
+        // Dynamic spellings read live state, never constant-fold.
+        for subscript in ["RANDOM", "SECONDS", "LINENO", "BASHPID", "__RUBASH_X"] {
+            assert_eq!(
+                plain_variable_subscript_index(subscript, &table),
+                None,
+                "{subscript} must stay slow"
+            );
+        }
+        // Non-name text is not a bare read.
+        for subscript in ["", "i+1", "$i", "a[0]", "1", "  "] {
+            assert_eq!(
+                plain_variable_subscript_index(subscript, &table),
+                None,
+                "{subscript:?} must stay slow"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod literal_subscript_tests {
     use super::literal_decimal_subscript;
@@ -709,6 +832,21 @@ impl Executor {
                 crate::executor::subscript_expansion::IndexedSubscript::Index(index) => Some(index),
                 _ => None,
             };
+        }
+        // Pure-variable fast path (`a[i]` with a plain-decimal `i`): one
+        // scalar load replaces the re-expansion, the assoc-subscript scan,
+        // the dynamic snapshot and the full parse. The helper reuses the
+        // decimal lane on the loaded value; doubt falls through unchanged.
+        // The hit is memoized like the slow path's result so the layered
+        // passes evaluate the subscript once per word.
+        if let Some(index) = plain_variable_subscript_index(resolved, &self.shell_state.env_vars) {
+            if let Some(key) = memo_key {
+                crate::executor::expand_braced_indices::sub_idx_store(
+                    key,
+                    crate::executor::subscript_expansion::IndexedSubscript::Index(index),
+                );
+            }
+            return Some(index);
         }
         self.shell_state.arithmetic_last_error_category.set(None);
         let _ = take_arith_eval_error();
