@@ -30,15 +30,52 @@ jobs:
           stale-pr-label: "stale"
           operations-per-run: 200
   greet:
-    if: github.event_name == 'issues' || github.event_name == 'pull_request_target'
+    # Greet actual first-time contributors with a precise, fail-closed check.
+    # Replaces actions/first-interaction, whose first-time detection misfired
+    # and greeted the repo owner on their own bug reports (six greetings on
+    # 2026-10-22) — its API lookup silently treats rate-limit/abuse failures
+    # as "no prior contributions". Here: exact total_count via the search
+    # API, maintainers excluded up front, and ANY API error skips the
+    # greeting (never greet on uncertainty).
+    if: >
+      (github.event_name == 'issues' && github.event.action == 'opened') ||
+      (github.event_name == 'pull_request_target' && github.event.action == 'opened')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/first-interaction@v3
-        with:
-          # Inputs are snake_case in first-interaction@v3 (action.yml:
-          # issue_message / pr_message / repo_token). Hyphenated spellings
-          # are not declared by the action, so it warns "Unexpected input(s)"
-          # and every first-time contribution goes ungreeted (niubash#224).
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          issue_message: "欢迎！这是你在本仓库的第一个 ISSUE 🎉 维护者会尽快跟进；报 bug 请附 `rubash --version`、系统平台与最小复现脚本。"
-          pr_message: "欢迎！这是你的第一个 PR 🎉 请确认已跑过本地测试套件；CI 通过后维护者会 review。"
+      - name: Greet first-time contributors (fail-closed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTHOR: ${{ github.event.issue.user.login || github.event.pull_request.user.login }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          MAINTAINERS: "caomengxuan666"
+          ISSUE_MESSAGE: "欢迎！这是你在本仓库的第一个 ISSUE 🎉 维护者会尽快跟进；报 bug 请附 `niu --version`、系统平台与最小复现脚本。"
+          PR_MESSAGE: "欢迎！这是你的第一个 PR 🎉 请确认已跑过本地测试套件；CI 通过后维护者会 review。"
+        run: |
+          set -euo pipefail
+          for m in $MAINTAINERS; do
+            if [ "$AUTHOR" = "$m" ]; then
+              echo "maintainer $AUTHOR — no greeting"
+              exit 0
+            fi
+          done
+          # Exact prior-contribution count (issues + PRs). The author's own
+          # current record is included, so first-time means total_count <= 1.
+          total=$(gh api "search/issues" \
+            -f q="repo:${GITHUB_REPOSITORY} author:${AUTHOR}" \
+            --jq '.total_count' 2>/dev/null) || {
+            echo "contribution lookup failed — skipping greeting (fail-closed)"
+            exit 0
+          }
+          case "$total" in
+            ''|*[!0-9]*) echo "unexpected lookup result — skipping"; exit 0 ;;
+          esac
+          if [ "$total" -le 1 ]; then
+            echo "first-time contributor $AUTHOR (total=$total) — greeting"
+            if [ -n "${GITHUB_EVENT_ISSUE:-}" ] || [ "${{ github.event_name }}" = "issues" ]; then
+              gh issue comment "$NUMBER" --body "$ISSUE_MESSAGE"
+            else
+              gh pr comment "$NUMBER" --body "$PR_MESSAGE"
+            fi
+          else
+            echo "not first-time (total=$total) — no greeting"
+          fi
