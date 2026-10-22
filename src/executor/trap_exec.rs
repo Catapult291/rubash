@@ -543,6 +543,23 @@ impl Executor {
         caller_line: usize,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // GNU evalstring.c parse_and_execute parses the string with the
+        // CURRENT extglob_flag (builtins/shopt.def:640 propagates the
+        // option to the parser when the builtin RUNS). The lexer global
+        // is a lex-time simulation for the script stream: the feeder
+        // flips it when it LEXES a `shopt -s/-u extglob` line, which can
+        // be lines ahead of execution — an eval running before that
+        // shopt line executes would see the gate flipped early and
+        // accept extglob patterns GNU rejects (rubash#1114). Pin the
+        // gate to the live runtime shopt state for this reparse
+        // (tokenize + parse; the case parser consults the global at
+        // parse time) and restore the stream value afterwards — a shopt
+        // executed BY the eval'd code re-pins it through set_option.
+        let saved_extglob = crate::lexer::parse_extended_glob();
+        crate::lexer::set_parse_extended_glob(crate::builtins::shopt::option_enabled(
+            &self.shell_state.env_vars,
+            "extglob",
+        ));
         let mut tokens = crate::lexer::tokenize(source);
         // GNU eval reports errors with the caller line numbering:
         // the string lines continue the script line counter
@@ -561,6 +578,7 @@ impl Executor {
                 source_line_offset: caller_line.saturating_sub(1),
             },
         );
+        crate::lexer::set_parse_extended_glob(saved_extglob);
         self.apply_command_output_redirects(cmd, &mut ast)?;
         // A syntax error inside the eval string makes eval return 2;
         // it does not abort the calling script the way a top-level
