@@ -1466,12 +1466,25 @@ impl Executor {
             // inner command ran and the assignment carries its status, so
             // the ERR trap still fires there.
             || self.command_expansion_failed.get()
-            || (self.shell_state.function_depth > 0
-                && !crate::builtins::set::shell_option_enabled(
-                    &self.shell_state.env_vars,
-                    "errtrace",
-                ))
         {
+            return Ok(());
+        }
+        // No function-depth gate here (rubash#1163): GNU execute_cmd.c
+        // execute_function (5284-5290) saves and CLEARS an inherited ERR
+        // trap at function entry when errtrace is off and restores it at
+        // exit — function_calls.rs mirrors that — so any ERR action
+        // visible while function_depth > 0 was set inside a function and
+        // must fire for that function's failing commands. The former
+        // `function_depth > 0 && !errtrace` early return here suppressed
+        // exactly those function-local traps, checking (in effect) only
+        // the function's final status at depth 0.
+        // rubash#1164: GNU adjudicates against was_error_trap sampled
+        // before the failing command started (execute_cmd.c:914) — a trap
+        // installed BY that command does not fire for it. The action string
+        // itself is read live here, as GNU reads trap_list at fire time (a
+        // trap replaced mid-command fires its NEW action at the enclosing
+        // frame whose sample was armed).
+        if self.err_trap_armed_sample.get() == Some(false) {
             return Ok(());
         }
         let Some(action) =
