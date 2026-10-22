@@ -1537,14 +1537,20 @@ impl Executor {
         // the physical line where the command's logical line ended (advanced
         // by any earlier heredoc bodies of the same command), not the `<<`
         // line. internal_warning's prefix uses line_number after the body
-        // scan, i.e. gather_line + body lines consumed.
+        // scan. Prefer the lexer's physical end line: with an unquoted
+        // delimiter GNU joins `\<newline>` pairs while collecting
+        // (parse.y read_a_line via read_secondary_line), so the stored body
+        // can hold fewer newlines than the physical lines consumed
+        // (rubash#1028); only fall back to gather + stored lines.
         let gather_line = cmd.heredoc_gather_line.or(cmd.line).unwrap_or(1);
         let body_lines = cmd
             .heredoc
             .as_deref()
             .map(unterminated_heredoc_body_line_count)
             .unwrap_or(0);
-        let warning_line = gather_line + body_lines;
+        let warning_line = cmd
+            .heredoc_end_line
+            .unwrap_or_else(|| gather_line + body_lines);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
         eprintln!(
             "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
@@ -1565,7 +1571,12 @@ impl Executor {
             .as_deref()
             .map(unterminated_heredoc_body_line_count)
             .unwrap_or(0);
-        let delimiter_line = gather_line + body_lines + 1;
+        // The physical end line is the delimiter line itself (see
+        // report_unterminated_heredoc for the `\<newline>`-join rationale,
+        // rubash#1028).
+        let delimiter_line = cmd
+            .heredoc_end_line
+            .unwrap_or_else(|| gather_line + body_lines + 1);
         let delimiter = cmd.heredoc_delimiter.as_deref().unwrap_or("");
         eprintln!(
             "{}warning: here-document at line {gather_line} delimited by end-of-file (wanted `{delimiter}')",
@@ -1635,7 +1646,9 @@ impl Executor {
             .as_deref()
             .map(unterminated_heredoc_body_line_count)
             .unwrap_or(0);
-        let warning_line = cmd.heredoc_gather_line.or(cmd.line).unwrap_or(1) + body_lines;
+        let warning_line = cmd
+            .heredoc_end_line
+            .unwrap_or_else(|| cmd.heredoc_gather_line.or(cmd.line).unwrap_or(1) + body_lines);
         let syntax_line = warning_line + 1;
         eprintln!(
             "{}syntax error: unexpected end of file from `(' command on line {start_line}",

@@ -2010,8 +2010,12 @@ fn push_unclosed_paren_error(state: &mut ParseState, tokens: &[Token], start: us
         let body_lines = body.lines().count();
         // A terminated or delimiter-prefixed `)` body also consumed the
         // delimiter line; an unterminated body ended at EOF on its last
-        // body line.
-        let consumed_last = gather_line + body_lines + usize::from(!unterminated);
+        // body line. Prefer the lexer's physical end line: an unquoted
+        // delimiter joins `\<newline>` pairs while collecting, so stored
+        // newlines can undercount the physical lines consumed (rubash#1028).
+        let consumed_last = token
+            .heredoc_end_line
+            .unwrap_or_else(|| gather_line + body_lines + usize::from(!unterminated));
         last_line = last_line.max(consumed_last);
         if unterminated {
             warned.push((delimiter, gather_line, consumed_last));
@@ -2607,7 +2611,12 @@ fn compound_eof_error_node(
             .or_else(|| body.strip_prefix(crate::executor::markers::HEREDOC_WARNED_BODY_PREFIX))
             .unwrap_or(body);
         let body_lines = body.lines().count();
-        let consumed_last = gather_line + body_lines + usize::from(!unterminated);
+        // Prefer the lexer's physical end line: an unquoted delimiter joins
+        // `\<newline>` pairs while collecting, so stored newlines can
+        // undercount the physical lines consumed (rubash#1028).
+        let consumed_last = token
+            .heredoc_end_line
+            .unwrap_or_else(|| gather_line + body_lines + usize::from(!unterminated));
         if unterminated {
             warned.push((delimiter, gather_line, consumed_last));
         }
