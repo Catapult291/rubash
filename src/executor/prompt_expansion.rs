@@ -613,6 +613,11 @@ impl Executor {
             ('T', Some("functrace")),
         ] {
             let on = match option {
+                // GNU print_cmd.c:462: the PS4 expansion runs with the `x`
+                // flag off, so a `$-` read from inside the prefix omits `x`
+                // (rubash#1042) while every other flag — and `$-` anywhere
+                // else — is unaffected.
+                Some("xtrace") if self.shell_state.xtrace_suspended.get() > 0 => false,
                 Some(option) => {
                     crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, option)
                 }
@@ -685,7 +690,14 @@ impl Executor {
     }
 
     pub(in crate::executor) fn xtrace_enabled(&self) -> bool {
-        crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "xtrace")
+        // GNU print_cmd.c:462 indirection_level_string runs the PS4
+        // expansion with the `x` flag off (change_flag ('x', FLAG_OFF)
+        // around decode_prompt_string): nothing expanded as part of the
+        // prefix — command substitutions included — may trace (rubash#1040).
+        // The suspension counter is that flag flip; it also gates the
+        // `$-` read below (rubash#1042).
+        self.shell_state.xtrace_suspended.get() == 0
+            && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "xtrace")
     }
 
     /// Expanded PS4 prefix for `set -x` tracing (Bash prints the expanded
@@ -775,7 +787,18 @@ impl Executor {
             .get("PS4")
             .cloned()
             .unwrap_or_else(|| "+ ".to_string());
+        // GNU print_cmd.c:462-466 indirection_level_string: `change_flag
+        // ('x', FLAG_OFF)` around decode_prompt_string, restored after —
+        // the prefix expansion runs untraced. The suspension counter is
+        // that flag flip: command substitutions inside PS4 execute with
+        // xtrace off (rubash#1040), and `$-` expanded there reads without
+        // `x` (rubash#1042). The cloned comsub child inherits the count
+        // through Clone, and the shared-executor fast paths read it
+        // through xtrace_enabled/shell_option_flags, so both routes agree.
+        let suspended = self.shell_state.xtrace_suspended.get();
+        self.shell_state.xtrace_suspended.set(suspended + 1);
         let expanded = self.expand_embedded_parameters(&ps4);
+        self.shell_state.xtrace_suspended.set(suspended);
         // GNU print_cmd.c:445-510 indirection_level_string: expand PS4
         // (decode_prompt_string), then repeat its FIRST CHARACTER once per
         // indirection_level and append the rest of the string. The base

@@ -311,6 +311,7 @@ impl Executor {
                 in_command_substitution: Cell::new(false),
                 stdin_redir: Cell::new(false),
                 xtrace_indirection_level: Cell::new(0),
+                xtrace_suspended: Cell::new(0),
                 job_table: crate::jobs::table::JobTable::default(),
                 last_background_pid: None,
                 coproc_names: HashMap::new(),
