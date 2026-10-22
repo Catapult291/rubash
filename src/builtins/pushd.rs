@@ -19,6 +19,38 @@ use std::io::{self, Write};
 
 const EXECUTION_SUCCESS: i32 = 0;
 const EXECUTION_FAILURE: i32 = 1;
+/// GNU general.c:953 polite_directory_format: when $HOME is longer than one
+/// byte and `name` is exactly $HOME or starts with `$HOME/`, the prefix is
+/// replaced with `~`. `dirs`/`pushd`/`popd` displays
+/// (builtins/pushd.def:493 DIRSTACK_FORMAT, :514 DIRSTACK_ENTRY) apply it
+/// unless -l (LONGFORM) is set; the DIRSTACK array itself stays raw
+/// (pushd.def:669 get_directory_stack(0) via variables.c get_dirstack).
+fn polite_directory_format(
+    name: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(home) = env_vars.get("HOME") {
+        if home.len() > 1 && (name == home.as_str() || name.starts_with(&format!("{home}/"))) {
+            return format!("~{}", &name[home.len()..]);
+        }
+    }
+    name.to_string()
+}
+
+/// Join the stack the way the default `dirs` display does: every entry
+/// through [`polite_directory_format`] (GNU pushd.def calls
+/// `dirs_builtin(NULL)` after pushd/popd, so those trailing listings are
+/// polite too).
+fn join_for_display(
+    stack: &[String],
+    env_vars: &std::collections::HashMap<String, String>,
+) -> String {
+    stack
+        .iter()
+        .map(|entry| polite_directory_format(entry, env_vars))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// GNU error.h EX_USAGE: a builtin's invalid number / usage error exits 2
 /// (builtins/common.c get_numeric_arg -> builtin_error("%s: invalid number")
 /// + return EX_USAGE). dirs/popd/pushd share that path for every ±N operand.
@@ -85,16 +117,15 @@ where
             let mut flag_end = 0;
             let mut printable = false;
             let mut numbered = false;
+            let mut long_form = false;
             while let Some(arg) = args.get(flag_end).copied() {
                 match arg {
                     // rubash#759: -l is the LONG form, not the one-per-line
-                    // form. GNU dirs.def only widens the rendering (it stops
-                    // collapsing $HOME to ~); the separator stays a single
-                    // space, and -p alone selects one entry per line. rubash's
-                    // stack always stores full paths, so -l has no separate
-                    // rendering at all and must not set `printable`:
-                    // `dirs -l` printed three lines where GNU prints one.
-                    "-l" => {}
+                    // form. GNU pushd.def:493 DIRSTACK_FORMAT skips
+                    // polite_directory_format (general.c:953, $HOME -> ~)
+                    // only under LONGFORM; the separator stays a single
+                    // space, and -p alone selects one entry per line.
+                    "-l" => long_form = true,
                     "-p" => printable = true,
                     "-v" => numbered = true,
                     _ => break,
@@ -117,10 +148,15 @@ where
                         )?;
                         return Ok(EXECUTION_FAILURE);
                     };
-                    if numbered {
-                        writeln!(stdout, "{index:2}  {}", stack[index])?;
+                    let shown = if long_form {
+                        stack[index].clone()
                     } else {
-                        writeln!(stdout, "{}", stack[index])?;
+                        polite_directory_format(&stack[index], env_vars)
+                    };
+                    if numbered {
+                        writeln!(stdout, "{index:2}  {shown}")?;
+                    } else {
+                        writeln!(stdout, "{shown}")?;
                     }
                     return Ok(EXECUTION_SUCCESS);
                 }
@@ -130,17 +166,31 @@ where
             }
             if numbered {
                 for (index, dir) in stack.iter().enumerate() {
-                    writeln!(stdout, "{index:2}  {dir}")?;
+                    let shown = if long_form {
+                        dir.clone()
+                    } else {
+                        polite_directory_format(dir, env_vars)
+                    };
+                    writeln!(stdout, "{index:2}  {shown}")?;
                 }
             } else if printable {
                 for dir in &stack {
-                    writeln!(stdout, "{dir}")?;
+                    let shown = if long_form {
+                        dir.clone()
+                    } else {
+                        polite_directory_format(dir, env_vars)
+                    };
+                    writeln!(stdout, "{shown}")?;
                 }
             } else {
                 // load_stack always exposes the cwd as element 0, so the
                 // plain (and -l) listing joins the stack; the old dead
                 // empty-stack arm only ever echoed $PWD.
-                writeln!(stdout, "{}", stack.join(" "))?;
+                if long_form {
+                    writeln!(stdout, "{}", stack.join(" "))?;
+                } else {
+                    writeln!(stdout, "{}", join_for_display(&stack, env_vars))?;
+                }
             }
             Ok(EXECUTION_SUCCESS)
         }
@@ -336,7 +386,7 @@ where
             }
 
             save_stack(env_vars, &stack);
-            writeln!(stdout, "{}", stack.join(" "))?;
+            writeln!(stdout, "{}", join_for_display(&stack, env_vars))?;
             Ok(EXECUTION_SUCCESS)
         }
         StackBuiltin::Popd => {
@@ -382,7 +432,7 @@ where
                 if no_cd {
                     stack.remove(1);
                     save_stack(env_vars, &stack);
-                    writeln!(stdout, "{}", stack.join(" "))?;
+                    writeln!(stdout, "{}", join_for_display(&stack, env_vars))?;
                     return Ok(EXECUTION_SUCCESS);
                 }
                 // pushd.def:394-403: cd_to_string(new top) runs BEFORE the
@@ -434,7 +484,7 @@ where
                 // same net stack the GNU free() of the popped word leaves.
                 stack.remove(0);
                 save_stack(env_vars, &stack);
-                writeln!(stdout, "{}", stack.join(" "))?;
+                writeln!(stdout, "{}", join_for_display(&stack, env_vars))?;
                 return Ok(EXECUTION_SUCCESS);
             }
 
@@ -443,7 +493,7 @@ where
             // was (GNU 5.3.0 probe: `popd +1` leaves pwd -P and $PWD alone).
             stack.remove(index);
             save_stack(env_vars, &stack);
-            writeln!(stdout, "{}", stack.join(" "))?;
+            writeln!(stdout, "{}", join_for_display(&stack, env_vars))?;
             Ok(EXECUTION_SUCCESS)
         }
     }
