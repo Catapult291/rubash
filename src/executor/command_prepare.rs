@@ -1002,6 +1002,149 @@ impl Executor {
         expanded.line = cmd.line;
         Some(expanded)
     }
+
+    /// Whitelist fast path for `[ $VAR -op operand ]` / `test $VAR -op
+    /// operand` integer comparisons with unquoted simple `$NAME` operands
+    /// (GNU test.c `arithcomp`, test.c:357, via `valid_number`,
+    /// general.c:248-281).
+    ///
+    /// The multi-word literal fast path necessarily misses any word
+    /// containing `$`, so every `[ $i -lt N ]` condition paid the full
+    /// per-word expansion pipeline (pre-scans, brace/positional probes,
+    /// field-split checks, materialize) even though each operand is a
+    /// single scalar read. This resolves such operands directly against
+    /// the variable table and emits the already-expanded word list,
+    /// skipping the pipeline; the test builtin's own decimal fast path
+    /// (`builtins::test::fast_decimal`) then compares without re-parsing.
+    ///
+    /// Admission is a whitelist (rubash#117 discipline — doubt falls
+    /// through to the real pipeline):
+    /// - `[` form is exactly 5 words (`[ A -op B ]`), `test` form exactly
+    ///   4; the operator is one of the six integer comparisons.
+    /// - No expandable structure (same shared predicate as the literal
+    ///   paths — assignments, redirects, substitutions, globs, quotes).
+    /// - Every word's raw equals its cooked text (no quoting or marker
+    ///   transforms anywhere in the command).
+    /// - Literal operands satisfy the shared fast-literal predicate, so
+    ///   the pipeline provably returns them unchanged.
+    /// - `$` operands are exactly `$NAME` with `NAME` a shell name, bound
+    ///   to a scalar (arrays, assoc arrays and namerefs keep the slow
+    ///   path — `shell_variable_value` would resolve/announce through
+    ///   them), and the resolved value is canonical decimal (reuses
+    ///   `fast_decimal`, never a second copy: `+12`/`007`/whitespace/
+    ///   empty/overflow keep the slow path with exact GNU diagnostics)
+    ///   with no byte in the current IFS (so unquoted field splitting is
+    ///   provably the identity under any IFS, and pathname expansion sees
+    ///   no metacharacters).
+    /// The resolution chain mirrors the walker's unquoted `$name` arm
+    /// (`dynamic_parameter_value` -> `shell_variable_value` ->
+    /// `exact_case_env_var`), minus the identity `shell_safe_value` clone
+    /// (provably a no-op on the admitted `[0-9-]` bytes — see below).
+    /// Construction mirrors `try_expand_literal_words_command`
+    /// field-for-field. A false negative only costs speed, never semantics.
+    pub(in crate::executor) fn try_expand_test_var_int_command(
+        &self,
+        cmd: &CommandNode,
+    ) -> Option<CommandNode> {
+        let (left, op, right) = match cmd.words.as_slice() {
+            [first, left, op, right, last] if first == "[" && last == "]" => (left, op, right),
+            [first, left, op, right] if first == "test" => (left, op, right),
+            _ => return None,
+        };
+        if !matches!(op.as_str(), "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") {
+            return None;
+        }
+        if Self::command_has_expandable_structure(cmd) {
+            return None;
+        }
+        for (index, word) in cmd.words.iter().enumerate() {
+            if !cmd
+                .word_metadata
+                .get(index)
+                .is_some_and(|metadata| metadata.raw == *word)
+            {
+                return None;
+            }
+        }
+        let left = self.resolve_test_var_int_operand(left)?;
+        let right = self.resolve_test_var_int_operand(right)?;
+        // Both admitted shapes place the operands at indices 1 and 3
+        // (`[` carries the trailing `]` at 4, `test` ends at 3).
+        let mut words = cmd.words.clone();
+        words[1] = left;
+        words[3] = right;
+        debug_assert!(
+            self.arrayref_operand_marks(cmd)
+                .iter()
+                .all(|marked| !*marked),
+            "test var-int words must never carry ARRAYREF marks: {:?}",
+            cmd.words
+        );
+        let mut expanded = CommandNode::new();
+        expanded.words = words;
+        if Self::preserves_word_metadata(cmd) {
+            expanded.word_metadata = cmd.word_metadata.clone();
+        }
+        expanded.pipe = cmd.pipe;
+        expanded.background = cmd.background;
+        expanded.and_or = cmd.and_or;
+        expanded.inverted = cmd.inverted;
+        expanded.arithmetic_command = cmd.arithmetic_command.clone();
+        expanded.conditional_command = cmd.conditional_command.clone();
+        expanded.brace_group = cmd.brace_group.clone();
+        expanded.line = cmd.line;
+        Some(expanded)
+    }
+
+    /// Resolve one `[ $VAR -op B ]` operand to its expanded word: literals
+    /// pass through unchanged (the shared whitelist proves the pipeline is
+    /// the identity on them); a simple `$NAME` reads through the same chain
+    /// as the walker's unquoted `$name` arm. `None` declines the whole fast
+    /// path (empty/unset names vanish or error downstream, non-canonical
+    /// values own GNU diagnostics, splittable values must field-split).
+    fn resolve_test_var_int_operand(&self, word: &str) -> Option<String> {
+        if crate::executor::assignment_helpers::is_expand_fast_literal_word(word) {
+            return Some(word.to_string());
+        }
+        let name = word.strip_prefix('$')?;
+        if !is_shell_name(name) {
+            return None;
+        }
+        // Arrays, assoc arrays and namerefs resolve through
+        // `shell_variable_value` (element/cell/indirection, plus possible
+        // diagnostics) — out of scope for a single scalar read.
+        if self.parameter_is_array_variable(name) {
+            return None;
+        }
+        let env_vars = &self.shell_state.env_vars;
+        if is_marked_var(env_vars, ASSOC_VARS, name) || is_marked_var(env_vars, NAMEREF_VARS, name)
+        {
+            return None;
+        }
+        let value = self
+            .dynamic_parameter_value(name)
+            .or_else(|| self.shell_variable_value(name))
+            .or_else(|| crate::executor::env_helpers::exact_case_env_var(name))?;
+        // No `shell_safe_value` call: it is currently the identity clone
+        // (`parse_helpers.rs` — Windows path conversion happens at
+        // filesystem/process boundaries, never here), and the canonical
+        // gate below admits only `[0-9-]` bytes, which carry no marker or
+        // NUL/C0 payload the walker-tail restores could rewrite. Skipping
+        // the duplicate allocation; if `shell_safe_value` ever gains a
+        // transform, this gate must route through it again.
+        // Canonical decimal only (reuses the test builtin's whitelist):
+        // guarantees a single word with no glob/quote bytes and exact
+        // agreement with `valid_number` on the result.
+        crate::builtins::test::fast_decimal(&value)?;
+        // Unquoted field splitting must be the identity under the CURRENT
+        // IFS (unset means the default `" \t\n"`): no value byte may be an
+        // IFS character.
+        let ifs = env_vars.get("IFS").map(String::as_str).unwrap_or(" \t\n");
+        if value.bytes().any(|b| ifs.as_bytes().contains(&b)) {
+            return None;
+        }
+        Some(value)
+    }
     pub(in crate::executor) fn try_expand_literal_command(
         cmd: &CommandNode,
     ) -> Option<CommandNode> {
@@ -1165,6 +1308,13 @@ impl Executor {
         // ARRAYREF marks) is checked up front so the win scales with the
         // word count instead of costing per word.
         if let Some(expanded) = self.try_expand_literal_words_command(cmd) {
+            return Ok(expanded);
+        }
+        // Variable-operand twin for `[ $VAR -op N ]` integer comparisons:
+        // the literal path necessarily misses `$` words, so loop conditions
+        // paid the full expansion pipeline per iteration for a single
+        // scalar read. Same whitelist discipline, same constructed shape.
+        if let Some(expanded) = self.try_expand_test_var_int_command(cmd) {
             return Ok(expanded);
         }
 
@@ -5467,6 +5617,121 @@ mod command_word_materialization_tests {
             assert!(
                 is_expand_fast_literal_word(word),
                 "hot-shape word {word:?} no longer admitted"
+            );
+        }
+    }
+
+    /// `[ $VAR -op N ]` variable-operand fast path: admission (shape,
+    /// operator, raw == word, scalar canonical binding) and construction
+    /// identical to the slow pipeline. Every doubt shape declines —
+    /// quoting, braces, positionals, unset/non-canonical/splittable
+    /// values, arrays, namerefs, string operators, wrong arity — so GNU
+    /// diagnostics (`integer expected`, `too many arguments`, `unary
+    /// operator expected`) keep coming from the real pipeline.
+    #[test]
+    fn test_var_int_fast_path_admits_and_constructs() {
+        use super::Executor;
+        let mut executor = Executor::new();
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_I".into(), "5".into());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_N".into(), "-3".into());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_PLUS".into(), "+12".into());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_PAD".into(), "007".into());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_SP".into(), "1 2".into());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_EMPTY".into(), String::new());
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_A".into(), "5".into());
+        crate::executor::mark_env_name(
+            &mut executor.shell_state.env_vars,
+            crate::executor::types::ARRAY_VARS,
+            "TVI_A",
+        );
+        executor
+            .shell_state
+            .env_vars
+            .insert("TVI_REF".into(), "TVI_I".into());
+        crate::executor::mark_env_name(
+            &mut executor.shell_state.env_vars,
+            crate::executor::types::NAMEREF_VARS,
+            "TVI_REF",
+        );
+        // (source, expected expanded words)
+        for (src, expected) in [
+            ("[ $TVI_I -lt 15000 ]", vec!["[", "5", "-lt", "15000", "]"]),
+            ("[ 1 -lt $TVI_I ]", vec!["[", "1", "-lt", "5", "]"]),
+            ("[ $TVI_I -eq $TVI_N ]", vec!["[", "5", "-eq", "-3", "]"]),
+            ("test $TVI_I -ge 5", vec!["test", "5", "-ge", "5"]),
+            ("[ $TVI_I -ne 6 ]", vec!["[", "5", "-ne", "6", "]"]),
+            ("[ $TVI_I -le 5 ]", vec!["[", "5", "-le", "5", "]"]),
+            ("[ $TVI_I -gt 4 ]", vec!["[", "5", "-gt", "4", "]"]),
+        ] {
+            let tokens = crate::lexer::tokenize(src);
+            let ast = crate::parser::parse(&tokens);
+            assert_eq!(ast.commands.len(), 1, "{src:?} parses to one command");
+            let cmd = &ast.commands[0];
+            let Some(expanded) = executor.try_expand_test_var_int_command(cmd) else {
+                panic!("{src:?} declined (words={:?})", cmd.words);
+            };
+            let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+            assert_eq!(expanded.words, expected, "{src:?} words changed");
+            // The live pipeline must agree field-for-field — a future
+            // CommandNode field with expansion semantics fails here
+            // instead of shipping a divergence.
+            let piped = executor.expand_command_words(cmd).expect("pipeline failed");
+            assert_eq!(
+                format!("{expanded:?}"),
+                format!("{piped:?}"),
+                "{src:?} fast != pipeline node"
+            );
+        }
+        // Declined shapes keep the slow path (admission unchanged).
+        for src in [
+            "[ \"$TVI_I\" -lt 15000 ]",
+            "[ ${TVI_I} -lt 15000 ]",
+            "[ $1 -lt 15000 ]",
+            "[ $@ -lt 15000 ]",
+            "[ $TVI_UNSET -lt 15000 ]",
+            "[ $TVI_PLUS -lt 15000 ]",
+            "[ $TVI_PAD -lt 15000 ]",
+            "[ $TVI_SP -lt 15000 ]",
+            "[ $TVI_EMPTY -lt 15000 ]",
+            "[ $TVI_A -lt 15000 ]",
+            "[ $TVI_REF -lt 15000 ]",
+            "[ $TVI_I = 5 ]",
+            "[ $TVI_I -lt ]",
+            "[ $TVI_I -lt 1 2 ]",
+            "[[ $TVI_I -lt 15000 ]]",
+            "[ $TVI_I -lt 15000",
+        ] {
+            let tokens = crate::lexer::tokenize(src);
+            let ast = crate::parser::parse(&tokens);
+            if ast.commands.len() != 1 {
+                continue;
+            }
+            let cmd = &ast.commands[0];
+            assert!(
+                executor.try_expand_test_var_int_command(cmd).is_none(),
+                "{src:?} admitted (words={:?})",
+                cmd.words
             );
         }
     }
