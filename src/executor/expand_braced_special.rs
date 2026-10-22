@@ -209,10 +209,10 @@ impl Executor {
             };
             element.unwrap_or_default()
         } else {
-            self.shell_state
-                .env_vars
-                .get(indirect_name)
-                .cloned()
+            // GNU subst.c:7839 parameter_brace_find_indir: t is the
+            // source's SCALAR-form value (array -> element 0), never its
+            // raw storage text (rubash#1147).
+            self.indirect_source_scalar_value(indirect_name)
                 .unwrap_or_default()
         };
         // GNU subst.c:7955 parameter_brace_expand_indir re-expands the

@@ -76,7 +76,35 @@ impl Executor {
             return Some(self.apply_parameter_transform_value(&value, transform));
         }
         let ref_name = ref_name?;
-        let target_name = self.shell_state.env_vars.get(ref_name)?;
+        let raw_value = self.shell_state.env_vars.get(ref_name)?;
+        // GNU subst.c:7883-7945 parameter_brace_expand_indir: t is the
+        // dollar_at join of the source's ELEMENT VALUES (a scalar base
+        // contributes its value as the sole element), and the transform
+        // applies to the parameter t names. This arm previously used the
+        // source's raw storage text AS the target name, so any real
+        // array transformed the value of a variable named by storage
+        // bytes — usually nothing (`${!a[@]@Q}` gave `''` for a=(x),
+        // x="hi there"; GNU gives 'hi there') — rubash#1147. A source
+        // with no elements yields no t: the indirect parameter is unset
+        // and a value transform of it is empty (not `''`).
+        let element_values = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, ref_name) {
+            self.parameter_array_storage(ref_name)
+                .map(|storage| {
+                    assoc_hash_ordered_values(
+                        &storage,
+                        assoc_nbuckets(&self.shell_state.env_vars, ref_name),
+                    )
+                })
+        } else if is_array_storage(raw_value) {
+            Some(array_values(raw_value))
+        } else {
+            None
+        };
+        let target_name = match element_values {
+            Some(values) if !values.is_empty() => values.join(" "),
+            Some(_) => return Some(String::new()),
+            None => raw_value.clone(),
+        };
         let value = if let Some(array_expr) = target_name
             .strip_suffix("[@]")
             .or_else(|| target_name.strip_suffix("[*]"))
@@ -89,10 +117,10 @@ impl Executor {
         } else {
             self.shell_state
                 .env_vars
-                .get(target_name)
+                .get(&target_name)
                 .and_then(|value| {
                     // Cell type, not value text (rubash#755).
-                    if self.parameter_is_array_variable(target_name) {
+                    if self.parameter_is_array_variable(&target_name) {
                         array_value_at(value, 0)
                     } else {
                         Some(value.clone())

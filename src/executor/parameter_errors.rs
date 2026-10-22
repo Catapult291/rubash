@@ -397,6 +397,20 @@ impl Executor {
         Some(body)
     }
 
+    /// GNU subst.c:7839-7885 parameter_brace_find_indir resolves the
+    /// indirect SOURCE in scalar form: t is the source variable's value
+    /// with an array name yielding element 0 (assoc: key "0") and an
+    /// array with no such element yielding NULL. Every validity and
+    /// value decision for `${!...}` uses THIS text, never the raw
+    /// storage encoding of the variable (whose element separators are
+    /// in-band markers) — rubash#1147 validated/joined the storage text
+    /// instead, inverting `${!assoc[@]:-d}` outcomes and leaking marker
+    /// bytes into the `invalid variable name` diagnostic.
+    pub(in crate::executor) fn indirect_source_scalar_value(&self, name: &str) -> Option<String> {
+        let value = self.shell_state.env_vars.get(name)?;
+        self.scalar_parameter_value(name, value)
+    }
+
     fn indirect_parameter_operator_value(&self, name: &str) -> Option<Option<String>> {
         let indirect_name = self.indirect_parameter_body(name)?;
         if let Some(target_name) = self.nameref_target_name(indirect_name) {
@@ -421,16 +435,42 @@ impl Executor {
                 None => Some(None),
             };
         }
-        let target_expr = self.shell_state.env_vars.get(indirect_name)?;
-        if target_expr.ends_with("[@]") || target_expr.ends_with("[*]") {
-            let values = self.indirect_target_values(target_expr);
+        // GNU subst.c:7924-7945 parameter_brace_expand_indir: a
+        // subscripted source (`${!name[sub]<op>...}`) resolves t through
+        // the subscripted reference itself — the element value, or the
+        // all-elements value for `[@]`/`[*]` — then the operator applies
+        // to the parameter t names (rubash#1147).
+        if parse_array_subscript(indirect_name).is_some() {
+            return match self.parameter_operator_value(indirect_name) {
+                Some(t) => Some(self.indirect_target_values(&t).into_iter().next()),
+                None => Some(None),
+            };
+        }
+        let Some(raw_value) = self.shell_state.env_vars.get(indirect_name) else {
+            // No value entry: a declared-unset source still yields an
+            // (unset) t, so the operator adjudicates an unset parameter;
+            // a wholly absent source is not this form.
+            if is_marked_var(
+                &self.shell_state.env_vars,
+                DECLARED_UNSET_VARS,
+                indirect_name,
+            ) {
+                return Some(None);
+            }
+            return None;
+        };
+        if raw_value.ends_with("[@]") || raw_value.ends_with("[*]") {
+            let values = self.indirect_target_values(raw_value);
             if values.is_empty() {
                 return Some(None);
             }
-            return Some(Some(self.join_expanded_array_values(values, target_expr)));
+            return Some(Some(self.join_expanded_array_values(values, raw_value)));
         }
 
-        Some(self.indirect_target_values(target_expr).into_iter().next())
+        match self.indirect_source_scalar_value(indirect_name) {
+            Some(t) => Some(self.indirect_target_values(&t).into_iter().next()),
+            None => Some(None),
+        }
     }
 
     fn is_valid_length_parameter_name(name: &str) -> bool {
@@ -1142,13 +1182,20 @@ impl Executor {
                             // Declared-unset entry: the expansion is empty,
                             // never a diagnostic (rubash#529).
                         }
-                        Some(value) => {
-                            if !Self::is_valid_indirect_target(value) {
-                                return Some((
-                                    value.clone(),
-                                    "invalid variable name".to_string(),
-                                    1,
-                                ));
+                        Some(_) => {
+                            // GNU validates t — the scalar-form value from
+                            // parameter_brace_find_indir (array element 0
+                            // / assoc key "0") — not the raw storage text
+                            // (rubash#1147: `${!a}` with a=(p q) validated
+                            // the marker-joined storage and leaked it).
+                            if let Some(t) = self.indirect_source_scalar_value(indirect) {
+                                if !Self::is_valid_indirect_target(&t) {
+                                    return Some((
+                                        t,
+                                        "invalid variable name".to_string(),
+                                        1,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1197,32 +1244,86 @@ impl Executor {
                     // `name[sub]: invalid indirect expansion` while a set
                     // scalar/array base expands silently even when the
                     // element itself is unset.
+                    if head_end > 0 && is_shell_name(head) && tail.starts_with('[') {
+                        // The subscript group may close mid-tail when an
+                        // operator follows (`${!m[@]:-x}`): GNU reports
+                        // the reference through the closing `]` (subst.c
+                        // parameter_brace_expand_indir), so the diagnostic
+                        // names `head + tail[..close]`, not the whole body
+                        // (rubash#1147: unset m with `[@]:-` was silent).
+                        if let Some(close) = Self::skip_indirect_array_subscript(tail) {
+                            let base_exists = match self.nameref_resolution(head) {
+                                NamerefResolution::Target(target) => {
+                                    let base =
+                                        target.split('[').next().unwrap_or(target.as_str());
+                                    self.shell_state.env_vars.contains_key(base)
+                                        || self.shell_state.variables.get(base).is_some()
+                                }
+                                NamerefResolution::NotNameref => {
+                                    self.shell_state.env_vars.contains_key(head)
+                                        || self.shell_state.variables.get(head).is_some()
+                                }
+                                // Unresolved (empty/unresolvable cell), Circular,
+                                // and MaxDepth all mean find_variable returned
+                                // NULL for the base.
+                                _ => false,
+                            };
+                            if !base_exists {
+                                return Some((
+                                    format!("{}{}", head, &tail[..close]),
+                                    "invalid indirect expansion".to_string(),
+                                    1,
+                                ));
+                            }
+                            // The PLAIN subscripted form (the group closes
+                            // the body) validates t too — here t is the
+                            // ELEMENT value (subst.c:7955-7961): `${!v[0]}`
+                            // with v="1bad" errors, while an unset element
+                            // yields no t and proceeds silently. The
+                            // trailing [@]/[*] KEYS form never validates
+                            // (subst.c:7887 keys shortcut) — rubash#1147.
+                            if close == tail.len() {
+                                let subscript = &tail[1..close - 1];
+                                if subscript != "@" && subscript != "*" {
+                                    let reference = format!("{head}{}", &tail[..close]);
+                                    if let Some(element) =
+                                        self.array_element_parameter_value(&reference)
+                                    {
+                                        if !Self::is_valid_indirect_target(&element) {
+                                            return Some((
+                                                element,
+                                                "invalid variable name".to_string(),
+                                                1,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // GNU subst.c:7955-7961 parameter_brace_expand_indir:
+                    // with an operator tail the form is indirection
+                    // through t, the head's scalar-form value, and an
+                    // invalid t reports `<t>: invalid variable name`
+                    // BEFORE the operator applies — for scalar sources
+                    // too (`${!v:-d}` with v="" or v="1bad"), not only
+                    // for the `[@]` form (rubash#1147). A source with no
+                    // scalar-form value proceeds silently; a nameref head
+                    // names its target's value, adjudicated by the
+                    // nameref arms.
                     if head_end > 0
                         && is_shell_name(head)
-                        && tail.starts_with('[')
-                        && tail.ends_with(']')
+                        && !tail.starts_with('[')
+                        && matches!(
+                            tail.chars().next(),
+                            Some(':' | '-' | '+' | '=' | '?' | '#' | '%' | '/' | '^' | ',' | '@')
+                        )
+                        && self.nameref_target_name(head).is_none()
                     {
-                        let base_exists = match self.nameref_resolution(head) {
-                            NamerefResolution::Target(target) => {
-                                let base = target.split('[').next().unwrap_or(target.as_str());
-                                self.shell_state.env_vars.contains_key(base)
-                                    || self.shell_state.variables.get(base).is_some()
+                        if let Some(t) = self.indirect_source_scalar_value(head) {
+                            if !Self::is_valid_indirect_target(&t) {
+                                return Some((t, "invalid variable name".to_string(), 1));
                             }
-                            NamerefResolution::NotNameref => {
-                                self.shell_state.env_vars.contains_key(head)
-                                    || self.shell_state.variables.get(head).is_some()
-                            }
-                            // Unresolved (empty/unresolvable cell), Circular,
-                            // and MaxDepth all mean find_variable returned
-                            // NULL for the base.
-                            _ => false,
-                        };
-                        if !base_exists {
-                            return Some((
-                                indirect.to_string(),
-                                "invalid indirect expansion".to_string(),
-                                1,
-                            ));
                         }
                     }
                 }
@@ -1239,29 +1340,41 @@ impl Executor {
                     let base = &indirect[..open];
                     if !base.is_empty() && is_shell_name(base) {
                         if let Some(value) = self.shell_state.env_vars.get(base) {
-                            if !Self::is_valid_indirect_target(value) {
-                                // GNU reports the dollar_at join of the
-                                // variable's values (array_value with
-                                // AV_ALLOWALL, arrayfunc.c:1563), not the
-                                // raw storage text.
-                                let display = if let Some(storage) =
-                                    self.parameter_array_storage(base)
-                                {
-                                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                            // GNU's t here is the dollar_at join of the
+                            // variable's ELEMENT VALUES (array_value with
+                            // AV_ALLOWALL, arrayfunc.c:1563), and validity
+                            // is judged on that join — not on the raw
+                            // storage text, whose in-band separators made
+                            // every multi-element array "invalid" and
+                            // every empty assoc "invalid" too (rubash#1147:
+                            // `${!assoc[@]:-d}` errored on an empty assoc
+                            // whose t is NULL and proceeds silently, and on
+                            // a one-element assoc whose value IS valid).
+                            // An array with no elements yields no t at all;
+                            // a scalar base yields its value as the sole
+                            // element.
+                            let element_values =
+                                if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                                    self.parameter_array_storage(base).map(|storage| {
                                         assoc_hash_ordered_values(
                                             &storage,
                                             assoc_nbuckets(&self.shell_state.env_vars, base),
                                         )
-                                        .join(" ")
-                                    } else {
-                                        array_values(&storage).join(" ")
-                                    }
+                                    })
                                 } else if is_array_storage(value) {
-                                    array_values(value).join(" ")
+                                    Some(array_values(value))
                                 } else {
-                                    value.clone()
+                                    None
                                 };
-                                return Some((display, "invalid variable name".to_string(), 1));
+                            let t = match element_values {
+                                Some(values) if !values.is_empty() => Some(values.join(" ")),
+                                Some(_) => None,
+                                None => Some(value.clone()),
+                            };
+                            if let Some(t) = t {
+                                if !Self::is_valid_indirect_target(&t) {
+                                    return Some((t, "invalid variable name".to_string(), 1));
+                                }
                             }
                         }
                     }
