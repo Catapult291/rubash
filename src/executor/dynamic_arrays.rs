@@ -9,6 +9,7 @@ use super::*;
 pub(crate) struct ArithDynamicContext {
     bashpid: u32,
     subshell_depth: usize,
+    histcmd: usize,
     function_depth: usize,
     funcname_top: Option<String>,
     debug_trap_command: Option<String>,
@@ -32,6 +33,7 @@ impl ArithDynamicContext {
         match name {
             "BASHPID" => Some(self.bashpid.to_string()),
             "BASH_SUBSHELL" => Some(self.subshell_depth.to_string()),
+            "HISTCMD" => Some(self.histcmd.to_string()),
             // variables.c:1526 get_bash_argv0 returns dollar_vars[0]; the
             // script-name chain below is rubash's dollar_vars[0] model.
             "BASH_ARGV0" => Some(script_name_value_from_env(env_vars)),
@@ -205,6 +207,7 @@ impl Executor {
                 | "SHELLOPTS"
                 | "BASHOPTS"
                 | "PIPESTATUS"
+                | "HISTCMD"
         ) {
             return None;
         }
@@ -221,6 +224,13 @@ impl Executor {
             "SRANDOM" => Some(self.next_srandom_value().to_string()),
             "BASHPID" => Some(self.bashpid_value().to_string()),
             "BASH_SUBSHELL" => Some(self.shell_state.subshell_depth.get().to_string()),
+            // GNU bashhist.c: HISTCMD is always defined — the history
+            // number of the current command, i.e. of the most recent
+            // history entry (history_base + history_length - 1); the
+            // pre-execution add makes that the current line whenever the
+            // line was recorded, and it is 0 before anything is recorded
+            // (rubash#1071: it read as entirely unset).
+            "HISTCMD" => Some(self.histcmd_value().to_string()),
             "BASH_ARGV0" => Some(self.script_name_value()),
             // GNU FUNCNAME carries att_invisible and only becomes visible
             // while a function is executing (variables.c:1812
@@ -385,8 +395,35 @@ impl Executor {
                 Some(format!("declare -a{exported} {name}=({elements})"))
             }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
-            | "BASH_COMMAND" => Some(format!("declare --{exported} {name}={quoted}")),
+            | "BASH_COMMAND" | "HISTCMD" => Some(format!("declare --{exported} {name}={quoted}")),
             _ => None,
+        }
+    }
+
+    /// GNU bashhist.c histcmd: the history number of the most recent
+    /// entry (history_base + history_length - 1); 0 when nothing has
+    /// been recorded or no session list is attached (rubash#1071).
+    pub(in crate::executor) fn histcmd_value(&self) -> usize {
+        // GNU variables.c histcmd stays 0 while history is disabled: the
+        // dynamic value tracks the readline-maintained list position, and
+        // with `set +o history` the list (even when `history -s` appended
+        // to it) never advances the variable (verified GNU 5.3 script:
+        // -s a / -s b / -c / -s z all leave $HISTCMD at 0).
+        if self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_SETOPT_history")
+            .map(String::as_str)
+            != Some("1")
+        {
+            return 0;
+        }
+        match self.shell_state.session_history.as_ref() {
+            Some(session) => {
+                let session = session.borrow();
+                (session.base + session.entries.len()).saturating_sub(1)
+            }
+            None => 0,
         }
     }
 
@@ -411,6 +448,7 @@ impl Executor {
                 | "SHELLOPTS"
                 | "BASHOPTS"
                 | "PIPESTATUS"
+                | "HISTCMD"
         )
     }
 
@@ -442,6 +480,7 @@ impl Executor {
         ArithDynamicContext {
             bashpid: self.bashpid_value(),
             subshell_depth: self.shell_state.subshell_depth.get(),
+            histcmd: self.histcmd_value(),
             function_depth: self.shell_state.function_depth,
             funcname_top: (self.shell_state.function_depth > 0).then(|| {
                 self.shell_state
