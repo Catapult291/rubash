@@ -131,23 +131,47 @@ impl Executor {
         self.tempenv_promoted_names.clear();
         let mut previous = Vec::new();
         if !assignments.is_empty() {
-            // Materialize the write-behind marker lists: restore replays
-            // the string, so the snapshot must reflect current flags,
-            // not a stale serialized copy.
-            let exported = self.shell_state.env_vars.rendered_attr_list(EXPORTED_VARS);
-            let nameref = self.shell_state.env_vars.rendered_attr_list(NAMEREF_VARS);
-            previous.push((
-                EXPORTED_VARS.to_string(),
-                exported,
-                self.shell_state.variables.get(EXPORTED_VARS).cloned(),
-                None,
-            ));
-            previous.push((
-                NAMEREF_VARS.to_string(),
-                nameref,
-                self.shell_state.variables.get(NAMEREF_VARS).cloned(),
-                None,
-            ));
+            // The EXPORTED/NAMEREF whole-list snapshots cost O(marked
+            // names) to render and again to restore, per command. The
+            // apply loop below can only change list membership in two
+            // ways, both visible before the loop runs: mark_exported on
+            // a target that has neither an env value nor a typed cell
+            // (its per-name entry restores with value/typed both None,
+            // which skips the per-name attribute restore, so only the
+            // list replay clears the bit), and the nameref paths (the
+            // unresolved-cell fallback unmarks NAMEREF; a resolved
+            // target is a different name whose state the base check
+            // cannot see). Every other target's membership bit is
+            // covered by its per-name entry's saved VarAttrs, whose
+            // restore rewrites the serialized lists from the flags.
+            // When no assignment can change membership, skip the
+            // snapshots entirely (rubash#1120: `IFS= read` in a loop
+            // paid both renders and both restores per record).
+            let lists_may_change = assignments.iter().any(|(name, _)| {
+                let (base_name, _) = assignment_name_and_append(name);
+                is_marked_var(&self.shell_state.env_vars, NAMEREF_VARS, base_name)
+                    || (self.shell_state.env_vars.get(base_name).is_none()
+                        && self.shell_state.variables.get(base_name).is_none())
+            });
+            if lists_may_change {
+                // Materialize the write-behind marker lists: restore
+                // replays the string, so the snapshot must reflect
+                // current flags, not a stale serialized copy.
+                let exported = self.shell_state.env_vars.rendered_attr_list(EXPORTED_VARS);
+                let nameref = self.shell_state.env_vars.rendered_attr_list(NAMEREF_VARS);
+                previous.push((
+                    EXPORTED_VARS.to_string(),
+                    exported,
+                    self.shell_state.variables.get(EXPORTED_VARS).cloned(),
+                    None,
+                ));
+                previous.push((
+                    NAMEREF_VARS.to_string(),
+                    nameref,
+                    self.shell_state.variables.get(NAMEREF_VARS).cloned(),
+                    None,
+                ));
+            }
         }
         // GNU findcmd.c:356-365: a PATH in the temporary command environment
         // (PATH=foo cmd) bypasses the hash table entirely. Rubash's lookup
