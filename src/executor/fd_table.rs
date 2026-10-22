@@ -157,6 +157,53 @@ pub(crate) struct FdTable {
     pub(crate) stdout_alias_generation: std::collections::HashMap<u32, Option<usize>>,
 }
 
+/// The byte sequences that terminate a `read` record for `delimiter`
+/// (builtins/read.def zread matches raw bytes): the delimiter's UTF-8
+/// encoding, plus — for a delimiter char in U+0080..=U+00FF, which a
+/// byte-oriented locale yields from ONE raw byte — that single byte. The
+/// old `delimiter as u8` truncation searched for a byte that never occurs
+/// in a UTF-8 stream, so `read -d é` over a captured pipeline record ran
+/// to EOF and reported failure (rubash#1062).
+pub(crate) struct ReadDelimiterSeqs {
+    seqs: [[u8; 4]; 2],
+    lens: [usize; 2],
+    count: usize,
+}
+
+pub(crate) fn read_delimiter_seqs(delimiter: char) -> ReadDelimiterSeqs {
+    let mut seqs = [[0u8; 4]; 2];
+    let mut lens = [0usize; 2];
+    let mut count = 0;
+    let mut buf = [0u8; 4];
+    let utf8 = delimiter.encode_utf8(&mut buf).as_bytes().to_vec();
+    seqs[count][..utf8.len()].copy_from_slice(&utf8);
+    lens[count] = utf8.len();
+    count += 1;
+    let code = delimiter as u32;
+    if (0x80..=0xFF).contains(&code) && utf8.len() > 1 {
+        seqs[count][0] = code as u8;
+        lens[count] = 1;
+        count += 1;
+    }
+    ReadDelimiterSeqs { seqs, lens, count }
+}
+
+/// Length of a delimiter sequence ending at `end` (exclusive) in `bytes`,
+/// if any.
+pub(crate) fn delimiter_seq_ending_at(
+    seqs: &ReadDelimiterSeqs,
+    bytes: &[u8],
+    end: usize,
+) -> Option<usize> {
+    for i in 0..seqs.count {
+        let len = seqs.lens[i];
+        if len <= end && &bytes[end - len..end] == &seqs.seqs[i][..len] {
+            return Some(len);
+        }
+    }
+    None
+}
+
 impl FdTable {
     pub(crate) fn new() -> Self {
         let mut table = Self {
@@ -434,14 +481,14 @@ impl FdTable {
         char_limit: Option<usize>,
         exact: bool,
     ) -> Option<String> {
-        self.read_bytes(fd, delimiter as u8, char_limit, exact)
+        self.read_bytes(fd, delimiter, char_limit, exact)
             .map(|bytes| bytes_to_shell_text(&bytes))
     }
 
     pub(crate) fn read_bytes(
         &mut self,
         fd: u32,
-        delimiter: u8,
+        delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
     ) -> Option<Vec<u8>> {
@@ -467,20 +514,24 @@ impl FdTable {
             return Some(Vec::new());
         }
         let slice = &input.data[input.offset..];
+        let seqs = read_delimiter_seqs(delimiter);
         let mut consumed = 0;
         let mut chars = 0;
         let mut delimiter_found = false;
+        let mut delimiter_len = 0usize;
         let mut limit_reached = false;
         for (index, byte) in slice.iter().copied().enumerate() {
-            if !exact && byte == delimiter {
-                consumed = index + 1;
-                delimiter_found = true;
-                break;
-            }
             if byte & 0xc0 != 0x80 {
                 chars += 1;
             }
             consumed = index + 1;
+            if !exact {
+                if let Some(len) = delimiter_seq_ending_at(&seqs, slice, consumed) {
+                    delimiter_found = true;
+                    delimiter_len = len;
+                    break;
+                }
+            }
             if char_limit.is_some_and(|limit| chars >= limit) {
                 limit_reached = true;
                 break;
@@ -494,8 +545,8 @@ impl FdTable {
             return None;
         }
         self.read_eof_no_delimiter = !delimiter_found && !limit_reached;
-        let result_len = if !exact && slice[consumed - 1] == delimiter {
-            consumed - 1
+        let result_len = if delimiter_found {
+            consumed - delimiter_len
         } else {
             consumed
         };
@@ -517,7 +568,7 @@ impl FdTable {
     fn read_file_bytes(
         &mut self,
         file: Rc<FileFd>,
-        delimiter: u8,
+        delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
     ) -> Option<Vec<u8>> {
@@ -542,6 +593,7 @@ impl FdTable {
         let mut consumed = false;
         let mut delimiter_found = false;
         let mut limit_reached = false;
+        let seqs = read_delimiter_seqs(delimiter);
         loop {
             // read.def check_read_timeout + shtimer_select: each byte read
             // is bounded by the remaining deadline.
@@ -561,19 +613,19 @@ impl FdTable {
                 Err(_) => break,
             };
             consumed = true;
-            let mut keep = true;
-            if !exact && byte == delimiter {
-                keep = false; // delimiter is consumed but not returned
-                delimiter_found = true;
-            }
             if byte & 0xc0 != 0x80 {
                 chars += 1;
             }
-            if keep {
-                result.push(byte);
-            }
-            if !keep {
-                break;
+            result.push(byte);
+            if !exact {
+                // The delimiter is consumed but not returned: when the
+                // accumulated bytes end with one of its sequences, drop
+                // the sequence back off the record (rubash#1062).
+                if let Some(len) = delimiter_seq_ending_at(&seqs, &result, result.len()) {
+                    result.truncate(result.len() - len);
+                    delimiter_found = true;
+                    break;
+                }
             }
             if char_limit.is_some_and(|limit| chars >= limit) {
                 limit_reached = true;
@@ -605,13 +657,14 @@ impl FdTable {
     fn read_file_bytes_buffered(
         &mut self,
         file: Rc<FileFd>,
-        delimiter: u8,
+        delimiter: char,
         char_limit: Option<usize>,
         exact: bool,
     ) -> Option<Vec<u8>> {
         let Ok(origin) = crate::fd::file_position(file.handle) else {
             return None;
         };
+        let seqs = read_delimiter_seqs(delimiter);
         let mut buffer: Vec<u8> = Vec::new();
         let mut result: Vec<u8> = Vec::new();
         let mut chars = 0usize;
@@ -629,21 +682,20 @@ impl FdTable {
             for (index, &byte) in buffer[scanned_from..].iter().enumerate() {
                 let absolute = scanned_from + index;
                 consumed = true;
-                let mut keep = true;
-                if !exact && byte == delimiter {
-                    keep = false;
-                    delimiter_found = true;
-                }
                 if byte & 0xc0 != 0x80 {
                     chars += 1;
                 }
-                if keep {
-                    result.push(byte);
-                } else {
-                    // Delimiter consumed but not returned; everything after
-                    // its position is prefetched data to rewind over.
-                    rewind = Some(origin + (absolute as u64) + 1);
-                    break 'chunks;
+                result.push(byte);
+                if !exact {
+                    if let Some(len) = delimiter_seq_ending_at(&seqs, &result, result.len()) {
+                        // Delimiter consumed but not returned; everything
+                        // after its end position is prefetched data to
+                        // rewind over.
+                        result.truncate(result.len() - len);
+                        delimiter_found = true;
+                        rewind = Some(origin + (absolute as u64) + 1);
+                        break 'chunks;
+                    }
                 }
                 if char_limit.is_some_and(|limit| chars >= limit) {
                     limit_reached = true;
