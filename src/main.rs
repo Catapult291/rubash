@@ -604,6 +604,16 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
         return 2;
     }
 
+    if pretty_print {
+        // GNU shell.c: --pretty-print with no script file runs
+        // pretty_print_loop over stdin (eval.c:215-253): the input is
+        // printed back canonically, never executed (rubash#1084).
+        use std::io::Read;
+        let mut contents = String::new();
+        let _ = io::stdin().read_to_string(&mut contents);
+        return run_pretty_print_text(executor, &contents);
+    }
+
     if read_from_stdin {
         executor.set_positional_params(std::mem::take(&mut stdin_positionals));
         return run_stdin_script_with_init(
@@ -905,6 +915,13 @@ fn run_pretty_print(executor: &mut Executor, script: &str) -> i32 {
         eprintln!("{shell_name}: {script}: {message}");
         return code;
     };
+    run_pretty_print_text(executor, &contents)
+}
+
+/// The contents-based core of [`run_pretty_print`] (pretty_print_loop,
+/// eval.c:215-253), shared by the script-file form and the stdin form.
+fn run_pretty_print_text(executor: &mut Executor, contents: &str) -> i32 {
+    let contents = contents.to_string();
     let posix = executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
     let mut output = String::new();
     // pretty_print_loop (eval.c:215-253) reads one command at a time: a
