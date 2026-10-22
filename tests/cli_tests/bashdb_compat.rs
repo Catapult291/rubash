@@ -1,12 +1,12 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, path::Path};
 
 #[path = "../support/bashdb_fixture.rs"]
 mod bashdb_fixture;
 
 fn run_rubash_inline(script: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rubash"))
+    crate::rubash_command()
         .arg("-c")
         .arg(script)
         .output()
@@ -184,7 +184,7 @@ fn virtual_stdin_and_tty_match_noninteractive_bashdb_expectations() {
 
 #[test]
 fn dynamic_fd_redirect_can_read_from_dev_stdin() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-c")
         .arg("exec {fd}</dev/stdin\nIFS= read -r -u $fd line\nprintf 'line=%s status=%s\\n' \"$line\" \"$?\"\n")
         .stdin(Stdio::piped())
@@ -368,7 +368,7 @@ fn bashdb_help_command_list_is_populated() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -477,7 +477,7 @@ fn bashdb_delete_removes_breakpoint_entry() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -540,7 +540,7 @@ fn bashdb_clear_removes_breakpoint_by_file_line() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -592,7 +592,7 @@ fn bashdb_commands_block_consumes_secondary_input_without_fd_loop() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -642,7 +642,7 @@ fn bashdb_examine_prints_debugged_local_variable() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -697,7 +697,7 @@ fn bashdb_info_variables_runs_without_assoc_value_errors() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -783,7 +783,7 @@ fn bashdb_info_variables_filters_indexed_and_associative_arrays() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -817,7 +817,7 @@ fn bashdb_sourced_command_errors_name_sourced_file() {
     let inner = Path::new("target/bashdb-source-diagnostic-inner.sh");
     fs::write(outer, "source target/bashdb-source-diagnostic-inner.sh\n").unwrap();
     fs::write(inner, "command_that_does_not_exist\n").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg(outer)
@@ -860,7 +860,7 @@ fn bashdb_info_files_reports_source_files_without_command_substitution_error() {
     let posix_drive_form = format!("/{}/{}", cwd[..1].to_ascii_lowercase(), &cwd[3..]);
     #[cfg(not(windows))]
     let posix_drive_form = cwd;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -904,7 +904,7 @@ fn bashdb_continue_numeric_location_hits_function_source_line() {
     let posix_drive_form = format!("/{}/{}", cwd[..1].to_ascii_lowercase(), &cwd[3..]);
     #[cfg(not(windows))]
     let posix_drive_form = cwd;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -942,7 +942,7 @@ fn bash_compat_debugger_options_run_init_file_before_script() {
     fs::write(&init, "INIT_VALUE=ready\n").unwrap();
     fs::write(&script, "printf 'value=%s\\n' \"$INIT_VALUE\"\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("--init-file")
         .arg(&init)
         .arg("--debugger")
@@ -963,7 +963,7 @@ fn bashdb_debug_nested_shell_preserves_typeset_array_quotes() {
         return;
     }
     ensure_bash_shim_fixture();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -1008,7 +1008,7 @@ fn bashdb_shell_nested_bash_uses_compatible_shim() {
     // (verified: under WSL GNU Bash 5.3.0 the same flow enters the nested
     // shell cleanly).
     ensure_bash_shim_fixture();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")
@@ -1066,7 +1066,7 @@ fn bashdb_list_function_name_uses_extdebug_declare_metadata() {
     if !bashdb_fixture_available() {
         return;
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("target/bashdb-clean/bashdb-generated")
         .arg("--no-highlight")
         .arg("target/bashdb-probe-target.sh")

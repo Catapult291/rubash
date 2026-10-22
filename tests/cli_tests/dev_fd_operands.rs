@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 // `/dev/std*` / `/dev/fd/N` / `/proc/self/fd/N` operand semantics, checked
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 // builtins, materialized paths for real children.
 
 fn run(script: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rubash"))
+    crate::rubash_command()
         .arg("-c")
         .arg(script)
         .output()
@@ -18,7 +18,7 @@ fn run(script: &str) -> std::process::Output {
 }
 
 fn run_with_stdin(script: &str, stdin: &[u8]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
@@ -195,7 +195,7 @@ fn dev_stdout_reopens_inherited_file_handle() {
         .append(true)
         .open(&seed)
         .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("cat /dev/stdout")
         .stdout(Stdio::from(file))
@@ -217,7 +217,7 @@ fn dev_stdout_reopens_inherited_file_handle() {
         .append(true)
         .open(&err_seed)
         .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("cat /dev/stderr")
         .stdout(Stdio::piped())
@@ -319,7 +319,7 @@ fn dev_tty_may_block_or_fail_like_gnu() {
     // pinned here is the absence of a path-translation failure: a fast
     // exit must carry a device-style diagnostic, not ENOENT for a mangled
     // path like winuxcmd\dev\tty.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-c")
         .arg("cat /dev/tty </dev/null")
         .stdin(Stdio::null())

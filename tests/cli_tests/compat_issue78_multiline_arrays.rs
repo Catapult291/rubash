@@ -3,10 +3,8 @@
 //! physical lines while a command-position `name=(` is unclosed (GNU parse.y),
 //! instead of executing the array elements as commands.
 
-use std::process::Command;
-
 fn run(script: &str) -> (String, String, Option<i32>) {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(script)
         .env("HOME", env!("CARGO_TARGET_TMPDIR"))
@@ -77,7 +75,7 @@ fn unclosed_compound_assignment_at_eof_reports_gnu_eof_diagnostic() {
     // `<script>: line 1:` prefix GNU uses for unclosed compound assignments.
     let script_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("issue78_unclosed.sh");
     std::fs::write(&script_path, "a=(\n1\n2\n").expect("write unclosed compound probe");
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .env("HOME", env!("CARGO_TARGET_TMPDIR"))
         .output()

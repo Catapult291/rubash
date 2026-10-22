@@ -1,6 +1,6 @@
 use super::shell_test_path;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, path::Path};
 
 fn bash_example_dir(kind: &str) -> std::path::PathBuf {
@@ -12,7 +12,7 @@ fn bash_example_dir(kind: &str) -> std::path::PathBuf {
 
 #[test]
 fn gnu_zprintf_usage_guard_exits_before_body() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("third_party/bash/examples/scripts/zprintf")
         .output()
         .expect("run rubash");
@@ -32,7 +32,7 @@ fn gnu_zprintf_usage_guard_exits_before_body() {
 // tree, which GNU rejects outright — platform noise; rubash tolerates).
 #[test]
 fn gnu_dirstack_function_definitions_parse_comments() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("third_party/bash/examples/functions/dirstack")
         .output()
         .expect("run rubash");
@@ -44,7 +44,7 @@ fn gnu_dirstack_function_definitions_parse_comments() {
 
 #[test]
 fn script_aliasconv_example_converts_aliases() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("aliasconv.bash")
         .current_dir(bash_example_dir("misc"))
         .stdin(Stdio::piped())
@@ -68,7 +68,7 @@ fn script_aliasconv_example_converts_aliases() {
 
 #[test]
 fn script_arrayops_example_manipulates_arrays() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-s")
         .current_dir(bash_example_dir("functions"))
         .stdin(Stdio::piped())
@@ -102,7 +102,7 @@ fn script_arrayops_example_manipulates_arrays() {
 
 #[test]
 fn script_array_stuff_example_runs_array_workflows() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("array-stuff")
         .current_dir(bash_example_dir("functions"))
         .output()
@@ -125,7 +125,7 @@ fn script_array_stuff_example_runs_array_workflows() {
 
 #[test]
 fn script_array_to_string_example_joins_arrays() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-s")
         .current_dir(bash_example_dir("functions"))
         .stdin(Stdio::piped())
@@ -160,7 +160,7 @@ fn script_center_example_reads_file_in_nested_loop() {
     fs::create_dir_all("target").unwrap();
     fs::write(&input_path, "alpha\nbeta\n").unwrap();
     let script_input = shell_test_path(&std::env::current_dir().unwrap().join(&input_path));
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("center")
         .arg(&script_input)
         .current_dir(bash_example_dir("scripts"))
@@ -181,7 +181,7 @@ fn script_center_example_reads_file_in_nested_loop() {
     ignore = "known Linux baseline: command substitution splits sorted quoted positional params"
 )]
 fn script_sort_pos_params_example_handles_quoted_positional_args() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("sort-pos-params")
         .current_dir(bash_example_dir("functions"))
         .output()
@@ -197,7 +197,7 @@ fn script_sort_pos_params_example_handles_quoted_positional_args() {
 
 #[test]
 fn script_kshenv_example_parses_multiline_awk_quote() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("kshenv")
         .current_dir(bash_example_dir("functions"))
         .output()
@@ -210,7 +210,7 @@ fn script_kshenv_example_parses_multiline_awk_quote() {
 
 #[test]
 fn script_xterm_title_example_reports_script_name_without_display() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("xterm_title")
         .current_dir(bash_example_dir("scripts"))
         .output()

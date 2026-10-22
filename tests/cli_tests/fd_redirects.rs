@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -10,7 +9,7 @@ fn c_external_cat_reads_raw_bytes_from_persistent_fd() {
     let path = env::temp_dir().join(format!("rubash-external-fd-{}.bin", std::process::id()));
     fs::write(&path, [0xff, b'\n']).expect("write raw fd input");
     let shell_path = path.to_string_lossy().replace('\\', "/");
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(format!("exec 3< '{shell_path}'; cat <&3"))
         .output()
@@ -24,7 +23,7 @@ fn c_external_cat_reads_raw_bytes_from_persistent_fd() {
 
 #[test]
 fn c_filtered_command_substitution_preserves_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("x=$(printf 'x\\377\\n' | sed -n '1p'); printf '%s\\n' \"$x\"")
         .output()
@@ -46,7 +45,7 @@ fn c_external_command_redirects_stdout_to_stderr_fd() {
     write_helper_script(&script_path, "echo external-fd-copy\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("emitout >&2")
@@ -71,7 +70,7 @@ fn c_external_command_redirects_stderr_to_stdout_fd() {
     write_helper_script(&script_path, "echo external-error >&2\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("emiterr 2>&1")
@@ -96,7 +95,7 @@ fn c_external_stderr_fd_copy_keeps_original_stdout_before_redirect() {
     write_helper_script(&script_path, "echo external-error >&2\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg(format!(
@@ -125,7 +124,7 @@ fn c_external_command_uses_persistent_fd_copied_from_stdout() {
     write_helper_script(&script_path, "echo external-via-fd\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("exec 3>&1; emitout >&3")
@@ -150,7 +149,7 @@ fn c_external_command_uses_persistent_fd_copied_from_stderr() {
     write_helper_script(&script_path, "echo external-via-fd\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("exec 3>&2; emitout >&3")
@@ -175,7 +174,7 @@ fn c_external_stderr_uses_persistent_fd_copied_from_stdout() {
     write_helper_script(&script_path, "echo external-error-via-fd >&2\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("exec 3>&1; emiterr 2>&3")
@@ -200,7 +199,7 @@ fn c_external_command_reports_bad_fd_after_exec_close() {
     write_helper_script(&script_path, "echo external-after-close\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("exec 3>&-; emitout >&3; printf 'status:%s\\n' \"$?\"")
@@ -226,7 +225,7 @@ fn c_external_command_reports_write_error_for_closed_stdout() {
     write_helper_script(&script_path, "echo external-closed-stdout\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("emitout >&-; printf 'status:%s\\n' \"$?\"")
@@ -253,7 +252,7 @@ fn c_external_command_reports_ambiguous_stderr_fd_redirect() {
     write_helper_script(&script_path, "echo external-error >&2\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg("emiterr 2>&bad; printf 'status:%s\\n' \"$?\"")
@@ -273,7 +272,7 @@ fn c_external_command_reports_ambiguous_stderr_fd_redirect() {
 #[test]
 fn c_builtin_command_reports_ambiguous_redirect_after_unquoted_expansion() {
     let _ = fs::remove_file("a b");
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("target='a b'; echo hi > $target; printf 'status:%s\\n' \"$?\"")
         .output()
@@ -290,7 +289,7 @@ fn c_builtin_command_reports_ambiguous_redirect_after_unquoted_expansion() {
 
 #[test]
 fn c_exec_reports_ambiguous_redirect_for_invalid_expanded_fd() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("fd=-1; exec <&$fd; printf 'status:%s\\n' \"$?\"")
         .output()
@@ -308,7 +307,7 @@ fn c_exec_reports_ambiguous_redirect_for_invalid_expanded_fd() {
 fn c_exec_keeps_stdout_redirect_after_invalid_expanded_option() {
     let output_path = Path::new("target").join("rubash-cli-exec-invalid-option.txt");
     let _ = fs::remove_file(&output_path);
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(format!(
             "fd=-1; exec $fd>{}; echo after",
@@ -335,7 +334,7 @@ fn c_external_combined_redirect_preserves_stderr_first_output() {
     write_helper_script(&script_path, "echo external-error >&2\necho external-out\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg(format!(
@@ -364,7 +363,7 @@ fn c_external_combined_append_preserves_existing_and_both_streams() {
     write_helper_script(&script_path, "echo external-error >&2\necho external-out\n");
     let path = path_with_bin_first(&bin_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .env("PATH", path)
         .arg("-c")
         .arg(format!(
@@ -390,7 +389,7 @@ fn c_builtin_printf_preserves_left_to_right_stderr_redirects() {
     let output_path = Path::new("target").join("rubash-cli-printf-stderr-order.txt");
     let _ = fs::remove_file(&output_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(format!(
             "printf 'first\\n' >&2 2> {}; printf 'second\\n' >&2 2>> {}; printf 'both\\n' >&2 2>&1",
@@ -409,13 +408,16 @@ fn c_builtin_printf_preserves_left_to_right_stderr_redirects() {
 }
 
 fn external_fd_copy_bin_dir() -> std::path::PathBuf {
-    // Unique per call so parallel tests never share (and delete) one dir.
+    // Unique per call so parallel tests never share (and delete) one dir:
+    // pid + counter is unique across concurrent test binaries and threads.
+    // Never format a ThreadId here: its Debug form `ThreadId(N)` puts
+    // brackets in a PATH entry and Windows `.cmd` resolution through such
+    // a path fails (unresolved command, not a shell regression).
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Path::new("target").join(format!(
-        "rubash-cli-external-fd-copy-bin-{}-{:?}-{}",
+        "rubash-cli-external-fd-copy-bin-{}-{}",
         std::process::id(),
-        std::thread::current().id(),
         id
     ))
 }
@@ -452,7 +454,7 @@ fn stream_text(bytes: &[u8]) -> String {
 
 #[test]
 fn c_dynamic_fd_closed_redirect_preserves_source_token_diagnostic() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"exec {fd}>&1; exec {fd}>&-; echo hi >&$fd; printf 'status:%s\n' "$?""#)
         .output()
@@ -478,7 +480,7 @@ fn read_text_or_default(path: &Path) -> String {
 
 #[test]
 fn c_dynamic_varredir_close_closes_fd_after_command() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "shopt -s varredir_close; : {fd}>&1; \
