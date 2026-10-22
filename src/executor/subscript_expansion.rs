@@ -386,7 +386,21 @@ impl Executor {
     ) -> IndexedSubscript {
         let resolved = self.resolve_array_subscript(source);
         if resolved.is_empty() {
-            return IndexedSubscript::Empty;
+            // GNU arrayfunc.c:1356 array_expand_index -> expr.c:417
+            // evalexp -> subexpr: empty expanded text evaluates to 0
+            // (valid), so `${a[$j]}` with an empty $j reads element 0
+            // (rubash#1004). A literally empty `${a[]}`/`${#a[]}` never
+            // reaches eval (parse-level "bad substitution", probed on
+            // both shells), so guard the literal shape and map only an
+            // expansion that VANISHED. Assoc bases never reach this
+            // indexed evaluator with an empty key (their arm errors
+            // first); unset/write keep the mutable evaluator unchanged.
+            if let SubscriptSource::Raw(raw) = source {
+                if raw.is_empty() {
+                    return IndexedSubscript::Empty;
+                }
+            }
+            return IndexedSubscript::Index(0);
         }
         // Same single-evaluation dedup as eval_indexed_subscript: the
         // layered `${}` passes re-resolve the identical site+text.
