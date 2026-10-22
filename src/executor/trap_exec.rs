@@ -1079,10 +1079,22 @@ impl Executor {
             // shift_trap_action_lines).
             shift_trap_action_lines(&mut ast.commands, call_line as i64 - 1);
         }
+        // rubash#1165: the function's return status is fixed BEFORE the
+        // RETURN trap runs (execute_cmd.c's return_catch value becomes
+        // last_command_exit_value; trap.c _run_trap_internal saves and
+        // restores it around the action) — the action's own last-command
+        // status must not replace it in either direction (`trap 'echo X'
+        // RETURN` after `false` keeps rc 1; `trap 'false' RETURN` after
+        // `true` keeps rc 0). Save/restore like the ERR/signal runners;
+        // unwinds (exit/return in the action) still propagate.
+        let saved_exit = self.exit_code;
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
         self.trap_saved_exit_value = prev_saved_exit;
         self.trap_saved_exit_context = prev_saved_context;
         self.return_trap_running = false;
+        if result.is_ok() {
+            self.exit_code = saved_exit;
+        }
         result
     }
 
