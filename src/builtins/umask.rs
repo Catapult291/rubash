@@ -153,10 +153,19 @@ fn current_mask(env_vars: &HashMap<String, String>) -> u32 {
     // umask(0) reveals the current mask; restore it immediately.
     // SAFETY: same read-restore dance as GNU/C libraries; the value is
     // only used for display here, never to gate file creation.
-    unsafe {
-        let mask = libc::umask(0);
-        libc::umask(mask);
-        mask as u32
+    // Unix-only (libc is a unix-only dependency): Windows has no process
+    // umask and keeps the previous default.
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mask = libc::umask(0);
+            libc::umask(mask);
+            return mask as u32;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        0o022
     }
 }
 
