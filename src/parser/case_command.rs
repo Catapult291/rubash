@@ -344,6 +344,7 @@ pub(super) fn parse_case_command(
                 TokenKind::HereDocBody => {
                     let body = tokens[i].value.clone();
                     let gather_line = tokens[i].position;
+                    let end_line = tokens[i].heredoc_end_line;
                     if let Some(clause) = clauses.last_mut() {
                         let mut ast = Ast {
                             commands: std::mem::take(&mut clause.body),
@@ -353,6 +354,7 @@ pub(super) fn parse_case_command(
                             &mut ast,
                             body,
                             gather_line,
+                            end_line,
                         );
                         clause.body = ast.commands;
                     }

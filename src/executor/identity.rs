@@ -58,6 +58,14 @@ pub fn ostype() -> String {
         // configure triple's os-env suffix. GNU bash 5.3.0 built against
         // glibc reports `linux-gnu` (WSL probe 2026-09-27: `echo $OSTYPE`).
         // MACHTYPE's `native_machtype()` arm already mirrors the triple.
+        // GNU-on-Android (bionic) configures as `*-unknown-linux-android`
+        // (support/config.guess: `__ANDROID__` -> LIBC=android, and only the
+        // linux-* kernels validate in support/config.sub), so its host_os
+        // — and therefore OSTYPE — is `linux-android`, not bare `android`
+        // (Termux GNU bash 5.3.20 probe 2026-10-22: `echo $OSTYPE`).
+        if cfg!(target_os = "android") {
+            return "linux-android".to_string();
+        }
         if cfg!(target_env = "gnu") {
             return format!("{}-gnu", std::env::consts::OS);
         }
@@ -90,6 +98,12 @@ fn native_machtype() -> String {
         format!("{}-pc-windows", std::env::consts::ARCH)
     } else if cfg!(target_os = "macos") {
         format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else if cfg!(target_os = "android") {
+        // GNU MACHTYPE is the full configure host triple (variables.c:725,
+        // Makefile.in MACHTYPE=@host@): `aarch64-unknown-linux-android`
+        // (Termux GNU bash 5.3.20 probe 2026-10-22), not the Rust
+        // `std::env::consts::OS` spelling `aarch64-unknown-android`.
+        format!("{}-unknown-linux-android", std::env::consts::ARCH)
     } else if cfg!(target_env = "gnu") {
         format!("{}-pc-{}-gnu", std::env::consts::ARCH, std::env::consts::OS)
     } else {
@@ -451,5 +465,22 @@ mod identity_tests {
     fn utc_timestamp_shape_matches_msys_form() {
         let text = format_utc_timestamp(std::time::UNIX_EPOCH).unwrap();
         assert_eq!(text, "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    #[cfg(target_os = "android")]
+    fn android_reports_gnu_linux_android_identity() {
+        // GNU-on-Android configures as `*-unknown-linux-android`
+        // (support/config.guess maps `__ANDROID__` to LIBC=android; only
+        // linux-* kernels validate in support/config.sub; Makefile.in binds
+        // MACHTYPE=@host@ and OS=@host_os@; variables.c:724-725 set_if_not).
+        // Termux GNU bash 5.3.20 reports OSTYPE=linux-android and
+        // MACHTYPE=aarch64-unknown-linux-android, so `case $OSTYPE in
+        // linux*` gates take the Linux branch (rubash#1030).
+        assert_eq!(ostype(), "linux-android");
+        assert_eq!(
+            machtype(),
+            format!("{}-unknown-linux-android", std::env::consts::ARCH)
+        );
     }
 }

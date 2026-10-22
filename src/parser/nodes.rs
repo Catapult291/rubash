@@ -1272,6 +1272,15 @@ pub struct CommandNode {
     /// GNU reports "here-document at line N" against this gather line, not
     /// the command start line (make_cmd.c:626-627, parse.y:3130).
     pub heredoc_gather_line: Option<usize>,
+    /// Physical line where the primary `<<` heredoc's body scan ended: the
+    /// closing-delimiter line when terminated, the last body line when EOF
+    /// terminated the gather (the lexer's `heredoc_end_line`, mirroring GNU's
+    /// `line_number` at internal_warning time in make_cmd.c:626). An
+    /// unquoted delimiter joins `\<newline>` pairs while collecting
+    /// (parse.y read_a_line), so the stored body can hold fewer newlines
+    /// than the physical lines consumed — the warning prefix must use this
+    /// line, not `gather_line + body.lines().count()` (rubash#1028).
+    pub heredoc_end_line: Option<usize>,
 }
 
 impl CommandNode {
@@ -1359,6 +1368,7 @@ impl CommandNode {
             logical_line: None,
             end_line: None,
             heredoc_gather_line: None,
+            heredoc_end_line: None,
         }
     }
 

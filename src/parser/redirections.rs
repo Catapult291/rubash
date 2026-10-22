@@ -27,7 +27,12 @@ pub(super) fn collect_trailing_redirections(
         }
 
         if token.kind == TokenKind::HereDocBody {
-            if fill_pending_heredoc_body(command, &token.value, token.position) {
+            if fill_pending_heredoc_body(
+                command,
+                &token.value,
+                token.position,
+                token.heredoc_end_line,
+            ) {
                 *index += 1;
                 continue;
             }
@@ -668,13 +673,14 @@ pub(super) fn assign_heredoc_body(
     ast: &mut Ast,
     body: String,
     gather_line: usize,
+    end_line: Option<usize>,
 ) {
     for command in ast.commands.iter_mut() {
-        if fill_pending_heredoc_body_recursive(command, &body, gather_line) {
+        if fill_pending_heredoc_body_recursive(command, &body, gather_line, end_line) {
             return;
         }
     }
-    if fill_pending_heredoc_body_recursive(current_cmd, &body, gather_line) {
+    if fill_pending_heredoc_body_recursive(current_cmd, &body, gather_line, end_line) {
         return;
     }
     current_cmd.heredoc = Some(encode_stdin_body_enq(&body));
@@ -684,92 +690,125 @@ fn fill_pending_heredoc_body_recursive(
     cmd: &mut CommandNode,
     body: &str,
     gather_line: usize,
+    end_line: Option<usize>,
 ) -> bool {
-    if fill_pending_heredoc_body(cmd, body, gather_line) {
+    if fill_pending_heredoc_body(cmd, body, gather_line, end_line) {
         return true;
     }
 
     if let Some(pipeline) = &mut cmd.pipeline_command {
-        if fill_pending_heredoc_body_in_commands(&mut pipeline.stages, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut pipeline.stages, body, gather_line, end_line)
+        {
             return true;
         }
     }
     if let Some(list) = &mut cmd.and_or_list {
-        if fill_pending_heredoc_body_in_commands(&mut list.commands, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut list.commands, body, gather_line, end_line) {
             return true;
         }
     }
     if let Some(time) = &mut cmd.time_command {
-        if fill_pending_heredoc_body_recursive(&mut time.command, body, gather_line) {
+        if fill_pending_heredoc_body_recursive(&mut time.command, body, gather_line, end_line) {
             return true;
         }
     }
     if let Some(background) = &mut cmd.background_command {
-        if fill_pending_heredoc_body_recursive(&mut background.command, body, gather_line) {
+        if fill_pending_heredoc_body_recursive(&mut background.command, body, gather_line, end_line)
+        {
             return true;
         }
     }
     if let Some(inverted) = &mut cmd.inverted_command {
-        if fill_pending_heredoc_body_recursive(&mut inverted.command, body, gather_line) {
+        if fill_pending_heredoc_body_recursive(&mut inverted.command, body, gather_line, end_line) {
             return true;
         }
     }
     if let Some(for_command) = &mut cmd.for_command {
-        if fill_pending_heredoc_body_in_commands(&mut for_command.body, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut for_command.body, body, gather_line, end_line)
+        {
             return true;
         }
     }
     if let Some(if_command) = &mut cmd.if_command {
-        if fill_pending_heredoc_body_in_commands(&mut if_command.condition, body, gather_line)
-            || fill_pending_heredoc_body_in_commands(&mut if_command.then_body, body, gather_line)
-            || if_command.elif_branches.iter_mut().any(|branch| {
-                fill_pending_heredoc_body_in_commands(&mut branch.condition, body, gather_line)
-                    || fill_pending_heredoc_body_in_commands(&mut branch.body, body, gather_line)
-            })
-            || if_command.else_body.as_mut().is_some_and(|commands| {
-                fill_pending_heredoc_body_in_commands(commands, body, gather_line)
-            })
-        {
+        if fill_pending_heredoc_body_in_commands(
+            &mut if_command.condition,
+            body,
+            gather_line,
+            end_line,
+        ) || fill_pending_heredoc_body_in_commands(
+            &mut if_command.then_body,
+            body,
+            gather_line,
+            end_line,
+        ) || if_command.elif_branches.iter_mut().any(|branch| {
+            fill_pending_heredoc_body_in_commands(
+                &mut branch.condition,
+                body,
+                gather_line,
+                end_line,
+            ) || fill_pending_heredoc_body_in_commands(
+                &mut branch.body,
+                body,
+                gather_line,
+                end_line,
+            )
+        }) || if_command.else_body.as_mut().is_some_and(|commands| {
+            fill_pending_heredoc_body_in_commands(commands, body, gather_line, end_line)
+        }) {
             return true;
         }
     }
     if let Some(loop_command) = &mut cmd.loop_command {
-        if fill_pending_heredoc_body_in_commands(&mut loop_command.condition, body, gather_line)
-            || fill_pending_heredoc_body_in_commands(&mut loop_command.body, body, gather_line)
-        {
+        if fill_pending_heredoc_body_in_commands(
+            &mut loop_command.condition,
+            body,
+            gather_line,
+            end_line,
+        ) || fill_pending_heredoc_body_in_commands(
+            &mut loop_command.body,
+            body,
+            gather_line,
+            end_line,
+        ) {
             return true;
         }
     }
     if let Some(subshell) = &mut cmd.subshell_command {
-        if fill_pending_heredoc_body_in_commands(&mut subshell.body, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut subshell.body, body, gather_line, end_line) {
             return true;
         }
     }
     if let Some(case_command) = &mut cmd.case_command {
         if case_command.clauses.iter_mut().any(|clause| {
-            fill_pending_heredoc_body_in_commands(&mut clause.body, body, gather_line)
+            fill_pending_heredoc_body_in_commands(&mut clause.body, body, gather_line, end_line)
         }) {
             return true;
         }
     }
     if let Some(select_command) = &mut cmd.select_command {
-        if fill_pending_heredoc_body_in_commands(&mut select_command.body, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(
+            &mut select_command.body,
+            body,
+            gather_line,
+            end_line,
+        ) {
             return true;
         }
     }
     if let Some(function) = &mut cmd.function_command {
-        if fill_pending_heredoc_body_in_commands(&mut function.body, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut function.body, body, gather_line, end_line) {
             return true;
         }
     }
     if let Some(brace_group) = &mut cmd.brace_group {
-        if fill_pending_heredoc_body_in_commands(&mut brace_group.body, body, gather_line) {
+        if fill_pending_heredoc_body_in_commands(&mut brace_group.body, body, gather_line, end_line)
+        {
             return true;
         }
     }
     if let Some(coproc) = &mut cmd.coproc_command {
         if coproc.body.as_mut().is_some_and(|commands| {
-            fill_pending_heredoc_body_in_commands(commands, body, gather_line)
+            fill_pending_heredoc_body_in_commands(commands, body, gather_line, end_line)
         }) {
             return true;
         }
@@ -782,10 +821,11 @@ fn fill_pending_heredoc_body_in_commands(
     commands: &mut [CommandNode],
     body: &str,
     gather_line: usize,
+    end_line: Option<usize>,
 ) -> bool {
     commands
         .iter_mut()
-        .any(|command| fill_pending_heredoc_body_recursive(command, body, gather_line))
+        .any(|command| fill_pending_heredoc_body_recursive(command, body, gather_line, end_line))
 }
 
 /// A literal ENQ (0x05) byte in collected stdin-body text is
@@ -824,6 +864,7 @@ pub(super) fn fill_pending_heredoc_body(
     cmd: &mut CommandNode,
     body: &str,
     gather_line: usize,
+    end_line: Option<usize>,
 ) -> bool {
     let Some(redirect) = cmd
         .heredoc_redirects
@@ -846,6 +887,11 @@ pub(super) fn fill_pending_heredoc_body(
                 .replace(crate::executor::markers::CTLESC, ""),
         );
         cmd.heredoc_gather_line = Some(gather_line);
+        // Physical end of the gather (closing-delimiter line, or the last
+        // body line at EOF): the warning prefix line. Stored newlines can
+        // undercount it when `\<newline>` joins folded several physical
+        // lines into one logical body line (rubash#1028).
+        cmd.heredoc_end_line = end_line;
     }
     true
 }

@@ -156,8 +156,13 @@ fn attach_pending_heredoc_eof_warnings(tokens: &[Token], index: usize, command: 
         let body_text = &body[crate::executor::markers::DATA_DOLLAR_STR.len()..];
         let gather_line = token.position;
         // An unterminated gather consumed the body lines it read and stops
-        // at EOF on the last one (no closing-delimiter line).
-        let warn_line = gather_line + body_text.lines().count();
+        // at EOF on the last one (no closing-delimiter line). Prefer the
+        // lexer's physical end line: an unquoted delimiter joins
+        // `\<newline>` pairs while collecting, so the stored body can hold
+        // fewer newlines than the physical lines consumed (rubash#1028).
+        let warn_line = token
+            .heredoc_end_line
+            .unwrap_or_else(|| gather_line + body_text.lines().count());
         command.insert_assignment(
             format!("__RUBASH_PARSE_ERROR_HD_WARN_{warn_index}__"),
             format!(
@@ -936,6 +941,7 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                 &mut state.ast,
                 token.value.clone(),
                 token.position,
+                token.heredoc_end_line,
             );
         }
         TokenKind::And | TokenKind::Or => {
