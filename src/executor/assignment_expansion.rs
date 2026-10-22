@@ -448,6 +448,71 @@ impl Executor {
         let value = self.shell_variable_value(src).unwrap_or_default();
         (!value.contains([markers::IFS_GLUE, markers::ANSI_C_IFS_GUARD])).then_some(value)
     }
+
+    /// `literal$text` splice for the word-funnel assignment path
+    /// (`parameter_core.rs`): `m[k$i]=v$i` reaches the funnel as
+    /// `m=` + cooked `v$i`, and the funnel's inline expansion (hoist,
+    /// embedded walker, tilde re-check) is provably the splice below on
+    /// this shape. GNU subst.c:11229 expand_word_internal copies such a
+    /// word's literal bytes and resolves the one read through the same
+    /// dynamic -> shell -> process-env chain, with no field splitting,
+    /// no globbing and no re-scan. Admission mirrors the subscript
+    /// plain-name lane (rubash#117 whitelist; doubt falls through):
+    /// exactly one `$`, a bare shell name after it, an optional single
+    /// trailing PARAM_NAME_END_MARKER (the lexer's quoted-word boundary,
+    /// consumed as a boundary by the walker, never data), and plain
+    /// bytes before it (the closed literal set — no introducer, quote,
+    /// escape, tilde, glob, paren, brace, or marker byte can occur;
+    /// cooked literal-`$` carriers arrive as DATA_DOLLAR, outside the
+    /// set, so mixed encodings fall through).
+    /// Conservatism mirrors fast_plain_copy (nounset/dynamics refuse)
+    /// plus the walker's exact_case_env_var fallback and a full
+    /// marker-bytes refusal, so the resolved bytes are byte-identical:
+    /// hoisting is identity (no quotes/backslash), the walker's DQ/SQ
+    /// replaces and sq restores are identity (no sentinels), the tail
+    /// DATA_BACKSLASH/PARAM_NAME_END_MARKER restores only remove the
+    /// stripped boundary, and the assignment tilde tail cannot fire
+    /// (no leading `~` admittable).
+    pub(in crate::executor) fn fast_assignment_plain_splice(&self, value: &str) -> Option<String> {
+        let value = value
+            .strip_suffix(markers::PARAM_NAME_END_MARKER)
+            .unwrap_or(value);
+        // Assignment words reaching the funnel carry live `$` reads as a
+        // literal `$` (the parser's cooked value and the whole-word
+        // cooked text alike); a DATA_DOLLAR (\x1f) byte is protection
+        // carrier for a literal `$` (classification.rs) and the walker
+        // outputs it unexpanded — so match the source byte, and the
+        // closed prefix set below (which excludes \x1f) rejects any
+        // value mixing the two encodings.
+        let dollar = value.find('$')?;
+        let (prefix, rest) = value.split_at(dollar);
+        if !prefix.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'+' | b'/' | b':' | b',')
+        }) {
+            return None;
+        }
+        let name = &rest[1..];
+        if !is_shell_name(name) {
+            return None;
+        }
+        if self.dynamic_parameter_value(name).is_some()
+            || crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset")
+        {
+            return None;
+        }
+        let resolved = self
+            .shell_variable_value(name)
+            .or_else(|| crate::executor::env_helpers::exact_case_env_var(name))
+            .unwrap_or_default();
+        if crate::executor::markers::contains_word_marker_bytes(&resolved) {
+            return None;
+        }
+        let mut out = String::with_capacity(prefix.len() + resolved.len());
+        out.push_str(prefix);
+        out.push_str(&resolved);
+        Some(out)
+    }
+
     /// Assignment expansion with the parser-preserved verbatim RHS available.
     ///
     /// GNU subst.c:11349-11378 (`expand_word_internal`): an unquoted `<(`/`>(`
