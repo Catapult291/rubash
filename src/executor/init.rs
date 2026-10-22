@@ -653,6 +653,13 @@ impl Executor {
         env_vars
             .entry("_".to_string())
             .or_insert_with(bash_path_value);
+        // GNU bashline.c initializes COMP_WORDBREAKS at startup from
+        // rl_basic_word_break_characters, so the variable is always set
+        // (declare -p COMP_WORDBREAKS succeeds in a fresh shell) even
+        // non-interactively (rubash#1086).
+        env_vars
+            .entry("COMP_WORDBREAKS".to_string())
+            .or_insert_with(|| " \t\n\"'@><=;|&(:".to_string());
         env_vars.insert(
             SHELL_START_EPOCH.to_string(),
             current_epoch_seconds().to_string(),
