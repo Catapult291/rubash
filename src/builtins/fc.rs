@@ -206,25 +206,28 @@ where
         index += 1;
     }
 
-    let count = entries.len();
-    if count == 0 {
-        // GNU fc.def: the execute form (`fc -s`, and `fc -e -` which sets
-        // execute=1 at fc.def:243-246) resolves its command through
-        // fc_gethist and reports "no command found" (EXECUTION_FAILURE)
-        // when the list is empty, while the list/edit forms return
-        // EXECUTION_SUCCESS on an empty list (fc.def:318-319
-        // `if (hlist == 0) return (EXECUTION_SUCCESS)`) (rubash#1123).
-        if execute || editor.as_deref() == Some("-") {
-            writeln!(stderr, "{diagnostic_prefix}fc: no command found")?;
-            return Ok(FcResult::Status(EXECUTION_FAILURE));
-        }
-        return Ok(FcResult::Status(EXECUTION_SUCCESS));
-    }
-
     // fc.def: "fc -e -" means execute without an editor -- same as fc -s.
     if editor.as_deref() == Some("-") {
         execute = true;
         editor = None;
+    }
+
+    let count = entries.len();
+    if count == 0 {
+        // GNU fc.def splits the empty-history verdict by form: the
+        // EXECUTE form (fc -s, and fc -e - which the conversion above
+        // already turned into execute=1, fc.def:243-246) resolves its
+        // command through fc_gethist (fc.def:280-286), which returns
+        // NULL over an empty list — "fc: no command found",
+        // EXECUTION_FAILURE (rubash#1123, rubash#1178). The list/edit
+        // forms instead check history_list() itself (fc.def:317-319:
+        // `if (hlist == 0) return (EXECUTION_SUCCESS)`) and succeed
+        // silently, for `fc -l` and the editor path alike.
+        if execute {
+            writeln!(stderr, "{diagnostic_prefix}fc: no command found")?;
+            return Ok(FcResult::Status(EXECUTION_FAILURE));
+        }
+        return Ok(FcResult::Status(EXECUTION_SUCCESS));
     }
 
     // fc.def:334-348 (fc_builtin) / fc_gethist: last_hist = i - rh -
@@ -692,6 +695,23 @@ mod tests {
             ),
         }
         assert_eq!(stderr, "echo xx xb xc\n");
+    }
+
+    #[test]
+    fn test_fc_execute_form_empty_history() {
+        // rubash#1178: the execute form (fc -s / fc -e -) over an empty
+        // history list is "no command found" (fc.def fc_gethist NULL);
+        // the list and edit forms succeed silently (fc.def: hlist == 0).
+        let (_, stderr, result) = run_fc(&["-e", "-", "5"], &[]);
+        expect_status(&result, EXECUTION_FAILURE);
+        assert_eq!(stderr, "fc: no command found\n");
+
+        let (_, stderr, result) = run_fc(&["-s"], &[]);
+        expect_status(&result, EXECUTION_FAILURE);
+        assert_eq!(stderr, "fc: no command found\n");
+
+        let (_, _, result) = run_fc(&["5"], &[]);
+        expect_status(&result, EXECUTION_SUCCESS);
     }
 
     #[test]
