@@ -4,7 +4,7 @@
 
 # Rubash
 
-用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎。
+用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎——原生 Windows bash、Git Bash/MSYS2 alternative，无 POSIX 模拟层。
 
 [English](README.md) · [unixwin.dev](https://unixwin.dev)
 
@@ -22,7 +22,7 @@ Rubash 本身不是 shell 产品。它自带一个参考 CLI（供兼容性 harn
 
 **实测而非宣称**：兼容性用 GNU Bash 自己的 83 套上游测试语料验证——2026-10-12 全量重跑 83/83 全部通过。Windows 上原始 stdout 逐字节相等为 62/83；另有 20 套仅在环境绑定行上有差异（宿主工具输出、NTFS 文件名/属性位、locale、路径形式——台账逐行归因），nameref 的唯一残差行经 GNU 自我对跑证实为 GNU 自身 coproc 收割时序竞争、非 rubash 分歧（台账见下）。
 
-**原生的意义**：打着"Windows 上的 bash"旗号的方案（Git Bash、MSYS2）装的是移植版 bash，骑在 POSIX 模拟层（`msys-2.0.dll`）上——fork 模拟、路径翻译的怪癖会渗进每一个脚本。Rubash 没有这层：一个自包含二进制，直接对话 Win32。
+**原生的意义**：打着"Windows 上的 bash"旗号的方案（Git Bash、MSYS2）装的是移植版 bash，骑在 POSIX 模拟层（`msys-2.0.dll`）上——fork 模拟、路径翻译的怪癖会渗进每一个脚本。Rubash 没有这层：一个自包含二进制，直接对话 Win32——从零实现的 from-scratch replacement。
 
 **路径是一等公民，一个子进程一种方言**：MSYS 的模型是*猜*哪些参数像路径然后改写——这就是为什么每个 AI agent 和脚本都得设置 `MSYS_NO_PATHCONV=1`，防止 `/flags` 被改成 `C:/Program Files/Git/flags`。Rubash 用**逐子进程方言契约**把模型反过来（与 GNU 画的是同一条线：`shell_execve` 把原始词字节原样交给 `execve`，从不改写 argv）。自带 POSIX 层的子进程——凡是从 WinuxCmd 安装解析出来的、或经 `winuxcmd` 分发器解析的——拿到的 argv **逐字原样**，`/d/...`、`/tmp`、`/dev/*` 由它自己解析。原生 Windows 程序则拿到路径形参数的真实 Win32 拼写，翻译**整体一致**（绝不半个 argv 被翻译、另一半留在 POSIX 形），原生工具的每个操作数——包括它即将创建的尚不存在目标——都拿到合法 Win32 路径。紧急回退：导出 `__RUBASH_ARGV_DIALECT=legacy` 可恢复 Option-B 之前的翻译行为。
 
@@ -74,6 +74,8 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
   9 月 9 日为 3427 行 → −99%+
 ```
 
+2026-10-12 全量重跑早于 v1.4.2 tag。
+
 ### 完全通过的套件（零差异，环境差除外）
 
 净化套件集派生自台账的逐套件分类，并非手工维护：仅当某套件的每一差异行都归因于环境（按 AGENTS.md 的 rubash 引起 vs 环境引起划分，并对应覆盖 issue）时才列入此处。上方原始计数（62）+ 环境归类集（20）+ nameref 已证实的 GNU 竞争 = 全部 83 套。
@@ -121,6 +123,11 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
 - 十进制下标数组写 fast lane：交错 8k 从 3.65x→3.16x；顺手修掉 `a[$((i++))]=v` 的真实双副作用（#959）；
 - case：`$BASH_COMMAND` 只渲染头臂：20 臂 ×10k −10%，附分歧修复（#958）；
 - 字面量词准入在 `expand_word_mut` 与命令词间共享，瞄准 export/unset 主体里 43% 的 `expand_command_words` 份额（#956）；同族还有 walker entry-chain 修剪（#973）与 `shift` 的偏移窗位置参数（#954）。
+- silent 内建短路（空输出且无重定向）：shift ~1.5-4%，export/unset 不变（#984）；
+- 纯 `$name` 下标快道：assoc 交错 8k 从 3.5x→2.6x，线性（~3.1x 渐近）（#985）；
+- quoteless 词跳过恒等 IFS 标记：export/unset 2k 从 2.14x→1.97x（~3-4%）（#986）；
+- compound 元素切分下标跨度扫描线性化：8k 字面量填充 ~850ms→~200ms，20k 从 ~5.1s→640ms（~8x，线性）（#987）；
+- `[ $VAR -op N ]` 整数比较快扩：loop-while 30k 对 GNU 从 ~2.4x→~1.8x（#990）。
 
 **export/unset 经济学**——[issue #916](https://github.com/unixwin/rubash/issues/916) 实测了该家族的单操作成本（如 2000 次动态 export：245 ms 对 GNU 33 ms；unset 腿约 200x）。写车道修复已合入（#917/#918/#920：单探针镜像、门控 env 回退、批量去标记；#943 对 unbind 做正确性返工）；issue 对残留保持开放。
 
@@ -247,4 +254,4 @@ MIT — 详见 [`LICENSE`](LICENSE)。
 
 ---
 
-*最后更新：2026-10-19*
+*最后更新：2026-10-22*
