@@ -555,18 +555,22 @@ impl Executor {
     /// bottom frame (the shell's own positional parameters, reversed)
     /// that GNU's init_bash_argv installs when the arrays materialize
     /// (variables.c get_bashargcv / execute_cmd.c:5337). The bottom
-    /// frame is captured at the first extdebug function entry; a
-    /// top-level read under extdebug before any call synthesizes it
-    /// from the current positional window, mirroring GNU's read-time
-    /// initialization at variable_context 0 (rubash#1051).
+    /// frame's content depends on how the arrays materialized:
+    /// startup / extdebug enable / a top-level read capture the
+    /// then-current positional parameters, while a compat <= 44
+    /// function entry installs an empty frame (see function entry).
+    /// A top-level read before any materialization synthesizes the
+    /// frame from the current positional window, mirroring GNU's
+    /// read-time initialization at variable_context 0
+    /// (variables.c get_bashargcv): GNU shows the bottom frame at
+    /// the top level regardless of extdebug (oracle: script and -c,
+    /// args X Y -> BASH_ARGC=(2), BASH_ARGV=(Y X)), while inside a
+    /// function the arrays stay unmaterialized until a
+    /// materializing call (rubash#1051, rubash#1110 item 4).
     pub(in crate::executor) fn bash_argv_view(&self) -> Vec<String> {
         let mut view = self.shell_state.bash_argv_stack.clone();
-        if let Some(bottom) = &self.shell_state.bash_arg_bottom {
+        if let Some(bottom) = self.bash_arg_bottom_frame() {
             view.extend(bottom.iter().cloned());
-        } else if self.shell_state.function_depth == 0
-            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug")
-        {
-            view.extend(self.shell_state.positional_window().iter().rev().cloned());
         }
         view
     }
@@ -575,14 +579,37 @@ impl Executor {
     /// the bottom frame's count last (see [`Self::bash_argv_view`]).
     pub(in crate::executor) fn bash_argc_view(&self) -> Vec<String> {
         let mut view = self.shell_state.bash_argc_stack.clone();
-        if let Some(bottom) = &self.shell_state.bash_arg_bottom {
+        if let Some(bottom) = self.bash_arg_bottom_frame() {
             view.push(bottom.len().to_string());
-        } else if self.shell_state.function_depth == 0
-            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug")
-        {
-            view.push(self.shell_state.positional_window().len().to_string());
         }
         view
+    }
+
+    /// The installed BASH_ARGV bottom frame, or None while the arg
+    /// arrays have never materialized. A read at the top level
+    /// materializes the frame on the spot, exactly like variables.c
+    /// get_bashargcv (variable_context == 0 && debugging_mode == 0 ->
+    /// init_bash_argv): the frame captures the positional parameters
+    /// current at that first read and persists for the shell's
+    /// lifetime, so a later function entry (even a compat <= 44 one,
+    /// whose own init is then a no-op) observes the same frame.
+    /// Inside a function an unmaterialized array stays unmaterialized.
+    fn bash_arg_bottom_frame(&self) -> Option<Vec<String>> {
+        if let Some(bottom) = self.shell_state.bash_arg_bottom.borrow().as_ref() {
+            return Some(bottom.clone());
+        }
+        if self.shell_state.function_depth > 0 {
+            return None;
+        }
+        let frame: Vec<String> = self
+            .shell_state
+            .positional_window()
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        *self.shell_state.bash_arg_bottom.borrow_mut() = Some(frame.clone());
+        Some(frame)
     }
 
     pub(in crate::executor) fn bash_lineno_view(&self) -> Vec<String> {
@@ -641,25 +668,15 @@ impl Executor {
                     stack
                 }
             }
-            "BASH_ARGV" => {
-                // rubash#1110 item 4: GNU execute_cmd.c (execute_function)
-                // pushes the call args into BASH_ARGV only under
-                // debugging_mode; at compat <= 44 without extdebug the
-                // array stays empty even though BASH_ARGC is populated
-                // (the #1051 writer-side gating keeps the stacks unpushed
-                // without extdebug; this read-side gate covers the
-                // compat <= 44 statement directly).
-                if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
-                    && !crate::builtins::shopt::option_enabled(
-                        &self.shell_state.env_vars,
-                        "extdebug",
-                    )
-                {
-                    Vec::new()
-                } else {
-                    self.bash_argv_view()
-                }
-            }
+            // rubash#1110 item 4 + rubash#1051: execute_cmd.c's
+            // push_args runs only in debugging_mode, so without
+            // extdebug no call frame is ever pushed; the view still
+            // shows the bottom frame once the arrays materialize
+            // (a compat <= 44 call materializes it — see function
+            // entry), which is why BASH_ARGV reads empty in an
+            // arg-less shell at compat <= 44 without extdebug while
+            // BASH_ARGC reads (0).
+            "BASH_ARGV" => self.bash_argv_view(),
             "BASH_ARGC" => self.bash_argc_view(),
             "BASH_LINENO" => self.bash_lineno_view(),
             "BASH_SOURCE" => {
@@ -747,17 +764,9 @@ impl Executor {
             }
             "BASH_ARGC" => return Some(format_indexed_array_values(self.bash_argc_view())),
             "BASH_ARGV" => {
-                // rubash#1110 item 4: same compat <= 44 gate as the direct
-                // view in dynamic_stack_array_values — empty without
-                // extdebug (execute_cmd.c pushes args only when debugging).
-                if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
-                    && !crate::builtins::shopt::option_enabled(
-                        &self.shell_state.env_vars,
-                        "extdebug",
-                    )
-                {
-                    return Some(format_indexed_array_values(Vec::new()));
-                }
+                // rubash#1110 item 4: same composed view as the direct
+                // arm in dynamic_stack_array_values (no call frames
+                // without extdebug; bottom frame once materialized).
                 return Some(format_indexed_array_values(self.bash_argv_view()));
             }
             "BASH_LINENO" => return Some(format_indexed_array_values(self.bash_lineno_view())),

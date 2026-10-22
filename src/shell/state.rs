@@ -75,9 +75,11 @@ pub struct ShellState {
     pub(crate) bash_argv_stack: Vec<String>,
     /// The BASH_ARGV bottom frame (the shell's own positional parameters,
     /// reversed into display order) installed by init_bash_argv the first
-    /// time the arg arrays materialize under extdebug (rubash#1051).
+    /// time the arg arrays materialize (rubash#1051). A RefCell because
+    /// GNU's materialization can happen inside the variables.c getter
+    /// (get_bashargcv) during a read, where the executor is shared.
     /// None while the arrays have never been initialized.
-    pub(crate) bash_arg_bottom: Option<Vec<String>>,
+    pub(crate) bash_arg_bottom: std::cell::RefCell<Option<Vec<String>>>,
     /// variables.c BASH_LINENO/BASH_SOURCE stacks.
     pub(crate) bash_lineno_stack: Vec<String>,
     pub(crate) bash_source_stack: Vec<String>,

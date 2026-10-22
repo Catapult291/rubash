@@ -510,8 +510,8 @@ impl Executor {
                 // installs the bottom frame from the CURRENT positional
                 // parameters (the caller's context), which then persists
                 // for the shell's lifetime (rubash#1051).
-                if self.shell_state.bash_arg_bottom.is_none() {
-                    self.shell_state.bash_arg_bottom = Some(
+                if self.shell_state.bash_arg_bottom.borrow().is_none() {
+                    *self.shell_state.bash_arg_bottom.borrow_mut() = Some(
                         self.shell_state
                             .positional_window()
                             .iter()
@@ -526,6 +526,26 @@ impl Executor {
                 for arg in args {
                     self.shell_state.bash_argv_stack.insert(0, arg.clone());
                 }
+            } else if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+                && self.shell_state.bash_arg_bottom.borrow().is_none()
+            {
+                // rubash#1110 item 4 / rubash#1051 integration: GNU
+                // execute_cmd.c:5337-5339 runs init_bash_argv at
+                // function entry when debugging_mode OR
+                // shell_compatibility_level <= 44, so a compat <= 44
+                // call materializes the BASH_ARGV/BASH_ARGC arrays
+                // even without extdebug — but push_args still runs
+                // only in debugging_mode, so no call frame is added.
+                // The frame the entry-time init pushes is EMPTY
+                // (observed against the GNU 5.3.20 oracle in every
+                // entry order: script args X Y, `set -- P Q R` first,
+                // nested entry — in-function reads always show
+                // BASH_ARGC=(0), BASH_ARGV=()); the positional content
+                // frame appears only when materialization happened
+                // earlier (startup, extdebug enable, or a top-level
+                // read via variables.c get_bashargcv). Once installed,
+                // the frame persists for later reads at any level.
+                *self.shell_state.bash_arg_bottom.borrow_mut() = Some(Vec::new());
             }
             self.set_positional_params(args.to_vec());
             (
