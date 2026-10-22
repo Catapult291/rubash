@@ -541,6 +541,27 @@ impl Executor {
             }
         }
 
+        // GNU execute_cmd.c:6139 shell_execve attempts execve directly
+        // and classifies an ENOEXEC refusal by first bytes (refuse
+        // binaries, run text as a script in THIS shell). std::process::
+        // Command spawns through glibc execvp, whose own ENOEXEC
+        // fallback silently substitutes /bin/sh — a foreign shell with
+        // different syntax — so on unix the classification must happen
+        // BEFORE the spawn: a regular file that is neither #!-headed
+        // nor a native ELF image is exactly what execve refuses
+        // (rubash#1037).
+        #[cfg(unix)]
+        if is_enoexec_candidate(&program) {
+            if let Some((diagnostic, status)) = self.exec_format_refusal(cmd, &program) {
+                let mut stderr = Vec::new();
+                let _ = writeln!(&mut stderr, "{diagnostic}");
+                self.finish_external_error(cmd, &stderr, status)?;
+                return Ok(());
+            }
+            self.execute_enoexec_shell_script(cmd, &program)?;
+            return Ok(());
+        }
+
         let (dev_args, dev_ops) = self.materialize_dev_fd_operands(
             &cmd.words[1..],
             crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
@@ -1439,6 +1460,26 @@ fn is_exec_format_error(error: &io::Error) -> bool {
         let _ = error;
         false
     }
+}
+
+/// Whether execve(2) would refuse `program` with ENOEXEC: a regular
+/// file whose first bytes are neither a `#!` interpreter line nor the
+/// ELF magic of a native image (the only two formats the kernel takes
+/// directly on modern Linux). Directories and unreadable files are
+/// left to the normal spawn-error classification.
+#[cfg(unix)]
+fn is_enoexec_candidate(program: &std::path::Path) -> bool {
+    use std::io::Read;
+    if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(program) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    let read = file.read(&mut head).unwrap_or(0);
+    let head = &head[..read];
+    !head.starts_with(b"#!") && !head.starts_with(b"\x7fELF")
 }
 
 /// GNU general.c:843 absolute_program: a name containing `/` (or `\` on a
