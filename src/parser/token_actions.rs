@@ -894,10 +894,10 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                 ));
                 if fd.is_none() {
                     // GNU stores `here_doc_eof` dequoted (make_cmd.c
-                    // string_quote_removal); CTLESC pairs must not leak
+                    // string_quote_removal); no carrier bytes may leak
                     // into the `wanted `%s'` warning text.
                     state.current_cmd.heredoc_delimiter =
-                        Some(delimiter.replace(crate::executor::markers::CTLESC, ""));
+                        Some(super::redirections::heredoc_delimiter_text(&delimiter));
                 }
                 *i += 1;
             } else if let Some(error) = missing_redirect_target_node(

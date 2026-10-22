@@ -2,6 +2,25 @@ use super::*;
 use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
 use crate::lexer::{Token, TokenKind};
 
+/// The stored here-document delimiter: GNU make_cmd.c:540
+/// make_here_document stores `here_doc_eof = string_quote_removal(word)`
+/// — the fully dequoted delimiter text, used both for body-line matching
+/// and for the `delimited by end-of-file (wanted `%s')` warning
+/// (make_cmd.c:626). The token value is transport text, so every carrier
+/// family must be decoded here: CTLESC pairs reduce to their data char,
+/// the DATA_*/ANSI-C quote carriers become the literal characters they
+/// denote, PARAM_NAME_END_MARKER (the `$name` terminator the lexer
+/// appends inside quoted segments, e.g. `<<\"$D\"`) is dropped, and the
+/// ANSI_C_IFS_GUARD field-split transport is stripped. Stripping CTLESC
+/// alone leaked the \023 name terminator into the warning text
+/// (rubash#1151, the same marker-leak family as #1029/#1060).
+pub(super) fn heredoc_delimiter_text(value: &str) -> String {
+    let decoded = crate::executor::markers::decode_word_position_carriers(value);
+    let decoded = crate::executor::markers::dequote_ctlesc_pairs(&decoded);
+    let decoded = decoded.replace(crate::executor::markers::PARAM_NAME_END_MARKER, "");
+    crate::executor::markers::strip_ansi_c_ifs_guard(&decoded)
+}
+
 pub(super) fn collect_trailing_redirections(
     tokens: &[Token],
     index: &mut usize,
@@ -279,9 +298,8 @@ pub(super) fn collect_trailing_redirections(
                     // `here_doc_eof = string_quote_removal(word)` — the
                     // DEQUOTED delimiter; it is used both for body-line
                     // matching and for the `delimited by end-of-file
-                    // (wanted `%s')` warning, so drop CTLESC pairs here.
-                    command.heredoc_delimiter =
-                        Some(target.value.replace(crate::executor::markers::CTLESC, ""));
+                    // (wanted `%s')` warning, so decode all carriers here.
+                    command.heredoc_delimiter = Some(heredoc_delimiter_text(&target.value));
                 }
                 *index += 2;
                 continue;
@@ -880,12 +898,8 @@ pub(super) fn fill_pending_heredoc_body(
     if redirect.fd.is_none() {
         cmd.heredoc = Some(body);
         // GNU stores the dequoted delimiter (`here_doc_eof = redir_word`),
-        // so CTLESC pairs must not reach the warning text either.
-        cmd.heredoc_delimiter = Some(
-            redirect
-                .delimiter
-                .replace(crate::executor::markers::CTLESC, ""),
-        );
+        // so no carrier bytes may reach the warning text either.
+        cmd.heredoc_delimiter = Some(heredoc_delimiter_text(&redirect.delimiter));
         cmd.heredoc_gather_line = Some(gather_line);
         // Physical end of the gather (closing-delimiter line, or the last
         // body line at EOF): the warning prefix line. Stored newlines can
