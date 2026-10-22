@@ -768,6 +768,25 @@ fn add_orig_ignored_signal(env_vars: &mut VarTable, signal: &str) {
 /// child) become hard-ignored for this shell, matching trap.c's
 /// original_signals == SIG_IGN startup handling.
 pub(crate) fn seed_startup_traps(env_vars: &mut VarTable) {
+    // rubash#1124: fold this process's ENTRY dispositions into the
+    // transported set before the rebuild below. GNU trap.c
+    // initialize_traps snapshots original_signals[] at startup: a
+    // signal ignored on entry (launcher/harness SIG_IGN, e.g. SIGUSR1,
+    // SIGPIPE, SIGXFSZ, SIGRTMIN+4) is SIG_HARD_IGNORE — `trap -p`
+    // lists it as `trap -- '' SIG` and set/reset are silent no-ops.
+    // The env transports only cover rubash-to-rubash spawns; a foreign
+    // parent's ignores are visible solely through the kernel probe.
+    // Idempotent (orig list is sorted/deduped), so subshell executors
+    // re-entering this constructor keep the same set.
+    for number in crate::builtins::kill::entry_ignored_signal_numbers() {
+        if let Some(name) = SIGNALS
+            .get((number - 1) as usize)
+            .copied()
+            .filter(|name| !name.is_empty())
+        {
+            add_orig_ignored_signal(env_vars, name);
+        }
+    }
     // Rebuild the empty trap-table entries for ignores transported across a
     // process boundary (transport_inherited_ignores): the per-signal "" keys
     // cannot survive a Windows environment block, so the ORIG_IGN list is

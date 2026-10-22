@@ -685,6 +685,22 @@ pub fn register_signal_mailbox(_pid: u32) -> io::Result<()> {
     kernel_signals::install()
 }
 
+/// Signal numbers (1..=64) whose disposition was SIG_IGN when this
+/// process started — GNU trap.c's original_signals snapshot, feeding
+/// the trap table's hard-ignore seed (trap.rs seed_startup_traps,
+/// rubash#1124). Probed once per process; empty on non-unix, where the
+/// trap table is transported through the environment instead.
+#[cfg(unix)]
+pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
+    let mask = kernel_signals::entry_ignored_mask_all();
+    (1..=64).filter(|sig| mask & (1u64 << (sig - 1)) != 0).collect()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
+    Vec::new()
+}
+
 #[cfg(not(unix))]
 pub fn register_signal_mailbox(pid: u32) -> io::Result<()> {
     let dir = signal_mailbox_dir();
@@ -1674,6 +1690,41 @@ mod kernel_signals {
     /// POSIX 2.11: a non-interactive shell keeps entry-ignored signals
     /// ignored (GNU sig.c:273-277 marks them hard-ignored).
     static ENTRY_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+    /// Process-wide probe of EVERY signal's entry disposition (bit
+    /// sig-1), captured once on first use. GNU trap.c initialize_traps
+    /// snapshots original_signals[] for all NSIG signals at startup;
+    /// trap -p lists the SIG_IGN ones as `trap -- '' SIG` and the trap
+    /// builtin refuses to trap or reset them (SIG_HARD_IGNORE,
+    /// trap.c:850). The MANAGED-only ENTRY_IGNORED above cannot serve
+    /// that display: entry-ignored SIGPIPE/SIGXFSZ/realtime signals are
+    /// outside the managed set (rubash#1124). The probe runs before any
+    /// rubash code changes a disposition (seed_startup_traps in
+    /// Executor::new precedes install()'s SIGQUIT policy ignore), and
+    /// the OnceLock keeps later executors (subshell clones) from
+    /// re-probing a live, already-mutated disposition table.
+    static ENTRY_IGNORED_ALL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    pub(super) fn entry_ignored_mask_all() -> u64 {
+        *ENTRY_IGNORED_ALL.get_or_init(|| {
+            let mut mask = 0u64;
+            for sig in 1..=64 {
+                if current_disposition_is_ignored(sig) {
+                    mask |= 1u64 << (sig - 1);
+                }
+            }
+            // SIGPIPE is excluded: the Rust runtime sets it to SIG_IGN
+            // before main() runs, so its observed disposition is the
+            // runtime's, never the invoking environment's — attributing
+            // it to the parent would list `trap -- '' SIGPIPE` in shells
+            // whose parent left it at SIG_DFL (GNU lists nothing there).
+            // The shell also depends on the ignore for its EPIPE write
+            // error model (rubash#440), so the entry state is
+            // deliberately not reconstructed.
+            mask &= !(1u64 << (libc::SIGPIPE as u64 - 1));
+            mask
+        })
+    }
 
     fn bit(sig: i32) -> u64 {
         1 << MANAGED
