@@ -29,7 +29,61 @@ impl Executor {
             .open(shell_path_to_windows(target, &self.shell_state.env_vars))
     }
 
+    /// rubash#1026: GNU redir.c netopen — `/dev/tcp/host/port` and
+    /// `/dev/udp/host/port` are not filesystem paths: opening one
+    /// connects a socket (TCP connect(2); UDP bind+connect, which
+    /// succeeds even with no listener). Host may be a name (resolved by
+    /// the OS) or an address; the port must be numeric (GNU also accepts
+    /// service names via getservbyname — not ported).
+    pub(in crate::executor) fn is_net_redirect_target(&self, target: &str) -> bool {
+        target.starts_with("/dev/tcp/") || target.starts_with("/dev/udp/")
+    }
+
+    /// Formatted variant: the returned error already carries the
+    /// `<target>: <strerror>` shape (posix_errors::path_error), matching
+    /// the other open paths in this module.
+    pub(in crate::executor) fn open_net_redirect(&self, target: &str) -> io::Result<File> {
+        self.open_net_redirect_raw(target)
+            .map_err(|e| crate::posix_errors::path_error(target, e))
+    }
+
+    /// Raw variant for callers that apply posix_errors::path_error
+    /// themselves (e.g. set_fd_readwrite_file's `<>` path).
+    pub(in crate::executor) fn open_net_redirect_raw(&self, target: &str) -> io::Result<File> {
+        let (udp, rest) = if let Some(rest) = target.strip_prefix("/dev/tcp/") {
+            (false, rest)
+        } else if let Some(rest) = target.strip_prefix("/dev/udp/") {
+            (true, rest)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No such file or directory",
+            ));
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "Invalid argument");
+        let (host, port_text) = rest.rsplit_once('/').ok_or_else(invalid)?;
+        let port: u16 = port_text.parse().map_err(|_| invalid())?;
+        if host.is_empty() {
+            return Err(invalid());
+        }
+        let file = if udp {
+            let bind_addr = if host.contains(':') { "[::]:0" } else { "0.0.0.0:0" };
+            let socket = std::net::UdpSocket::bind(bind_addr)?;
+            socket.connect((host, port))?;
+            udp_socket_file(socket)
+        } else {
+            let stream = std::net::TcpStream::connect((host, port))?;
+            tcp_stream_file(stream)
+        };
+        Ok(file)
+    }
+
     fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
+        // rubash#1026: /dev/tcp|udp targets connect a socket, never a
+        // filesystem open (see open_net_redirect).
+        if self.is_net_redirect_target(target) {
+            return self.open_net_redirect(target);
+        }
         if is_null_device(target) {
             return File::open(shell_path_to_windows(
                 "/dev/null",
@@ -263,6 +317,11 @@ impl Executor {
         target: &str,
         clobber: bool,
     ) -> io::Result<File> {
+        // rubash#1026: /dev/tcp|udp targets connect a socket (see
+        // open_net_redirect); noclobber has no meaning for them.
+        if self.is_net_redirect_target(target) {
+            return self.open_net_redirect(target);
+        }
         if is_null_device(target) {
             return OpenOptions::new().write(true).open(shell_path_to_windows(
                 "/dev/null",
@@ -1823,4 +1882,33 @@ mod windows_raw_stdio {
 
         Ok(())
     }
+}
+
+
+/// Connected TCP stream as a std File (rubash#1026).
+#[cfg(unix)]
+fn tcp_stream_file(stream: std::net::TcpStream) -> File {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(stream.into_raw_fd()) }
+}
+
+/// Connected TCP stream as a std File (rubash#1026).
+#[cfg(windows)]
+fn tcp_stream_file(stream: std::net::TcpStream) -> File {
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    unsafe { File::from_raw_socket(stream.into_raw_socket()) }
+}
+
+/// Connected UDP socket as a std File (rubash#1026).
+#[cfg(unix)]
+fn udp_socket_file(socket: std::net::UdpSocket) -> File {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(socket.into_raw_fd()) }
+}
+
+/// Connected UDP socket as a std File (rubash#1026).
+#[cfg(windows)]
+fn udp_socket_file(socket: std::net::UdpSocket) -> File {
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    unsafe { File::from_raw_socket(socket.into_raw_socket()) }
 }

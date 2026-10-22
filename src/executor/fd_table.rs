@@ -48,6 +48,23 @@ impl FileFd {
     pub(crate) fn open_readwrite(path: PathBuf) -> std::io::Result<Rc<Self>> {
         crate::fd::open_file_readwrite(&path).map(|handle| Rc::new(Self { handle, path }))
     }
+
+    /// Adopt an already-open std File (a connected socket for
+    /// /dev/tcp|/dev/udp redirection, rubash#1026) as a FileFd whose
+    /// `path` is the shell-level target name.
+    pub(crate) fn from_file(file: std::fs::File, path: PathBuf) -> Rc<Self> {
+        #[cfg(unix)]
+        let handle = {
+            use std::os::unix::io::IntoRawFd;
+            file.into_raw_fd()
+        };
+        #[cfg(windows)]
+        let handle = {
+            use std::os::windows::io::IntoRawHandle;
+            file.into_raw_handle() as crate::fd::HANDLE
+        };
+        Rc::new(Self { handle, path })
+    }
 }
 
 impl Drop for FileFd {

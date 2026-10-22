@@ -71,6 +71,25 @@ impl Executor {
         target: &str,
         dynamic: bool,
     ) -> std::io::Result<()> {
+        // rubash#1026: `N<>/dev/tcp/host/port` binds the connected
+        // socket (one descriptor, both directions — redir.c netopen).
+        if self.is_net_redirect_target(target) {
+            // Raw error: every caller of this function applies
+            // posix_errors::path_error itself.
+            let file = self.open_net_redirect_raw(target)?;
+            let file_fd = FileFd::from_file(file, target.into());
+            self.set_fd_input_file(fd, file_fd.clone(), dynamic);
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
         let path = shell_path_to_windows(target, &self.shell_state.env_vars);
         let file = FileFd::open_readwrite(path)?;
         self.set_fd_input_file(fd, file.clone(), dynamic);
@@ -96,6 +115,20 @@ impl Executor {
         dynamic: bool,
         append: bool,
     ) -> std::io::Result<()> {
+        // rubash#1026: `N>/dev/tcp/host/port` binds the connected
+        // socket, not a filesystem path (redir.c netopen).
+        if self.is_net_redirect_target(&target) {
+            let file = self.open_net_redirect(&target)?;
+            let file_fd = FileFd::from_file(file, target.clone().into());
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state.env_vars.insert(fd_output_key(fd), target);
+            return Ok(());
+        }
         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
         let file = FileFd::open_write(path, append, false)
             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
@@ -2515,6 +2548,13 @@ impl Executor {
                     if redirect.operator.ends_with("<>") {
                         self.set_fd_readwrite_file(fd, &target, fd != 0)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                    } else if self.is_net_redirect_target(&target) {
+                        // rubash#1026: `N</dev/tcp/host/port` also
+                        // connects (redir.c netopen serves both
+                        // directions); the socket binds as the read end.
+                        let file = self.open_net_redirect(&target)?;
+                        let file_fd = FileFd::from_file(file, target.clone().into());
+                        self.set_fd_input_file(fd, file_fd, fd != 0);
                     } else {
                         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
                         let file = FileFd::open_read(path)
