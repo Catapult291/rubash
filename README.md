@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/rubash-lockup.svg" alt="rubash — embeddable bash-compatible engine" width="620" />
+</p>
+
 # Rubash
 
 An embeddable GNU Bash-compatible shell engine, written from scratch in Rust.

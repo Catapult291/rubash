@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/rubash-lockup.svg" alt="rubash — 可嵌入的 bash 兼容引擎" width="620" />
+</p>
+
 # Rubash
 
 用 Rust 从零实现的可嵌入 GNU Bash 兼容 shell 引擎。
