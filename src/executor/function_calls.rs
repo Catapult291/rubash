@@ -639,8 +639,13 @@ impl Executor {
         // return success without unwinding (modernish QRK_BCDANGER: bash
         // 5.x is quirk-ABSENT). Restore the caller's depth after the body
         // like the unwind-protect does.
+        // rubash#1110 item 1: at compat level <= 43 the reset does NOT
+        // happen — the caller's loop_level carries into the body, so a
+        // `break` inside the function breaks the caller's loop.
         let saved_loop_depth = self.shell_state.loop_depth;
-        self.shell_state.loop_depth = 0;
+        if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 43 {
+            self.shell_state.loop_depth = 0;
+        }
         // The fresh loop scope covers fork-inherited depth too: a function
         // called from a comsub body inside a loop still hits
         // check_loop_level's empty case (rubash#1064/#1065 boundary rule).
