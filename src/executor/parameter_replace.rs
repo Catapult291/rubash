@@ -533,9 +533,17 @@ pub(in crate::executor) fn apply_parameter_transform(
         ParameterTransform::KeyValueQuoted => shell_reusable_quote(value),
         ParameterTransform::KeyValueSplit => shell_reusable_quote(value),
         ParameterTransform::Prompt => value.to_string(),
-        ParameterTransform::Upper => value.chars().flat_map(char::to_uppercase).collect(),
+        // ${var@U}/${var@L} run the same casemod.c simple 1:1 mapping
+        // as ${var^^}/${var,,} (rubash#1063).
+        ParameterTransform::Upper => value
+            .chars()
+            .map(crate::locale::simple_case_upper)
+            .collect(),
         ParameterTransform::UpperFirst => uppercase_first_char(value),
-        ParameterTransform::Lower => value.chars().flat_map(char::to_lowercase).collect(),
+        ParameterTransform::Lower => value
+            .chars()
+            .map(crate::locale::simple_case_lower)
+            .collect(),
     }
 }
 
@@ -544,7 +552,10 @@ fn uppercase_first_char(value: &str) -> String {
     let Some(first) = chars.next() else {
         return String::new();
     };
-    first.to_uppercase().chain(chars).collect::<String>()
+    let mut out = String::with_capacity(value.len());
+    out.push(crate::locale::simple_case_upper(first));
+    out.push_str(chars.as_str());
+    out
 }
 
 pub(in crate::executor) fn format_key_value_transform_part(

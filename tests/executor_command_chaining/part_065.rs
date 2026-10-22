@@ -243,7 +243,12 @@ fn test_parameter_case_mod_unpatterned_all_preserves_unicode_case_mapping() {
     assert_eq!(executor.last_exit_code(), 0);
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        "STRASSE \u{0130}\nstra\u{00DF}e i\u{307}\n"
+        // GNU lib/sh/casemod.c maps through towupper/towlower — the SIMPLE
+        // (1:1) case mapping: ß has no simple uppercase and stays, İ's
+        // simple lowercase is plain i (rubash#1063; verified against GNU
+        // bash 5.3.20 under a UTF-8 locale). The full mappings (ß->SS,
+        // İ->i+combining dot) this test used to expect are not GNU.
+        "STRA\u{00DF}E \u{0130}\nstra\u{00DF}e i\n"
     );
     let _ = fs::remove_file(output_path);
 }
