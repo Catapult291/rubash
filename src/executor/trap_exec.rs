@@ -1475,9 +1475,8 @@ impl Executor {
             // observe_signals_while_blocked re-queued any trapped
             // deliveries; take them back for the virtual-child check
             // and put back whatever does not abort the sleep.
-            let pending =
-                crate::builtins::kill::take_pending_signals_now(std::process::id())
-                    .unwrap_or_default();
+            let pending = crate::builtins::kill::take_pending_signals_now(std::process::id())
+                .unwrap_or_default();
             if pending.is_empty() {
                 continue;
             }
@@ -2582,7 +2581,9 @@ impl Executor {
         let mut child = Command::new(&exe);
         child.arg("-c").arg(source);
         for (key, value) in &self.shell_state.env_vars {
-            if !key.starts_with("__RUBASH_") || super::compound_exec::rubash_spawn_inherited_state(key) {
+            if !key.starts_with("__RUBASH_")
+                || super::compound_exec::rubash_spawn_inherited_state(key)
+            {
                 child.env(key, value);
             }
         }

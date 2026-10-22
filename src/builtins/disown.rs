@@ -13,9 +13,16 @@ pub enum DisownAction {
     /// No jobspec: the current job. `nohup_only` is `disown -h` —
     /// GNU builtins/jobs.def disown_builtin: with -h the job is marked
     /// (jobs.c nohup_job, J_NOHUP) instead of deleted (rubash#1048).
-    Current { nohup_only: bool },
-    All { nohup_only: bool },
-    Jobs { specs: Vec<String>, nohup_only: bool },
+    Current {
+        nohup_only: bool,
+    },
+    All {
+        nohup_only: bool,
+    },
+    Jobs {
+        specs: Vec<String>,
+        nohup_only: bool,
+    },
 }
 
 pub fn execute_with_io<E>(

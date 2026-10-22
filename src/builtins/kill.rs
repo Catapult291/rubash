@@ -693,7 +693,9 @@ pub fn register_signal_mailbox(_pid: u32) -> io::Result<()> {
 #[cfg(unix)]
 pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
     let mask = kernel_signals::entry_ignored_mask_all();
-    (1..=64).filter(|sig| mask & (1u64 << (sig - 1)) != 0).collect()
+    (1..=64)
+        .filter(|sig| mask & (1u64 << (sig - 1)) != 0)
+        .collect()
 }
 
 #[cfg(not(unix))]

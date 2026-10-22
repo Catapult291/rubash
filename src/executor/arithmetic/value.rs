@@ -818,9 +818,7 @@ fn leading_zero_digit_string(value: &str) -> bool {
         Some(b'-' | b'+') => &value[1..],
         _ => value,
     };
-    digits.len() > 1
-        && digits.starts_with('0')
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
+    digits.len() > 1 && digits.starts_with('0') && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// GNU expr.c:1539/1557 strlong's `0nnn -> base 8` arm for variable

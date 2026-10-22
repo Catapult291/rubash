@@ -101,7 +101,6 @@ impl Executor {
         cmd: &CommandNode,
         stdout: &[u8],
     ) -> Result<(), ExecuteError> {
-
         if let Some(redirect) = &cmd.redirect_out {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {

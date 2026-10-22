@@ -148,10 +148,7 @@ where
                         // sh_erange "index out of range" form otherwise
                         // (rubash#1125).
                         if stack.len() <= 1 {
-                            writeln!(
-                                stderr,
-                                "{diagnostic_prefix}dirs: directory stack empty"
-                            )?;
+                            writeln!(stderr, "{diagnostic_prefix}dirs: directory stack empty")?;
                         } else {
                             writeln!(
                                 stderr,

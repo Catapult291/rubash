@@ -260,8 +260,7 @@ impl Executor {
         if !self.conditional_expansion_fatal.get() {
             if let Some((name, message, status)) = self.parameter_expansion_error_in_word(word) {
                 if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
-                    let line =
-                        format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+                    let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
                     let _ = self.write_diagnostic_fd2(line.as_bytes());
                     self.exit_code = if self.expansion_error_is_interactive_discard() {
                         1
@@ -484,7 +483,9 @@ impl Executor {
         let right = if matches!(op, "=" | "==" | "!=") {
             let doubled = right.replace(
                 crate::executor::markers::DATA_BACKSLASH,
-                &crate::executor::markers::DATA_BACKSLASH.to_string().repeat(2),
+                &crate::executor::markers::DATA_BACKSLASH
+                    .to_string()
+                    .repeat(2),
             );
             self.expand_conditional_word(&doubled)
         } else {
@@ -827,8 +828,7 @@ impl Executor {
                 for body in &prefix_comsubs {
                     self.expand_command_substitution(body);
                 }
-                let line =
-                    format!("{}{}: unbound variable\n", self.diagnostic_prefix(), name);
+                let line = format!("{}{}: unbound variable\n", self.diagnostic_prefix(), name);
                 let _ = self.write_default_stderr(line.as_bytes());
                 self.shell_state.conditional_nounset_error.set(true);
                 return true;
@@ -956,8 +956,7 @@ impl Executor {
         let case_insensitive =
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "nocasematch");
         let byte_mode = conditional_regex_byte_mode();
-        if let Some(cached) = conditional_regex_cache_lookup(pattern, case_insensitive, byte_mode)
-        {
+        if let Some(cached) = conditional_regex_cache_lookup(pattern, case_insensitive, byte_mode) {
             return match cached {
                 Some(regex) => Ok((*regex).clone()),
                 None => Err(regex::Regex::new("(").unwrap_err()),

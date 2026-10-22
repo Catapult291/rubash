@@ -373,12 +373,10 @@ impl Executor {
             if let Some(seed) = Self::canonical_decimal_seed(value) {
                 self.shell_state.random_state.rseed.set(seed as u32);
                 self.shell_state.random_state.last_value.set(0);
-            } else if let Some(seed) =
-                crate::executor::arithmetic::eval_conditional_arith_value(
-                    value,
-                    &self.shell_state.env_vars,
-                )
-            {
+            } else if let Some(seed) = crate::executor::arithmetic::eval_conditional_arith_value(
+                value,
+                &self.shell_state.env_vars,
+            ) {
                 // Same evalexp seeding as the plain assignment path
                 // (rubash#1082); a failed evaluation leaves the seed
                 // alone — declare's caller surfaces the evalerror.
@@ -747,9 +745,7 @@ impl Executor {
                 }
                 return Some(format_indexed_array_values(stack));
             }
-            "BASH_ARGC" => {
-                return Some(format_indexed_array_values(self.bash_argc_view()))
-            }
+            "BASH_ARGC" => return Some(format_indexed_array_values(self.bash_argc_view())),
             "BASH_ARGV" => {
                 // rubash#1110 item 4: same compat <= 44 gate as the direct
                 // view in dynamic_stack_array_values — empty without
@@ -762,7 +758,7 @@ impl Executor {
                 {
                     return Some(format_indexed_array_values(Vec::new()));
                 }
-                return Some(format_indexed_array_values(self.bash_argv_view()))
+                return Some(format_indexed_array_values(self.bash_argv_view()));
             }
             "BASH_LINENO" => return Some(format_indexed_array_values(self.bash_lineno_view())),
             "BASH_SOURCE" => {

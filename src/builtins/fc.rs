@@ -235,8 +235,7 @@ where
     // history / interactive). With rh == 0 and the current line not
     // added, last_hist lands one past the end and backs up over the
     // empty tail slot to the last real entry (#1117).
-    let mut last_hist: i64 =
-        count as i64 - remember_on_history as i64 - last_line_added as i64;
+    let mut last_hist: i64 = count as i64 - remember_on_history as i64 - last_line_added as i64;
     if last_hist >= count as i64 {
         last_hist = count as i64 - 1;
     }
@@ -272,7 +271,15 @@ where
         }
         let resolved = match spec {
             None => Ok(last_hist.max(0) as usize),
-            Some(s) => fc_gethnum(s, &entries, history_base, last_hist, real_last, false, false),
+            Some(s) => fc_gethnum(
+                s,
+                &entries,
+                history_base,
+                last_hist,
+                real_last,
+                false,
+                false,
+            ),
         };
         let idx = match resolved {
             Ok(i) => i,
@@ -764,12 +771,8 @@ mod tests {
     fn test_fc_s_substitution_on_pushed_entries() {
         // fc15 probe: `fc -s BBB=CCC` resolves the last pushed entry
         // (last_hist = count - rh - added = 1), not the one before it.
-        let (_, _, result) = run_fc_model(
-            &["-s", "BBB=CCC"],
-            &["echo AAA", "echo BBB"],
-            true,
-            false,
-        );
+        let (_, _, result) =
+            run_fc_model(&["-s", "BBB=CCC"], &["echo AAA", "echo BBB"], true, false);
         match result {
             FcResult::Reexec { command } => assert_eq!(command, "echo CCC"),
             _ => panic!("expected Reexec"),

@@ -479,10 +479,9 @@ impl Executor {
                     .env_vars
                     .contains_key("__RUBASH_CNF_HANDLER_RUNNING")
             {
-                self.shell_state.env_vars.insert(
-                    "__RUBASH_CNF_HANDLER_RUNNING".to_string(),
-                    "1".to_string(),
-                );
+                self.shell_state
+                    .env_vars
+                    .insert("__RUBASH_CNF_HANDLER_RUNNING".to_string(), "1".to_string());
                 // GNU passes the whole command line: $1 is the missing
                 // command name, $2.. its arguments.
                 let args: Vec<String> = cmd.words.to_vec();
@@ -490,8 +489,7 @@ impl Executor {
                 handler_cmd.words = std::iter::once("command_not_found_handle".to_string())
                     .chain(cmd.words.iter().cloned())
                     .collect();
-                let result =
-                    self.execute_function("command_not_found_handle", &args, &handler_cmd);
+                let result = self.execute_function("command_not_found_handle", &args, &handler_cmd);
                 self.shell_state
                     .env_vars
                     .remove("__RUBASH_CNF_HANDLER_RUNNING");
@@ -526,13 +524,12 @@ impl Executor {
             // PATH unset the name is never searched, so the failure is
             // the execve ENOENT text, not "command not found" — bash
             // switches diagnostic on PATH being unset (rubash#1145).
-            let not_found_message = if crate::executor::path::path_is_unset(
-                &self.shell_state.env_vars,
-            ) {
-                "No such file or directory"
-            } else {
-                "command not found"
-            };
+            let not_found_message =
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    "No such file or directory"
+                } else {
+                    "command not found"
+                };
             writeln!(
                 &mut stderr,
                 "{}{}: {}",
@@ -1401,10 +1398,7 @@ fn spawn_error_diagnostic(program: &PathBuf, error: &io::Error) -> (String, i32)
             EX_NOTFOUND,
         );
     }
-    (
-        crate::posix_errors::message(error).to_string(),
-        EX_NOTFOUND,
-    )
+    (crate::posix_errors::message(error).to_string(), EX_NOTFOUND)
 }
 
 /// GNU executable_file (execute_cmd.c / findcmd.c file_status FS_EXECABLE):

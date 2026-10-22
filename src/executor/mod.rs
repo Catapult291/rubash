@@ -569,8 +569,7 @@ pub struct Executor {
     /// action text pays zero clones and zero parses per firing. Any change
     /// to the spliced text (trap re-set, alias-table change feeding the
     /// splice) misses and re-parses.
-    debug_trap_action_cache:
-        std::cell::RefCell<Option<(String, crate::parser::Ast, i64)>>,
+    debug_trap_action_cache: std::cell::RefCell<Option<(String, crate::parser::Ast, i64)>>,
     return_trap_running: bool,
     signal_trap_running: bool,
     /// The last value written to the OS environment's

@@ -673,10 +673,7 @@ impl Executor {
                     .get("__RUBASH_EXTGLOB_ENABLED_LINE")
                     .and_then(|value| value.parse::<usize>().ok());
                 if token == "("
-                    && crate::builtins::shopt::option_enabled(
-                        &self.shell_state.env_vars,
-                        "extglob",
-                    )
+                    && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob")
                     && enabled_line.is_some_and(|enabled| enabled < line)
                 {
                     if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {

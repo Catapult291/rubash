@@ -88,13 +88,12 @@ impl Executor {
         // with no elements yields no t: the indirect parameter is unset
         // and a value transform of it is empty (not `''`).
         let element_values = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, ref_name) {
-            self.parameter_array_storage(ref_name)
-                .map(|storage| {
-                    assoc_hash_ordered_values(
-                        &storage,
-                        assoc_nbuckets(&self.shell_state.env_vars, ref_name),
-                    )
-                })
+            self.parameter_array_storage(ref_name).map(|storage| {
+                assoc_hash_ordered_values(
+                    &storage,
+                    assoc_nbuckets(&self.shell_state.env_vars, ref_name),
+                )
+            })
         } else if is_array_storage(raw_value) {
             Some(array_values(raw_value))
         } else {

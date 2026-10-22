@@ -353,21 +353,22 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
         }
         if cache.fingerprint == fingerprint {
             if let Some(result) = cache.results.get(name) {
-            // GNU findcmd.c:367-380: if check_hashed_filenames (the `checkhash`
-            // shopt) is active, stat the cached path on every hit; a file
-            // that no longer exists or is not executable is removed from the
-            // hash table and PATH search resumes.
-            if let Some(path) = result {
-                if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path) {
-                    cache.results.remove(name);
-                    // fall through to re-search PATH below
-                } else {
-                    return Some(path.clone());
+                // GNU findcmd.c:367-380: if check_hashed_filenames (the `checkhash`
+                // shopt) is active, stat the cached path on every hit; a file
+                // that no longer exists or is not executable is removed from the
+                // hash table and PATH search resumes.
+                if let Some(path) = result {
+                    if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path)
+                    {
+                        cache.results.remove(name);
+                        // fall through to re-search PATH below
+                    } else {
+                        return Some(path.clone());
+                    }
                 }
-            }
-            // rubash#392: a memoized miss is no longer served — fall through
-            // to the PATH walk (GNU findcmd.c:623 re-walks for every unhashed
-            // lookup, so a command that appears mid-session stays findable).
+                // rubash#392: a memoized miss is no longer served — fall through
+                // to the PATH walk (GNU findcmd.c:623 re-walks for every unhashed
+                // lookup, so a command that appears mid-session stays findable).
             }
         }
     }

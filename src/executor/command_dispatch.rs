@@ -205,8 +205,7 @@ impl Executor {
                         if let Some(scope) = self.shell_state.local_attr_scopes.get_mut(index) {
                             scope.remove(name);
                         }
-                        if let Some(scope) = self.shell_state.local_typed_scopes.get_mut(index)
-                        {
+                        if let Some(scope) = self.shell_state.local_typed_scopes.get_mut(index) {
                             scope.remove(name);
                         }
                     }

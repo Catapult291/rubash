@@ -30,9 +30,7 @@ fn unexpected_token_error_node(
     if let Some(text) = diagnostic_text {
         if let Some(source) = line
             .checked_sub(source_line_offset)
-            .and_then(|line_in_text| {
-                super::parse_loop::source_line_by_number(text, line_in_text)
-            })
+            .and_then(|line_in_text| super::parse_loop::source_line_by_number(text, line_in_text))
         {
             command.insert_assignment("__RUBASH_PARSE_SOURCE__".to_string(), source);
         }
@@ -101,18 +99,10 @@ pub(super) fn parse_function_command_with_diagnostic(
         };
         match tokens.get(start + 1) {
             None => {
-                return near_error(
-                    "newline",
-                    tokens[start].position,
-                    start,
-                );
+                return near_error("newline", tokens[start].position, start);
             }
             Some(token) if token.kind == TokenKind::Eof => {
-                return near_error(
-                    "newline",
-                    tokens[start].position,
-                    start,
-                );
+                return near_error("newline", tokens[start].position, start);
             }
             Some(token) if token.kind == TokenKind::Semicolon => {
                 let name = if token.line_break { "newline" } else { ";" };
@@ -261,7 +251,10 @@ pub(super) fn parse_function_command_with_diagnostic(
         command.insert_assignment("__RUBASH_PARSE_ERROR_EOF__".to_string(), "1".to_string());
         return Some((command, tokens.len()));
     }
-    if tokens.get(i).is_some_and(|token| token.kind == TokenKind::Eof) {
+    if tokens
+        .get(i)
+        .is_some_and(|token| token.kind == TokenKind::Eof)
+    {
         let mut command = CommandNode::new();
         command.line = Some(
             tokens

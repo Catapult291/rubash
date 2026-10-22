@@ -43,9 +43,8 @@ pub(in crate::executor) fn recycle_synthetic_fragment_word(word: String) {
 /// name — the target whose later assignment can leak into earlier
 /// fragments of the same word (rubash#1169).
 fn parameter_assignment_target(inner: &str) -> Option<String> {
-    let (name, _word) =
-        super::expand_braced_ops::split_once_outside_subscript_str(inner, ":=")
-            .or_else(|| super::expand_braced_ops::split_once_outside_subscript(inner, '='))?;
+    let (name, _word) = super::expand_braced_ops::split_once_outside_subscript_str(inner, ":=")
+        .or_else(|| super::expand_braced_ops::split_once_outside_subscript(inner, '='))?;
     let base = name.split('[').next().unwrap_or(name);
     if is_shell_name(base) {
         Some(base.to_string())
@@ -68,10 +67,7 @@ fn fragment_is_pure(inner: &str) -> bool {
     if inner.contains("$(") {
         let comsubs = inner.matches("$(").count();
         let ariths = inner.matches("$((").count();
-        if comsubs != ariths
-            || inner.contains("++")
-            || inner.contains("--")
-            || inner.contains('=')
+        if comsubs != ariths || inner.contains("++") || inner.contains("--") || inner.contains('=')
         {
             return false;
         }

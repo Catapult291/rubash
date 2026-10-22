@@ -1548,7 +1548,10 @@ fn diagnose_bash_env_directory(executor: &mut Executor) {
     if executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
         return;
     }
-    let Some(bash_env) = executor.get_env("BASH_ENV").filter(|value| !value.is_empty()) else {
+    let Some(bash_env) = executor
+        .get_env("BASH_ENV")
+        .filter(|value| !value.is_empty())
+    else {
         return;
     };
     let path = executor.resolve_shell_path(&bash_env);

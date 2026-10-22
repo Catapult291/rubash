@@ -824,9 +824,7 @@ fn render_one_pass(
                     return RenderedPrintf {
                         output,
                         status: EXECUTION_FAILURE,
-                        errors: vec![format!(
-                            "{prefix}printf: `T': invalid format character"
-                        )],
+                        errors: vec![format!("{prefix}printf: `T': invalid format character")],
                         stop_output: true,
                         conversion_error: false,
                     };

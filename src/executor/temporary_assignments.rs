@@ -1011,11 +1011,8 @@ impl Executor {
         // instead of re-arming the dynamic getter (rubash#1050). When
         // the name carries the unbound mark, every dynamic assignment
         // arm below must stand down and let the plain bind happen.
-        let dynamic_unbound = is_marked_var(
-            &self.shell_state.env_vars,
-            UNSET_DYNAMIC_VARS,
-            base_name,
-        );
+        let dynamic_unbound =
+            is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, base_name);
         if base_name == "SECONDS" && !append && !dynamic_unbound {
             let assigned = value.trim().parse::<i64>().unwrap_or(0);
             let start = self
@@ -1054,17 +1051,13 @@ impl Executor {
             if let Some(seed) = Self::canonical_decimal_seed(&value) {
                 self.shell_state.random_state.rseed.set(seed as u32);
                 self.shell_state.random_state.last_value.set(0);
-            } else if let Some(seed) =
-                crate::executor::arithmetic::eval_conditional_arith_value(
-                    &value,
-                    &self.shell_state.env_vars,
-                )
-            {
+            } else if let Some(seed) = crate::executor::arithmetic::eval_conditional_arith_value(
+                &value,
+                &self.shell_state.env_vars,
+            ) {
                 self.shell_state.random_state.rseed.set(seed as u32);
                 self.shell_state.random_state.last_value.set(0);
-            } else if let Some(record) =
-                crate::executor::arithmetic::take_arith_eval_error()
-            {
+            } else if let Some(record) = crate::executor::arithmetic::take_arith_eval_error() {
                 let line = format!("{}{}\n", self.diagnostic_prefix(), record.render());
                 self.emit_assignment_diag(line);
             } else {

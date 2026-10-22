@@ -67,7 +67,11 @@ impl Executor {
             return Err(invalid());
         }
         let file = if udp {
-            let bind_addr = if host.contains(':') { "[::]:0" } else { "0.0.0.0:0" };
+            let bind_addr = if host.contains(':') {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             let socket = std::net::UdpSocket::bind(bind_addr)?;
             socket.connect((host, port))?;
             udp_socket_file(socket)
@@ -1312,7 +1316,10 @@ impl Executor {
         if self.fd_table.is_closed(0) {
             return Some(String::new());
         }
-        if matches!(self.fd_table.read_endpoint(0), Some(FdReadEndpoint::File(_))) {
+        if matches!(
+            self.fd_table.read_endpoint(0),
+            Some(FdReadEndpoint::File(_))
+        ) {
             if let Ok(mut file) = self.open_fd_read_endpoint(0, "fd 0") {
                 use std::io::Read as _;
                 let mut buf = Vec::new();
@@ -1917,7 +1924,6 @@ mod windows_raw_stdio {
         Ok(())
     }
 }
-
 
 /// Connected TCP stream as a std File (rubash#1026).
 #[cfg(unix)]

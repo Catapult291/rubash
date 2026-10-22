@@ -1395,15 +1395,15 @@ impl Executor {
                             status = 1;
                             stdin_remaining = Some(Vec::new());
                         } else if options.identity() && self.cat_stdin_is_real_process_stdin(cmd) {
-                        // rubash#415 (CI coproc.tests hang): GNU cat streams
-                        // stdin as chunks arrive (cat.c byte-copy loop); a
-                        // buffered drain deadlocks interactive producers —
-                        // coproc.tests runs `coproc { cat - ; }`, writes,
-                        // reads the echo back, and closes the writer much
-                        // later. With identity options and the REAL process
-                        // stdin, flush what earlier operands collected and
-                        // stream; in-memory sources and formatting keep the
-                        // buffered drain (bounded, no cross-process wait).
+                            // rubash#415 (CI coproc.tests hang): GNU cat streams
+                            // stdin as chunks arrive (cat.c byte-copy loop); a
+                            // buffered drain deadlocks interactive producers —
+                            // coproc.tests runs `coproc { cat - ; }`, writes,
+                            // reads the echo back, and closes the writer much
+                            // later. With identity options and the REAL process
+                            // stdin, flush what earlier operands collected and
+                            // stream; in-memory sources and formatting keep the
+                            // buffered drain (bounded, no cross-process wait).
                             if !output.is_empty() {
                                 self.write_cat_output(cmd, &filter(&output))?;
                                 output.clear();

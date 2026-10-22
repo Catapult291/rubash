@@ -1928,10 +1928,8 @@ impl Executor {
             };
             // fc.def:334: rh = remember_on_history (the `history` set -o
             // option; on for interactive shells).
-            let remember = crate::builtins::set::shell_option_enabled(
-                &self.shell_state.env_vars,
-                "history",
-            );
+            let remember =
+                crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "history");
             crate::builtins::fc::execute_with_history(
                 &cmd.words[1..],
                 &self.diagnostic_prefix(),

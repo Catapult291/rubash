@@ -55,14 +55,21 @@ fn invalid_octal_value_in_command_contexts_reports_and_continues() {
     // command label and the shell keeps running with status 1.
     let (stdout, stderr, code) = rubash("z=08; ((z)); echo rc=$?; let z; echo rc2=$?");
     assert_eq!(stdout, "rc=1\nrc2=1\n");
-    assert!(stderr.contains("((: 08: value too great for base"), "stderr: {stderr}");
-    assert!(stderr.contains("let: 08: value too great for base"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("((: 08: value too great for base"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("let: 08: value too great for base"),
+        "stderr: {stderr}"
+    );
     assert_eq!(code, Some(0));
 }
 
 #[test]
 fn valid_octal_and_decimal_values_still_evaluate() {
-    let (stdout, stderr, code) = rubash("a=010; b=123; c=0; d=-010; echo $((a)) $((b)) $((c)) $((d))");
+    let (stdout, stderr, code) =
+        rubash("a=010; b=123; c=0; d=-010; echo $((a)) $((b)) $((c)) $((d))");
     assert_eq!(stdout, "8 123 0 -8\n");
     assert_eq!(stderr, "");
     assert_eq!(code, Some(0));

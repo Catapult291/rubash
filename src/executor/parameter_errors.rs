@@ -1181,11 +1181,7 @@ impl Executor {
                             // the marker-joined storage and leaked it).
                             if let Some(t) = self.indirect_source_scalar_value(indirect) {
                                 if !Self::is_valid_indirect_target(&t) {
-                                    return Some((
-                                        t,
-                                        "invalid variable name".to_string(),
-                                        1,
-                                    ));
+                                    return Some((t, "invalid variable name".to_string(), 1));
                                 }
                             }
                         }
@@ -1245,8 +1241,7 @@ impl Executor {
                         if let Some(close) = Self::skip_indirect_array_subscript(tail) {
                             let base_exists = match self.nameref_resolution(head) {
                                 NamerefResolution::Target(target) => {
-                                    let base =
-                                        target.split('[').next().unwrap_or(target.as_str());
+                                    let base = target.split('[').next().unwrap_or(target.as_str());
                                     self.shell_state.env_vars.contains_key(base)
                                         || self.shell_state.variables.get(base).is_some()
                                 }
