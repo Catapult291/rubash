@@ -397,10 +397,13 @@ pub(in crate::executor) fn execute_history_session(
             let write_ts = write_timestamps_of(executor);
             let outcome = match mode {
                 HistoryMode::Append => shell.append_file(&path, write_ts).map(|_| 0),
-                HistoryMode::Write => shell.write_file(&path, write_ts).map(|_| {
-                    shell.lines_this_session = 0;
-                    0
-                }),
+                // GNU builtins/history.def WFLAG branch: write_history
+                // does NOT reset history_lines_this_session — only -a
+                // (maybe_append_history) consumes the session counter.
+                // Resetting here starved the exit-time append in
+                // finish_shell of lines already written by -w
+                // (rubash#1049: GNU re-appends them at exit).
+                HistoryMode::Write => shell.write_file(&path, write_ts).map(|_| 0),
                 HistoryMode::Read => shell.read_file(&path, histsize).map(|_| 0),
                 HistoryMode::ReadNew => shell.read_new_file(&path, histsize).map(|_| 0),
                 _ => Ok(0),

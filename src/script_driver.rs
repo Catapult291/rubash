@@ -4147,9 +4147,12 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
     // (bashhist.c:488-530): append only this session's lines when the list
     // was not stifled below them, rewrite the file otherwise, then
     // sv_histsize("HISTFILESIZE") truncates the file (variables.c:6088).
-    if interactive {
+    {
         // shell.c:1008: the save is gated on remember_on_history (the
-        // `history` set option), which `set +o history` clears.
+        // `history` set option), which `set +o history` clears. It is
+        // NOT gated on interactivity: a non-interactive shell that ran
+        // `set -o history` appends its session lines at exit too
+        // (rubash#1049 — the save used to sit inside `if interactive`).
         let remember_on_history =
             executor.get_env("__RUBASH_SETOPT_history").as_deref() == Some("1");
         if remember_on_history {
