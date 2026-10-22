@@ -73,6 +73,11 @@ pub struct ShellState {
     /// variables.c BASH_ARGC/BASH_ARGV stacks.
     pub(crate) bash_argc_stack: Vec<String>,
     pub(crate) bash_argv_stack: Vec<String>,
+    /// The BASH_ARGV bottom frame (the shell's own positional parameters,
+    /// reversed into display order) installed by init_bash_argv the first
+    /// time the arg arrays materialize under extdebug (rubash#1051).
+    /// None while the arrays have never been initialized.
+    pub(crate) bash_arg_bottom: Option<Vec<String>>,
     /// variables.c BASH_LINENO/BASH_SOURCE stacks.
     pub(crate) bash_lineno_stack: Vec<String>,
     pub(crate) bash_source_stack: Vec<String>,
@@ -387,6 +392,7 @@ impl Clone for ShellState {
             function_name_stack: self.function_name_stack.clone(),
             bash_argc_stack: self.bash_argc_stack.clone(),
             bash_argv_stack: self.bash_argv_stack.clone(),
+            bash_arg_bottom: self.bash_arg_bottom.clone(),
             bash_lineno_stack: self.bash_lineno_stack.clone(),
             bash_source_stack: self.bash_source_stack.clone(),
             local_var_scopes: self.local_var_scopes.clone(),

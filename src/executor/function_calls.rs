@@ -443,6 +443,10 @@ impl Executor {
                 self.restore_function_call_fd0(binding);
             }
         }
+        // Set inside the entry block when this call actually pushes
+        // BASH_ARGC/BASH_ARGV frames (extdebug only — see below), so the
+        // exit path pops exactly what this call pushed (rubash#1051).
+        let mut pushed_bash_args = false;
         let (old_function, old_function_stdin, old_function_stdin_offset, old_positional_params) = {
             let old_function = self
                 .shell_state
@@ -493,11 +497,35 @@ impl Executor {
                     source
                 },
             );
-            self.shell_state
-                .bash_argc_stack
-                .insert(0, args.len().to_string());
-            for arg in args {
-                self.shell_state.bash_argv_stack.insert(0, arg.clone());
+            // GNU execute_cmd.c:5342-5347 execute_function: push_args
+            // runs ONLY in debugging_mode (extdebug). Without it the
+            // BASH_ARGV/BASH_ARGC cells stay empty — populating them
+            // unconditionally leaked call-stack data to introspection
+            // and left ${#BASH_ARGC[@]} disagreeing with declare -p
+            // (rubash#1051).
+            if crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug") {
+                pushed_bash_args = true;
+                // execute_cmd.c:5337: init_bash_argv() runs before the
+                // push when debugging — the first materialization
+                // installs the bottom frame from the CURRENT positional
+                // parameters (the caller's context), which then persists
+                // for the shell's lifetime (rubash#1051).
+                if self.shell_state.bash_arg_bottom.is_none() {
+                    self.shell_state.bash_arg_bottom = Some(
+                        self.shell_state
+                            .positional_window()
+                            .iter()
+                            .rev()
+                            .cloned()
+                            .collect(),
+                    );
+                }
+                self.shell_state
+                    .bash_argc_stack
+                    .insert(0, args.len().to_string());
+                for arg in args {
+                    self.shell_state.bash_argv_stack.insert(0, arg.clone());
+                }
             }
             self.set_positional_params(args.to_vec());
             (
@@ -751,12 +779,14 @@ impl Executor {
             if !self.shell_state.bash_source_stack.is_empty() {
                 self.shell_state.bash_source_stack.remove(0);
             }
-            if !self.shell_state.bash_argc_stack.is_empty() {
-                self.shell_state.bash_argc_stack.remove(0);
-            }
-            for _ in args {
-                if !self.shell_state.bash_argv_stack.is_empty() {
-                    self.shell_state.bash_argv_stack.remove(0);
+            if pushed_bash_args {
+                if !self.shell_state.bash_argc_stack.is_empty() {
+                    self.shell_state.bash_argc_stack.remove(0);
+                }
+                for _ in args {
+                    if !self.shell_state.bash_argv_stack.is_empty() {
+                        self.shell_state.bash_argv_stack.remove(0);
+                    }
                 }
             }
             // Fold any deferred comsub write-back into the child's cursor

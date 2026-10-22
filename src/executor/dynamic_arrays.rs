@@ -482,6 +482,40 @@ impl Executor {
     /// frame and reports BASH_LINENO with no trailing "0" (probe
     /// 2026-09-27: "inner outer|bash bash|1 1"). The main script frame
     /// exists exactly when has_script_main_frame() is true.
+    /// Effective BASH_ARGV contents: the extdebug call frames plus the
+    /// bottom frame (the shell's own positional parameters, reversed)
+    /// that GNU's init_bash_argv installs when the arrays materialize
+    /// (variables.c get_bashargcv / execute_cmd.c:5337). The bottom
+    /// frame is captured at the first extdebug function entry; a
+    /// top-level read under extdebug before any call synthesizes it
+    /// from the current positional window, mirroring GNU's read-time
+    /// initialization at variable_context 0 (rubash#1051).
+    pub(in crate::executor) fn bash_argv_view(&self) -> Vec<String> {
+        let mut view = self.shell_state.bash_argv_stack.clone();
+        if let Some(bottom) = &self.shell_state.bash_arg_bottom {
+            view.extend(bottom.iter().cloned());
+        } else if self.shell_state.function_depth == 0
+            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug")
+        {
+            view.extend(self.shell_state.positional_window().iter().rev().cloned());
+        }
+        view
+    }
+
+    /// Effective BASH_ARGC contents — one count per BASH_ARGV frame,
+    /// the bottom frame's count last (see [`Self::bash_argv_view`]).
+    pub(in crate::executor) fn bash_argc_view(&self) -> Vec<String> {
+        let mut view = self.shell_state.bash_argc_stack.clone();
+        if let Some(bottom) = &self.shell_state.bash_arg_bottom {
+            view.push(bottom.len().to_string());
+        } else if self.shell_state.function_depth == 0
+            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug")
+        {
+            view.push(self.shell_state.positional_window().len().to_string());
+        }
+        view
+    }
+
     pub(in crate::executor) fn bash_lineno_view(&self) -> Vec<String> {
         let mut stack = self.shell_state.bash_lineno_stack.clone();
         if self.has_script_main_frame() && stack.last().map(String::as_str) != Some("0") {
@@ -538,8 +572,8 @@ impl Executor {
                     stack
                 }
             }
-            "BASH_ARGV" => self.shell_state.bash_argv_stack.clone(),
-            "BASH_ARGC" => self.shell_state.bash_argc_stack.clone(),
+            "BASH_ARGV" => self.bash_argv_view(),
+            "BASH_ARGC" => self.bash_argc_view(),
             "BASH_LINENO" => self.bash_lineno_view(),
             "BASH_SOURCE" => {
                 let mut stack = self.shell_state.bash_source_stack.clone();
@@ -625,14 +659,10 @@ impl Executor {
                 return Some(format_indexed_array_values(stack));
             }
             "BASH_ARGC" => {
-                return Some(format_indexed_array_values(
-                    self.shell_state.bash_argc_stack.clone(),
-                ))
+                return Some(format_indexed_array_values(self.bash_argc_view()))
             }
             "BASH_ARGV" => {
-                return Some(format_indexed_array_values(
-                    self.shell_state.bash_argv_stack.clone(),
-                ))
+                return Some(format_indexed_array_values(self.bash_argv_view()))
             }
             "BASH_LINENO" => return Some(format_indexed_array_values(self.bash_lineno_view())),
             "BASH_SOURCE" => {
