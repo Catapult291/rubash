@@ -3449,12 +3449,17 @@ fn script_file_accepts_shell_style_drive_path() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     // Lowercase only the drive letter (same convention as bashdb_compat):
-    // the rest of $0 preserves the checkout path's case verbatim.
+    // the rest of $0 preserves the checkout path's case verbatim. Off
+    // Windows there is no drive letter; $0 is exactly the forward-slash
+    // argv spelling (GNU prints $0 as passed).
+    #[cfg(windows)]
     let expected = format!(
         "/{}/{}",
         shell_path[..1].to_ascii_lowercase(),
         &shell_path[3..]
     );
+    #[cfg(not(windows))]
+    let expected = shell_path.clone();
     assert_eq!(stdout, format!("{expected}\n"));
     let _ = fs::remove_file(script_path);
 }

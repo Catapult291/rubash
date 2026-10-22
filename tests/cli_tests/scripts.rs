@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, path::Path};
 
 #[path = "errexit.rs"]
@@ -133,8 +133,10 @@ fn nested_this_shell_script_runs_in_process() {
     )
     .unwrap();
 
+    // Forward slashes only matter for the THIS_SH value the child sees;
+    // spawn through the env-stripping helper like every other test.
     let shell = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
-    let output = Command::new(&shell)
+    let output = crate::rubash_command()
         .env("THIS_SH", &shell)
         .arg(parent_script)
         .output()

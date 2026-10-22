@@ -1,5 +1,8 @@
 use std::env;
 use std::fs;
+// Only the cfg(not(windows)) ash-named probe below spawns a raw Command.
+#[cfg(not(windows))]
+use std::process::Command;
 
 #[test]
 fn posix_parameter_word_can_contain_single_quoted_closing_brace() {
@@ -902,6 +905,11 @@ fn ash_named_invocation_uses_posix_redirection_glob_rules() {
     fs::copy(env!("CARGO_BIN_EXE_rubash"), &ash_path).expect("copy rubash as ash");
 
     let output = Command::new(&ash_path)
+        // ash-named probe: strip the same host-install variables as every
+        // other spawn (cfg(not(windows)), so it cannot use the Windows-only
+        // helper's import graph, but the env contract is identical).
+        .env_remove("WINUXSH_ROOT")
+        .env_remove("__RUBASH_SHELL_ROOT")
         .arg("-c")
         .arg(
             r#"rm -f z.tmp '?.tmp'; >z.tmp; echo TEST >?.tmp; printf 'z.tmp:<%s>\n' "$(cat z.tmp)"; printf '?.tmp:<%s>\n' "$(cat '?.tmp')"; rm -f z.tmp '?.tmp'"#,
