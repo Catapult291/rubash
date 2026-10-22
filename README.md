@@ -114,6 +114,8 @@ as zero after audit; earlier slice: 2026-09-25 on 71c933eb)
   Was 3427 on Sep 9 → −99%+ raw
 ```
 
+The 2026-10-12 full re-run predates the v1.4.2 tag.
+
 ### Fully passing suites (zero diff, environment diffs excluded)
 
 The clean set is derived from the ledger's per-suite classification, not
@@ -193,6 +195,16 @@ differential battery):
   targeting the 43% `expand_command_words` share of the export/unset body
   (#956); walker entry-chain trim (#973) and offset-window positional
   params for `shift` (#954) land in the same family.
+- silent-builtin short-circuit with empty output and no redirects:
+  shift ~1.5-4%, export/unset unchanged (#984);
+- plain-`$name` subscript fast lane: assoc interleave 8k 3.5x→2.6x,
+  linear (~3.1x asymptote) (#985);
+- skip identity IFS-marking passes on quoteless words: export/unset 2k
+  2.14x→1.97x (~3-4%) (#986);
+- linearize subscript-span scan in compound element splitting: 8k literal
+  fill ~850ms→~200ms, 20k ~5.1s→640ms (~8x, linear) (#987);
+- fast-expand `[ $VAR -op N ]` integer comparisons: loop-while 30k
+  ~2.4x→~1.8x vs bash (#990).
 
 **export/unset economics** — [issue #916](https://github.com/unixwin/rubash/issues/916)
 measured the per-op cost family (e.g. 2000 dynamic exports: 245 ms vs
@@ -341,4 +353,4 @@ Issues, compatibility reproductions, focused regression tests, and implementatio
 
 ---
 
-*Last updated: 2026-10-19*
+*Last updated: 2026-10-22*

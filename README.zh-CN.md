@@ -74,6 +74,8 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
   9 月 9 日为 3427 行 → −99%+
 ```
 
+2026-10-12 全量重跑早于 v1.4.2 tag。
+
 ### 完全通过的套件（零差异，环境差除外）
 
 净化套件集派生自台账的逐套件分类，并非手工维护：仅当某套件的每一差异行都归因于环境（按 AGENTS.md 的 rubash 引起 vs 环境引起划分，并对应覆盖 issue）时才列入此处。上方原始计数（62）+ 环境归类集（20）+ nameref 已证实的 GNU 竞争 = 全部 83 套。
@@ -121,6 +123,11 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
 - 十进制下标数组写 fast lane：交错 8k 从 3.65x→3.16x；顺手修掉 `a[$((i++))]=v` 的真实双副作用（#959）；
 - case：`$BASH_COMMAND` 只渲染头臂：20 臂 ×10k −10%，附分歧修复（#958）；
 - 字面量词准入在 `expand_word_mut` 与命令词间共享，瞄准 export/unset 主体里 43% 的 `expand_command_words` 份额（#956）；同族还有 walker entry-chain 修剪（#973）与 `shift` 的偏移窗位置参数（#954）。
+- silent 内建短路（空输出且无重定向）：shift ~1.5-4%，export/unset 不变（#984）；
+- 纯 `$name` 下标快道：assoc 交错 8k 从 3.5x→2.6x，线性（~3.1x 渐近）（#985）；
+- quoteless 词跳过恒等 IFS 标记：export/unset 2k 从 2.14x→1.97x（~3-4%）（#986）；
+- compound 元素切分下标跨度扫描线性化：8k 字面量填充 ~850ms→~200ms，20k 从 ~5.1s→640ms（~8x，线性）（#987）；
+- `[ $VAR -op N ]` 整数比较快扩：loop-while 30k 对 GNU 从 ~2.4x→~1.8x（#990）。
 
 **export/unset 经济学**——[issue #916](https://github.com/unixwin/rubash/issues/916) 实测了该家族的单操作成本（如 2000 次动态 export：245 ms 对 GNU 33 ms；unset 腿约 200x）。写车道修复已合入（#917/#918/#920：单探针镜像、门控 env 回退、批量去标记；#943 对 unbind 做正确性返工）；issue 对残留保持开放。
 
@@ -247,4 +254,4 @@ MIT — 详见 [`LICENSE`](LICENSE)。
 
 ---
 
-*最后更新：2026-10-19*
+*最后更新：2026-10-22*
