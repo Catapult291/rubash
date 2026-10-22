@@ -349,20 +349,24 @@ impl Executor {
                 Ok(())
             }
             "dirname" => {
-                if let Some(status) = self.try_execute_dirname_fast_path(cmd) {
-                    self.exit_code = status;
-                    Ok(())
-                } else {
-                    self.execute_external(cmd)
+                // The fast paths emulate external commands: with PATH
+                // unset they must not resolve (rubash#1126).
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    if let Some(status) = self.try_execute_dirname_fast_path(cmd) {
+                        self.exit_code = status;
+                        return Ok(());
+                    }
                 }
+                self.execute_external(cmd)
             }
             "basename" => {
-                if let Some(status) = self.try_execute_basename_fast_path(cmd) {
-                    self.exit_code = status;
-                    Ok(())
-                } else {
-                    self.execute_external(cmd)
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    if let Some(status) = self.try_execute_basename_fast_path(cmd) {
+                        self.exit_code = status;
+                        return Ok(());
+                    }
                 }
+                self.execute_external(cmd)
             }
             // Bash posix-mode notes (item 19): in POSIX mode a function whose
             // name contains a slash is never executed — the word falls
@@ -380,14 +384,23 @@ impl Executor {
             // builtin. The `command`-builtin path (command_no_alias_late)
             // bypasses functions by definition and dispatches directly.
             "uname" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_identity_tool(cmd, "uname");
                 Ok(())
             }
             "arch" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_identity_tool(cmd, "arch");
                 Ok(())
             }
             "stty" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_console_mode_tool(cmd);
                 Ok(())
             }

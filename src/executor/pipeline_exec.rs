@@ -1043,6 +1043,11 @@ impl Executor {
         match name.as_str() {
             "true" | ":" => Some(()),
             "sleep" => {
+                // With PATH unset, sleep does not resolve (rubash#1126):
+                // decline the timing model so the real pipeline reports it.
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return None;
+                }
                 let duration = command
                     .words
                     .get(1)
@@ -3292,6 +3297,16 @@ impl Executor {
         // and a pure inline fast-path arm (`echo`/`printf`/`tr`/...) is
         // confirmed as a builtin when the stage returns.
         let _profiler_stage = super::profiler::enter_prepared_command(name);
+        // GNU findcmd.c: with PATH unset no external command resolves —
+        // the inline arms below that emulate external programs (head,
+        // cat, sed, grep, wc, tr) must stand down and let the external
+        // stage report the failure (rubash#1126). Builtin arms are
+        // unaffected.
+        if crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            && matches!(name, "head" | "cat" | "sed" | "grep" | "wc" | "tr" | "tput")
+        {
+            return self.execute_external_pipeline_stage(command, input, stdin_inherit);
+        }
         match name {
             "true" | ":" => Ok(Some((String::new(), String::new(), 0))),
             "false" => Ok(Some((String::new(), String::new(), 1))),

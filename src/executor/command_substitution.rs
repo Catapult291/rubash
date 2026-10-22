@@ -880,6 +880,7 @@ impl Executor {
         // `-` operands): those read fd 0, which lives in FUNCTION_STDIN and
         // shares the caller's cursor — external_cat owns that semantics.
         if words.first().map(String::as_str) == Some("cat")
+            && !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
             && words[1..].iter().all(|word| !word.starts_with('-'))
             && words.len() > 1
             // A `/dev/fd/N` operand needs real execution when it names an

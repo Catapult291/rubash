@@ -296,7 +296,11 @@ impl Executor {
         } else {
             (first, ast.commands.get(1))
         };
-        if first.words.first().map(String::as_str) != Some("cat") {
+        if first.words.first().map(String::as_str) != Some("cat")
+            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+        {
+            // With PATH unset, cat does not resolve (rubash#1126): the
+            // heredoc shortcut must not produce the content.
             return None;
         }
         // rubash#320: admission whitelist — this fast path models only
@@ -407,7 +411,11 @@ impl Executor {
         } else {
             (first, ast.commands.get(1))
         };
-        if first.words.first().map(String::as_str) != Some("cat") {
+        if first.words.first().map(String::as_str) != Some("cat")
+            || crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+        {
+            // With PATH unset, cat does not resolve (rubash#1126): the
+            // heredoc shortcut must not produce the content.
             return None;
         }
         // rubash#320: same admission whitelist as the typed path — a file
@@ -547,6 +555,11 @@ impl Executor {
                 )
             }
             Some("tty") | Some("/bin/tty") | Some("/usr/bin/tty") => {
+                if words.first().map(String::as_str) == Some("tty")
+                    && crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                {
+                    return None;
+                }
                 let silent = words
                     .iter()
                     .skip(1)
@@ -559,6 +572,10 @@ impl Executor {
                 })
             }
             Some("cat") => {
+                // With PATH unset, cat does not resolve (rubash#1126).
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return None;
+                }
                 // Bare `cat` (or flag/`-` operands) reads fd 0 — the shared
                 // FUNCTION_STDIN cursor — which this shortcut cannot model;
                 // fall back to real execution (external_cat owns it).

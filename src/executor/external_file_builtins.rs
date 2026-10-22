@@ -12,6 +12,17 @@ impl Executor {
             return Ok(false);
         }
         let name = cmd.words[0].as_str();
+        // GNU findcmd.c: with PATH unset no external command resolves —
+        // the emulations below stand in for PATH binaries, so a
+        // slash-free name must fall through to the (failing) lookup
+        // instead of executing (rubash#1126). Slash names go straight
+        // to execve in GNU and keep working.
+        if !name.contains('/')
+            && !name.contains('\\')
+            && crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+        {
+            return Ok(false);
+        }
         let emulated = matches!(
             name,
             "/bin/pwd"

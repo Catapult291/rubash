@@ -280,6 +280,18 @@ pub(crate) fn path_is_user_owned(env_vars: &HashMap<String, String>) -> bool {
     }
 }
 
+/// GNU findcmd.c:279-293 (_find_user_command_internal): when PATH is
+/// unset, search_for_command never walks a path list at all — NO
+/// external command resolves, and shell_execve's ENOENT reports "No
+/// such file or directory". Every internal emulation of an external
+/// command (pipeline inline stages, file builtins, identity tools,
+/// the sleep fast path) must stand down under the same condition or
+/// the command's existence depends on the invocation shape
+/// (rubash#1126, #1145).
+pub(crate) fn path_is_unset(env_vars: &HashMap<String, String>) -> bool {
+    !env_vars.contains_key("PATH")
+}
+
 pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Option<PathBuf> {
     if name.is_empty() {
         return None;

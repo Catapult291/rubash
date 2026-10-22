@@ -140,7 +140,9 @@ impl Executor {
                 }
             }
             "sleep" => {
-                if crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..]) {
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                    && crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..])
+                {
                     // GNU sleep is an external child process, so the waiting
                     // shell is interruptible: a caught signal is recorded
                     // (trap.c:545 trap_handler -> trap.c:537 set_trap_state)
