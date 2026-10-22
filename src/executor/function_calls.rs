@@ -560,7 +560,7 @@ impl Executor {
         // body may still set a new DEBUG trap, which then fires for the
         // remaining body commands (trap.tests: "func[29] funcdebug").
         let saved_debug_action =
-            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG");
+            crate::builtins::trap::get_trap_action_fast(&self.shell_state.env_vars, "DEBUG");
         if saved_debug_action.is_some() && !function_traced {
             crate::builtins::trap::clear_debug_trap(&mut self.shell_state.env_vars);
         }
@@ -572,7 +572,7 @@ impl Executor {
         let errtrace =
             crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "errtrace");
         let saved_err_action =
-            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR");
+            crate::builtins::trap::get_trap_action_fast(&self.shell_state.env_vars, "ERR");
         if saved_err_action.is_some() && !errtrace {
             crate::builtins::trap::clear_error_trap(&mut self.shell_state.env_vars);
         }

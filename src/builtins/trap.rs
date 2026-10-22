@@ -505,6 +505,24 @@ pub(crate) fn get_trap_action(env_vars: &HashMap<String, String>, signal: &str) 
     env_vars.get(&trap_key(signal)).cloned()
 }
 
+/// Allocation-light `get_trap_action` for per-call hot paths (function
+/// entry consults DEBUG and ERR on every call, rubash#1121): the reset
+/// membership test is a split-scan of the same `:`-joined TRAP_RESET
+/// value `reset_trap_signals` collects into a BTreeSet — identical
+/// semantics (a reset signal reads as unset), without building the set.
+pub(crate) fn get_trap_action_fast(
+    env_vars: &HashMap<String, String>,
+    signal: &str,
+) -> Option<String> {
+    if env_vars
+        .get(TRAP_RESET)
+        .is_some_and(|value| value.split(':').any(|reset| reset == signal))
+    {
+        return None;
+    }
+    env_vars.get(&trap_key(signal)).cloned()
+}
+
 /// Borrowing, allocation-free `get_trap_action` for the per-firing trap
 /// dispatches (rubash#375). GNU `_run_trap_internal` (trap.c:1154-1155)
 /// reads `trap_list[sig]` — a pointer — and savestrings it once; it never
