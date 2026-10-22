@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, path::Path};
 
 #[path = "errexit.rs"]
@@ -7,7 +7,7 @@ mod errexit;
 
 #[test]
 fn stdin_script_uses_s_positional_arguments() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-s")
         .arg("alpha")
         .arg("beta")
@@ -48,7 +48,7 @@ fn stdin_script_child_shell_inherits_unread_input() {
 
     let shell = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
     let child_script_arg = child_script.to_string_lossy().replace('\\', "/");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .env("THIS_SH", &shell)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -79,7 +79,7 @@ fn stdin_script_child_shell_inherits_unread_input() {
 
 #[test]
 fn stdin_script_honors_errexit_across_input_lines() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -100,7 +100,7 @@ fn stdin_script_honors_errexit_across_input_lines() {
 
 #[test]
 fn stdin_script_preserves_debug_trap_line_numbers() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -133,8 +133,10 @@ fn nested_this_shell_script_runs_in_process() {
     )
     .unwrap();
 
+    // Forward slashes only matter for the THIS_SH value the child sees;
+    // spawn through the env-stripping helper like every other test.
     let shell = env!("CARGO_BIN_EXE_rubash").replace('\\', "/");
-    let output = Command::new(&shell)
+    let output = crate::rubash_command()
         .env("THIS_SH", &shell)
         .arg(parent_script)
         .output()
@@ -152,7 +154,7 @@ fn nested_this_shell_script_runs_in_process() {
 
 #[test]
 fn stdin_script_collects_heredoc_before_execution() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -175,7 +177,7 @@ fn stdin_script_handles_large_heredoc_incrementally() {
     let line = "heredoc-line\n";
     let body = line.repeat(100_000);
     let input = format!("cat <<EOF\n{body}EOF\n");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -196,7 +198,7 @@ fn stdin_script_handles_large_heredoc_incrementally() {
 
 #[test]
 fn script_brace_group_inner_command_keeps_trailing_heredoc() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("{ cat <<EOF; }; echo Ok2\nOk1\nEOF\n")
         .output()
@@ -209,7 +211,7 @@ fn script_brace_group_inner_command_keeps_trailing_heredoc() {
 
 #[test]
 fn stdin_script_runs_multiline_case_command() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -232,7 +234,7 @@ fn stdin_script_runs_multiline_case_command() {
 
 #[test]
 fn stdin_script_runs_multiline_function_definition() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -255,7 +257,7 @@ fn stdin_script_runs_multiline_function_definition() {
 
 #[test]
 fn stdin_script_runs_split_function_definition() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -278,7 +280,7 @@ fn stdin_script_runs_split_function_definition() {
 
 #[test]
 fn stdin_script_runs_parenthesized_function_definition() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -318,7 +320,7 @@ fn script_multiline_quoted_assignment_is_one_command() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -352,7 +354,7 @@ fn script_nested_case_stays_inside_outer_case_body() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .arg("a")
         .arg("b")
@@ -374,7 +376,7 @@ fn script_backtick_basename_expands_script_name() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -407,7 +409,7 @@ fn script_nested_if_keeps_outer_fi_pairing() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -431,7 +433,7 @@ fn script_backtick_echo_sed_pipeline_splits_version() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -452,7 +454,7 @@ fn script_escaped_backtick_in_quotes_is_literal() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -472,7 +474,7 @@ fn script_bash_source_pattern_removal_uses_first_element() {
     fs::create_dir_all("target").unwrap();
     fs::write(&script_path, "printf '%s\\n' \"${BASH_SOURCE##*/}\"\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -501,7 +503,7 @@ fn script_bash_source_index_locates_sibling_source_file() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -532,7 +534,7 @@ fn source_expands_braces_and_passes_remaining_words_as_args() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(main_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -568,7 +570,7 @@ fn source_expands_braces_then_pathname_globs_for_bashdb_style_command_load() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(main_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -607,7 +609,7 @@ fn command_dot_uses_expanded_source_arguments() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(main_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -629,7 +631,7 @@ fn command_dot_uses_expanded_source_arguments() {
 
 #[test]
 fn case_clause_tracks_nested_if_before_clause_terminator() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "case x in \
@@ -661,7 +663,7 @@ fn sourced_file_updates_bash_source_zero() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(main_path.to_string_lossy().replace('\\', "/"))
         .output()
         .expect("run rubash");
@@ -687,7 +689,7 @@ fn script_assignment_command_substitution_captures_function_output() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");

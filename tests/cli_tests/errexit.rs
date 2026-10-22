@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::{fs, path::Path};
 
 #[test]
@@ -19,7 +18,7 @@ fn script_errexit_allows_common_conditional_failures() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -38,7 +37,7 @@ fn script_errexit_exits_on_assignment_command_substitution_failure() {
     fs::create_dir_all("target").unwrap();
     fs::write(&script_path, "set -e\nv=$(false)\necho bad\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");
@@ -58,7 +57,7 @@ fn script_assignment_command_substitution_success_keeps_running() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(&script_path)
         .output()
         .expect("run rubash");

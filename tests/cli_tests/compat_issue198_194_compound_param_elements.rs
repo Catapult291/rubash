@@ -8,10 +8,8 @@
 //! (parse.y:5786-5796), so assign_compound_array_list (arrayfunc.c:745-747)
 //! never re-reads `[sub]=` text that came out of an expansion.
 
-use std::process::Command;
-
 fn run(script: &str) -> (String, String, Option<i32>) {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(script)
         .env("HOME", env!("CARGO_TARGET_TMPDIR"))

@@ -1,9 +1,12 @@
+use std::env;
 use std::fs;
-use std::{env, process::Command};
+// Only the cfg(not(windows)) ash-named probe below spawns a raw Command.
+#[cfg(not(windows))]
+use std::process::Command;
 
 #[test]
 fn posix_parameter_word_can_contain_single_quoted_closing_brace() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "set -o posix; (echo 1 $",
@@ -29,7 +32,7 @@ fn posix_dq_parameter_word_single_quotes_are_literal() {
     // in script-file and -c forms (both print `2 ''z}`); bash 5.2.21
     // printed `2 '}'z`, which is where the previous expectation came
     // from. Rubash matches 5.3.0 byte-for-byte.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -o posix; (echo 2 \"${IFS+'}'z}\")")
         .output()
@@ -41,7 +44,7 @@ fn posix_dq_parameter_word_single_quotes_are_literal() {
 }
 #[test]
 fn quoted_native_wildcards_and_special_arguments_survive_argv_boundary() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"printf '<%s>\n' "a*b" "q?x" "/CN=test" --send-only"#)
         .output()
@@ -58,7 +61,7 @@ fn quoted_native_wildcards_and_special_arguments_survive_argv_boundary() {
 #[cfg(windows)]
 #[test]
 fn rubash_to_powershell_preserves_native_argument_literals() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r#"pwsh -NoProfile -Command 'Write-Output (Get-Variable args -ValueOnly)' -- "a*b" "q?x" "/CN=test" --send-only"#,
@@ -80,7 +83,7 @@ fn rubash_to_powershell_preserves_native_argument_literals() {
 
 #[test]
 fn quoted_positional_at_keeps_suffix_expansion_unquoted() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"set -- a ""; space=" "; printf '<%s>\n' "$@"$space"#)
         .output()
@@ -93,7 +96,7 @@ fn quoted_positional_at_keeps_suffix_expansion_unquoted() {
 
 #[test]
 fn unquoted_parameter_expansion_splits_on_custom_ifs_empty_fields() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"IFS=":"; x=":a:"; set x $x; shift; printf "[%s](%s)(%s)\n" "$#" "$1" "$2"; IFS=" "; x="  "; set x $x; shift; printf "[%s]\n" "$#""#)
         .output()
@@ -106,7 +109,7 @@ fn unquoted_parameter_expansion_splits_on_custom_ifs_empty_fields() {
 
 #[test]
 fn escaped_brace_expansion_preserves_literal_suffix() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"echo {x,y,\{a,b,c}}"#)
         .output()
@@ -123,7 +126,7 @@ fn quoted_parameter_assignment_preserves_escaped_space_for_equals() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/parameter_assignment_escaped_space.sh"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script)
         .output()
         .expect("run parameter assignment escape probe");
@@ -138,7 +141,7 @@ fn quoted_parameter_assignment_preserves_escaped_space_for_equals() {
 
 #[test]
 fn quoted_parameter_pattern_braces_match_bash() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x=foo*bar; printf '%s\n' "${x##"}"}"; printf '%s\n' "${x##'}'}""#)
         .output()
@@ -154,7 +157,7 @@ fn quoted_parameter_pattern_braces_match_bash() {
 
 #[test]
 fn heredoc_parameter_error_writes_to_stderr_and_continues() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("M=AAA; cat <<EOF; echo Y\n${D?$M}\nEOF")
         .output()
@@ -172,7 +175,7 @@ fn malformed_script_preserves_valid_prefix_before_status_two() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/malformed_parameter_prefix.sh"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script)
         .output()
         .expect("run multiline malformed expansion fixture");
@@ -187,7 +190,7 @@ fn malformed_script_preserves_valid_prefix_before_status_two() {
 
 #[test]
 fn nested_parameter_pattern_removal_keeps_argument_boundaries() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r##"v=a
@@ -208,7 +211,7 @@ echo "${v%"${v#?}"}"
 
 #[test]
 fn parameter_replacement_consumes_quoted_backslashes_like_bash() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"value=x; printf '<%s>|<%s>\n' "${value//x/\n}" "${value//x/\\n}""#)
         .output()
@@ -221,7 +224,7 @@ fn parameter_replacement_consumes_quoted_backslashes_like_bash() {
 
 #[test]
 fn parameter_replacement_keeps_escaped_command_substitution_literal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"v=abc; printf '<%s>\n' "${v//a/\$(printf X)}""#)
         .output()
@@ -234,7 +237,7 @@ fn parameter_replacement_keeps_escaped_command_substitution_literal() {
 
 #[test]
 fn nested_parameter_subscript_rejects_recursive_indirection_without_stack_overflow() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("a=(zero one); i=1; printf '<%s>\\n' \"${a[${i}]}\"; y=${a[${${i}}]}")
         .output()
@@ -247,7 +250,7 @@ fn nested_parameter_subscript_rejects_recursive_indirection_without_stack_overfl
 
 #[test]
 fn printf_integer_conversion_keeps_valid_prefix_before_invalid_suffix() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "printf '%d:%d:%d\\n' '1.2' '08' '10#12'; status=$?; printf 'status=%s\\n' \"$status\"",
@@ -269,7 +272,7 @@ fn printf_integer_conversion_keeps_valid_prefix_before_invalid_suffix() {
 
 #[test]
 fn printf_b_emits_octals_as_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("printf '%b|%b|%b' '\\400' '\\777' '\\377'")
         .output()
@@ -282,7 +285,7 @@ fn printf_b_emits_octals_as_raw_bytes() {
 
 #[test]
 fn scalar_command_substitution_round_trips_c0_1d_byte() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("x=$(printf '\\035'); printf '%s' \"$x\" | od -An -tx1")
         .output()
@@ -295,7 +298,7 @@ fn scalar_command_substitution_round_trips_c0_1d_byte() {
 
 #[test]
 fn printf_q_uses_ansi_c_quotes_for_control_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("printf '<%q>\\n' $'a\\x01b'")
         .output()
@@ -308,7 +311,7 @@ fn printf_q_uses_ansi_c_quotes_for_control_bytes() {
 
 #[test]
 fn command_substitution_preserves_printf_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=\"$(printf '\\377')\"; printf '%s' \"$value\"")
         .output()
@@ -321,7 +324,7 @@ fn command_substitution_preserves_printf_raw_bytes() {
 
 #[test]
 fn timed_command_substitution_preserves_printf_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=\"$(time printf '\\377')\"; printf '%s' \"$value\"")
         .output()
@@ -333,7 +336,7 @@ fn timed_command_substitution_preserves_printf_raw_bytes() {
 
 #[test]
 fn command_substitution_pipeline_preserves_printf_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=\"$(printf '\\377' | tr x y)\"; printf '%s' \"$value\"")
         .output()
@@ -346,7 +349,7 @@ fn command_substitution_pipeline_preserves_printf_raw_bytes() {
 
 #[test]
 fn command_substitution_pipeline_applies_tr_translation() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=\"$(printf 'x\\n' | tr x y)\"; printf '<%s>\\n' \"$value\"")
         .output()
@@ -359,7 +362,7 @@ fn command_substitution_pipeline_applies_tr_translation() {
 
 #[test]
 fn command_substitution_pipeline_applies_common_filters() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "printf '<%s>|<%s>|<%s>\\n' \"$(printf 'b\\na\\n' | grep a)\" \"$(printf 'b\\na\\n' | head -n 1)\" \"$(printf 'b\\na\\n' | wc -l)\"",
@@ -374,7 +377,7 @@ fn command_substitution_pipeline_applies_common_filters() {
 
 #[test]
 fn command_substitution_pipeline_preserves_last_filter_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "value=\"$(printf 'x\\n' | grep y)\"; printf 'value=<%s> status=%s\\n' \"$value\" \"$?\"",
@@ -392,7 +395,7 @@ fn command_substitution_pipeline_preserves_last_filter_status() {
 
 #[test]
 fn command_substitution_pipeline_applies_tail_and_uniq() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "printf '<%s>|<%s>\\n' \"$(printf 'b\\nb\\na\\n' | uniq)\" \"$(printf 'b\\nb\\na\\n' | tail -n 1)\"",
@@ -407,7 +410,7 @@ fn command_substitution_pipeline_applies_tail_and_uniq() {
 
 #[test]
 fn command_substitution_nested_pipeline_expands_tr_ranges() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "inner(){ printf 'inner'; }; outer(){ printf '%s:%s' \"$1\" \"$(printf '%s' \"$1\" | tr a-z A-Z)\"; }; echo \"$(outer \"$(inner)\")\"",
@@ -422,7 +425,7 @@ fn command_substitution_nested_pipeline_expands_tr_ranges() {
 
 #[test]
 fn arithmetic_empty_quoted_operand_with_operator_fails() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("(( 1 - \"\" )); printf 'status=%s\\n' \"$?\"")
         .output()
@@ -435,7 +438,7 @@ fn arithmetic_empty_quoted_operand_with_operator_fails() {
 
 #[test]
 fn arithmetic_empty_array_subscript_defaults_to_zero() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"declare -a a; let a[" "]=13; declare -p a"#)
         .output()
@@ -455,7 +458,7 @@ fn arithmetic_empty_quoted_array_subscript_fails_outside_let() {
     // `` `a[]': not a valid identifier `` and continues with status 0; the
     // word-expansion form `: $(( a[""]=25 ))` reports the same diagnostic
     // and the next command still runs (rc 0).
-    let command_output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let command_output = crate::rubash_command()
         .arg("-c")
         .arg("declare -a a; (( a[\"\"]=24 )); printf 'status=%s\\n' \"$?\"")
         .output()
@@ -473,7 +476,7 @@ fn arithmetic_empty_quoted_array_subscript_fails_outside_let() {
         "status=0\n"
     );
 
-    let expansion_output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let expansion_output = crate::rubash_command()
         .arg("-c")
         .arg("declare -a a; : $(( a[\"\"]=25 )); echo after")
         .output()
@@ -485,7 +488,7 @@ fn arithmetic_empty_quoted_array_subscript_fails_outside_let() {
 
 #[test]
 fn parameter_substring_empty_length_is_zero() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "v=12345; printf '<%s>|<%s>|<%s>\\n' \
@@ -501,7 +504,7 @@ fn parameter_substring_empty_length_is_zero() {
 
 #[test]
 fn umask_symbolic_output_takes_precedence_over_reusable_output() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("umask -Sp 0002")
         .output()
@@ -517,7 +520,7 @@ fn umask_symbolic_output_takes_precedence_over_reusable_output() {
 
 #[test]
 fn custom_space_ifs_does_not_create_empty_fields() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"value="a  b"; IFS=" "; printf '<%s>\n' $value"#)
         .output()
@@ -530,7 +533,7 @@ fn custom_space_ifs_does_not_create_empty_fields() {
 
 #[test]
 fn quoted_arithmetic_expansion_survives_test_builtin_word_expansion() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set 4 '' opt no-highlight 0 '' x; if [ \"$(($2 + 2))\" -gt \"$#\" ]; then echo yes; else echo no; fi")
         .output()
@@ -546,7 +549,7 @@ fn arithmetic_nounset_errors_exit_127_like_bash() {
         "set -u; ((missing + 1))",
         r#"set -u; printf '%s\n' "$((missing + 1))""#,
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        let output = crate::rubash_command()
             .arg("-c")
             .arg(command)
             .output()
@@ -559,7 +562,7 @@ fn arithmetic_nounset_errors_exit_127_like_bash() {
 
 #[test]
 fn aliases_stay_disabled_in_noninteractive_shells_by_default() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"alias ll="echo hi"; ll"#)
         .output()
@@ -572,7 +575,7 @@ fn aliases_stay_disabled_in_noninteractive_shells_by_default() {
 
 #[test]
 fn aliases_expand_when_expand_aliases_is_enabled() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("shopt -s expand_aliases\nalias ll=\"echo hi\"\nll\n")
         .output()
@@ -585,7 +588,7 @@ fn aliases_expand_when_expand_aliases_is_enabled() {
 
 #[test]
 fn aliases_defined_on_the_same_line_are_not_expanded() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"shopt -s expand_aliases; alias ll="echo hi"; ll"#)
         .output()
@@ -598,7 +601,7 @@ fn aliases_defined_on_the_same_line_are_not_expanded() {
 
 #[test]
 fn arithmetic_conditional_false_branch_assignment_matches_bash() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("x=0; (( 1 ? x=4 : x=9 )); printf 'status:%s x:%s\n' \"$?\" \"$x\"")
         .output()
@@ -620,7 +623,7 @@ fn arithmetic_conditional_false_branch_assignment_matches_bash() {
 #[test]
 fn arithmetic_word_errors_abort_noninteractive_scripts() {
     for expression in ["1=2", "1++", "1/0", "08"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        let output = crate::rubash_command()
             .arg("-c")
             .arg(format!("echo $(({expression})); echo after"))
             .output()
@@ -641,7 +644,7 @@ fn arithmetic_word_errors_abort_noninteractive_scripts() {
 
 #[test]
 fn arithmetic_invalid_octal_reports_bash_base_diagnostic() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("printf '%s\n' $((08))")
         .output()
@@ -659,7 +662,7 @@ fn arithmetic_invalid_octal_reports_bash_base_diagnostic() {
 
 #[test]
 fn inherit_errexit_aborts_command_substitution_body() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -e; shopt -s inherit_errexit; x=$(false; echo sub); echo after")
         .output()
@@ -674,7 +677,7 @@ fn inherit_errexit_aborts_command_substitution_body() {
 // assignment to non-variable" and aborts the run (status 1).
 #[test]
 fn arithmetic_assignment_error_aborts_without_errexit() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("declare -i x=2; y=$((1 ? 20 : x+=2)); echo after:$? y:$y x:$x")
         .output()
@@ -692,7 +695,7 @@ fn arithmetic_assignment_error_aborts_without_errexit() {
 
 #[test]
 fn associative_arithmetic_subscript_preserves_escaped_command_substitution() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("declare -A a; key=\"x],b[\\$(echo uname >&2)\"; (( a[$key]++ )); declare -p a")
         .output()
@@ -717,7 +720,7 @@ fn associative_arithmetic_subscript_preserves_escaped_command_substitution() {
 #[test]
 fn arithmetic_word_error_inside_function_returns_early_only() {
     let script_dir = env!("CARGO_MANIFEST_DIR");
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("f() { x=$((08)); echo post; }\nf\necho end-sub:$?")
         .current_dir(script_dir)
@@ -740,7 +743,7 @@ fn arithmetic_word_error_inside_function_returns_early_only() {
 
 #[test]
 fn arithmetic_conditional_requires_false_branch_expression() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo $((4 ? 20 : )); echo after")
         .output()
@@ -757,7 +760,7 @@ fn arithmetic_conditional_requires_false_branch_expression() {
 
 #[test]
 fn nameref_to_array_element_expands_value_and_indirect_name() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("arr=(zero 'one two'); declare -n ref='arr[1]'; printf '<%s>|<%s>\n' \"${ref}\" \"${!ref}\"")
         .output()
@@ -773,7 +776,7 @@ fn nameref_to_array_element_expands_value_and_indirect_name() {
 
 #[test]
 fn positional_slice_offset_zero_includes_script_name() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -- alpha beta; got=\"${@:0:1}\"; [ \"$got\" = \"$0\" ]")
         .output()
@@ -789,7 +792,7 @@ fn positional_slice_offset_zero_includes_script_name() {
 
 #[test]
 fn explicit_read_reply_trims_like_normal_scalar_name() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"printf '%s\n' '  \abc  d\ef  ' | (read REPLY; printf '<%s>\n' "$REPLY")"#)
         .output()
@@ -802,7 +805,7 @@ fn explicit_read_reply_trims_like_normal_scalar_name() {
 
 #[test]
 fn read_without_r_joins_backslash_newline() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"printf '%s\n%s\n' 'test\' 'best' | (read reply; printf '<%s>\n' "$reply")"#)
         .output()
@@ -815,7 +818,7 @@ fn read_without_r_joins_backslash_newline() {
 
 #[test]
 fn read_mixed_ifs_splits_like_bash() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r#"printf 'a ,, c
@@ -842,7 +845,7 @@ a ,, c d
 
 #[test]
 fn empty_command_substitution_command_word_preserves_previous_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r#"true; $(); printf 'a:%s
@@ -859,7 +862,7 @@ fn empty_command_substitution_command_word_preserves_previous_status() {
 
 #[test]
 fn redirection_target_glob_uses_single_match() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r#"rm -f z.tmp; >z.tmp; echo TEST >?.tmp; printf '<%s>\n' "$(cat z.tmp)"; rm -f z.tmp"#,
@@ -875,7 +878,7 @@ fn redirection_target_glob_uses_single_match() {
 #[cfg(not(windows))]
 #[test]
 fn posix_redirection_target_does_not_glob() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("--posix")
         .arg("-c")
         .arg(
@@ -902,6 +905,11 @@ fn ash_named_invocation_uses_posix_redirection_glob_rules() {
     fs::copy(env!("CARGO_BIN_EXE_rubash"), &ash_path).expect("copy rubash as ash");
 
     let output = Command::new(&ash_path)
+        // ash-named probe: strip the same host-install variables as every
+        // other spawn (cfg(not(windows)), so it cannot use the Windows-only
+        // helper's import graph, but the env contract is identical).
+        .env_remove("WINUXSH_ROOT")
+        .env_remove("__RUBASH_SHELL_ROOT")
         .arg("-c")
         .arg(
             r#"rm -f z.tmp '?.tmp'; >z.tmp; echo TEST >?.tmp; printf 'z.tmp:<%s>\n' "$(cat z.tmp)"; printf '?.tmp:<%s>\n' "$(cat '?.tmp')"; rm -f z.tmp '?.tmp'"#,
@@ -922,7 +930,7 @@ fn ash_named_invocation_uses_posix_redirection_glob_rules() {
 
 #[test]
 fn glob_backslash_literal_in_unquoted_variable_matches_filename() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -rf testdir.TMP; mkdir testdir.TMP; >testdir.TMP/name; b="test*.TMP/\name"; printf '<%s>\n' $b; rm -f testdir.TMP/name; rmdir testdir.TMP"#)
         .output()
@@ -938,7 +946,7 @@ fn glob_backslash_literal_in_unquoted_variable_matches_filename() {
 
 #[test]
 fn escaped_glob_from_parameter_expansion_stays_literal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -f Zf; >Zf; v='\*'; printf '<%s>\n' Z$v; rm -f Zf"#)
         .output()
@@ -951,7 +959,7 @@ fn escaped_glob_from_parameter_expansion_stays_literal() {
 
 #[test]
 fn escaped_glob_in_parameter_alternate_stays_literal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -f glob_altvalue1.tests; >glob_altvalue1.tests; x=x; printf '<%s>\n' ${x:+glob_altvalue1.t\*}; rm -f glob_altvalue1.tests"#)
         .output()
@@ -971,7 +979,7 @@ fn unquoted_parameter_default_preserves_escaped_space_field_boundary() {
     // `${v-foo\\bar}` must stay untouched - the String-based operator path
     // already handles non-whitespace escapes, so only escaped IFS whitespace
     // is routed through the quote-aware fragment expansion.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"set -- ${v-a\ b}; printf '1=%s\n' "$#"; printf '2=<%s>\n' "$1"; set -- ${v:-a\ b}; printf '3=<%s>\n' "$1"; printf '4=<%s>\n' ${v-foo\\bar}; set -- ${IFS+a\ b}; printf '5=<%s>\n' "$1""#)
         .output()
@@ -987,7 +995,7 @@ fn unquoted_parameter_default_preserves_escaped_space_field_boundary() {
 
 #[test]
 fn parameter_alternate_preserves_nested_literal_double_quotes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x=a; printf '<%s>\n' ${x:+"b c" d}; printf '<%s>\n' "${x:+"b c" d}""#)
         .output()
@@ -1003,7 +1011,7 @@ fn parameter_alternate_preserves_nested_literal_double_quotes() {
 
 #[test]
 fn quoted_process_substitution_stays_literal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo \"<(echo \\\"hello 0\\\")\"")
         .output()
@@ -1020,7 +1028,7 @@ fn quoted_process_substitution_stays_literal() {
 
 #[test]
 fn process_substitution_external_redirect_preserves_printf_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("cat <(printf '\\377')")
         .output()
@@ -1037,7 +1045,7 @@ fn assignment_process_substitution_preserves_printf_raw_bytes() {
     // WITHIN the creating command (`cat <(printf '\377')` above), but the
     // assignment-carried `/dev/fd/N` is dead for the later `cat` — GNU
     // 5.3.0(1) probe 2026-10-12: ENOENT, rc 1, nothing on stdout.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x=<(printf '\377'); cat "$x""#)
         .output()
@@ -1054,7 +1062,7 @@ fn assignment_process_substitution_preserves_printf_raw_bytes() {
 
 #[test]
 fn output_process_substitution_preserves_printf_raw_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"printf '\377' > >(od -An -tx1)"#)
         .output()
@@ -1067,7 +1075,7 @@ fn output_process_substitution_preserves_printf_raw_bytes() {
 
 #[test]
 fn shell_read_with_input_and_output_process_substitutions_preserves_streams() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"f() { read value; printf 'value=%s\n' "$value"; }; f < <(printf 'hello\n') > >(cat)"#)
         .output()
@@ -1080,7 +1088,7 @@ fn shell_read_with_input_and_output_process_substitutions_preserves_streams() {
 
 #[test]
 fn command_substitution_preserves_quoted_empty_word() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -- \"$(printf '')\"; printf 'q:%d:<%s>\\n' \"$#\" \"$1\"; set -- $(printf ''); printf 'u:%d\\n' \"$#\"")
         .output()
@@ -1093,7 +1101,7 @@ fn command_substitution_preserves_quoted_empty_word() {
 
 #[test]
 fn command_substitution_does_not_split_literal_ifs_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("IFS=:; set -- a$(printf '')b::c; printf 'ifs:%d:%s:%s:%s:%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\"")
         .output()
@@ -1106,7 +1114,7 @@ fn command_substitution_does_not_split_literal_ifs_bytes() {
 
 #[test]
 fn command_substitution_multiple_fragments_split_independently() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r###"printf '<%s>\n' pre$(printf '%s' a)mid$(printf '%s' 'b c')post; printf '<%s>\n' pre$(printf '%s' a)mid"$(printf '%s' 'b c')"post"###)
         .output()
@@ -1122,7 +1130,7 @@ fn command_substitution_multiple_fragments_split_independently() {
 
 #[test]
 fn command_substitution_mixed_fragments_follow_quote_context() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r###"printf '<%s>\n' pre$(printf '%s' 'a b')post; printf '<%s>\n' pre"$(printf '%s' 'a b')"post"###)
         .output()
@@ -1138,7 +1146,7 @@ fn command_substitution_mixed_fragments_follow_quote_context() {
 
 #[test]
 fn command_substitution_echo_handles_escaped_parens_and_nested_backticks() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"echo $(echo \(\(TEST\) BEST); echo $(echo \)); echo $(echo a"`echo ")"`"c ); echo OK: $?"#)
         .output()
@@ -1158,7 +1166,7 @@ OK: 0
 
 #[test]
 fn quoted_backtick_command_substitution_preserves_newlines_through_pipeline() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -f __rubash_cmdsubst_pipe_lines.tmp; printf '%s\n' one two three > __rubash_cmdsubst_pipe_lines.tmp; printf '<%s>\n' "`cat __rubash_cmdsubst_pipe_lines.tmp`" | cat; rm -f __rubash_cmdsubst_pipe_lines.tmp"#)
         .output()
@@ -1174,7 +1182,7 @@ fn quoted_backtick_command_substitution_preserves_newlines_through_pipeline() {
 
 #[test]
 fn quoted_backtick_command_substitution_preserves_internal_newlines() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -f __rubash_cmdsubst_lines.tmp; printf '%s\n' one two three > __rubash_cmdsubst_lines.tmp; printf '<%s>\n' "`cat __rubash_cmdsubst_lines.tmp`"; rm -f __rubash_cmdsubst_lines.tmp"#)
         .output()
@@ -1190,7 +1198,7 @@ fn quoted_backtick_command_substitution_preserves_internal_newlines() {
 
 #[test]
 fn assignment_with_null_command_word_uses_assignment_substitution_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"v=v; v=`exit 2` `false`; printf 'Two:%s v:[%s]\n' "$?" "$v""#)
         .output()
@@ -1203,7 +1211,7 @@ fn assignment_with_null_command_word_uses_assignment_substitution_status() {
 
 #[test]
 fn assignment_only_redirect_failure_sets_status_and_continues() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -rf __rubash_missing_redirect_dir__; a=$(exit 2) >__rubash_missing_redirect_dir__/out; printf 'status:%s\n' "$?"; printf 'after\n'"#)
         .output()
@@ -1216,7 +1224,7 @@ fn assignment_only_redirect_failure_sets_status_and_continues() {
 
 #[test]
 fn failed_empty_output_command_substitution_sets_command_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             r#"true; $(""); printf 'status:%s
@@ -1236,7 +1244,7 @@ fn failed_empty_output_command_substitution_sets_command_status() {
 
 #[test]
 fn read_timeout_keeps_partial_pipeline_input() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"{ echo -n te; sleep 2; echo st; } | (read -t 1 reply; echo ">$reply<")"#)
         .output()
@@ -1249,7 +1257,7 @@ fn read_timeout_keeps_partial_pipeline_input() {
 
 #[test]
 fn read_timeout_followup_printf_sees_partial_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"{ echo -n te; sleep 2; echo st; } | (read -t 1 reply; printf ">%s<[%s]\n" "$reply" "$?")"#)
         .output()
@@ -1262,7 +1270,7 @@ fn read_timeout_followup_printf_sees_partial_status() {
 
 #[test]
 fn read_timeout_zero_reports_pipe_readiness() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"echo Ok | { sleep 0.1; read -t 0 reply; echo ">$reply<[$?]"; }; sleep 0.2 | { read -t 0 reply; echo ">$reply<[$?]"; }"#)
         .output()
@@ -1275,7 +1283,7 @@ fn read_timeout_zero_reports_pipe_readiness() {
 
 #[test]
 fn read_prompt_is_suppressed_for_pipeline_input() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"echo data | { read -p IGNORED_PROMPT reply; printf '<%s>\n' "$reply"; }"#)
         .output()
@@ -1288,7 +1296,7 @@ fn read_prompt_is_suppressed_for_pipeline_input() {
 
 #[test]
 fn assignment_shaped_command_argument_still_gets_pathname_expansion() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"rm -f RUBASH_GLOB_ASSIGN=one.rg one.rg; >RUBASH_GLOB_ASSIGN=one.rg; >one.rg; echo RUBASH_GLOB_ASSIGN=*.rg "RUBASH_GLOB_ASSIGN=*.rg"; rm -f RUBASH_GLOB_ASSIGN=one.rg one.rg"#)
         .output()
@@ -1304,7 +1312,7 @@ fn assignment_shaped_command_argument_still_gets_pathname_expansion() {
 
 #[test]
 fn getopts_inline_option_argument_starts_after_option() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"set -- -w2; while getopts "w:" var; do printf '%s:%s:%s\n' "$var" "$OPTARG" "$OPTIND"; done"#)
         .output()
@@ -1317,7 +1325,7 @@ fn getopts_inline_option_argument_starts_after_option() {
 
 #[test]
 fn getopts_invalid_option_diagnostic_has_bash_separator() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"while getopts "a" var -d; do :; done"#)
         .output()
@@ -1330,7 +1338,7 @@ fn getopts_invalid_option_diagnostic_has_bash_separator() {
 
 #[test]
 fn assignment_shaped_argument_preserves_quoted_rhs_spaces() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"jv=16; let jv="$jv / 2"; printf '<%s>\n' jv="$jv / 2"; echo rc:$? jv:$jv"#)
         .output()
@@ -1353,7 +1361,7 @@ fn arithmetic_error_aborts_current_subshell_only() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/arithmetic_error_subshell_continues_outer.sh"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script)
         .output()
         .expect("run arithmetic subshell error probe");
@@ -1368,7 +1376,7 @@ fn arithmetic_error_aborts_current_subshell_only() {
 // non-variable" and aborts the run; status 1, stdout empty.
 #[test]
 fn arithmetic_logical_short_circuit_literal_assignment_aborts() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("B=9; echo $((0 && B=42)); echo after")
         .output()
@@ -1385,7 +1393,7 @@ fn arithmetic_logical_short_circuit_literal_assignment_aborts() {
 
 #[test]
 fn separated_double_parentheses_parse_as_nested_subshells() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("((echo abc; echo def;); echo ghi); echo after")
         .output()
@@ -1404,7 +1412,7 @@ fn subshell_keeps_variable_assignment_and_positional_params_local() {
     // The subshell body runs in place on the parent executor, so the typed
     // variable store and positional parameters must be saved and restored
     // like env_vars (posixexp2 case 36/37).
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"unset v; set -- p1 p2; ( v=hello ); printf '1=%s\n' "${v-unset}"; v=outer; ( v=inner ); printf '2=%s\n' "$v"; ( set -- a b ); printf '3=%s\n' "$#:$1"; unset IFS; ( IFS=: ); printf '4=[%s]\n' "$IFS""#)
         .output()
@@ -1426,7 +1434,7 @@ fn double_quoted_parameter_alternate_keeps_quotes_literal() {
     // expansion must not rebuild it from the unmarked raw: that recursion
     // drops the marker, re-expands the alternate as unquoted, and the
     // inner quotes become real single quotes that suppress $key.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"set -o posix; shopt -u xpg_echo; unset v; key=value; printf "1=[%s]\n" "${IFS+'$key'}"; printf "2=[%s]\n" "${IFS+x'a'y}"; printf "3=[%s]\n" "${IFS+'quoted word'}"; printf "4=[%s]\n" "${v-'a b'}"; printf "5=[%s]\n" "${v-foo\bar}""#)
         .output()
@@ -1446,7 +1454,7 @@ fn double_quoted_parameter_default_keeps_escaped_space_literal() {
     // is literal: bash lets \ escape only $, `, ", \, and newline inside
     // double quotes. The unquoted form drops the backslash and keeps the
     // space as one field (escspace C-quoted/D-alt-narrow/H-narrow-q).
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"unset v; printf "1=<%s>\n" "${v-a\ b}"; printf "2=<%s>\n" "${v:-a\ b}"; printf "3=<%s>\n" ${v-a\ b}; printf "4=<%s>\n" ${v-foo\\bar}"#)
         .output()
@@ -1468,7 +1476,7 @@ fn double_quoted_parameter_alternate_keeps_escaped_space_literal() {
     // stays one field. Separately, an unquoted expansion of a value that
     // already contains a backslash keeps it: w='a\ b' yields fields a\ and
     // b, not a and b.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"unset v; printf '1=<%s>\n' "${v-a\ b}"; printf '2=<%s>\n' "${v:-a\ b}"; printf '3=<%s>\n' ${v-a\ b}; printf '4=<%s>\n' ${v-foo\\bar}"#)
         .output()
@@ -1484,7 +1492,7 @@ fn double_quoted_parameter_alternate_keeps_escaped_space_literal() {
 
 #[test]
 fn quoted_parameter_pattern_glob_chars_are_literal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x='*'; printf '<%s>\n' "${x#'*'}"; x='a*b'; printf '<%s>\n' "${x#'a*'}""#)
         .output()
@@ -1497,7 +1505,7 @@ fn quoted_parameter_pattern_glob_chars_are_literal() {
 
 #[test]
 fn unquoted_heredoc_backslash_and_parameter_errors_match_bash() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "cat <<EOF\n",
@@ -1531,7 +1539,7 @@ fn unquoted_heredoc_backslash_and_parameter_errors_match_bash() {
 
 #[test]
 fn heredoc_old_style_backticks_preserve_single_quoted_literals() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "a=qwerty\n",
@@ -1554,7 +1562,7 @@ fn comsub_arithmetic_body_preserves_escaped_quote_tokens() {
     // inner lexer dequotes at execution. Words routed through the mutable
     // embedded walker (anything containing `$((`) lost the backslash, so
     // the inner parse saw a syntactic quote and dropped it.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "echo $(echo $(( x )) | echo \"${x:-d}\" '$x' \"\\\"q\\\"\" \"${x:-d}\")\n",
@@ -1577,7 +1585,7 @@ fn empty_ifs_for_list_drops_null_unquoted_expansion() {
     // GNU subst.c:13219 expand_word_list_internal: an unquoted expansion
     // that produces nothing contributes no field, regardless of IFS.
     // `IFS=''` disables splitting only — an empty `$x` must still vanish.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "unset x\n",
@@ -1601,7 +1609,7 @@ fn empty_ifs_for_list_drops_null_unquoted_expansion() {
 
 #[test]
 fn malformed_heredoc_reports_offending_source_line() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("<<EOF; then <W")
         .output()
@@ -1615,7 +1623,7 @@ fn malformed_heredoc_reports_offending_source_line() {
 
 #[test]
 fn grouped_background_trap_receives_kill_from_parent() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"{ trap "echo got TERM" TERM; sleep 2; }& sleep 1; kill $!; wait; echo "Done: $?""#)
         .output()
@@ -1640,7 +1648,7 @@ fn background_redirected_job_releases_stdout_pipe_at_exit() {
     use std::process::Stdio;
     use std::time::Duration;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let mut child = crate::rubash_command()
         .arg("-c")
         .arg("sleep 2 >/dev/null 2>&1 & echo ok")
         .stdout(Stdio::piped())
@@ -1671,7 +1679,7 @@ fn background_dup_redirects_share_one_file_description() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create bg dup temp dir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("{ echo out; echo err >&2; } >bg-log.txt 2>&1 & wait; cat bg-log.txt")
         .current_dir(&dir)
@@ -1689,7 +1697,23 @@ fn background_dup_redirects_share_one_file_description() {
 
 #[test]
 fn external_pipeline_preserves_quoted_awk_field_separator_argument() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    // The probe asserts GNU-awk `-F` escape semantics, so it needs a real
+    // gawk-compatible awk reachable from the sanitized engine environment
+    // (spawns strip WINUXSH_ROOT, so install-root fallbacks don't count).
+    // Skip where no awk is reachable: external resolution is not what this
+    // test measures, and a missing host tool is not a rubash regression.
+    let awk_available = crate::rubash_command()
+        .arg("-c")
+        .arg("command -v awk")
+        .output()
+        .expect("probe awk availability for pipeline regression test")
+        .status
+        .success();
+    if !awk_available {
+        eprintln!("skipping: no gawk-compatible awk reachable from the sanitized test environment");
+        return;
+    }
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"printf 'a\tb\n' | awk -F '\t' 'BEGIN { print "FS=[" FS "]" }'"#)
         .output()
@@ -1712,7 +1736,7 @@ fn external_pipeline_preserves_quoted_awk_field_separator_argument() {
 
 #[test]
 fn unquoted_function_substitution_preserves_quoted_positional_arguments() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("f(){ printf '%s\\n' \"$@\"; }; set -- a b; set -- $(f \"$@\"); printf '<%s>\\n' \"$@\"")
         .output()
@@ -1725,7 +1749,7 @@ fn unquoted_function_substitution_preserves_quoted_positional_arguments() {
 
 #[test]
 fn command_substitution_sed_restores_shell_sentinels() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("v=5.3; a=`echo $v | sed 's:\\\\..*$::'`; b=$(echo $v | sed 's:^.*\\.::'); printf '%s:%s\\n' \"$a\" \"$b\"")
         .output()
@@ -1738,7 +1762,7 @@ fn command_substitution_sed_restores_shell_sentinels() {
 
 #[test]
 fn mixed_backtick_assignment_uses_typed_fragments() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=pre`printf x`post; printf '<%s>\\n' \"$value\"")
         .output()
@@ -1751,7 +1775,7 @@ fn mixed_backtick_assignment_uses_typed_fragments() {
 
 #[test]
 fn mixed_dollar_and_backtick_assignment_uses_typed_fragments() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=a$(printf b)`printf c`d; printf '<%s>\\n' \"$value\"")
         .output()
@@ -1764,7 +1788,7 @@ fn mixed_dollar_and_backtick_assignment_uses_typed_fragments() {
 
 #[test]
 fn quoted_mixed_assignment_preserves_substitution_context() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("value=\"pre$(printf 'a b')`printf c`post\"; printf '<%s>\\n' \"$value\"")
         .output()
@@ -1777,7 +1801,7 @@ fn quoted_mixed_assignment_preserves_substitution_context() {
 
 #[test]
 fn command_substitution_assignment_preserves_c0_payload_bytes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x=$(printf '\024'); printf '14 '; printf '%s' "$x" | od -An -tx1; x=$(printf '\025'); printf '15 '; printf '%s' "$x" | od -An -tx1; x=$(printf '\032'); printf '1a '; printf '%s' "$x" | od -An -tx1; x=$(printf '\037'); printf '1f '; printf '%s' "$x" | od -An -tx1"#)
         .output()
@@ -1794,7 +1818,7 @@ fn command_substitution_assignment_preserves_c0_payload_bytes() {
 
 #[test]
 fn backtick_command_substitution_preserves_raw_c0_variable_payload() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"x=$(printf '\024'); y=`printf '%s' "$x"`; printf '14 '; printf '%s' "$y" | od -An -tx1; x=$(printf '\025'); y=`printf '%s' "$x"`; printf '15 '; printf '%s' "$y" | od -An -tx1; x=$(printf '\032'); y=`printf '%s' "$x"`; printf '1a '; printf '%s' "$y" | od -An -tx1; x=$(printf '\037'); y=`printf '%s' "$x"`; printf '1f '; printf '%s' "$y" | od -An -tx1"#)
         .output()
@@ -1820,7 +1844,7 @@ fn backtick_command_substitution_preserves_raw_c0_variable_payload() {
 // prefix in the expansion context; 5.3 never does).
 #[test]
 fn arithmetic_empty_assignment_rhs_reports_operand_expected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo $((j=)); echo after:$?")
         .output()
@@ -1837,7 +1861,7 @@ fn arithmetic_empty_assignment_rhs_reports_operand_expected() {
 // never runs the body; rubash used to skip it silently.
 #[test]
 fn arithmetic_for_empty_assignment_init_reports_error() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("for ((j=;;)); do echo body; done; echo after:$?")
         .output()
@@ -1857,7 +1881,7 @@ fn arithmetic_for_empty_assignment_init_reports_error() {
 // token is "+")`).
 #[test]
 fn arithmetic_trailing_increment_after_number_token_is_single_plus() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo $((7++))")
         .output()
@@ -1903,7 +1927,7 @@ fn arithmetic_trailing_operator_tokens_match_gnu() {
             "7+=: attempted assignment to non-variable (error token is \"+=\")",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        let output = crate::rubash_command()
             .arg("-c")
             .arg(format!("echo $(({expr}))"))
             .output()
@@ -1919,7 +1943,7 @@ fn arithmetic_trailing_operator_tokens_match_gnu() {
 
 #[test]
 fn standalone_assignment_persists_but_prefix_assignment_restores() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("( IFS=:; printf 'standalone=%s\\n' \"${#IFS}\" ); IFS=:; IFS=' ' true; printf 'prefix-after=%s\\n' \"${#IFS}\"")
         .output()
@@ -1953,7 +1977,7 @@ fn command_substitution_preserves_nested_quote_literals() {
     // on the quote-preservation face and CWD-independent; the CWD-sensitive
     // glob face itself is pinned byte-exact against GNU in
     // tests/issue832_cmdsub_cwd_glob_regressions.rs.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "v=$(echo '{\"a\":1}')\n",
@@ -1988,7 +2012,7 @@ fn cmdsub_inline_filters_run_real_commands_for_unmodeled_flags() {
     // after the opening quote of a double-quoted word triggers a separate
     // preexisting bug (the 0x11 glob carrier leaks into the output) and
     // would mask what this test is meant to pin.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "echo \"n=$(printf 'b\\na\\nc\\n' | sort -r)\"\n",
@@ -2014,7 +2038,7 @@ fn command_substitution_literal_arithmetic_text_is_not_stubbed() {
     // "129". `$(echo 1280+1)` must reach the real parser and echo the
     // literal text, while `$(echo $((128+1)))` computes through the real
     // arithmetic path.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo \"$(echo 1280+1)\" \"$(echo $((128+1)))\"")
         .output()
@@ -2030,7 +2054,7 @@ fn set_option_pipeline_in_substitution_uses_real_line_count() {
     // rubash#117: the removed `set -o -B ... wc -l` stub hardcoded "4"; the
     // body must run the real pipeline. GNU emits more than 3 `set -o`
     // lines (builtins.tests sigone expectation).
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("n=$(set -o -B 2>&1 | wc -l); if [ \"$n\" -gt 3 ]; then echo ok; else echo \"bad:$n\"; fi")
         .output()
@@ -2048,7 +2072,7 @@ fn parameter_length_brace_is_not_an_unclosed_substitution() {
     // `${...}` `#` is the length operator). A swallowed `}` reported
     // "unexpected EOF while looking for matching ')'" and killed the
     // script.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("x=abcd; echo ${#x}; y=${#x}z; echo $y")
         .output()
@@ -2070,7 +2094,7 @@ fn alias_injected_operator_body_routes_to_real_parser() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/comsub_alias_injected_operator.sh"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg(script)
         .output()
         .expect("run alias-injected operator probe");
@@ -2090,7 +2114,7 @@ fn cp_dot_slash_source_copies_contents_into_existing_directory() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create cp dot-slash probe dir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(concat!(
             "mkdir -p src/sub dst && ",
@@ -2152,7 +2176,7 @@ fn history_builtin_rejects_extra_and_malformed_arguments() {
     )
     .expect("write history args probe script");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("probe.sh")
         .current_dir(&dir)
         .output()
@@ -2185,7 +2209,7 @@ fn history_builtin_rejects_extra_and_malformed_arguments() {
 
 #[test]
 fn history_append_without_histfile_reports_failure_and_continues() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("echo pre; history -a; echo AFTER")
         .output()
@@ -2204,7 +2228,7 @@ fn c_command_multiline_set_h_enables_history_expansion() {
     // `set -H` on earlier lines takes effect for later lines. The whole
     // first line is read before `set -H` runs, so a single-line
     // `;`-joined command keeps `!!` literal.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -o history\nset -H\necho alpha\necho !!")
         .output()
@@ -2217,7 +2241,7 @@ fn c_command_multiline_set_h_enables_history_expansion() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "echo echo alpha\n");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("set -o history; set -H; echo alpha; echo !!")
         .output()

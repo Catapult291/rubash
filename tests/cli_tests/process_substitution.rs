@@ -1,8 +1,6 @@
-use std::process::Command;
-
 #[test]
 fn c_command_exec_persistent_output_process_substitution_receives_later_writes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("exec 9> >(read -r line; printf 'line=%s\\n' \"$line\"); printf 'hello\\n' >&9; exec 9>&-; wait")
         .output()
@@ -15,7 +13,7 @@ fn c_command_exec_persistent_output_process_substitution_receives_later_writes()
 
 #[test]
 fn assignment_output_process_substitution_feeds_external_stdin() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(r#"f() { cat "$1" >"$x"; }; x=>(tr '[:lower:]' '[:upper:]') f <(printf 'hi there\n')"#)
         .output()
@@ -28,7 +26,7 @@ fn assignment_output_process_substitution_feeds_external_stdin() {
 
 #[test]
 fn exec_replacing_stderr_process_substitution_flushes_previous_target() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("rm -f __rubash_psubst_err.tmp; exec 4>&2; exec 2> >(tee __rubash_psubst_err.tmp); echo hello >&2; exec 2>&4; cat __rubash_psubst_err.tmp; rm -f __rubash_psubst_err.tmp")
         .output()
@@ -41,7 +39,7 @@ fn exec_replacing_stderr_process_substitution_flushes_previous_target() {
 
 #[test]
 fn coproc_input_move_marks_array_endpoint_closed() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg("coproc C { echo hi; }; exec 4<&${C[0]}-; read -r x <&4; printf 'x=%s arr=%s\\n' \"$x\" \"${C[*]}\"")
         .output()
@@ -64,7 +62,7 @@ fn coproc_child_inherits_function_table_for_debug_trap() {
     // child instead of falling through to a PATH lookup and reporting
     // `command not found`. GNU Bash 5.2.37 (msys) oracle probe
     // 2026-10-09: `PREEXEC: inside-coproc`, no diagnostics on stderr.
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "preexec() { echo \"PREEXEC: $1\" >&2; }; \
@@ -97,7 +95,7 @@ fn coproc_function_snapshot_is_one_way_into_child() {
     // The function table rides to the coprocess as a BASH_FUNC snapshot;
     // the child sees it but the parent's table and exported set are
     // untouched by the spawn (fork snapshot semantics).
-    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+    let output = crate::rubash_command()
         .arg("-c")
         .arg(
             "parent_fn() { echo p; }; \
