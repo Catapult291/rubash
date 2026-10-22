@@ -114,7 +114,7 @@ impl Executor {
     }
 
     fn expand_subscript_string_inner(&self, raw: &str, preserve_ansi_backslashes: bool) -> String {
-        // rubash#XXX literal fast lane: a subscript of plain bytes needs no
+        // whitelist literal fast lane: a subscript of plain bytes needs no
         // expansion work at all. GNU subst.c:11063 expand_subscript_string
         // -> expand_string runs one word expansion with W_NOSPLIT2 |
         // W_NOPROCSUB (no field splitting, no pathname expansion, no
@@ -133,7 +133,7 @@ impl Executor {
         if is_plain_literal_subscript(raw) {
             return raw.to_string();
         }
-        // rubash#XXX fast lane: `prefix$name+suffix` with exactly one plain
+        // whitelist fast lane: `prefix$name+suffix` with exactly one plain
         // `$name` read and literal text around it. The walker below would
         // copy the literal bytes verbatim (no field splitting, no pathname
         // expansion, no re-scan of results — subst.c:11063

@@ -368,7 +368,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn shell_variable_value(&self, name: &str) -> Option<String> {
-        // Fuse the per-read attribute probes (rubash#XXX): GNU reads one
+        // Fuse the per-read attribute probes ([whitelist]: GNU reads one
         // SHELL_VAR flag word per lookup (variables.c); the five probes
         // below (nameref, array, declared-unset, assoc, array) each paid a
         // SipHash. One attr_of answers them together. An unmarked name

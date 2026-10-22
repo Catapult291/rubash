@@ -154,7 +154,7 @@ impl Executor {
                 };
                 return format!("{name}={marker}{expanded}");
             }
-            // rubash#XXX fast lane: `name=literal+$name` resolves through
+            // whitelist fast lane: `name=literal+$name` resolves through
             // fast_assignment_plain_splice (provable splice, see its
             // admission proof) instead of the hoist + embedded-walker +
             // tilde pipeline below. Only non-compound values qualify (the

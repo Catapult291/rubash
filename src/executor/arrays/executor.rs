@@ -155,7 +155,7 @@ impl Executor {
     fn array_element_parameter_value_uncached(&self, expression: &str) -> Option<String> {
         let (array_name, key) = parse_array_subscript(expression)?;
 
-        // Fuse the per-read attribute probes (rubash#XXX, same discipline
+        // Fuse the per-read attribute probes (same discipline
         // as the element-write path): one attr_of answers nameref/assoc
         // together instead of two SipHash probes, and an unmarked base
         // skips resolved_variable_name's NotNameref String alloc via the

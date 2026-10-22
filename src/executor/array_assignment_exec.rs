@@ -35,7 +35,7 @@ impl Executor {
         // (rubash#618 fast lane). Whitelist: any of those bytes falls through to
         // the full path.
         if !raw_subscript.contains(['$', '`', '~', '\'', '"', '\\', '[', ']', '=']) {
-            // Wholly-literal key (rubash#XXX): the key IS the raw text (the
+            // Wholly-literal key ([whitelist]: the key IS the raw text (the
             // literal fast lane proves it — same closed set, same identity).
             // When the value splices too (fast_assignment_plain_splice, same
             // proof as the word funnel it replaces here), emit the synthetic
@@ -180,7 +180,7 @@ impl Executor {
                     .iter()
                     .any(|quote| quote.kind != crate::parser::QuoteKind::Backslash)
         });
-        // Fuse the per-write attribute probes (rubash#XXX): GNU reads one
+        // Fuse the per-write attribute probes ([whitelist]: GNU reads one
         // SHELL_VAR flag word (variables.c); rubash keeps one VarAttrs per
         // name, so a single attr_of answers nameref/readonly/assoc/integer
         // together instead of four SipHash probes. An unmarked base skips
