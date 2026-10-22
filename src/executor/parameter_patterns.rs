@@ -231,18 +231,22 @@ impl Executor {
         // "0" (assoc_cell), indexed arrays read element [0] (array_cell). Expanding
         // the raw storage marker here leaks ([FOO]=BAR) where GNU prints the
         // element value or empty when key "0" is absent.
+        // A missing element is NOT an empty element: GNU get_string_value
+        // yields no value for an array whose [0] (assoc: key "0") does not
+        // exist, so the expansion behaves like an unset parameter —
+        // `${a@Q}` with a=() produces zero words, while a=("") produces
+        // the quoted empty string `''` (rubash#1112). Returning None here
+        // preserves that distinction; every caller maps None to "" for
+        // the value-only operations (pattern removal, case mods), where
+        // absent and empty are indistinguishable in GNU too.
         if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved) {
-            return Some(dequote_storage_marks(
-                &assoc_value_at(value, "0").unwrap_or_default(),
-            ));
+            return assoc_value_at(value, "0").map(|value| dequote_storage_marks(&value));
         }
 
         if is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, &resolved) {
-            return Some(dequote_storage_marks(
-                &array_value_at(value, 0)
-                    .or_else(|| assoc_value_at(value, "0"))
-                    .unwrap_or_default(),
-            ));
+            return array_value_at(value, 0)
+                .or_else(|| assoc_value_at(value, "0"))
+                .map(|value| dequote_storage_marks(&value));
         }
 
         Some(dequote_storage_marks(value))
