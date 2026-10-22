@@ -364,7 +364,7 @@ mod environment_tests {
     }
 
     #[test]
-    fn default_shell_is_current_executable_when_missing() {
+    fn default_shell_is_login_shell_when_missing() {
         let _cwd_guard = CwdGuard::take();
         let _guard = ENV_LOCK.lock().unwrap();
         let _shell = EnvGuard::unset("SHELL");
@@ -372,10 +372,49 @@ mod environment_tests {
 
         let executor = Executor::new();
 
-        assert_eq!(executor.get_env("SHELL"), executor.get_env("BASH"));
-        assert!(executor
-            .get_env("SHELL")
-            .is_some_and(|value| !value.is_empty()));
+        // GNU variables.c set_shell_var: a missing SHELL defaults to the
+        // passwd entry's shell (getpwuid(getuid())->pw_shell), never to
+        // the shell's own executable path (that is $BASH). rubash#1143.
+        let shell = executor.get_env("SHELL");
+        assert!(shell.is_some_and(|value| !value.is_empty()));
+        #[cfg(unix)]
+        if let Some(passwd_shell) = passwd_login_shell() {
+            assert_eq!(shell, Some(passwd_shell.as_str()));
+        }
+    }
+
+    /// The current user's login shell from the passwd database, mirroring
+    /// the `getpwuid_r` probe in tests/cli_tests.rs.
+    #[cfg(unix)]
+    fn passwd_login_shell() -> Option<String> {
+        let mut buffer = vec![0u8; 16384];
+        loop {
+            let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result = std::ptr::null_mut();
+            let status = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    &mut entry,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if status == libc::ERANGE {
+                buffer.resize(buffer.len() * 2, 0);
+                continue;
+            }
+            if status != 0 || result.is_null() || entry.pw_shell.is_null() {
+                return None;
+            }
+            return unsafe {
+                Some(
+                    std::ffi::CStr::from_ptr(entry.pw_shell)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            };
+        }
     }
 
     #[test]
