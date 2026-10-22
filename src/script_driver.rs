@@ -76,6 +76,38 @@ pub fn script_uses_aliases(contents: &str, alias_live_at_start: bool) -> bool {
     alias_live_at_start || contents.contains("expand_aliases") || contents.contains("set -o posix")
 }
 
+/// True when the script may flip a parse-time gate at runtime, so the
+/// whole-file `run_source` fast path cannot parse it soundly and it must
+/// take the grouped driver (which lexes each command group only after all
+/// previous groups executed).
+///
+/// GNU shell.c runs a script file through an incremental reader: every
+/// complete command is parsed only after the previous commands EXECUTED
+/// (reader_loop -> parse_and_execute), so a runtime `shopt -s extglob`
+/// — via eval, a function body, or a sourced file — opens the parse-time
+/// extglob gate for every LATER command (builtins/shopt.def
+/// extglob_flag, propagated by reset_parser parse.y:3502; rubash models
+/// the gate as PARSE_EXTENDED_GLOB, lexer/mod.rs). A `-c` string is one
+/// parse_and_execute call and keeps the whole-string upfront parse, as
+/// does eval's own string — only the script-file reader is incremental,
+/// so only that path needs the grouped driver. The gate flips at runtime
+/// solely through the shopt builtin with name == "extglob"
+/// (builtins/shopt.rs set_option); any other shopt use is inert for the
+/// parser, and the textual heuristic only over-admits (slower, never
+/// wrong) — the same whitelist-admission shape as script_uses_aliases
+/// (rubash#414). A dynamically constructed option name
+/// (`shopt -s $x`) evades the text scan; GNU would honor it, this stays a
+/// documented limitation of the fast path.
+/// Verified: `shopt -s extglob` before a `case` with `+(...)` arms parses
+/// under both drivers; `eval 'shopt -s extglob'` followed by such a
+/// `case` parses only under the grouped driver (rubash#1093).
+/// Admission is narrowed to extglob flips: unrelated shopt options
+/// (e.g. failglob) must keep the fast path until grouped-driver
+/// line-abandonment parity lands (rubash#1186).
+pub fn script_uses_runtime_parse_gates(contents: &str) -> bool {
+    contents.contains("shopt") && contents.contains("extglob")
+}
+
 /// GNU parse.y alias_expand_token + push_string, run over the text of one
 /// command group. The lookup yields (value, AL_EXPANDNEXT); alias values
 /// store '$' as DATA_DOLLAR when the word carried it in data position.

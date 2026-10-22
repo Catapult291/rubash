@@ -8,7 +8,7 @@ use rubash::parser::parse;
 use rubash::script_driver::{
     check_binary_file, finish_shell, prepare_interactive_history, run_interactive_stdin,
     run_script_with_history, run_source, run_source_with_line_offset, script_uses_aliases,
-    script_uses_history,
+    script_uses_history, script_uses_runtime_parse_gates,
 };
 use std::env;
 use std::fs;
@@ -1268,7 +1268,13 @@ fn run_script_file_with_init(
     // --posix / -O expand_aliases — shell.c:1853) takes the incremental
     // grouped driver, matching GNU's command-by-command reader.
     let uses_alias = script_uses_aliases(&contents, executor.alias_expansion_enabled());
-    let status = if uses_hist || uses_alias {
+    // rubash#1093: a runtime `shopt -s extglob` (eval/function/sourced
+    // file) opens the parse-time extglob gate for later commands under
+    // GNU's incremental script reader, but the whole-file fast path
+    // below already parsed them. Route such scripts through the grouped
+    // driver, which lexes each group after the previous groups ran.
+    let uses_parse_gates = script_uses_runtime_parse_gates(&contents);
+    let status = if uses_hist || uses_alias || uses_parse_gates {
         run_script_with_history(executor, &contents, None)
     } else {
         run_source(executor, &contents, interactive)
