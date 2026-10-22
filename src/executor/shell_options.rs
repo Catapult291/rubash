@@ -1080,6 +1080,10 @@ impl Executor {
     pub(in crate::executor) fn function_stdin_is_command_source(&self, cmd: &CommandNode) -> bool {
         cmd.redirect_in.is_none()
             && self.virtual_fd_stdin_remaining(0).is_none()
+            // rubash#1102/#1103: an exec-rebound fd 0 (file endpoint or
+            // closed entry) is the command's source, not FUNCTION_STDIN.
+            && !self.fd_table.is_closed(0)
+            && !matches!(self.fd_table.read_endpoint(0), Some(FdReadEndpoint::File(_)))
             && self.function_stdin_remaining().is_some()
     }
 
@@ -1295,6 +1299,28 @@ impl Executor {
 
         if let Some(input) = self.virtual_fd_stdin_remaining(0) {
             return Some(input);
+        }
+
+        // rubash#1102/#1103: an exec-installed fd 0 in the fd table shadows
+        // the ambient FUNCTION_STDIN buffer. Inside a pipeline stage,
+        // `exec <file` / `exec <&-` rebinds fd 0 for the rest of the stage
+        // (GNU redir.c: the redirection is permanent in the forked stage
+        // shell), so string-stdin consumers must read the rebound endpoint,
+        // not the pipe bytes that were current before the exec. A closed
+        // fd 0 is EOF; a file endpoint streams its remaining bytes
+        // through the shared-offset dup in open_fd_read_endpoint.
+        if self.fd_table.is_closed(0) {
+            return Some(String::new());
+        }
+        if matches!(self.fd_table.read_endpoint(0), Some(FdReadEndpoint::File(_))) {
+            if let Ok(mut file) = self.open_fd_read_endpoint(0, "fd 0") {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let _ = file.read_to_end(&mut buf);
+                return Some(crate::executor::substitution_metadata::bytes_to_shell_text(
+                    &buf,
+                ));
+            }
         }
 
         // Check for FUNCTION_STDIN (set by pipeline execution for builtins)

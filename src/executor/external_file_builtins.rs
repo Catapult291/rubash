@@ -1376,6 +1376,14 @@ impl Executor {
                 let target = word.as_str();
                 if target == "-" {
                     if stdin_remaining.is_none() {
+                        if self.cat_stdin_closed(cmd) {
+                            // rubash#1102: `cat -` on a closed fd 0 — the
+                            // read fails EBADF (see fail text in
+                            // report_cat_closed_stdin).
+                            self.report_cat_closed_stdin(cmd)?;
+                            status = 1;
+                            stdin_remaining = Some(Vec::new());
+                        } else if options.identity() && self.cat_stdin_is_real_process_stdin(cmd) {
                         // rubash#415 (CI coproc.tests hang): GNU cat streams
                         // stdin as chunks arrive (cat.c byte-copy loop); a
                         // buffered drain deadlocks interactive producers —
@@ -1385,7 +1393,6 @@ impl Executor {
                         // stdin, flush what earlier operands collected and
                         // stream; in-memory sources and formatting keep the
                         // buffered drain (bounded, no cross-process wait).
-                        if options.identity() && self.cat_stdin_is_real_process_stdin(cmd) {
                             if !output.is_empty() {
                                 self.write_cat_output(cmd, &filter(&output))?;
                                 output.clear();
@@ -1478,6 +1485,15 @@ impl Executor {
             return Ok(true);
         }
 
+        // rubash#1102: no operands and fd 0 is closed — GNU cat's read
+        // fails EBADF (the string funnel models closed as empty, which
+        // would silently exit 0).
+        if self.cat_stdin_closed(cmd) {
+            self.report_cat_closed_stdin(cmd)?;
+            self.exit_code = 1;
+            return Ok(true);
+        }
+
         if let Some(input) = self.stdin_string_for_command_mut(cmd) {
             self.write_cat_output(
                 cmd,
@@ -1528,6 +1544,49 @@ impl Executor {
             }
             return Ok(false);
         }
+    }
+
+    /// True when cat's stdin source is a CLOSED fd 0 (rubash#1102): the
+    /// command's own `<&-`/`0<&-`, or an `exec <&-` earlier in the stage
+    /// left a closed entry in the fd table. Heredocs/here-strings are
+    /// bodies, not descriptors, and never count as closed.
+    fn cat_stdin_closed(&self, cmd: &CommandNode) -> bool {
+        if cmd.heredoc.is_some() || cmd.here_string.is_some() {
+            return false;
+        }
+        if let Some(redirect) = &cmd.redirect_in {
+            if redirect.fd.unwrap_or(0) != 0 {
+                return false;
+            }
+            let target = self.expand_redirect_target(redirect);
+            return is_closed_redirect_target(&target);
+        }
+        if matches!(
+            super::shell_options::fd0_stdin_redirect_winner(cmd),
+            Some(crate::parser::RedirectKind::CloseInput)
+        ) {
+            return true;
+        }
+        self.fd_table.is_closed(0)
+    }
+
+    /// GNU coreutils cat on a closed stdin (cat.c): the read fails and the
+    /// close of standard input fails too — two diagnostics, and the caller
+    /// sets exit status 1.
+    fn report_cat_closed_stdin(&mut self, cmd: &CommandNode) -> Result<(), ExecuteError> {
+        let mut stderr = Vec::new();
+        writeln!(
+            &mut stderr,
+            "{}cat: -: Bad file descriptor",
+            self.diagnostic_prefix()
+        )?;
+        writeln!(
+            &mut stderr,
+            "{}cat: closing standard input: Bad file descriptor",
+            self.diagnostic_prefix()
+        )?;
+        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        Ok(())
     }
 
     /// The `-' operand's bytes: the command's own stdin source (heredoc /
