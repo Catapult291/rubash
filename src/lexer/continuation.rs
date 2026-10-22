@@ -4010,49 +4010,11 @@ pub(crate) fn subscript_residuals_advance(
             index += 1;
             continue;
         }
-        // parse.y read_token_word: `${` opens parse_matched_pair
-        // (P_FIRSTCLOSE|P_DOLBRACE, parse.y:5513) whose scan consumes the
-        // whole braced parameter as WORD text — a `[` inside it never opens
-        // a subscript unless directly preceded by `$` (parse.y:4126
-        // LEX_WASDOL), so `echo ${a[` reports the braced `}' at EOF, not
-        // `]' (#551 C3). Mirror of the oracle walk's arm in
-        // skip::unclosed_array_subscript_walk: a CLOSED body is consumed
-        // atomically; an unterminated one BAILS the oracle to the generic
-        // close-char scan (answer None for this prefix) — the twin parks at
-        // the `${` because a longer buffer may close the body and flip the
-        // answer, exactly like the S1/S2 re-derivation points.
-        if ch == '{' && state.word.ends_with('$') {
-            let context = super::dolbrace::BraceContext {
-                outer_double_quote: false,
-                posix: false,
-                replacement_context: false,
-                initial_state: super::dolbrace::DolbraceState::Param,
-            };
-            match super::dolbrace::scan_braced_parameter_body_chars(&chars[index..], context) {
-                Some(scan) => {
-                    let consumed = 2 + scan.end;
-                    state.line += chars[index..index + consumed]
-                        .iter()
-                        .filter(|c| **c == '\n')
-                        .count();
-                    index += consumed;
-                    // The whole `${...}` is word material: no longer a pure
-                    // identifier, so a later `[` stays literal.
-                    state.word.clear();
-                    state.word.push('$');
-                    state.command_position = false;
-                    state.element_start = false;
-                    continue;
-                }
-                None => {
-                    let snapshot = state.clone();
-                    return Some(park.take().unwrap_or(SubscriptResidualPark {
-                        pos: index,
-                        snapshot,
-                    }));
-                }
-            }
-        }
+        // LEX_WASDOL note (parse.y:4126, #551 C3): a `{` whose word prefix
+        // ends in `$` is the `${` opener — but that shape never reaches this
+        // point: the `'$'` arm above consumes `${...}` atomically (parking
+        // on an unterminated body), and every path that skips the match
+        // clears `state.word`. A bare `{` here is word/delimiter text.
         // `[` opens a subscript when the word prefix is a pure shell
         // identifier at command position (parse.y:5637), or we are at
         // element start inside a compound assignment (parse.y:5638,
