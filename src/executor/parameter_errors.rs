@@ -2534,6 +2534,19 @@ impl Executor {
     }
 
     pub(in crate::executor) fn parameter_error_value(&self, name: &str) -> Option<String> {
+        // GNU subst.c:7786 (parameter_brace_expand_word, PF_ALLINDS) +
+        // subst.c:10142 (var_is_set/var_is_null): for `${arr[@]}` /
+        // `${arr[*]}` the value an operator tests is the whole-array join
+        // — NULL only when the array has NO elements, never merely
+        // because an all-element subscript is not an element reference.
+        // parameter_operator_value implements exactly that rule for
+        // `:-`/`:=`; route the error-operator scan through it too, or
+        // `${a[@]:?}` on a non-empty array misreads as unset
+        // (array_element_parameter_value returns None for `[@]`/`[*]`)
+        // and aborts the script (rubash#1174).
+        if name.ends_with("[@]") || name.ends_with("[*]") {
+            return self.parameter_operator_value(name);
+        }
         match name {
             "#" => Some(self.shell_state.positional_window().len().to_string()),
             // GNU chk_atstar (subst.c): `$@`/`$*` are UNSET with zero
