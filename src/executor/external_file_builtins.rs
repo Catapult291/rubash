@@ -349,19 +349,31 @@ impl Executor {
         // utimensat(AT_FDCWD, file, NULL, 0) stamps atime and mtime with
         // the current time — the file is opened O_WRONLY only when it has
         // to be created, and the content is never truncated or rewritten.
-        // The previous File::create here truncated every existing operand
-        // to zero bytes. A missing operand is created empty (unless
-        // -c/--no-create) and then stamped. Every operand is processed
-        // independently: a failure prints `touch: cannot touch 'FILE': ...`
-        // and the loop continues, leaving exit status 1 (touch.c do_touch
-        // loop). Timestamp-bearing options (-t TIME, -d TIME, -r FILE)
-        // consume their argument; their clock is approximated as "now" —
-        // the invariants this emulation preserves are non-truncation,
-        // creation, -c, and the per-operand error loop.
+        // A missing operand is created empty (unless -c/--no-create) and
+        // then stamped. Every operand is processed independently: a
+        // failure prints `touch: cannot touch 'FILE': ...` and the loop
+        // continues, leaving exit status 1 (touch.c do_touch loop).
+        //
+        // rubash#1069: the timestamp options carry their REAL time, not
+        // "now": -r copies the reference file's atime/mtime, -t parses
+        // [[CC]YY]MMDDhhmm[.ss] as local time, and -d accepts @epoch,
+        // "now", and ISO-8601 local date-times. A -d string outside that
+        // grammar (GNU's getdate accepts far more) and --version/--help
+        // delegate to the real PATH binary when one resolves — the
+        // emulation must not silently stamp the current time where GNU
+        // would stamp the requested time or print its own version. With
+        // no real binary to delegate to, an unparseable date is GNU's
+        // `invalid date format` error and nothing is touched.
         let mut failed = false;
         let mut create_missing = true;
         let mut stamp_accessed = true;
         let mut stamp_modified = true;
+        // (atime, mtime) requested by -t/-d/-r; None = current time.
+        let mut stamp: Option<(SystemTime, SystemTime)> = None;
+        // A -d/-t value this emulation cannot evaluate exactly.
+        let mut unevaluated_date: Option<String> = None;
+        let mut info_request = false;
+        let mut ref_failed = false;
         let mut operands: Vec<String> = Vec::new();
         let mut no_more_options = false;
         let mut index = 1;
@@ -380,60 +392,140 @@ impl Executor {
                 continue;
             }
             if let Some(long) = expanded.strip_prefix("--") {
-                // Long options that take a value: consume it.
-                if matches!(long, "date" | "reference" | "time") {
-                    index += 1;
-                    continue;
-                }
-                if long == "no-create" {
-                    create_missing = false;
-                } else {
-                    failed = true;
-                    eprintln!(
-                        "{}touch: unrecognized option '--{}'",
-                        self.diagnostic_prefix(),
-                        long
-                    );
+                let (name, attached) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value.to_string())),
+                    None => (long, None),
+                };
+                match name {
+                    "date" | "reference" => {
+                        let value = attached.or_else(|| {
+                            let value = cmd.words.get(index).cloned();
+                            index += 1;
+                            value
+                        });
+                        match value {
+                            Some(value) => self.touch_apply_stamp_option(
+                                if name == "date" { 'd' } else { 'r' },
+                                &value,
+                                &mut stamp,
+                                &mut unevaluated_date,
+                                &mut ref_failed,
+                            ),
+                            None => failed = true,
+                        }
+                    }
+                    "time" => {
+                        let value = attached.or_else(|| {
+                            let value = cmd.words.get(index).cloned();
+                            index += 1;
+                            value
+                        });
+                        match value.as_deref() {
+                            Some("atime" | "access" | "use") => stamp_modified = false,
+                            Some("mtime" | "modify") => stamp_accessed = false,
+                            _ => failed = true,
+                        }
+                    }
+                    "no-create" => create_missing = false,
+                    "version" | "help" => info_request = true,
+                    _ => {
+                        failed = true;
+                        eprintln!(
+                            "{}touch: unrecognized option '--{}'",
+                            self.diagnostic_prefix(),
+                            name
+                        );
+                    }
                 }
                 continue;
             }
             let shorts = &expanded[1..];
-            if let Some(bad) = shorts
-                .chars()
-                .find(|flag| !matches!(flag, 'c' | 'a' | 'm' | 'h' | 't' | 'd' | 'r'))
-            {
-                failed = true;
-                eprintln!(
-                    "{}touch: invalid option -- '{}'",
-                    self.diagnostic_prefix(),
-                    bad
-                );
-                continue;
-            }
-            for flag in shorts.chars() {
+            let mut position = 0;
+            while position < shorts.len() {
+                let flag = shorts[position..].chars().next().unwrap_or('\0');
+                position += flag.len_utf8();
                 match flag {
                     'c' => create_missing = false,
                     'a' => stamp_modified = false,
                     'm' => stamp_accessed = false,
-                    // -t/-d/-r take a value: consume the next word.
-                    't' | 'd' | 'r' => index += 1,
-                    _ => {}
+                    'h' => {}
+                    // -t/-d/-r take a value: the rest of this cluster when
+                    // attached (-t202001010000), else the next word.
+                    't' | 'd' | 'r' => {
+                        let rest = &shorts[position..];
+                        let value = if !rest.is_empty() {
+                            Some(rest.to_string())
+                        } else {
+                            let value = cmd.words.get(index).cloned();
+                            index += 1;
+                            value
+                        };
+                        match value {
+                            Some(value) => self.touch_apply_stamp_option(
+                                flag,
+                                &value,
+                                &mut stamp,
+                                &mut unevaluated_date,
+                                &mut ref_failed,
+                            ),
+                            None => failed = true,
+                        }
+                        break;
+                    }
+                    bad => {
+                        failed = true;
+                        eprintln!(
+                            "{}touch: invalid option -- '{}'",
+                            self.diagnostic_prefix(),
+                            bad
+                        );
+                        break;
+                    }
                 }
             }
         }
+        // Delegation: --version/--help and dates outside the evaluated
+        // grammar belong to the real binary whenever one resolves.
+        let real_touch =
+            crate::executor::path::find_user_command("touch", &self.shell_state.env_vars);
+        if (info_request || unevaluated_date.is_some()) && !failed && real_touch.is_some() {
+            return Ok(false);
+        }
+        if let Some(value) = &unevaluated_date {
+            eprintln!(
+                "{}touch: invalid date format '{}'",
+                self.diagnostic_prefix(),
+                value
+            );
+            failed = true;
+        }
+        if ref_failed {
+            failed = true;
+        }
+        if failed {
+            self.exit_code = 1;
+            return Ok(true);
+        }
+        let (stamp_atime, stamp_mtime) = stamp.unwrap_or_else(|| {
+            let now = SystemTime::now();
+            (now, now)
+        });
         for expanded in operands {
             let target = shell_path_to_windows(&expanded, &self.shell_state.env_vars);
-            let stamped = File::options().write(true).open(&target).and_then(|file| {
-                let now = SystemTime::now();
+            let make_times = || {
                 let mut times = std::fs::FileTimes::new();
                 if stamp_accessed {
-                    times = times.set_accessed(now);
+                    times = times.set_accessed(stamp_atime);
                 }
                 if stamp_modified {
-                    times = times.set_modified(now);
+                    times = times.set_modified(stamp_mtime);
                 }
-                file.set_times(times)
-            });
+                times
+            };
+            let stamped = File::options()
+                .write(true)
+                .open(&target)
+                .and_then(|file| file.set_times(make_times()));
             let outcome = match stamped {
                 Ok(()) => Ok(()),
                 // -c on a missing operand: GNU touch skips it silently
@@ -441,15 +533,9 @@ impl Executor {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create_missing => {
                     Ok(())
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => File::create(&target)
-                    .and_then(|file| {
-                        let now = SystemTime::now();
-                        file.set_times(
-                            std::fs::FileTimes::new()
-                                .set_accessed(now)
-                                .set_modified(now),
-                        )
-                    }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    File::create(&target).and_then(|file| file.set_times(make_times()))
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = outcome {
@@ -466,6 +552,210 @@ impl Executor {
         Ok(true)
     }
 
+    /// One -t/-d/-r option for the emulated touch (rubash#1069): resolve
+    /// it to a concrete (atime, mtime) stamp, record an unevaluated date
+    /// for the delegation/error decision, or flag a missing reference.
+    fn touch_apply_stamp_option(
+        &self,
+        flag: char,
+        value: &str,
+        stamp: &mut Option<(SystemTime, SystemTime)>,
+        unevaluated_date: &mut Option<String>,
+        ref_failed: &mut bool,
+    ) {
+        match flag {
+            'r' => {
+                let target = shell_path_to_windows(value, &self.shell_state.env_vars);
+                match std::fs::metadata(&target) {
+                    Ok(metadata) => {
+                        let atime = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
+                        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                        *stamp = Some((atime, mtime));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{}touch: failed to get attributes of '{}': {}",
+                            self.diagnostic_prefix(),
+                            value,
+                            crate::posix_errors::message(&error)
+                        );
+                        *ref_failed = true;
+                    }
+                }
+            }
+            't' => match parse_touch_stamp_time(value) {
+                Some(time) => *stamp = Some((time, time)),
+                None => *unevaluated_date = Some(value.to_string()),
+            },
+            'd' => match parse_touch_date_string(value) {
+                Some(time) => *stamp = Some((time, time)),
+                None => *unevaluated_date = Some(value.to_string()),
+            },
+            _ => {}
+        }
+    }
+}
+
+/// GNU touch -t [[CC]YY]MMDDhhmm[.ss], interpreted as LOCAL time
+/// (coreutils touch.c posarg + posixtime). Years 69-99 are 19xx, 00-68
+/// are 20xx; the 8-digit form uses the current year.
+fn parse_touch_stamp_time(value: &str) -> Option<SystemTime> {
+    let (main, second) = match value.split_once('.') {
+        Some((main, frac)) => {
+            if frac.len() != 2 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (main, frac.parse::<u32>().ok()?)
+        }
+        None => (value, 0),
+    };
+    if !main.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (year, rest) = match main.len() {
+        8 => (current_local_year(), main),
+        10 => {
+            let yy = main[..2].parse::<i64>().ok()?;
+            (if yy >= 69 { 1900 + yy } else { 2000 + yy }, &main[2..])
+        }
+        12 => (main[..4].parse::<i64>().ok()?, &main[4..]),
+        _ => return None,
+    };
+    let month = rest[0..2].parse::<u32>().ok()?;
+    let day = rest[2..4].parse::<u32>().ok()?;
+    let hour = rest[4..6].parse::<u32>().ok()?;
+    let minute = rest[6..8].parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    local_civil_to_system_time(year, month, day, hour, minute, second)
+}
+
+/// The -d forms the emulation evaluates exactly (rubash#1069): `@epoch`,
+/// `now`, and ISO-8601 local date-times `YYYY-MM-DD[ T]HH:MM[:SS]`
+/// (a bare date means local midnight). Anything else delegates to the
+/// real binary or errors, like GNU's getdate grammar would decide.
+fn parse_touch_date_string(value: &str) -> Option<SystemTime> {
+    let text = value.trim();
+    if let Some(epoch) = text.strip_prefix('@') {
+        let seconds: i64 = epoch.parse().ok()?;
+        return Some(system_time_from_epoch_seconds(seconds));
+    }
+    if text.eq_ignore_ascii_case("now") {
+        return Some(SystemTime::now());
+    }
+    let (date, time) = match text.split_once(['T', ' ']) {
+        Some((date, time)) => (date, Some(time.trim())),
+        None => (text, None),
+    };
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, minute, second) = match time {
+        None => (0, 0, 0),
+        Some(time) => {
+            let mut parts = time.split(':');
+            let hour: u32 = parts.next()?.parse().ok()?;
+            let minute: u32 = parts.next()?.parse().ok()?;
+            let second: u32 = match parts.next() {
+                Some(part) => part.parse().ok()?,
+                None => 0,
+            };
+            if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            (hour, minute, second)
+        }
+    };
+    local_civil_to_system_time(year, month, day, hour, minute, second)
+}
+
+/// Local civil time -> SystemTime via the C library's UTC offset
+/// (two passes so a DST boundary picks the offset in force at the
+/// target instant). Non-unix hosts have no localtime_r here and treat
+/// the civil time as UTC — the pre-#1069 approximation narrowed to
+/// this one conversion.
+fn local_civil_to_system_time(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<SystemTime> {
+    let days = days_from_civil(year, month, day);
+    let naive = days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    let epoch = naive - local_utc_offset_seconds(naive);
+    let epoch = naive - local_utc_offset_seconds(epoch);
+    Some(system_time_from_epoch_seconds(epoch))
+}
+
+fn system_time_from_epoch_seconds(epoch: i64) -> SystemTime {
+    if epoch >= 0 {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(epoch.unsigned_abs())
+    }
+}
+
+/// Howard Hinnant's days-from-civil: days since 1970-01-01 for a
+/// proleptic Gregorian date (the inverse of identity.rs civil_from_days).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 {
+        i64::from(month) - 3
+    } else {
+        i64::from(month) + 9
+    };
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn current_local_year() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let local = now + local_utc_offset_seconds(now);
+    let days = local.div_euclid(86_400);
+    // civil_from_days (Hinnant), year component only.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    if mp >= 10 {
+        year + 1
+    } else {
+        year
+    }
+}
+
+#[cfg(unix)]
+fn local_utc_offset_seconds(epoch: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = epoch as libc::time_t;
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        0
+    } else {
+        i64::from(tm.tm_gmtoff)
+    }
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset_seconds(_epoch: i64) -> i64 {
+    0
+}
+impl Executor {
     fn external_cp(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
         // GNU cp (coreutils cp.c) parses long and short options before and
         // between operands, and `--` ends option parsing. -r/-R/-a recurse
