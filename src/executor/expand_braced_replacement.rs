@@ -208,6 +208,17 @@ impl Executor {
             "patsub_replacement",
         );
         let chars: Vec<char> = replacement.chars().collect();
+        // rubash#1109 item 1: at compat <= 42 the replacement undergoes NO
+        // quote removal (the pre-4.3 patsub behavior bash 4.3 gated behind
+        // compat42): quote characters are literal data, expansions proceed
+        // straight through them (`${v/b/'$y'}` -> 'Y'), a backslash quotes
+        // only the quotable set and otherwise stays literal, and a leading
+        // tilde is not expanded.
+        if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 42 {
+            let marked = Self::mark_patsub_replacement_quotes_compat42(&chars);
+            let expanded = self.expand_embedded_parameters(&marked);
+            return self.finish_patsub_replacement(&expanded, patsub_replacement);
+        }
         // GNU expands a leading tilde in the replacement string regardless
         // of outer quoting and of the shopt state (new-exp16.sub P1/P2).
         if chars.first() == Some(&'~') && (replacement == "~" || replacement.starts_with("~/")) {
@@ -221,6 +232,53 @@ impl Executor {
         let marked = Self::mark_patsub_replacement_quotes(&chars);
         let expanded = self.expand_embedded_parameters(&marked);
         self.finish_patsub_replacement(&expanded, patsub_replacement)
+    }
+
+    /// The compat <= 42 marking pass (rubash#1109 item 1): like
+    /// mark_patsub_replacement_quotes, but quote characters are protected
+    /// literal data (DATA_SQUOTE/DATA_DQUOTE) instead of span delimiters,
+    /// so the expander walks straight through them and the finish pass
+    /// restores them as literal quotes in the output.
+    fn mark_patsub_replacement_quotes_compat42(chars: &[char]) -> String {
+        let mut marked = String::with_capacity(chars.len() + 8);
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            match ch {
+                '\'' | crate::executor::markers::DATA_SQUOTE => {
+                    marked.push(crate::executor::markers::DATA_SQUOTE);
+                    index += 1;
+                }
+                '"' | crate::executor::markers::DATA_DQUOTE => {
+                    marked.push(crate::executor::markers::DATA_DQUOTE);
+                    index += 1;
+                }
+                '\\' => {
+                    index = push_unquoted_escape_compat42(&mut marked, chars, index);
+                }
+                crate::executor::markers::DATA_BACKSLASH => {
+                    marked.push(PATSUB_QUOTED_BACKSLASH);
+                    index += 1;
+                }
+                '$' => {
+                    if chars.get(index + 1) == Some(&'\'') {
+                        index = push_ansi_c_replacement_span(&mut marked, chars, index);
+                    } else {
+                        index = push_replacement_dollar(&mut marked, chars, index, false);
+                    }
+                }
+                '`' => {
+                    let end = backtick_replacement_span_end(chars, index);
+                    marked.extend(chars[index..end].iter());
+                    index = end;
+                }
+                other => {
+                    push_replacement_literal(&mut marked, other);
+                    index += 1;
+                }
+            }
+        }
+        marked
     }
 
     /// Pre-expansion pass: remove the replacement's own quotes while
@@ -591,6 +649,48 @@ fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usiz
         push_single_quoted_replacement_char(marked, decoded_char, true);
     }
     cursor
+}
+
+/// The compat <= 42 backslash rule (rubash#1109 item 1): a backslash
+/// quotes only the quotable set (`& $ ` " ' \` — the escape is consumed
+/// and the character becomes protected data); before any other character
+/// the backslash itself is literal data and stays (`\n` -> `\n`).
+fn push_unquoted_escape_compat42(marked: &mut String, chars: &[char], index: usize) -> usize {
+    match chars.get(index + 1) {
+        Some('&') => {
+            marked.push(PATSUB_QUOTED_AMP);
+            index + 2
+        }
+        Some('$') => {
+            marked.push(DATA_DOLLAR);
+            index + 2
+        }
+        Some('`') => {
+            marked.push(crate::executor::markers::DATA_BACKTICK);
+            index + 2
+        }
+        Some('\'') | Some(&crate::executor::markers::DATA_SQUOTE) => {
+            marked.push(crate::executor::markers::DATA_SQUOTE);
+            index + 2
+        }
+        Some('"') | Some(&crate::executor::markers::DATA_DQUOTE) => {
+            marked.push(crate::executor::markers::DATA_DQUOTE);
+            index + 2
+        }
+        Some('\\') | Some(&crate::executor::markers::DATA_BACKSLASH) => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            index + 2
+        }
+        Some(other) => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            push_replacement_literal(marked, *other);
+            index + 2
+        }
+        None => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            index + 1
+        }
+    }
 }
 
 /// Handle an unquoted backslash in a replacement: GNU quote removal
