@@ -2123,6 +2123,15 @@ impl Executor {
             } else {
                 None
             };
+            // GNU names the pseudo compspecs by their pcomplete.h magic
+            // names in diagnostics (`complete: _DefaultCmD_: no completion
+            // specification`), while -p prints the -D/-E flag form
+            // (rubash#1090).
+            let pseudo_diag_name = pseudo.map(|flag| match flag {
+                "-D" => "_DefaultCmD_",
+                "-E" => "_EmptycmD_",
+                _ => "_InitialWorD_",
+            });
             if parsed.pflag {
                 // -p overrides everything else (complete.def:426-441).
                 let mut status = 0;
@@ -2138,7 +2147,8 @@ impl Executor {
                         None => {
                             writeln!(
                                 stderr,
-                                "{diagnostic_prefix}complete: {pseudo}: no completion specification"
+                                "{diagnostic_prefix}complete: {}: no completion specification",
+                                pseudo_diag_name.unwrap_or(pseudo)
                             )?;
                             status = 1;
                         }
@@ -2180,7 +2190,8 @@ impl Executor {
                     if !self.shell_state.completion_specs.remove(pseudo) {
                         writeln!(
                             stderr,
-                            "{diagnostic_prefix}complete: {pseudo}: no completion specification"
+                            "{diagnostic_prefix}complete: {}: no completion specification",
+                            pseudo_diag_name.unwrap_or(pseudo)
                         )?;
                         status = 1;
                     }
@@ -2275,18 +2286,25 @@ impl Executor {
             // complete.def:893-911: `for (l = wl ? wl : list; ...)` — the
             // pseudo word replaces the operand list when present.
             let mut status = 0;
-            let operand_refs: Vec<(&str, &str)> = parsed
+            // (print name, diagnostic name, registry key): GNU compopt
+            // prints the pseudo specs by their -D/-E flag form but names
+            // the pcomplete.h magic names in diagnostics (rubash#1090).
+            let operand_refs: Vec<(&str, &str, &str)> = parsed
                 .operands
                 .iter()
-                .map(|name| (name.as_str(), name.as_str()))
+                .map(|name| (name.as_str(), name.as_str(), name.as_str()))
                 .collect();
-            for (report_name, key) in pseudo.into_iter().chain(operand_refs) {
+            let pseudo_ref: Vec<(&str, &str, &str)> = pseudo
+                .into_iter()
+                .map(|(magic, flag)| (flag, magic, flag))
+                .collect();
+            for (report_name, diag_name, key) in pseudo_ref.into_iter().chain(operand_refs) {
                 match self.shell_state.completion_specs.get_mut(key) {
                     None => {
                         // complete.def:896-898 progcomp_search miss.
                         writeln!(
                             stderr,
-                            "{diagnostic_prefix}compopt: {report_name}: no completion specification"
+                            "{diagnostic_prefix}compopt: {diag_name}: no completion specification"
                         )?;
                         status = 1;
                     }
@@ -2360,12 +2378,19 @@ impl Executor {
                 Ok(parsed) => {
                     if parsed.funcname.is_some() || parsed.command.is_some() {
                         // complete.def:693-696: builtin_error warning, no
-                        // usage line.
+                        // usage line. GNU's builtin_error reaches stderr
+                        // BEFORE the -F function / -C command runs, so
+                        // flush it through the buffered-output path (which
+                        // honors this command's redirects) before the
+                        // function produces its own output (rubash#1090).
                         let which = if parsed.funcname.is_some() { 'F' } else { 'C' };
                         writeln!(
                             stderr,
                             "{diagnostic_prefix}compgen: warning: -{which} option may not work as you expect"
                         )?;
+                        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                        stdout.clear();
+                        stderr.clear();
                     }
                     let word = parsed.word().to_string();
                     let mut resolved = crate::builtins::complete::CompgenDynamic::default();
@@ -2570,8 +2595,16 @@ impl Executor {
         self.set_env("COMP_POINT", &point.to_string());
         self.set_env("COMP_TYPE", "0");
         self.set_env("COMP_KEY", "0");
-        store_indexed_array_state(&mut self.shell_state, "COMP_WORDS", words.to_vec());
-        self.shell_state.variables.remove("COMP_WORDS");
+        // GNU compgen passes the caller's COMP_WORDS through to the -F
+        // function: outside a live completion there is no word list to
+        // bind, so a COMP_WORDS the script already set stays visible
+        // (only an unset one is bound, to the empty list) (rubash#1088).
+        if !self.shell_state.env_vars.contains_key("COMP_WORDS")
+            && self.shell_state.variables.get("COMP_WORDS").is_none()
+        {
+            store_indexed_array_state(&mut self.shell_state, "COMP_WORDS", words.to_vec());
+            self.shell_state.variables.remove("COMP_WORDS");
+        }
         self.set_env("COMP_CWORD", &cword.to_string());
     }
 

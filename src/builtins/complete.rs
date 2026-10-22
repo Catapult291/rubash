@@ -966,6 +966,49 @@ pub(crate) fn complete_line_candidates(
 /// globpat and -W wordlist), filter by the word prefix and the -X filter
 /// pattern, then print them (or store them into the -V array at the executor
 /// level, which reads them from the stdout buffer).
+/// Quote removal for the compgen word being completed: GNU's generators
+/// compare candidates against the DEQUOTED word (pcomplete.c
+/// gen_compspec_completions — the word arrives with shell quotes stripped,
+/// an unterminated quote simply quotes the rest), so `compgen -W ... --
+/// '"al'` matches `alpha` (rubash#1087).
+fn dequote_completion_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    out.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    match chars.next() {
+                        Some(next) => out.push(next),
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => match chars.next() {
+                    Some(next) => out.push(next),
+                    None => out.push('\\'),
+                },
+                _ => out.push(ch),
+            },
+        }
+    }
+    out
+}
+
 fn execute_compgen<E>(
     args: &[String],
     env_vars: &crate::shell::var_table::VarTable,
@@ -998,9 +1041,10 @@ where
     // matcher when the extglob shell option is on.
     let extglob = crate::builtins::shopt::option_enabled(env_vars, "extglob");
 
+    let dequoted_word = dequote_completion_word(parsed.word());
     let mut candidates = apply_completion_actions(
         parsed.actions,
-        parsed.word(),
+        &dequoted_word,
         env_vars,
         aliases,
         function_names,
@@ -1037,7 +1081,7 @@ where
     // function's COMPREPLY / command's output unfiltered. Prefix-filter the
     // static set only, append the dynamic candidates, then run the -X
     // filter over the whole list (pcomplete.c:1402-1407).
-    let word = parsed.word();
+    let word = dequoted_word.as_str();
     let mut selected = candidates
         .into_iter()
         .filter(|candidate| candidate.starts_with(word))
@@ -1165,7 +1209,10 @@ fn path_completion_candidates(
         }
         candidates.push(format!("{display_prefix}{}", entry.name));
     }
-    candidates.sort();
+    // Directory order, not sorted: GNU's filename generators walk
+    // readdir() order (`compgen -A file` in a directory lists entries in
+    // directory order) (rubash#1089). Interactive callers sort the merged
+    // candidate list themselves.
     candidates
 }
 
@@ -1481,13 +1528,18 @@ fn command_completion_candidates(
     aliases: &HashMap<String, Alias>,
     function_names: &[String],
 ) -> Vec<String> {
-    let mut candidates = BTreeSet::new();
+    // GNU gen_command_matches does not deduplicate across sources: a name
+    // that is both a builtin and a PATH file is reported once per source
+    // (`compgen -A command echo` prints echo for the builtin and again
+    // for each PATH hit) (rubash#1089). Interactive callers sort/dedup
+    // the merged candidate list themselves.
+    let mut candidates = Vec::new();
     candidates.extend(SHELL_BUILTINS.iter().map(|name| (*name).to_string()));
     candidates.extend(SHELL_KEYWORDS.iter().map(|name| (*name).to_string()));
     candidates.extend(aliases.keys().cloned());
     candidates.extend(function_names.iter().cloned());
     candidates.extend(path_command_completion_candidates(env_vars));
-    candidates.into_iter().collect()
+    candidates
 }
 
 fn path_command_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
