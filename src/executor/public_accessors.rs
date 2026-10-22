@@ -1433,6 +1433,21 @@ impl Executor {
     /// get_name_for_error(). For `bash -c` the stream name is "-c", producing
     /// "bash: -c: line N:". For script files the stream name equals the script
     /// name, so no extra segment appears.
+    /// rubash#1161: whether the input currently being parsed/executed is
+    /// a sourced FILE (the `.` builtin's dynamic extent) rather than the
+    /// invocation's own stream. `__RUBASH_IN_SOURCE` is the engine's
+    /// sourcelevel marker (set by execute_source_with_args);
+    /// source_nest_depth is its counter twin.
+    pub(in crate::executor) fn in_source_context(&self) -> bool {
+        self.source_nest_depth > 0
+            || self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_IN_SOURCE")
+                .map(String::as_str)
+                == Some("1")
+    }
+
     pub(crate) fn parser_diagnostic_prefix(&self) -> String {
         let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
         if let (Some(script), Some(line)) = (
@@ -1446,7 +1461,14 @@ impl Executor {
             {
                 return format!("{script}: eval: line {line}: ");
             }
-            if is_c {
+            // rubash#1161: while a FILE is being sourced, GNU's
+            // yy_input_name() is that file (error.c:300-316) — the `-c`
+            // stream name belongs only to the command string itself.
+            // A sourced file under a `-c` invocation (every startup
+            // rc/profile under `niu -i -c`, or `. file` inside `-c`)
+            // therefore reports `{file}: line N:`, never
+            // `{file}: -c: line N:`.
+            if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
             }
             return format!("{script}: line {line}: ");
@@ -1539,7 +1561,9 @@ impl Executor {
             return format!("bash: eval: line {line}: ");
         }
         if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
-            if is_c {
+            // rubash#1161: sourced file input suppresses the `-c`
+            // segment, exactly as in parser_diagnostic_prefix.
+            if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
             }
             return format!("{script}: line {line}: ");
