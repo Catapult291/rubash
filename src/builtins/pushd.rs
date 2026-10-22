@@ -141,11 +141,24 @@ where
                         return Ok(EX_USAGE);
                     }
                     let Some(index) = stack_index(arg, stack.len()) else {
-                        writeln!(
-                            stderr,
-                            "{diagnostic_prefix}dirs: {}: directory stack index out of range",
-                            arg.trim_start_matches(['+', '-'])
-                        )?;
+                        // GNU pushd.def pushd_error (shared by dirs):
+                        // "directory stack empty" when the stack has no
+                        // entries beyond the cwd slot (rubash's stack
+                        // models the cwd as slot 0, so len <= 1), the
+                        // sh_erange "index out of range" form otherwise
+                        // (rubash#1125).
+                        if stack.len() <= 1 {
+                            writeln!(
+                                stderr,
+                                "{diagnostic_prefix}dirs: directory stack empty"
+                            )?;
+                        } else {
+                            writeln!(
+                                stderr,
+                                "{diagnostic_prefix}dirs: {}: directory stack index out of range",
+                                arg.trim_start_matches(['+', '-'])
+                            )?;
+                        }
                         return Ok(EXECUTION_FAILURE);
                     };
                     let shown = if long_form {

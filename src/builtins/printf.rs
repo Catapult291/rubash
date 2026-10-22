@@ -163,6 +163,11 @@ where
                         "{}printf: -v: option requires an argument",
                         diagnostic_prefix(env_vars)
                     )?;
+                    // GNU internal_getopt errors are followed by
+                    // builtin_usage (builtins/common.c): every sibling
+                    // option-error arm here prints the usage line; the
+                    // missing-argument arm dropped it (rubash#1125).
+                    writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
                     return Ok(EX_USAGE);
                 };
                 index += 2;
