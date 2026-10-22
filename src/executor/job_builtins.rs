@@ -1201,25 +1201,38 @@ impl Executor {
         )?;
         let status = match action {
             crate::builtins::disown::DisownAction::Complete(status) => status,
-            crate::builtins::disown::DisownAction::All => {
-                let pids: Vec<u32> = self
-                    .shell_state
-                    .job_table
-                    .jobs
-                    .values()
-                    .flat_map(|job| job.pids.iter().copied())
-                    .chain(self.background_children.keys().copied())
-                    .collect();
-                self.background_children.clear();
-                for pid in pids {
-                    self.close_coproc_endpoints(pid);
-                    self.fd_table.close(pid);
+            crate::builtins::disown::DisownAction::All { nohup_only } => {
+                if nohup_only {
+                    // GNU jobs.c:5111 nohup_all_jobs: mark, never delete.
+                    for job in self.shell_state.job_table.jobs.values_mut() {
+                        job.nohup = true;
+                    }
+                    0
+                } else {
+                    let pids: Vec<u32> = self
+                        .shell_state
+                        .job_table
+                        .jobs
+                        .values()
+                        .flat_map(|job| job.pids.iter().copied())
+                        .chain(self.background_children.keys().copied())
+                        .collect();
+                    self.background_children.clear();
+                    for pid in pids {
+                        self.close_coproc_endpoints(pid);
+                        self.fd_table.close(pid);
+                    }
+                    self.shell_state.job_table.clear_jobs();
+                    0
                 }
-                self.shell_state.job_table.clear_jobs();
-                0
             }
-            crate::builtins::disown::DisownAction::Current => {
-                if self.disown_current_job() {
+            crate::builtins::disown::DisownAction::Current { nohup_only } => {
+                let acted = if nohup_only {
+                    self.nohup_current_job()
+                } else {
+                    self.disown_current_job()
+                };
+                if acted {
                     0
                 } else {
                     writeln!(
@@ -1230,14 +1243,30 @@ impl Executor {
                     1
                 }
             }
-            crate::builtins::disown::DisownAction::Jobs(jobs) => {
+            crate::builtins::disown::DisownAction::Jobs { specs, nohup_only } => {
                 let mut status = 0;
-                for job in jobs {
+                for job in specs {
                     if let Some(pid) = self.resolve_disown_job(&job) {
-                        self.background_children.remove(&pid);
-                        self.close_coproc_endpoints(pid);
-                        self.fd_table.close(pid);
-                        self.shell_state.job_table.remove_job_by_pid(pid);
+                        if nohup_only {
+                            // GNU jobs.c:1548 nohup_job: J_NOHUP mark
+                            // only — the job stays in the table, so
+                            // `jobs` still lists it and `wait %N` still
+                            // finds it (rubash#1048).
+                            if let Some(job_id) =
+                                self.shell_state.job_table.pid_to_job.get(&pid).copied()
+                            {
+                                if let Some(entry) =
+                                    self.shell_state.job_table.jobs.get_mut(&job_id)
+                                {
+                                    entry.nohup = true;
+                                }
+                            }
+                        } else {
+                            self.background_children.remove(&pid);
+                            self.close_coproc_endpoints(pid);
+                            self.fd_table.close(pid);
+                            self.shell_state.job_table.remove_job_by_pid(pid);
+                        }
                     } else {
                         // GNU jobs.def:283-289 disown_builtin: non-numeric
                         // operands go through get_job_spec, which warns when
@@ -1263,6 +1292,22 @@ impl Executor {
         };
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         Ok(status)
+    }
+
+    /// `disown -h` with no jobspec: mark the current job J_NOHUP
+    /// (jobs.c nohup_job via get_job_spec(NULL)); the job stays live in
+    /// the table (rubash#1048).
+    fn nohup_current_job(&mut self) -> bool {
+        let Some(job_id) = self.shell_state.job_table.current_job() else {
+            return false;
+        };
+        match self.shell_state.job_table.jobs.get_mut(&job_id) {
+            Some(entry) => {
+                entry.nohup = true;
+                true
+            }
+            None => false,
+        }
     }
 
     fn disown_current_job(&mut self) -> bool {
