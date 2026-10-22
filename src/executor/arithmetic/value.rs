@@ -343,14 +343,21 @@ impl ConditionalArithParser<'_> {
         // GNU expr.c treats a bare indexed-array operand as element zero.
         // The typed store serializes the whole array, which is not itself an
         // arithmetic expression, so resolve the scalar view before parsing.
+        // An unset element zero (an empty array, or a sparse array with no
+        // [0]) evaluates 0 — the same empty-expanded-text-is-0 contract as
+        // the empty-subscript read (arrayfunc.c:1356 -> expr.c:417); it
+        // must NOT fall through to the serialized storage text, which is
+        // not an expression (niubash#508: `a=(); $((a))` reported
+        // `error token is "()"`).
         if is_marked_var(self.env_vars, ARRAY_VARS, name) {
-            if let Some(value) = self
+            return match self
                 .env_vars
                 .get(name)
                 .and_then(|value| array_value_at(value, 0))
             {
-                return self.evaluate_variable_text(name, &value);
-            }
+                Some(value) => self.evaluate_variable_text(name, &value),
+                None => Some(0),
+            };
         }
 
         let value = self
