@@ -300,7 +300,7 @@ where
                         diagnostic_prefix(env_vars),
                         other
                     )?;
-                    writeln!(stderr, "cd: usage: cd [-L|[-P [-e]]] [dir]")?;
+                    writeln!(stderr, "cd: usage: cd [-L|[-P [-e]]] [-@] [dir]")?;
                     return Ok(Err(EX_USAGE));
                 }
             }
