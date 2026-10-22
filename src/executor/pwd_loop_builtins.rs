@@ -27,7 +27,12 @@ impl Executor {
         W: Write,
         E: Write,
     {
-        if args.is_empty() || args.first().map(String::as_str) == Some("-L") {
+        // The $PWD echo fast path is the LOGICAL rendering; with the
+        // `physical` shell option set (set -P) a bare `pwd` defaults to
+        // physical mode and must not take it (rubash#1039).
+        if (args.is_empty() || args.first().map(String::as_str) == Some("-L"))
+            && !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "physical")
+        {
             if let Some(pwd) = self.shell_state.env_vars.get("PWD") {
                 if pwd.starts_with('/') {
                     writeln!(stdout, "{pwd}")?;

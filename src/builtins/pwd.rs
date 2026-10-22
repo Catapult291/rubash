@@ -50,7 +50,13 @@ where
     W: Write,
     E: Write,
 {
-    let mut mode = Mode::Logical;
+    // GNU builtins/cd.def pwd_builtin: the default mode follows the
+    // `physical` shell option (set -P), like cd (rubash#1039).
+    let mut mode = if crate::builtins::set::shell_option_enabled(env_vars, "physical") {
+        Mode::Physical
+    } else {
+        Mode::Logical
+    };
 
     for arg in args {
         if arg == "--" {
