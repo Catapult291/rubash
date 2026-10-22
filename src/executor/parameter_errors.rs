@@ -813,11 +813,8 @@ impl Executor {
                     for body in &prefix_comsubs {
                         self.expand_command_substitution(body);
                     }
-                    return Some((
-                        name,
-                        "unbound variable".to_string(),
-                        Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                    ));
+                    let (name, message) = self.nounset_unbound_diagnostic(name);
+                    return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
                 }
             }
             for value in cmd.assignment_values() {
@@ -825,11 +822,8 @@ impl Executor {
                     for body in &prefix_comsubs {
                         self.expand_command_substitution(body);
                     }
-                    return Some((
-                        name,
-                        "unbound variable".to_string(),
-                        Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                    ));
+                    let (name, message) = self.nounset_unbound_diagnostic(name);
+                    return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
                 }
             }
         }
@@ -1032,11 +1026,8 @@ impl Executor {
             if let Some(name) = self.nounset_unbound_parameter(word) {
                 // expr.c expr_streval raises FORCE_EOF for unbound vars
                 // under set -u — fatal like `${x?}` (see command_execute).
-                return Some((
-                    name,
-                    "unbound variable".to_string(),
-                    Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                ));
+                let (name, message) = self.nounset_unbound_diagnostic(name);
+                return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
             }
         }
         let mut rest = word;
@@ -2425,6 +2416,43 @@ impl Executor {
             || is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, &resolved)
             || !is_array;
         unbound.then(|| reported.to_string())
+    }
+
+    /// Build the printed (name, message) pair for a nounset fatal.
+    /// GNU parameter_brace_expand evaluates the subscript before
+    /// check_unbound_variable, so an indexed reference whose negative
+    /// subscript lands before the array start first draws
+    /// `base: bad array subscript` and only then the fatal
+    /// `base[sub]: unbound variable` (rubash#1170). The nounset scan is
+    /// side-effect-free (it can run speculatively), so the earlier line
+    /// rides inside the message of the single diagnostic the caller
+    /// prints: every print site formats `{prefix}{name}: {message}`,
+    /// which reproduces the two GNU lines byte-for-byte. Positive-index
+    /// and associative references are valid references and keep the
+    /// plain single-line form.
+    fn nounset_unbound_diagnostic(&self, reported: String) -> (String, String) {
+        if let Some((base, sub)) = parse_array_subscript(&reported) {
+            if !self.is_assoc_parameter_array(base) {
+                let index = self.eval_integer_assignment_value(sub);
+                // A scalar/unset base has only element 0, so every
+                // negative subscript is an invalid reference; an array
+                // base is invalid only when the element is absent (the
+                // subscript lands before the array start).
+                let invalid = index < 0
+                    && (!self.parameter_is_array_variable(base)
+                        || self.nounset_indexed_element_absent(base, sub));
+                if invalid {
+                    return (
+                        base.to_string(),
+                        format!(
+                            "bad array subscript\n{}{reported}: unbound variable",
+                            self.diagnostic_prefix()
+                        ),
+                    );
+                }
+            }
+        }
+        (reported, "unbound variable".to_string())
     }
 
     fn nounset_array_element_unbound(
