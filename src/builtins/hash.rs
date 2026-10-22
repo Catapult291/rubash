@@ -239,8 +239,13 @@ where
             }
             return Ok(EXECUTION_SUCCESS);
         }
-        // GNU hash.def prints the empty-table message on stdout.
-        writeln!(stdout, "hash: hash table empty")?;
+        // GNU builtins/hash.def:141-144: the empty-table message prints
+        // only for the plain form — with -l (list_portably) it is
+        // suppressed once shell_compatibility_level > 50 (bash 5.3 runs
+        // at 51), so `hash -l` on an empty table is silent (rubash#1052).
+        if !reusable {
+            writeln!(stdout, "hash: hash table empty")?;
+        }
         return Ok(EXECUTION_SUCCESS);
     }
 
