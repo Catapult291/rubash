@@ -619,14 +619,20 @@ impl Executor {
                     if !redirect.append && !self.take_noclobber_prepared_target(&target) {
                         self.create_redirect_output(&target, redirect.clobber)?;
                     }
-                    // rubash#826: an fd-2 file binding is a diagnostics
-                    // destination — the compound wrapper's own failure
-                    // reports now route through fd_table fd 2, so the handle
-                    // must keep every write at EOF like GNU's shared open
-                    // file description (the create above did the single
-                    // O_TRUNC). An fd-1 binding keeps the trunc handle the
-                    // body's own sequential writes expect.
-                    let append = redirect.append || fd == 2;
+                    // GNU redir.c do_redirection_internal: every `>file`
+                    // redirection performs its OWN open() — `>f 2>f` binds
+                    // two independent open file descriptions with
+                    // independent offsets, so the fd-2 write overwrites the
+                    // fd-1 write at offset 0 instead of concatenating
+                    // (rubash#1068). A shared offset exists only where a dup
+                    // created it (`2>&1`, `&>`, `>&word` — the dup arms
+                    // above and share_fd_output_file). The earlier
+                    // fd==2-forces-append model (rubash#826) made every
+                    // compound fd-2 binding write at EOF, which is exactly
+                    // the concatenation #1068 files; diagnostics routed
+                    // through a plain `2>f` binding take the same
+                    // independent-offset semantics as GNU's second open.
+                    let append = redirect.append;
                     self.set_fd_output_file(fd, target.clone(), fd >= 10, append)
                         .map_err(|error| crate::posix_errors::path_error(&target, error))?;
                 }
