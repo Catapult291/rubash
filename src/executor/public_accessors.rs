@@ -1471,6 +1471,19 @@ impl Executor {
             if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
             }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                // Interactive + sourced file: shell name prolog plus the
+                // file as input name (see parser_diagnostic_prefix_for_line).
+                return format!(
+                    "{}: {script}: line {line}: ",
+                    Self::interactive_shell_basename(&self.shell_state.env_vars)
+                );
+            }
             return format!("{script}: line {line}: ");
         }
         if is_c {
@@ -1565,6 +1578,21 @@ impl Executor {
             // segment, exactly as in parser_diagnostic_prefix.
             if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                // GNU error.c parser_error in an interactive shell: the
+                // prolog name is the shell name (get_name_for_error) and
+                // the sourced file rides as yy_input_name —
+                // `bash: FILE: line N:` for startup rc/profile errors.
+                return format!(
+                    "{}: {script}: line {line}: ",
+                    Self::interactive_shell_basename(&self.shell_state.env_vars)
+                );
             }
             return format!("{script}: line {line}: ");
         }
