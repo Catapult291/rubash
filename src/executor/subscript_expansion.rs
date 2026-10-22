@@ -114,6 +114,20 @@ impl Executor {
     }
 
     fn expand_subscript_string_inner(&self, raw: &str, preserve_ansi_backslashes: bool) -> String {
+        // rubash#XXX fast lane: `prefix$name+suffix` with exactly one plain
+        // `$name` read and literal text around it. The walker below would
+        // copy the literal bytes verbatim (no field splitting, no pathname
+        // expansion, no re-scan of results — subst.c:11063
+        // expand_subscript_string -> expand_string) and resolve the one read
+        // through dynamic_parameter_value -> shell_variable_value ->
+        // exact_case_env_var, so splicing that value in directly is
+        // byte-identical while skipping the mask allocation, the walker
+        // frame, the tail marker-strip copies and the tilde re-check.
+        // Whitelist admission (rubash#117): doubt falls through to the slow
+        // path unchanged.
+        if let Some(expanded) = self.expand_subscript_plain_name_fast(raw) {
+            return expanded;
+        }
         // Nothing expands inside a single-quoted span, so a subscript covered
         // entirely by single quotes is literal data: `A['$v']` keys on `$v`
         // and `A['a\b']` keeps the backslash.
@@ -184,6 +198,57 @@ impl Executor {
                 .unwrap_or(expanded);
         }
         expanded
+    }
+
+    /// Splice a lone plain `$name` read into literal subscript text.
+    ///
+    /// Byte-identity with the slow path rests on the admission shape enforced
+    /// by [`split_subscript_plain_name`]: the mask pass copies the text
+    /// unchanged (no backslash, so no escape arm fires), the walker copies
+    /// every non-`$` byte verbatim (its quote/backtick/paren/brace arms
+    /// cannot fire on the admitted bytes, and subscript expansion performs
+    /// no field splitting or pathname expansion — subst.c:11063), the one
+    /// `$name` resolves through the same dynamic -> shell -> process-env
+    /// chain, and the tail marker strips are no-ops (no sentinel byte can
+    /// reach them: the raw text is marker-free and a marker-bearing value
+    /// is rejected). The tilde check reads the raw text, which the shape
+    /// guarantees does not start with `~`. `preserve_ansi_backslashes` is
+    /// irrelevant: the `$'` decode it gates needs a quote the shape
+    /// forbids. GNU owner: subst.c:11063 expand_subscript_string.
+    fn expand_subscript_plain_name_fast(&self, raw: &str) -> Option<String> {
+        let (prefix, name, suffix) = split_subscript_plain_name(raw)?;
+        // Mirror fast_plain_copy conservatism (assignment_expansion.rs): a
+        // nounset shell reports unbound names with diagnostics the splice
+        // cannot reproduce, so it keeps the slow path entirely.
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
+            return None;
+        }
+        if crate::executor::embedded_parameters::expand_depth_limit_reached() {
+            // The walker returns the masked word unchanged past its depth
+            // limit, and masking is identity on the admitted shape.
+            return Some(raw.to_string());
+        }
+        if self.dynamic_parameter_value(name).is_some() {
+            // Dynamics (RANDOM/SECONDS/LINENO/...) re-evaluate per expansion
+            // with side effects the splice must not duplicate or skip.
+            return None;
+        }
+        let value = self
+            .shell_variable_value(name)
+            .or_else(|| crate::executor::env_helpers::exact_case_env_var(name))
+            .unwrap_or_default();
+        // A value carrying sentinel bytes would be transformed by the
+        // walker's tail restores (DATA_BACKSLASH, PARAM_NAME_END_MARKER)
+        // and the subscript marker-strip chain (IFS_GLUE, E309, E401):
+        // keep the slow path, which owns those decodings.
+        if crate::executor::markers::contains_word_marker_bytes(&value) {
+            return None;
+        }
+        let mut out = String::with_capacity(prefix.len() + value.len() + suffix.len());
+        out.push_str(prefix);
+        out.push_str(&value);
+        out.push_str(suffix);
+        Some(out)
     }
 
     /// Retroactive `array_expand_once` application (arrayfunc.c:50,
@@ -1924,6 +1989,49 @@ pub(crate) fn mark_expanded_once_data_dquotes(text: &str) -> String {
 /// collapses to the character alone; inside double quotes a backslash is
 /// special before `$`, `` ` ``, `"` and `\` only (subst.c
 /// `string_extract_double_quoted`) and stays literal before anything else.
+/// Split a `prefix$name+suffix` subscript with exactly one plain parameter
+/// read and literal text around it; `None` for every other shape.
+///
+/// Admission is byte-exact about what the slow path would consume rather
+/// than copy: quotes and backslash (quote removal / escape processing),
+/// backtick and parens/braces (substitution syntax), a second `$`, and
+/// anything that is not a plain-name opener after the `$` (positionals,
+/// specials, `${`, `$(`, trailing `$`). Carrier bytes (C0 controls, PUA)
+/// are rejected so the mask pass, the walker arms and the tail marker
+/// strips are provably identity on admitted text. Every other byte —
+/// brackets, globs, `=`/`#`/`!`, whitespace, mid-word `~`, UTF-8 — is
+/// literal-copied by the walker, so it rides along in prefix/suffix.
+/// A leading `~` is rejected: the slow path tilde-expands on the raw text.
+fn split_subscript_plain_name(raw: &str) -> Option<(&str, &str, &str)> {
+    if raw.is_empty() || raw.starts_with('~') {
+        return None;
+    }
+    if crate::executor::markers::contains_word_marker_bytes(raw) {
+        return None;
+    }
+    let dollar = raw.find('$')?;
+    let (prefix, rest) = raw.split_at(dollar);
+    if prefix.contains(['\'', '"', '\\', '`', '(', ')', '{', '}']) {
+        return None;
+    }
+    let after = &rest[1..];
+    let first = after.bytes().next()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut len = 1;
+    while len < after.len()
+        && (after.as_bytes()[len].is_ascii_alphanumeric() || after.as_bytes()[len] == b'_')
+    {
+        len += 1;
+    }
+    let (name, suffix) = after.split_at(len);
+    if suffix.contains(['$', '\'', '"', '\\', '`', '(', ')', '{', '}']) {
+        return None;
+    }
+    Some((prefix, name, suffix))
+}
+
 fn mask_subscript_escapes(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -2118,5 +2226,42 @@ impl Executor {
             .is_some_and(|metadata| {
                 valid_array_reference_env(&metadata.raw, false, false, &self.shell_state.env_vars)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_subscript_plain_name;
+
+    #[test]
+    fn plain_name_admission_pins_literal_and_syntax_split() {
+        // Admitted: literal text around exactly one plain `$name` read.
+        assert_eq!(split_subscript_plain_name("k$i"), Some(("k", "i", "")));
+        assert_eq!(split_subscript_plain_name("$i"), Some(("", "i", "")));
+        assert_eq!(
+            split_subscript_plain_name("pre$i-post"),
+            Some(("pre", "i", "-post"))
+        );
+        assert_eq!(
+            split_subscript_plain_name("a$i1 b"),
+            Some(("a", "i1", " b"))
+        );
+        // Rejected: no read, or a read the splice cannot reproduce.
+        assert_eq!(split_subscript_plain_name("plain"), None);
+        assert_eq!(split_subscript_plain_name(""), None);
+        assert_eq!(split_subscript_plain_name("k$"), None);
+        assert_eq!(split_subscript_plain_name("k$1"), None);
+        assert_eq!(split_subscript_plain_name("k$?"), None);
+        assert_eq!(split_subscript_plain_name("k${i}"), None);
+        assert_eq!(split_subscript_plain_name("k$(x)"), None);
+        assert_eq!(split_subscript_plain_name("k$i$j"), None);
+        assert_eq!(split_subscript_plain_name("~$i"), None);
+        assert_eq!(split_subscript_plain_name("a'$i"), None);
+        assert_eq!(split_subscript_plain_name("a\"$i"), None);
+        assert_eq!(split_subscript_plain_name("a\\$i"), None);
+        assert_eq!(split_subscript_plain_name("`$i`"), None);
+        // Mid-word tilde and glob/bracket bytes are literal data: admitted.
+        assert_eq!(split_subscript_plain_name("a~$i"), Some(("a~", "i", "")));
+        assert_eq!(split_subscript_plain_name("k$i*"), Some(("k", "i", "*")));
     }
 }
