@@ -39,8 +39,8 @@ impl ArithDynamicContext {
             // function depth 0 (variables.c:1812 make_funcname_visible);
             // the dynamic snapshot omitted it there — funcname_top is None.
             "FUNCNAME" => self.funcname_top.clone(),
-            // groups_words() is the current stub (vec!["0"]); keep both
-            // readers on one source so a real port changes them together.
+            // groups_words() is the single GROUPS source (general.c
+            // get_groupset port); keep both readers on it.
             "GROUPS" => Some(groups_words().get(0).cloned().unwrap_or_default()),
             "BASH_COMMAND" => Some(
                 self.debug_trap_command
@@ -116,8 +116,8 @@ pub(in crate::executor) fn env_derived_dynamic_parameter_value(
     }
 }
 
-/// GROUPS word list — stub returning a single "0" (a real port would walk
-/// the process group set, GNU variables.c:1886 get_groupset). Shared by
+/// GROUPS word list — the process group set (GNU general.c:1281
+/// initialize_group_array / variables.c:1637 get_groupset). Shared by
 /// the Executor accessors and the arithmetic dynamic context.
 /// shquote.c sh_double_quote: wrap in `"` and backslash-escape `\`, `"`,
 /// `` ` `` and `$` — the declare -p renderer for dynamic variable values.
@@ -135,7 +135,46 @@ fn sh_double_quote_text(value: &str) -> String {
 }
 
 pub(in crate::executor) fn groups_words() -> Vec<String> {
-    vec!["0".to_string()]
+    // GNU general.c:1281 initialize_group_array feeding variables.c:1637
+    // get_groupset: the process group set from getgroups(), with the
+    // primary gid guaranteed present and moved to element 0 (an empty
+    // getgroups result degrades to just the primary gid). Cached by GNU
+    // for the shell's lifetime (group_set is built once); the process
+    // group set cannot change under a running shell except through
+    // setgroups by the process itself, which rubash never calls.
+    // rubash#1046 (the old stub always returned ["0"]).
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+        GROUPS
+            .get_or_init(|| {
+                let gid = unsafe { libc::getgid() };
+                let mut groups: Vec<libc::gid_t> = vec![0; 64];
+                let count = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+                let mut gids: Vec<u32> = if count > 0 {
+                    groups.truncate(count as usize);
+                    groups
+                } else {
+                    Vec::new()
+                };
+                if gids.is_empty() {
+                    gids.push(gid);
+                } else if let Some(pos) = gids.iter().position(|&g| g == gid) {
+                    if pos != 0 {
+                        gids.swap(0, pos);
+                    }
+                } else {
+                    gids.insert(0, gid);
+                }
+                gids.iter().map(u32::to_string).collect()
+            })
+            .clone()
+    }
+    #[cfg(not(unix))]
+    {
+        vec!["0".to_string()]
+    }
 }
 
 impl Executor {
@@ -336,7 +375,15 @@ impl Executor {
             "RANDOM" | "SECONDS" | "SRANDOM" | "BASHPID" => {
                 Some(format!("declare -i{exported} {name}={quoted}"))
             }
-            "GROUPS" => Some(format!("declare -a{exported} {name}=([0]={quoted})")),
+            "GROUPS" => {
+                let elements = groups_words()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| format!("[{index}]={}", sh_double_quote_text(group)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(format!("declare -a{exported} {name}=({elements})"))
+            }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
             | "BASH_COMMAND" => Some(format!("declare --{exported} {name}={quoted}")),
             _ => None,
