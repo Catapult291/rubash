@@ -828,6 +828,39 @@ impl Executor {
         self.parameter_expansion_error_in_word_context(word, true)
     }
 
+    /// Report a word-expansion error found outside the simple-command
+    /// pre-scan (for-list words, the case subject, [[ ]] operands —
+    /// rubash#1130) and raise its GNU consequence, mirroring the
+    /// simple-command handling in command_prepare: the diagnostic goes
+    /// to fd 2 as currently bound; the FATAL class (nounset unbound,
+    /// `${x?}`, bad @xform) is FORCE_EOF — ExitCode(expansion_fatal_status)
+    /// noninteractively, a status-1 DISCARD in an interactive reader;
+    /// lesser classes abandon the current command list with their status.
+    pub(in crate::executor) fn raise_word_expansion_error(
+        &mut self,
+        (name, message, status): (String, String, i32),
+    ) -> Result<(), ExecuteError> {
+        let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+        self.write_diagnostic_fd2(line.as_bytes());
+        if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
+            if self.expansion_error_is_interactive_discard() {
+                self.exit_code = 1;
+                // rubash#439: expansion error, not a failed command.
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            let code = self.expansion_fatal_status();
+            self.exit_code = code;
+            return Err(ExecuteError::ExitCode(code));
+        }
+        self.exit_code = status;
+        self.command_expansion_failed.set(true);
+        if status == 1 {
+            return Err(ExecuteError::ExpansionFailure(status));
+        }
+        Err(ExecuteError::ExitCode(status))
+    }
+
     /// The single owner of the fatal-expansion exit status (FORCE_EOF
     /// class: `${var?msg}` / nounset word errors, nounset and posix-fatal
     /// arithmetic). GNU chain: subst.c:10168/11027 (nounset),

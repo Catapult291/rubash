@@ -250,6 +250,31 @@ impl Executor {
     /// dequote (subst.c:4795+); no [[ ]] context consumes the field-
     /// splitting semantics it encodes.
     fn expand_conditional_word(&mut self, word: &str) -> String {
+        // GNU cond.c cond_expand_word -> expand_word: a nounset unbound
+        // variable (or another FATAL expansion error) in a [[ ]]
+        // operand raises FORCE_EOF, exactly as in a simple command's
+        // words (rubash#1130). Expansion happens per term, so
+        // short-circuited branches never reach this scan. The evaluator
+        // returns only i32, so record the fatal for
+        // execute_conditional_command_with_redirects to unwind.
+        if !self.conditional_expansion_fatal.get() {
+            if let Some((name, message, status)) = self.parameter_expansion_error_in_word(word) {
+                if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
+                    let line =
+                        format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+                    let _ = self.write_diagnostic_fd2(line.as_bytes());
+                    self.exit_code = if self.expansion_error_is_interactive_discard() {
+                        1
+                    } else {
+                        self.expansion_fatal_status()
+                    };
+                    // rubash#439: expansion error, not a failed command.
+                    self.command_expansion_failed.set(true);
+                    self.conditional_expansion_fatal.set(true);
+                    return String::new();
+                }
+            }
+        }
         // A conditional word is a comparison VALUE: drop the
         // ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) so both
         // operands compare as their real text (rubash#379).

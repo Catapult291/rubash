@@ -331,6 +331,29 @@ impl Executor {
         let procsub_fd_base = self.command_scoped_procsub_input_fds.len();
         self.bind_conditional_stdio_redirects(cmd)?;
         self.exit_code = self.execute_conditional_command(conditional_command);
+        // rubash#1130: a [[ ]] operand hit a FATAL word-expansion error
+        // (nounset unbound) — the diagnostic and exit_code are already
+        // in place from expand_conditional_word; unwind with the
+        // FORCE_EOF class (or the interactive DISCARD class).
+        let conditional_fatal = self.conditional_expansion_fatal.replace(false);
+        if conditional_fatal {
+            self.finish_conditional_output_procsubs()?;
+            self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
+            for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {
+                match saved {
+                    Some(entry) => {
+                        self.fd_table.entries.insert(fd, entry);
+                    }
+                    None => {
+                        self.fd_table.entries.remove(&fd);
+                    }
+                }
+            }
+            if self.expansion_error_is_interactive_discard() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            return Err(ExecuteError::ExitCode(self.exit_code));
+        }
         self.finish_conditional_output_procsubs()?;
         self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
         for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {

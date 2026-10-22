@@ -749,6 +749,13 @@ pub struct Executor {
     /// that clears `evalerror_pending` clears this alongside, so a caught
     /// abort never poisons a later unrelated abandon with 127.
     pub(crate) nounset_force_eof: Cell<bool>,
+    /// rubash#1130: a [[ ]] operand word hit a FATAL expansion error
+    /// (nounset unbound) during cond_expand_word; the diagnostic and
+    /// exit_code are already in place and
+    /// execute_conditional_command_with_redirects converts the flag
+    /// into the FORCE_EOF/DISCARD unwind, since the conditional
+    /// evaluator itself only returns an i32 status.
+    pub(crate) conditional_expansion_fatal: Cell<bool>,
     /// rubash#637: marks a pending evalerror abort as bad-subscript class.
     /// The eval boundary absorbs exactly this class (eval returns failure,
     /// the caller continues — GNU evalstring.c:365,422-442 swallowing

@@ -27,6 +27,27 @@ impl Executor {
             return Ok(());
         }
 
+        // GNU execute_cmd.c execute_for_command expands the word list
+        // with expand_words: a nounset unbound variable (or another
+        // fatal expansion error) in a list word raises the same
+        // FORCE_EOF class as in a simple command's words — the loop
+        // never runs and the noninteractive shell exits (rubash#1130).
+        // The simple-command pre-scan never sees these words, so scan
+        // them here (raw text when the lexer kept it).
+        if !for_command.default_positional {
+            for (index, word) in for_command.words.iter().enumerate() {
+                let scan_text = for_command
+                    .word_metadata
+                    .get(index)
+                    .map(|metadata| metadata.raw.as_str())
+                    .filter(|raw| !raw.is_empty())
+                    .unwrap_or(word.as_str());
+                if let Some(error) = self.parameter_expansion_error_in_word(scan_text) {
+                    return self.raise_word_expansion_error(error);
+                }
+            }
+        }
+
         let values = if for_command.default_positional {
             if self.shell_state.positional_window().is_empty() {
                 Vec::new()

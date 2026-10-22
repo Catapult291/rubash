@@ -303,6 +303,34 @@ impl Executor {
             // heredoc shortcut must not produce the content.
             return None;
         }
+        // GNU redir.c expands the heredoc / here-string word in the
+        // child with the full error machinery: under `set -u` an
+        // unbound variable there is fatal to the substitution
+        // (rubash#1130: `$(cat <<< $p)` reported the diagnostic and
+        // left the assignment status 1). This shortcut expands the
+        // body itself and would silently substitute the empty string,
+        // so decline any command whose body carries an expansion
+        // error and let the real executor raise it.
+        let body_has_expansion_error = ast.commands.iter().any(|command| {
+            let mut blocked = false;
+            if let Some(word) = &command.here_string {
+                let trimmed = word.trim_start();
+                if !trimmed.starts_with('\'') && !trimmed.starts_with("$'") {
+                    blocked |= self.parameter_expansion_error_in_word(word).is_some();
+                }
+            }
+            for redirect in &command.heredoc_redirects {
+                if let Some(body) = &redirect.body {
+                    blocked |= self
+                        .parameter_expansion_error_in_heredoc_body(body)
+                        .is_some();
+                }
+            }
+            blocked
+        });
+        if body_has_expansion_error {
+            return None;
+        }
         // rubash#320: admission whitelist — this fast path models only
         // `cat <<EOF` reading its heredoc and echoing it to the captured
         // stdout. GNU executes `cat <<EOF > /dev/null` with the redirect
@@ -426,6 +454,29 @@ impl Executor {
             return None;
         }
         if piped_next.is_some_and(command_has_file_redirect) {
+            return None;
+        }
+        // rubash#1130: same nounset gate as the typed path — a body
+        // carrying an expansion error (unbound variable under `set -u`)
+        // belongs to the real executor, not this silent shortcut.
+        let body_has_expansion_error = ast.commands.iter().any(|command| {
+            let mut blocked = false;
+            if let Some(word) = &command.here_string {
+                let trimmed = word.trim_start();
+                if !trimmed.starts_with('\'') && !trimmed.starts_with("$'") {
+                    blocked |= self.parameter_expansion_error_in_word(word).is_some();
+                }
+            }
+            for redirect in &command.heredoc_redirects {
+                if let Some(body) = &redirect.body {
+                    blocked |= self
+                        .parameter_expansion_error_in_heredoc_body(body)
+                        .is_some();
+                }
+            }
+            blocked
+        });
+        if body_has_expansion_error {
             return None;
         }
 

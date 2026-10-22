@@ -3239,6 +3239,21 @@ impl Executor {
                 return Ok(());
             }
         }
+        // GNU execute_cmd.c:3695: the case subject goes through
+        // expand_word_leave_quoted, so a nounset unbound variable (or
+        // another fatal expansion error) in it raises the FORCE_EOF
+        // class before any clause is tested (rubash#1130) — the
+        // simple-command pre-scan never sees the subject.
+        {
+            let scan_text = if case_command.word_metadata.raw.is_empty() {
+                case_command.word.as_str()
+            } else {
+                case_command.word_metadata.raw.as_str()
+            };
+            if let Some(error) = self.parameter_expansion_error_in_word(scan_text) {
+                return self.raise_word_expansion_error(error);
+            }
+        }
         // GNU execute_cmd.c:3695-3699: the case word is expanded by
         // expand_word_leave_quoted and then passed through dequote_string —
         // every single-quoted span is literal data (subst.c:11882-11886
