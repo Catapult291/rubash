@@ -577,6 +577,17 @@ impl Executor {
         self.expand_command_substitution_with_context(source, SubstitutionQuoteContext::Unquoted)
     }
 
+    /// True when an ERR trap is set and `set -E` makes the substitution
+    /// child inherit it (bash's errtrace contract names command
+    /// substitutions explicitly, rubash#1133): a failing body command
+    /// must then run the trap in the child, with the trap's output
+    /// captured — behavior only the real executor path provides.
+    pub(in crate::executor) fn err_trap_inherited_into_comsub(&self) -> bool {
+        crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "errtrace")
+            && crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR")
+                .is_some_and(|action| !action.is_empty())
+    }
+
     pub(in crate::executor) fn expand_command_substitution_with_context(
         &self,
         source: &str,
@@ -755,7 +766,7 @@ impl Executor {
         // be provably equivalent, and it is not when tracing or when the
         // inherited DEBUG trap fires) and the body falls to the real
         // parser/executor below (rubash#254, rubash#825).
-        if source == "false" && !self.xtrace_enabled() {
+        if source == "false" && !self.xtrace_enabled() && !self.err_trap_inherited_into_comsub() {
             self.last_command_substitution_status.set(Some(1));
             return String::new();
         }
@@ -798,7 +809,15 @@ impl Executor {
         // execute_cmd.c:4649 (`++ echo hi` for `v=$(echo hi)`), and the
         // shortcut cannot express it. Routing to the real executor costs
         // speed only (rubash#254).
-        if !command_substitution_body_is_trivial(&word_source) || self.xtrace_enabled() {
+        // rubash#1133: an ERR trap inherited under `set -E` fires inside
+        // the substitution child for a failing body command, and its
+        // output belongs to the capture — the word-level shortcuts
+        // below cannot express that either, so they are disqualified
+        // the same way (the real executor owns the trap machinery).
+        if !command_substitution_body_is_trivial(&word_source)
+            || self.xtrace_enabled()
+            || self.err_trap_inherited_into_comsub()
+        {
             if let Some(output) = self.command_list_substitution_output(source, context) {
                 return output;
             }
@@ -909,7 +928,9 @@ impl Executor {
                     .and_then(|rest| rest.strip_suffix(')'))
                 {
                     let mut executor = self.command_substitution_executor();
-                    crate::builtins::trap::reset_for_subshell(&mut executor.shell_state.env_vars);
+                    crate::builtins::trap::reset_for_subshell_child(
+                        &mut executor.shell_state.env_vars,
+                    );
                     output.push_str(&executor.expand_command_substitution(source));
                     continue;
                 }
@@ -1296,7 +1317,13 @@ impl Executor {
         // word-level gate ran the reset and the exit trap only when the
         // body text contained a literal `trap` word, so an EXIT trap set
         // by a sourced file never fired and the substitution read empty.
-        crate::builtins::trap::reset_for_subshell(&mut subshell.shell_state.env_vars);
+        // rubash#1133: the reset follows the `( )` child's errtrace rule
+        // — bash's `-E` contract names command substitutions explicitly
+        // ("an ERR trap is inherited by shell functions, command
+        // substitutions, and commands executed in a subshell"), so
+        // under `set -E` the child keeps the ERR action live and its
+        // output (the trap's included) lands in the capture.
+        crate::builtins::trap::reset_for_subshell_child(&mut subshell.shell_state.env_vars);
         // Keep the command source visible to BASH_COMMAND while the parsed
         // substitution body runs, including DEBUG trap actions.
         *subshell.shell_state.debug_trap_command.borrow_mut() = Some(source.trim().to_string());

@@ -2092,7 +2092,9 @@ impl Executor {
         // trap, so a parent trap cannot fire inside the substitution. The
         // in-place body below runs on this executor, but the wholesale
         // state restore at the end rolls the parent's trap table back.
-        crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
+        // The ERR trap is the errtrace exception (rubash#1133): under
+        // `set -E` it stays live in the child, like the `( )` path.
+        crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         // Bash runs command substitution in a subshell where the -e option
         // is turned off at child entry: `$(false; echo ok)` prints ok
         // because the inner `false` does not abort the substitution
