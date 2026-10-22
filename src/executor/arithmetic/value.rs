@@ -393,8 +393,17 @@ impl ConditionalArithParser<'_> {
         if let Some(number) = strlong_leading_zero_octal(value) {
             return Some(bash_arith(number));
         }
-        if let Ok(number) = value.parse::<i128>() {
-            return Some(bash_arith(number));
+        // rubash#1101: a leading-zero digit string containing 8/9 (`08`,
+        // `-08`, `+09`) is NOT decimal — GNU strlong takes the octal arm
+        // for every `0nnn` value and evalerrors "value too great for
+        // base" (expr.c:1539-1557). The plain-decimal shortcut must not
+        // swallow it; let it fall through to the nested expression parser,
+        // whose literal reader raises exactly that error (the same path
+        // that already handles `08x` / `0x1g` values correctly).
+        if !leading_zero_digit_string(value) {
+            if let Ok(number) = value.parse::<i128>() {
+                return Some(bash_arith(number));
+            }
         }
 
         let mut resolving = self.resolving.clone();
@@ -762,6 +771,19 @@ impl ConditionalArithParser<'_> {
         // (same discipline as the indexed element store above).
         self.env_vars.mark_array_cells_dirty();
     }
+}
+
+/// Whether a variable value is a pure digit string (optional sign) with
+/// a leading zero and more than one digit (`08`, `010`, `-09`): GNU
+/// strlong reads every such value in the octal arm, never as decimal.
+fn leading_zero_digit_string(value: &str) -> bool {
+    let digits = match value.as_bytes().first() {
+        Some(b'-' | b'+') => &value[1..],
+        _ => value,
+    };
+    digits.len() > 1
+        && digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// GNU expr.c:1539/1557 strlong's `0nnn -> base 8` arm for variable
