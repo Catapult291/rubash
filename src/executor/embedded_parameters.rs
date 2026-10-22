@@ -574,9 +574,8 @@ impl Executor {
                     // rules. Without this, the body collector below pairs
                     // the quote and swallows the tail into the default word.
                     if self.posix_mode_enabled()
-                        && crate::builtins::shopt::compatibility_level(
-                            &self.shell_state.env_vars,
-                        ) > 42
+                        && crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars)
+                            > 42
                         && (in_double
                             || double_quoted
                             || heredoc

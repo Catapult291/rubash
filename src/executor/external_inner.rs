@@ -1006,7 +1006,27 @@ impl Executor {
         #[cfg(unix)]
         crate::executor::dev_fd_operands::attach_unix_dev_fd_operands(&mut process, &dev_ops);
         suppress_orphan_console(&mut process);
-        let spawned = process.spawn();
+        // rubash#1035: GNU shell_execve (execute_cmd.c:6126) execs the
+        // program directly and only consults the file's first bytes when
+        // the kernel refuses (ENOEXEC). Rust's spawn (posix_spawn) never
+        // surfaces that refusal for scripts without `#!`: libc runs them
+        // under /bin/sh instead — the WRONG shell (no `trap -p`, wrong
+        // traps, wrong POSIX mode). Pre-empt the spawn for files the
+        // kernel could not exec and feed the refusal classifier below a
+        // synthetic ENOEXEC, so the ENOEXEC shell-script fallback (or the
+        // bad-interpreter/binary refusal) applies exactly as if execve
+        // had refused. The 4-byte read costs microseconds against the
+        // millisecond spawn; `used_shell` spawns already run under a shell
+        // and skip it. Unix-only: Windows routes scripts through the shell
+        // fallback before reaching any spawn (should_run_with_shell), so a
+        // magic sniff here would only misroute batch files and MZ images.
+        let spawned =
+            if !used_shell && cfg!(unix) && !crate::executor::path::program_execs_directly(program)
+            {
+                Err(std::io::Error::from_raw_os_error(8))
+            } else {
+                process.spawn()
+            };
         // Drop the Command NOW: std retains every `Stdio::from(..)` it was
         // given (the #144 shared capture-pipe write clones among them), so a
         // still-live Command keeps the pipe's write end open in the parent

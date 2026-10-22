@@ -524,10 +524,21 @@ impl Executor {
             // pdeathsig arm keys off __RUBASH_BACKGROUND_WRAPPER, which is
             // never set here — a directly-exec'd async child survives shell
             // exit, as GNU's does.
+            // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
+            // SIGINT/SIGQUIT in the async child while job_control is off
+            // (the `monitor` option is unset) — a background `sleep`
+            // survives `kill -INT $!`. The async pre_exec variant forces
+            // that ignore after the entry-disposition restore; with job
+            // control on the plain reset applies, as in GNU.
             #[cfg(unix)]
             unsafe {
                 use std::os::unix::process::CommandExt;
-                process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+                if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor")
+                {
+                    process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
+                } else {
+                    process.pre_exec(crate::builtins::kill::child_pre_exec_reset_async);
+                }
             }
             suppress_orphan_console(&mut process);
             match process.spawn() {
@@ -592,6 +603,55 @@ impl Executor {
         env_map.retain(|key, _| {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
+        // rubash#1035: GNU execute_cmd.c setup_async_signals ignores
+        // SIGINT/SIGQUIT in the forked async child while job_control is off
+        // (the `monitor` option is unset). A respawned `rubash -c` child
+        // cannot inherit that disposition through spawn (the parent holds
+        // no ignore itself), so stamp the async marker the child's startup
+        // consumes (main.rs -> kill::apply_async_child_entry_ignores)
+        // before its trap table seeds. With job control on the marker is
+        // removed instead — including a user-forged ambient copy — so
+        // monitored children keep the entry dispositions, as in GNU.
+        // An exec-like body (a bare simple command GNU would exec: an
+        // external or a script file) additionally inherits the ignore as
+        // SIG_HARD_IGNORE — merge SIGINT/SIGQUIT into the forwarded
+        // ORIG_IGN set so the child's `trap ... INT` is silently refused
+        // and `trap -p INT` shows `trap -- '' SIGINT` (trap.c set_signal).
+        // Compound bodies stay trappable: GNU runs those in-process in the
+        // forked child (trap.c's ASYNCSIG special-case in set_signal), so
+        // no ORIG_IGN merge — only the kernel ignore, which a later `trap`
+        // overrides through the normal reconcile.
+        #[cfg(unix)]
+        if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor") {
+            env_map.remove(crate::builtins::kill::ASYNC_CHILD_ENV_KEY);
+        } else {
+            env_map.insert(
+                crate::builtins::kill::ASYNC_CHILD_ENV_KEY.to_string(),
+                "1".to_string(),
+            );
+            if self.background_body_execs_in_child(&background_command.command) {
+                let mut ignores: Vec<String> = env_map
+                    .get(crate::builtins::trap::TRAP_ORIG_IGNORES)
+                    .map(|value| {
+                        value
+                            .split(':')
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for signal in ["SIGINT", "SIGQUIT"] {
+                    if !ignores.iter().any(|ignored| ignored == signal) {
+                        ignores.push(signal.to_string());
+                    }
+                }
+                ignores.sort();
+                env_map.insert(
+                    crate::builtins::trap::TRAP_ORIG_IGNORES.to_string(),
+                    ignores.join(":"),
+                );
+            }
+        }
         env_map.insert("__RUBASH_SHELL_PID".to_string(), self.shell_pid.to_string());
         // rubash#1074: the wrapper child is one subshell level deeper than
         // this shell (execute_in_subshell's subshell_level++); carry the
@@ -884,6 +944,67 @@ impl Executor {
         self.shell_state.last_background_pid = Some(pid);
         self.exit_code = 0;
         Ok(())
+    }
+
+    /// rubash#1035: whether GNU would EXECUTE the background body as a fresh
+    /// process image (as opposed to running it in-process in the forked
+    /// async child). Only exec-like bodies inherit the async SIGINT/SIGQUIT
+    /// ignore as SIG_HARD_IGNORE (trap.c set_signal refuses to trap them):
+    /// a bare simple command resolving to an external or a script file.
+    /// Compound bodies (subshells, brace groups, pipelines, `&&`/`||`
+    /// lists, loops, conditionals, ...) run in-process in GNU's forked
+    /// child, where trap.c's ASYNCSIG special-case keeps `trap ... INT`
+    /// installable — and function/builtin bodies likewise run in-process
+    /// (execute_subshell_builtin_or_function, async path). Aliases stay
+    /// conservative: an alias can expand to a compound body, so an aliased
+    /// name counts as in-process. Anything else bare-simple (externals,
+    /// scripts, even unresolvable names — GNU still exec-attempts those)
+    /// counts as exec-like.
+    #[cfg(unix)]
+    fn background_body_execs_in_child(&self, command: &CommandNode) -> bool {
+        if command.pipe.is_some()
+            || command.pipeline_command.is_some()
+            || command.and_or_list.is_some()
+            || command.and_or.is_some()
+            || command.time_command.is_some()
+            || command.background_command.is_some()
+            || command.inverted_command.is_some()
+            || command.inverted
+            || command.subshell
+            || command.subshell_end
+            || command.subshell_command.is_some()
+            || command.for_command.is_some()
+            || command.arithmetic_command.is_some()
+            || command.if_command.is_some()
+            || command.loop_command.is_some()
+            || command.conditional_command.is_some()
+            || command.case_command.is_some()
+            || command.select_command.is_some()
+            || command.function_command.is_some()
+            || command.brace_group.is_some()
+            || command.coproc_command.is_some()
+        {
+            return false;
+        }
+        if command.words.is_empty() {
+            return false;
+        }
+        let name = &command.words[0];
+        if name.starts_with('%') {
+            return false;
+        }
+        if let Some((prefix, _)) = name.split_once('=') {
+            if super::support_names::is_shell_name(prefix) {
+                return false;
+            }
+        }
+        if super::builtin_names::is_shell_builtin_name(name)
+            || self.shell_state.functions.contains_key(name)
+            || self.shell_state.aliases.contains_key(name)
+        {
+            return false;
+        }
+        true
     }
 
     /// rubash#809: resolve a background body to a directly-spawnable external
