@@ -1559,7 +1559,10 @@ impl Executor {
     /// GNU's expand_word_internal (subst.c:11229) forks each comsub as the
     /// walk reaches it, so a child's stderr output precedes a later
     /// `unbound variable` diagnostic.
-    fn nounset_unbound_parameter_with_comsubs(&self, word: &str) -> (Option<String>, Vec<String>) {
+    pub(in crate::executor) fn nounset_unbound_parameter_with_comsubs(
+        &self,
+        word: &str,
+    ) -> (Option<String>, Vec<String>) {
         let chars: Vec<char> = word.chars().collect();
         let mut comsubs = Vec::new();
         let mut index = 0usize;

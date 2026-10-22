@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use super::{
     is_marked_var, is_shell_name_char, is_shell_name_start, mark_env_name,
-    parse_helpers::decode_ansi_c_escapes, Executor, ARRAY_VARS, NAMEREF_VARS,
+    parse_helpers::decode_ansi_c_escapes, ExecuteError, Executor, ARRAY_VARS, NAMEREF_VARS,
 };
 use crate::executor::arithmetic::{
     assoc_skip_substitution, assoc_subscript_end, eval_mutable_arith_value_with_random_flags,
@@ -804,7 +804,64 @@ impl Executor {
         mark_env_name(&mut self.shell_state.env_vars, ARRAY_VARS, "BASH_REMATCH");
     }
 
+    /// GNU cond.c cond_expand_word -> subst.c expand_word: the `=~`
+    /// operands are expanded like any other `[[ ]]` word, so an unbound
+    /// parameter under `set -u` raises err_unboundvar (subst.c:11027)
+    /// BEFORE the match is attempted. The regex paths expand through
+    /// expand_conditional_word, whose plain-reference arm carries no
+    /// nounset verdict, so `[[ x =~ $u ]]` silently matched (rubash#1177).
+    /// Scan both raw operands with the shared nounset scan, subject
+    /// first (GNU expands left-to-right); on a hit, run the comsubs that
+    /// precede it in the word (GNU forks each as the walk reaches it),
+    /// print the diagnostic, and latch the fatal for the dispatch sites
+    /// to convert via take_conditional_nounset_fatal.
+    fn regex_operands_nounset_fatal(&mut self, left: &str, right: &str) -> bool {
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
+            return false;
+        }
+        let mut prefix_comsubs: Vec<String> = Vec::new();
+        for word in [left, right] {
+            let (unbound, bodies) = self.nounset_unbound_parameter_with_comsubs(word);
+            prefix_comsubs.extend(bodies);
+            if let Some(name) = unbound {
+                for body in &prefix_comsubs {
+                    self.expand_command_substitution(body);
+                }
+                let line =
+                    format!("{}{}: unbound variable\n", self.diagnostic_prefix(), name);
+                let _ = self.write_default_stderr(line.as_bytes());
+                self.shell_state.conditional_nounset_error.set(true);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Convert a latched `[[ =~ ]]` nounset fatal (rubash#1177) into the
+    /// exit the simple-command pre-scan produces for the same hit
+    /// (command_prepare.rs parameter_expansion_error FATAL arm):
+    /// interactive shells DISCARD the command with status 1; elsewhere
+    /// the FORCE_EOF status is context-owned (expansion_fatal_status).
+    pub(in crate::executor) fn take_conditional_nounset_fatal(
+        &mut self,
+    ) -> Option<Result<(), ExecuteError>> {
+        if !self.shell_state.conditional_nounset_error.replace(false) {
+            return None;
+        }
+        if self.expansion_error_is_interactive_discard() {
+            self.exit_code = 1;
+            self.command_expansion_failed.set(true);
+            return Some(Err(ExecuteError::ExpansionFailure(1)));
+        }
+        let code = self.expansion_fatal_status();
+        self.exit_code = code;
+        Some(Err(ExecuteError::ExitCode(code)))
+    }
+
     pub(super) fn conditional_regex_match_status(&mut self, left: &str, right: &str) -> i32 {
+        if self.regex_operands_nounset_fatal(left, right) {
+            return 1;
+        }
         let left_exp = self.expand_conditional_word(left);
         let right_exp = self.expand_conditional_word(right);
         let right_f = restore_numeric_decimal_regex_escapes(&right_exp);
@@ -844,6 +901,9 @@ impl Executor {
         // exactly those mode-0 semantics.
         if crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "compat31") {
             return self.conditional_regex_match_status(left, right);
+        }
+        if self.regex_operands_nounset_fatal(left, right) {
+            return 1;
         }
         let left = crate::executor::execution_misc::decode_command_substitution_payload(
             &self.expand_conditional_word(left),

@@ -197,6 +197,13 @@ pub struct ShellState {
     pub(crate) arithmetic_nonfatal_error: Cell<bool>,
     pub(crate) arithmetic_fatal_error: Cell<bool>,
     pub(crate) arithmetic_nounset_error: Cell<bool>,
+    /// Latch for a nounset fatal raised while expanding a `[[ =~ ]]`
+    /// operand (rubash#1177): the diagnostic prints at detection inside
+    /// conditional evaluation (which returns only an i32 status), and
+    /// execute_conditional_command_with_redirects converts the latch to
+    /// the FORCE_EOF exit, mirroring arithmetic_nounset_error's flow
+    /// through execute_bare_arithmetic_command.
+    pub(crate) conditional_nounset_error: Cell<bool>,
     pub(crate) arithmetic_last_error_category:
         Cell<Option<crate::executor::arithmetic::ArithmeticErrorCategory>>,
     /// Bad substitution flag (subshell boundary).
@@ -278,6 +285,7 @@ pub(crate) struct InteriorSnapshot {
     arithmetic_nonfatal_error: bool,
     arithmetic_fatal_error: bool,
     arithmetic_nounset_error: bool,
+    conditional_nounset_error: bool,
     arithmetic_last_error_category: Option<crate::executor::arithmetic::ArithmeticErrorCategory>,
     parameter_bad_substitution: bool,
     redirect_failglob_error: bool,
@@ -331,6 +339,7 @@ impl ShellState {
             arithmetic_nonfatal_error: self.arithmetic_nonfatal_error.get(),
             arithmetic_fatal_error: self.arithmetic_fatal_error.get(),
             arithmetic_nounset_error: self.arithmetic_nounset_error.get(),
+            conditional_nounset_error: self.conditional_nounset_error.get(),
             arithmetic_last_error_category: self.arithmetic_last_error_category.get(),
             parameter_bad_substitution: self.parameter_bad_substitution.get(),
             redirect_failglob_error: self.redirect_failglob_error.get(),
@@ -371,6 +380,8 @@ impl ShellState {
             .set(snapshot.arithmetic_fatal_error);
         self.arithmetic_nounset_error
             .set(snapshot.arithmetic_nounset_error);
+        self.conditional_nounset_error
+            .set(snapshot.conditional_nounset_error);
         self.arithmetic_last_error_category
             .set(snapshot.arithmetic_last_error_category);
         self.parameter_bad_substitution
@@ -437,6 +448,7 @@ impl Clone for ShellState {
             arithmetic_nonfatal_error: Cell::new(self.arithmetic_nonfatal_error.get()),
             arithmetic_fatal_error: Cell::new(self.arithmetic_fatal_error.get()),
             arithmetic_nounset_error: Cell::new(self.arithmetic_nounset_error.get()),
+            conditional_nounset_error: Cell::new(self.conditional_nounset_error.get()),
             arithmetic_last_error_category: Cell::new(self.arithmetic_last_error_category.get()),
             parameter_bad_substitution: Cell::new(self.parameter_bad_substitution.get()),
             redirect_failglob_error: Cell::new(self.redirect_failglob_error.get()),

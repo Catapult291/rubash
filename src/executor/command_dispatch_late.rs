@@ -292,6 +292,11 @@ impl Executor {
                             return Err(error);
                         }
                         self.exit_code = self.execute_conditional_command(command);
+                        // rubash#1177: same `=~` nounset-fatal conversion
+                        // as the with-redirects path.
+                        if let Some(result) = self.take_conditional_nounset_fatal() {
+                            return result;
+                        }
                         Ok(())
                     }
                     None => self.execute_external(cmd),

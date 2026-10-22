@@ -370,6 +370,12 @@ impl Executor {
                 }
             }
         }
+        // rubash#1177: a nounset fatal latched while expanding a `=~`
+        // operand inside the conditional converts to the FORCE_EOF exit
+        // here, after the command's redirects are restored.
+        if let Some(result) = self.take_conditional_nounset_fatal() {
+            return result;
+        }
         Ok(())
     }
 

@@ -338,6 +338,7 @@ impl Executor {
                 arithmetic_nonfatal_error: Cell::new(false),
                 arithmetic_fatal_error: Cell::new(false),
                 arithmetic_nounset_error: Cell::new(false),
+                conditional_nounset_error: Cell::new(false),
                 arithmetic_last_error_category: Cell::new(None),
                 parameter_bad_substitution: Cell::new(false),
                 redirect_failglob_error: Cell::new(false),
