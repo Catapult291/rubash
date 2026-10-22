@@ -19,6 +19,17 @@ pub(super) fn format_time_value(
         value: seconds,
         invalid,
     } = parse_i64(value);
+    // GNU getintmax distinguishes a MISSING argument (the caller passes
+    // the -1 "now" sentinel, never an empty string) from a PRESENT empty
+    // one: strtoimax on "" leaves ep == s, so chk_converror reports
+    // `: invalid number' and the value is 0 (rubash#1116). parse_i64's
+    // empty arm models the missing case, so re-arm the diagnostic here,
+    // where empty can only mean present.
+    let invalid = if value.is_empty() {
+        Some(String::new())
+    } else {
+        invalid
+    };
     let seconds = match seconds {
         -1 => current_epoch_seconds(),
         -2 => env_vars

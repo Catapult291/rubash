@@ -807,6 +807,24 @@ fn render_one_pass(
                         conversion_error: false,
                     };
                 };
+
+                // GNU printf.def: the time conversion is the `(' case
+                // (printf.def:586) — only %(...)T is a conversion at all.
+                // A bare %T reaches the default arm (printf.def:811) and
+                // dies with "`T': invalid format character" + PRETURN
+                // (rc 1, no output for the directive), instead of printing
+                // the current time (rubash#1116).
+                if spec.specifier == 'T' && spec.time_format.is_none() {
+                    return RenderedPrintf {
+                        output,
+                        status: EXECUTION_FAILURE,
+                        errors: vec![format!(
+                            "{prefix}printf: `T': invalid format character"
+                        )],
+                        stop_output: true,
+                        conversion_error: false,
+                    };
+                }
                 let dynamic = resolve_dynamic_format_args(&mut spec, args, arg_index);
                 // GNU getint/chk_converror: every diagnostic from a `*'
                 // width/precision argument is a conversion error (rc 1),
@@ -880,6 +898,12 @@ fn render_one_pass(
                     };
                     let (rendered, error) = format_time_value(value, &spec, env_vars);
                     if let Some(error) = error {
+                        // GNU printf.def getintmax + chk_converror: an
+                        // invalid time argument is a conversion error —
+                        // the formatted value (0 for garbage) still prints
+                        // but the builtin's status is EXECUTION_FAILURE
+                        // (rubash#1116).
+                        conversion_error = true;
                         errors.push(format!("{prefix}{error}"));
                     }
                     output.push_str(&rendered);
