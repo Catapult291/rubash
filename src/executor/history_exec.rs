@@ -342,7 +342,16 @@ pub(in crate::executor) fn execute_history_session(
             if !command.is_empty() {
                 let control = executor.get_env("HISTCONTROL").unwrap_or_default();
                 let ignore = executor.get_env("HISTIGNORE").unwrap_or_default();
-                shell.record(&command, &control, &ignore, histsize);
+                let was_recorded = shell.record(&command, &control, &ignore, histsize);
+                // push_history goes through check_add_history ->
+                // really_add_history (bashhist.c:961), which sets
+                // hist_last_line_added = 1 for the pushed entry, and
+                // push_history then marks it pushed (history.def:451).
+                // fc's last_hist arithmetic (fc.def:335) depends on the
+                // added flag being set here (#1117).
+                if was_recorded {
+                    shell.last_line_added = true;
+                }
                 shell.last_line_pushed = true;
             }
         }

@@ -1911,12 +1911,19 @@ impl Executor {
                 let shell = session.borrow();
                 (shell.entries.clone(), shell.base, shell.last_line_added)
             };
+            // fc.def:334: rh = remember_on_history (the `history` set -o
+            // option; on for interactive shells).
+            let remember = crate::builtins::set::shell_option_enabled(
+                &self.shell_state.env_vars,
+                "history",
+            );
             crate::builtins::fc::execute_with_history(
                 &cmd.words[1..],
                 &self.diagnostic_prefix(),
-                &entries,
+                entries,
                 base,
                 last_added,
+                remember,
                 posix_mode,
                 &mut stdout,
                 &mut stderr,
@@ -1929,8 +1936,9 @@ impl Executor {
             crate::builtins::fc::execute_with_history(
                 &cmd.words[1..],
                 &self.diagnostic_prefix(),
-                &provider_entries,
+                provider_entries,
                 1,
+                false,
                 false,
                 posix_mode,
                 &mut stdout,
@@ -1944,10 +1952,24 @@ impl Executor {
                 start,
                 end,
                 rev,
+                drop_last_entry,
             } => {
                 // fc.def edit_and_execute_command: write the selected
                 // entries to a temp file, run the editor with inherited
                 // stdio, read the result back, remember and execute it.
+                // The fc-line deletion (fc.def:403-421) happens first:
+                // EditWith indices address the post-deletion list. An
+                // empty selection still runs the editor on an empty
+                // file, exactly like GNU (#1117).
+                if drop_last_entry {
+                    if let Some(session) = session.as_ref() {
+                        let mut shell = session.borrow_mut();
+                        if !shell.entries.is_empty() {
+                            shell.entries.pop();
+                            shell.timestamps.pop();
+                        }
+                    }
+                }
                 let indices: Vec<usize> = if rev {
                     (start..=end).rev().collect()
                 } else {
@@ -1962,16 +1984,56 @@ impl Executor {
                     .filter(|i| **i < session_entries.len())
                     .map(|i| session_entries[*i].clone())
                     .collect();
-                if selected.is_empty() {
-                    return Ok(0);
-                }
                 let editor_name = editor
                     .or_else(|| self.get_env("FCEDIT").map(String::from))
                     .or_else(|| self.get_env("EDITOR").map(String::from))
                     .unwrap_or_else(|| String::from("vi"));
+                // fc.def: sh_mktmpfp ("bash-fc", MT_USERANDOM|MT_USETMPDIR)
+                // -- a six-character random suffix, created exclusively.
+                let file_text = if selected.is_empty() {
+                    String::new()
+                } else {
+                    selected.join("\n") + "\n"
+                };
                 let mut path = std::env::temp_dir();
-                path.push(format!("bash-fc.{}", std::process::id()));
-                if std::fs::write(&path, selected.join("\n") + "\n").is_err() {
+                let mut rng_state = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9e37_79b9_7f4a_7c15)
+                    ^ (std::process::id() as u64).rotate_left(17)
+                    | 1;
+                let mut created = false;
+                for _ in 0..16 {
+                    let suffix: String = (0..6)
+                        .map(|_| {
+                            // xorshift64*; take a letter/digit like mkstemp.
+                            rng_state ^= rng_state >> 12;
+                            rng_state ^= rng_state << 25;
+                            rng_state ^= rng_state >> 27;
+                            let v = (rng_state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 58) as u8;
+                            match v % 62 {
+                                0..=25 => (b'a' + v % 62) as char,
+                                26..=51 => (b'A' + v % 62 - 26) as char,
+                                _ => (b'0' + v % 62 - 52) as char,
+                            }
+                        })
+                        .collect();
+                    path.push(format!("bash-fc.{suffix}"));
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(mut file) => {
+                            created = file.write_all(file_text.as_bytes()).is_ok();
+                            break;
+                        }
+                        Err(_) => {
+                            path.pop();
+                        }
+                    }
+                }
+                if !created {
                     writeln!(
                         stderr,
                         "{pfx}fc: cannot open temp file",
@@ -1980,34 +2042,43 @@ impl Executor {
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     return Ok(1);
                 }
-                let editor_path = crate::executor::path::find_user_command(
-                    &editor_name,
-                    &self.shell_state.env_vars,
-                )
-                .unwrap_or_else(|| std::path::PathBuf::from(&editor_name));
-                let mut edit_command = std::process::Command::new(&editor_path);
-                // The editor is an external child like any other: it gets
-                // the exported table vars explicitly (#916 — no process-env
-                // mirror to inherit from anymore).
-                self.apply_child_environment(&mut edit_command);
-                edit_command.arg(&path);
-                suppress_orphan_console(&mut edit_command);
-                let edit_status = edit_command.status();
-                match edit_status {
-                    Ok(st) if st.success() => {}
-                    Ok(st) => {
+                // fc.def edit_and_execute_command: the editor string is
+                // a shell COMMAND LINE run through parse_and_execute with
+                // the temp file appended (sprintf "%s %s", ename, fn) —
+                // builtins, functions and multi-word editors all work
+                // (`fc -e :`, `fc -e 'sed -i s/a/b/'`), and any failure
+                // makes fc fail with EXECUTION_FAILURE (#1117).
+                let editor_line = format!("{editor_name} {}", path.display());
+                let editor_tokens = crate::lexer::tokenize(&editor_line);
+                let mut editor_ast = crate::parser::parse_with_options(
+                    &editor_tokens,
+                    crate::parser::ParseLoopOptions {
+                        stray_close_is_error: true,
+                        diagnostic_text: None,
+                        source_text: Some(editor_line.as_str().into()),
+                        source_line_offset: 0,
+                    },
+                );
+                self.apply_command_output_redirects(cmd, &mut editor_ast)?;
+                let editor_result = self.with_compound_output_redirects(cmd, |executor| {
+                    executor.execute_ast(&editor_ast)
+                });
+                let editor_status = self.exit_code;
+                match editor_result {
+                    Ok(()) if editor_status == 0 => {}
+                    Ok(()) => {
                         let _ = std::fs::remove_file(&path);
-                        return Ok(crate::executor::wait_status::process_exit_status(&st));
+                        self.exit_code = 1;
+                        return Ok(1);
                     }
-                    Err(err) => {
-                        writeln!(
-                            stderr,
-                            "{pfx}fc: {editor_name}: {err}",
-                            pfx = self.diagnostic_prefix(),
-                        )?;
-                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    Err(ExecuteError::ExitCode(code)) => {
                         let _ = std::fs::remove_file(&path);
-                        return Ok(127);
+                        return Err(ExecuteError::ExitCode(code));
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&path);
+                        self.exit_code = 1;
+                        return Ok(1);
                     }
                 }
                 let edited = std::fs::read_to_string(&path).unwrap_or_default();
@@ -2026,9 +2097,13 @@ impl Executor {
                     let ignore = self.get_env("HISTIGNORE").unwrap_or_default();
                     let histsize =
                         crate::history::SessionHistory::size_limit(self.get_env("HISTSIZE"));
-                    session
-                        .borrow_mut()
-                        .record(&edited, &control, &ignore, histsize);
+                    let mut shell = session.borrow_mut();
+                    // The fc-line entry was already deleted above
+                    // (fc.def:403-421); the executed text is remembered
+                    // in its place (fc_execute_file with
+                    // remember_on_history forced on, fc.def:530).
+                    let was_recorded = shell.record(&edited, &control, &ignore, histsize);
+                    shell.last_line_added = was_recorded;
                 }
                 let tokens = crate::lexer::tokenize(&edited);
                 let mut ast = crate::parser::parse_with_options(
@@ -2054,9 +2129,13 @@ impl Executor {
                     let histsize =
                         crate::history::SessionHistory::size_limit(self.get_env("HISTSIZE"));
                     let mut shell = session.borrow_mut();
-                    // fc.def fc_replhist: the executed command REPLACES the
-                    // fc entry (delete the last line, add the new one), so
-                    // the fc command itself never appears in the history.
+                    // fc.def fc_replhist: the executed command REPLACES
+                    // the last entry (bash_delete_last_history +
+                    // maybe_add_history), so the fc command itself never
+                    // appears in the history. Rubash pops when the last
+                    // entry is the current line's (hist_last_line_added),
+                    // which covers both the interactive fc line and the
+                    // entry an `fc -s`/`fc -e -` re-execution resolved.
                     if shell.last_line_added && !shell.entries.is_empty() {
                         shell.entries.pop();
                         shell.timestamps.pop();

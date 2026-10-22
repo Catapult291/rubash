@@ -18,12 +18,16 @@ pub enum FcResult {
         command: String,
     },
     /// fc -e: open the selected entries in an editor, then execute the
-    /// edited result (fc.def edit_and_execute_command).
+    /// edited result (fc.def edit_and_execute_command). `start`/`end`
+    /// index the history list AFTER the fc-line entry has been dropped
+    /// (fc.def:403-421); `drop_last_entry` tells the executor to perform
+    /// that deletion on the live session before selecting.
     EditWith {
         editor: Option<String>,
         start: usize,
         end: usize,
         rev: bool,
+        drop_last_entry: bool,
     },
 }
 
@@ -111,8 +115,9 @@ where
     execute_with_history(
         args,
         diagnostic_prefix,
-        &[],
+        Vec::new(),
         1,
+        false,
         false,
         false,
         &mut io::sink(),
@@ -124,9 +129,10 @@ where
 pub fn execute_with_history<E, O>(
     args: &[String],
     diagnostic_prefix: &str,
-    entries: &[String],
+    mut entries: Vec<String>,
     history_base: usize,
     last_line_added: bool,
+    remember_on_history: bool,
     posix_mode: bool,
     stdout: &mut O,
     stderr: &mut E,
@@ -221,10 +227,16 @@ where
         editor = None;
     }
 
-    // fc.def: hist_last_line_added handling -- when the currently executing
-    // line was recorded, back up over it so the "last entry" is the one
-    // before the current line (last_hist = i - rh - hist_last_line_added).
-    let last_hist: i64 = count as i64 - 1 - last_line_added as i64;
+    // fc.def:334-348 (fc_builtin) / fc_gethist: last_hist = i - rh -
+    // hist_last_line_added, where rh is remember_on_history (set -o
+    // history / interactive). With rh == 0 and the current line not
+    // added, last_hist lands one past the end and backs up over the
+    // empty tail slot to the last real entry (#1117).
+    let mut last_hist: i64 =
+        count as i64 - remember_on_history as i64 - last_line_added as i64;
+    if last_hist >= count as i64 {
+        last_hist = count as i64 - 1;
+    }
     let real_last: usize = count.saturating_sub(1);
 
     let pos: Vec<&String> = args[index..].iter().collect();
@@ -257,7 +269,7 @@ where
         }
         let resolved = match spec {
             None => Ok(last_hist.max(0) as usize),
-            Some(s) => fc_gethnum(s, entries, history_base, last_hist, real_last, false, false),
+            Some(s) => fc_gethnum(s, &entries, history_base, last_hist, real_last, false, false),
         };
         let idx = match resolved {
             Ok(i) => i,
@@ -283,7 +295,7 @@ where
     let resolved: Result<(usize, usize), SpecErr> = match (pos.first(), pos.get(1)) {
         (Some(f), Some(l)) => fc_gethnum(
             f,
-            entries,
+            &entries,
             history_base,
             last_hist,
             real_last,
@@ -293,7 +305,7 @@ where
         .and_then(|b| {
             fc_gethnum(
                 l,
-                entries,
+                &entries,
                 history_base,
                 last_hist,
                 real_last,
@@ -304,7 +316,7 @@ where
         }),
         (Some(f), None) => fc_gethnum(
             f,
-            entries,
+            &entries,
             history_base,
             last_hist,
             real_last,
@@ -353,6 +365,40 @@ where
         }
     };
 
+    // fc.def:403-421: when not listing and the current line was added,
+    // "the fc command that caused the editing shall not be entered into
+    // the history list" -- the last entry is deleted BEFORE the edited
+    // text is produced, and a range that pointed at the deleted slot
+    // backs off to the new last entry (hlist[last_hist] == 0 after the
+    // delete). This is why `history -s X; fc -e :` edits an empty file
+    // in a non-interactive shell: the -s entry is the deleted slot and
+    // the range collapses onto the (empty) remainder (#1117).
+    let mut drop_last_entry = false;
+    if !listing && last_line_added && !entries.is_empty() {
+        entries.pop();
+        drop_last_entry = true;
+        let mut beg = histbeg as i64;
+        let mut end = histend as i64;
+        let mut last = last_hist;
+        // hlist[last_hist] == 0 once the slot at last_hist was deleted.
+        if beg == end && end == last && last >= entries.len() as i64 {
+            last -= 1;
+            end -= 1;
+            beg = end;
+        }
+        if last >= entries.len() as i64 || last < 0 {
+            last -= 1;
+        }
+        if end >= last {
+            end = last;
+        } else if beg >= last {
+            beg = last;
+        }
+        histbeg = beg.max(0) as usize;
+        histend = end.max(0) as usize;
+        last_hist = last;
+    }
+
     // fc.def: an inverted range swaps and forces reverse order.
     let mut rev = reverse;
     if histend < histbeg {
@@ -392,6 +438,7 @@ where
             start: histbeg,
             end: histend,
             rev,
+            drop_last_entry,
         });
     }
 
@@ -452,6 +499,17 @@ mod tests {
     use super::*;
 
     fn run_fc(args: &[&str], entries: &[&str]) -> (String, String, FcResult) {
+        // Interactive model: the fc line itself is the last entry and
+        // remember_on_history is on.
+        run_fc_model(args, entries, true, true)
+    }
+
+    fn run_fc_model(
+        args: &[&str],
+        entries: &[&str],
+        last_line_added: bool,
+        remember_on_history: bool,
+    ) -> (String, String, FcResult) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
         let mut stdout = Vec::new();
@@ -459,9 +517,10 @@ mod tests {
         let result = execute_with_history(
             &args,
             "",
-            &entries,
+            entries,
             1,
-            entries.last().map(|e| e == "fc").unwrap_or(false),
+            last_line_added,
+            remember_on_history,
             false,
             &mut stdout,
             &mut stderr,
@@ -640,6 +699,61 @@ mod tests {
         let (_, stderr, result) = run_fc(&["-s", "cc"], &["echo aa ab ac", "fc"]);
         expect_status(&result, EXECUTION_FAILURE);
         assert_eq!(stderr, "fc: no command found\n");
+    }
+
+    // --- non-interactive model (remember_on_history off) ---
+
+    #[test]
+    fn test_fc_list_after_s_pushes_uses_raw_last_hist() {
+        // rubash#1117: entries fed only by `history -s` (each push sets
+        // hist_last_line_added via really_add_history, bashhist.c:961)
+        // with remember_on_history off: last_hist = count - 0 - 1, so
+        // -2 covers both pushed entries.
+        let (out, _, result) = run_fc_model(
+            &["-ln", "-2"],
+            &["echo FIRST_CMD", "echo SECOND_CMD"],
+            true,
+            false,
+        );
+        expect_status(&result, EXECUTION_SUCCESS);
+        expect_lines(&out, &["\t echo FIRST_CMD", "\t echo SECOND_CMD"]);
+    }
+
+    #[test]
+    fn test_fc_edit_drops_last_pushed_entry() {
+        // fc.def:403-421 + fc16 probe: the default edit range points at
+        // the last entry; the not-listing deletion removes that entry
+        // first, so the range backs off to the previous one and the
+        // executor must drop the entry from the live session.
+        let (_, _, result) = run_fc_model(&["-e", ":"], &["echo U1", "echo U2"], true, false);
+        match result {
+            FcResult::EditWith {
+                start,
+                end,
+                drop_last_entry,
+                ..
+            } => {
+                assert_eq!((start, end), (0, 0));
+                assert!(drop_last_entry);
+            }
+            _ => panic!("expected EditWith"),
+        }
+    }
+
+    #[test]
+    fn test_fc_s_substitution_on_pushed_entries() {
+        // fc15 probe: `fc -s BBB=CCC` resolves the last pushed entry
+        // (last_hist = count - rh - added = 1), not the one before it.
+        let (_, _, result) = run_fc_model(
+            &["-s", "BBB=CCC"],
+            &["echo AAA", "echo BBB"],
+            true,
+            false,
+        );
+        match result {
+            FcResult::Reexec { command } => assert_eq!(command, "echo CCC"),
+            _ => panic!("expected Reexec"),
+        }
     }
 
     // --- --help ---
