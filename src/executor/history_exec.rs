@@ -420,6 +420,16 @@ pub(in crate::executor) fn execute_history_session(
         HistoryMode::List => {
             let base = shell.base;
             let entries = shell.entries.clone();
+            let timestamps = shell.timestamps.clone();
+            // GNU builtins/history.def (display_history): with
+            // HISTTIMEFORMAT set and non-null, each line carries the
+            // entry's timestamp rendered through strftime between the
+            // marker and the entry text (rubash#1070). An entry without a
+            // recorded stamp renders against the epoch, matching GNU's
+            // zero-initialized hist_inittime for unstamped entries.
+            let time_format = executor
+                .get_env("HISTTIMEFORMAT")
+                .filter(|value| !value.is_empty());
             let start = match count {
                 Some(n) => entries.len().saturating_sub(n),
                 None => 0,
@@ -430,7 +440,25 @@ pub(in crate::executor) fn execute_history_session(
                 // histdata is only set for interactive continuations;
                 // script entries always print the space marker (history.def:408).
                 let mark = " ";
-                let _ = writeln!(stdout, "{:>5}{} {}", base + index, mark, entry);
+                match &time_format {
+                    Some(format) => {
+                        let epoch = timestamps
+                            .get(index)
+                            .and_then(|stamp| stamp.strip_prefix('#'))
+                            .and_then(|seconds| seconds.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let rendered = crate::builtins::printf::time::format_epoch_time(
+                            format,
+                            epoch,
+                            &executor.shell_state.env_vars,
+                        );
+                        let _ =
+                            writeln!(stdout, "{:>5}{} {}{}", base + index, mark, rendered, entry);
+                    }
+                    None => {
+                        let _ = writeln!(stdout, "{:>5}{} {}", base + index, mark, entry);
+                    }
+                }
             }
         }
     }

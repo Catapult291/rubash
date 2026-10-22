@@ -47,6 +47,20 @@ pub(crate) fn format_current_time(format: &str, env_vars: &HashMap<String, Strin
     strftime_subset(format, &local)
 }
 
+/// Format an arbitrary epoch second with the same strftime subset and
+/// TZ rules as `printf %()T` (history listings render HISTTIMEFORMAT
+/// against each entry's recorded timestamp this way — builtins/
+/// history.def display_history via strftime, rubash#1070).
+pub(crate) fn format_epoch_time(
+    format: &str,
+    epoch: i64,
+    env_vars: &HashMap<String, String>,
+) -> String {
+    let timezone = TimeZoneRule::from_env(env_vars.get("TZ").map(String::as_str));
+    let local = timezone.local_time(epoch);
+    strftime_subset(format, &local)
+}
+
 fn current_epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
