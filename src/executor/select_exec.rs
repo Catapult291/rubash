@@ -176,40 +176,73 @@ impl Executor {
         select_command: &SelectCommand,
         values: &[String],
     ) -> Result<(), ExecuteError> {
-        let ps3 = self
-            .shell_state
-            .env_vars
-            .get("PS3")
-            .cloned()
-            .unwrap_or_else(|| "#? ".to_string());
         let has_stdin = self.shell_state.env_vars.contains_key(FUNCTION_STDIN);
         let mut stdin_offset = self.select_stdin_offset(has_stdin);
 
+        // GNU execute_cmd.c:3495-3631 execute_select_command with
+        // config-top.h:89 KSH_COMPATIBLE_SELECT: the menu prints once
+        // (show_menu starts 1); after each body run only the prompt
+        // prints, unless the body emptied REPLY.
+        let mut show_menu = true;
         loop {
+            // GNU execute_cmd.c:3566-3570: PS3 is re-read every iteration,
+            // so a body assignment retargets the next prompt.
+            let ps3 = self
+                .shell_state
+                .env_vars
+                .get("PS3")
+                .cloned()
+                .unwrap_or_else(|| "#? ".to_string());
             let mut prompt = Vec::new();
-            for (i, value) in values.iter().enumerate() {
-                writeln!(&mut prompt, "{}) {}", i + 1, value)?;
+            if show_menu {
+                for (i, value) in values.iter().enumerate() {
+                    writeln!(&mut prompt, "{}) {}", i + 1, value)?;
+                }
             }
             write!(&mut prompt, "{ps3}")?;
             self.write_default_stderr(&prompt)?;
 
-            let Some(input) = self.read_select_input(has_stdin, &mut stdin_offset) else {
-                // GNU execute_cmd.c:3574-3580: select_query's EOF (read
-                // failure) returns NULL and execute_select_command sets
-                // retval = EXECUTION_FAILURE.
+            let (input, at_eof) = self.read_select_line(has_stdin, &mut stdin_offset);
+            // GNU builtins/read.def:987-1011 (no NAMEs, non-raw call from
+            // select_query): every read attempt lands in REPLY verbatim —
+            // no IFS strip — with backslash unescaping, including the
+            // empty string on clean EOF and the partial line on an
+            // unterminated tail.
+            let reply = unescape_read_backslashes(&input);
+            if !self.apply_shell_assignment("REPLY", reply.clone()) {
+                // GNU: the read_builtin bind failure fails the query —
+                // stdout newline, no body, status failure (rubash#1018
+                // probe: `readonly REPLY` prints `REPLY: readonly
+                // variable`, skips the body, exits 1).
+                let _ = self.write_default_stdout(b"\n");
+                self.exit_code = 1;
+                if self.posix_assignment_failure_is_fatal() {
+                    let code = self.expansion_fatal_status();
+                    self.exit_code = code;
+                    return Err(ExecuteError::ExitCode(code));
+                }
+                return Ok(());
+            }
+            set_process_env("REPLY", &reply);
+            if at_eof {
+                // GNU zread/read.def: an unterminated tail still binds
+                // REPLY but fails the read, so the menu is done — stdout
+                // newline, status 1, no body run.
+                let _ = self.write_default_stdout(b"\n");
                 self.exit_code = 1;
                 return Ok(());
-            };
-            if input.is_empty() {
+            }
+            if reply.is_empty() {
+                // GNU execute_cmd.c:3473-3477 select_query: an empty REPLY
+                // re-arms the menu and reprompts without running the body.
+                // The check is on the bound REPLY (post-unescape), so a
+                // whitespace-only line is NOT empty — it runs the body
+                // with an empty selection (valid_number fails on it).
+                show_menu = true;
                 continue;
             }
 
-            let selected = input
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n >= 1 && *n <= values.len())
-                .map(|n| values[n - 1].clone())
-                .unwrap_or_default();
+            let selected = select_reply_selection(&reply, values).unwrap_or_default();
             // GNU execute_cmd.c execute_select_command binds the reply
             // through bind_variable: nameref select variables follow full
             // assignment semantics (empty-cell nameref stores the cell,
@@ -239,7 +272,18 @@ impl Executor {
             // GNU execute_cmd.c:3606 REAP() (execute_select_command).
             self.reap_dead_jobs_after_loop_body();
             match body_flow {
-                SelectBodyFlow::ContinueLoop => continue,
+                SelectBodyFlow::ContinueLoop => {
+                    // GNU config-top.h:89 KSH_COMPATIBLE_SELECT tail: the
+                    // menu stays hidden unless the body emptied REPLY (an
+                    // unset REPLY is NULL, not empty — the menu stays
+                    // hidden).
+                    show_menu = self
+                        .shell_state
+                        .env_vars
+                        .get("REPLY")
+                        .is_some_and(|current| current.is_empty());
+                    continue;
+                }
                 SelectBodyFlow::BreakLoop => break,
             }
         }
@@ -259,43 +303,69 @@ impl Executor {
         }
     }
 
-    fn read_select_input(&mut self, has_stdin: bool, stdin_offset: &mut usize) -> Option<String> {
+    fn read_select_line(&mut self, has_stdin: bool, stdin_offset: &mut usize) -> (String, bool) {
+        // Logical line for select_query's read_builtin(NULL) call: GNU
+        // builtins/read.def:802-830 reads char-by-char (non-raw), so a
+        // `\<newline>` pair vanishes and reading continues with the next
+        // physical line; a trailing-backslash run of even length is an
+        // escaped backslash (no continuation — `a\\` binds `a\`). EOF,
+        // clean or as an unterminated tail, fails the read in every case.
+        // No trimming: select_query parses and emptiness-checks the bound
+        // REPLY value, and the no-NAMEs path leaves surrounding
+        // whitespace intact.
+        let mut logical = String::new();
+        loop {
+            let (physical, at_eof) = match self.read_select_physical_line(has_stdin, stdin_offset) {
+                None => return (logical, true),
+                Some(pair) => pair,
+            };
+            logical.push_str(&physical);
+            if at_eof {
+                return (logical, true);
+            }
+            if trailing_backslash_run(&logical) % 2 == 1 {
+                // GNU backs up over the CTLESC: drop the continuating
+                // backslash (one ASCII byte) and read on.
+                logical.pop();
+                continue;
+            }
+            return (logical, false);
+        }
+    }
+
+    fn read_select_physical_line(
+        &mut self,
+        has_stdin: bool,
+        stdin_offset: &mut usize,
+    ) -> Option<(String, bool)> {
+        // Returns the raw physical line WITHOUT the trailing newline plus
+        // whether it is an unterminated EOF tail; None is clean EOF with
+        // no bytes.
         if !has_stdin {
             // Raw handle read like GNU zread: io::stdin() owns a process-wide
             // BufReader that would prefetch the whole stream and break the
             // shared kernel offset for sibling reads.
             let stdin_handle = crate::fd::process_std_handle(0);
             let mut line: Vec<u8> = Vec::new();
-            let result = loop {
+            let at_eof = loop {
                 match crate::fd::read_some(stdin_handle, 1) {
-                    Ok(buf) if buf.is_empty() => break Ok(0_usize),
+                    Ok(buf) if buf.is_empty() => break true,
                     Ok(buf) => {
                         line.push(buf[0]);
                         if buf[0] == b'\n' {
-                            break Ok(1_usize);
+                            break false;
                         }
                     }
-                    Err(e) => break Err(e),
+                    Err(_) => {
+                        self.exit_code = 1;
+                        return Some((String::new(), false));
+                    }
                 }
             };
-            return match result {
-                Ok(0) => {
-                    // GNU execute_cmd.c:3468: on the read failure (EOF),
-                    // select_query does putchar('\n') — a STDOUT newline —
-                    // before returning NULL.
-                    let _ = self.write_default_stdout(b"\n");
-                    None
-                }
-                Ok(_) => Some(
-                    crate::executor::bytes_to_shell_text(&line)
-                        .trim()
-                        .to_string(),
-                ),
-                Err(_) => {
-                    self.exit_code = 1;
-                    Some(String::new())
-                }
-            };
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            return Some((crate::executor::bytes_to_shell_text(&line), at_eof));
         }
 
         let stdin_content = self
@@ -305,22 +375,20 @@ impl Executor {
             .cloned()
             .unwrap_or_default();
         if *stdin_offset >= stdin_content.len() {
-            // Same execute_cmd.c:3468 putchar('\n') — stdout — on EOF.
-            let _ = self.write_default_stdout(b"\n");
             return None;
         }
         let remaining = &stdin_content[*stdin_offset..];
-        let input = if let Some(newline_pos) = remaining.find('\n') {
+        let (input, at_eof) = if let Some(newline_pos) = remaining.find('\n') {
             *stdin_offset += newline_pos + 1;
-            remaining[..newline_pos].to_string()
+            (remaining[..newline_pos].to_string(), false)
         } else {
             *stdin_offset = stdin_content.len();
-            remaining.to_string()
+            (remaining.to_string(), true)
         };
         self.shell_state
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), stdin_offset.to_string());
-        Some(input)
+        Some((input, at_eof))
     }
 
     fn execute_select_body(
@@ -348,4 +416,60 @@ impl Executor {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Length of the trailing `\` byte run. GNU builtins/read.def:802-830
+/// swallows a `\<newline>` pair mid-stream, so continuation fires exactly
+/// for an odd run (the last backslash is unescaped); an even run is
+/// escaped backslashes with no continuation.
+fn trailing_backslash_run(s: &str) -> usize {
+    s.as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count()
+}
+
+/// GNU general.c:248 valid_number (strtoimax, base 10) as used by
+/// execute_cmd.c:3479 select_query: leading C-locale whitespace is
+/// skipped, an optional sign and ASCII digits are consumed, trailing
+/// whitespace is skipped, and the whole string must convert with no
+/// overflow. Returns the selected value for 1..=len, None otherwise
+/// (select_query returns "" for both invalid and out-of-range input —
+/// the body still runs with an empty selection).
+fn select_reply_selection(reply: &str, values: &[String]) -> Option<String> {
+    fn is_c_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+    }
+    let bytes = reply.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && is_c_space(bytes[i]) {
+        i += 1;
+    }
+    let mut j = i;
+    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+        j += 1;
+    }
+    let digits_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == digits_start {
+        return None;
+    }
+    let mut k = j;
+    while k < bytes.len() && is_c_space(bytes[k]) {
+        k += 1;
+    }
+    if k != bytes.len() {
+        return None;
+    }
+    // Slice boundaries sit on ASCII whitespace/sign/digits, so this
+    // cannot split a UTF-8 sequence. i64 overflow (strtoimax errno)
+    // fails the conversion, matching valid_number.
+    let n: i64 = reply[i..j].parse().ok()?;
+    if n < 1 || n as u64 > values.len() as u64 {
+        return None;
+    }
+    Some(values[n as usize - 1].clone())
 }
