@@ -3783,22 +3783,25 @@ pub(in crate::executor) fn split_compound_element_words(value: &str) -> Vec<Stri
             // expand_assignment_value_hoisting) as the quotes they stand
             // for — a `]` inside them is data. The pushed token keeps the
             // sentinels verbatim; only this span walk reads the shadow.
-            let rest: Vec<char> = value[offset..].chars().collect();
-            let shadow: Vec<char> = rest
-                .iter()
-                .map(|c| match c {
-                    c if *c == SQ_DATA => '\'',
-                    c if *c == DQ_DATA => '"',
-                    other => *other,
-                })
-                .collect();
-            if let Some(end) = crate::lexer::arraysub_span_len(&shadow) {
-                token.push_str(&rest[..end].iter().collect::<String>());
-                // The leading `[` was already consumed by the iterator's
-                // `chars.next()`; the walker's span covers it, so advance
-                // only the remaining end - 1 characters.
-                for _ in 1..end {
-                    chars.next();
+            // perf: measure the span on the string itself — the old
+            // `value[offset..].chars().collect::<Vec<char>>()` (plus its
+            // shadow copy) of the whole rest made every element cost
+            // O(remaining input), i.e. the whole split O(n^2)
+            // (a=([0]="0" ...) 8k ~850ms, 20k ~5.2s). Same span, no
+            // collect; `compound_subscript_span_len` keeps the
+            // sentinel-as-quote rule.
+            let rest = &value[offset..];
+            if let Some(end) = compound_subscript_span_len(rest) {
+                token.push_str(&rest[..end]);
+                // The leading `[` (one byte) was already consumed by the
+                // iterator's `chars.next()`; advance past the span's
+                // remaining end - 1 bytes.
+                let mut consumed = 1usize;
+                while consumed < end {
+                    match chars.next() {
+                        Some((_, c)) => consumed += c.len_utf8(),
+                        None => break,
+                    }
                 }
                 continue;
             }
@@ -3863,6 +3866,52 @@ pub(in crate::executor) fn split_compound_element_words(value: &str) -> Vec<Stri
         tokens.push(token);
     }
     tokens
+}
+
+/// Byte length (ending just past the closer) of the `[...]` element-leader
+/// span at `text[0]` — the same scan as `lexer::arraysub_span_len` (GNU
+/// parse.y:5635-5651 read_token_word under PST_COMPASSIGN, parse_matched_pair
+/// P_ARRAYSUB: quotes/escapes recurse, nested `[` pairs count, everything
+/// else is span data), but over the string itself so the splitter never
+/// collects the whole rest of the input per element (that collect was the
+/// compound-literal O(n^2)), and with the hoisted quote sentinels (E307/E302,
+/// expand_assignment_value_hoisting) counting as quotes like the shadow walk
+/// it replaces. Returns a byte index, always a char boundary (it stops just
+/// past the ASCII `]`).
+fn compound_subscript_span_len(text: &str) -> Option<usize> {
+    let mut bytes = text.char_indices();
+    match bytes.next() {
+        Some((_, '[')) => {}
+        _ => return None,
+    }
+    let mut depth = 1usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for (off, ch) in bytes {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !single => escaped = true,
+            '\'' | crate::executor::markers::ASSIGN_HOISTED_SQUOTE if !double => {
+                single = !single;
+            }
+            '"' | crate::executor::markers::ASSIGN_DATA_DQUOTE if !single => {
+                double = !double;
+            }
+            '[' if !single && !double => depth += 1,
+            ']' if !single && !double => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(off + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn preserve_prompt_escapes(value: &str) -> String {
