@@ -363,6 +363,15 @@ impl Executor {
         self.history_provider = Some(provider);
     }
 
+    /// Whether a host HistoryProvider owns the interactive history list.
+    /// builtins/history.def reads the shell's ONE list; an installed
+    /// provider IS that list (job_builtins execute_history's provider
+    /// precedence encodes it), so grouped-reader scratch sessions must key
+    /// their install on this and never shadow it (unixwin/niubash#508).
+    pub(crate) fn has_history_provider(&self) -> bool {
+        self.history_provider.is_some()
+    }
+
     /// Snapshot of the host-installed history provider's list (oldest to
     /// newest), for interactive history expansion. `None` when no provider
     /// is installed — the engine's session history is the list then.

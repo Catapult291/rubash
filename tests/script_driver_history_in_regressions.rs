@@ -229,6 +229,116 @@ fn interactive_set_minus_h_explicitly_enables() {
     );
 }
 
+/// unixwin/niubash#508 (part B): an interactive host whose history list is
+/// a HistoryProvider (niu's REPL wires reedline's file-backed list here)
+/// must keep that list across a grouped-reader line batch. The driver
+/// unconditionally installed a fresh SessionHistory over the provider
+/// (script_driver's session swap), so `history`/`fc` — which read the
+/// shell's ONE list per builtins/history.def — saw an empty list inside
+/// the batch and forever after.
+#[test]
+fn provider_backed_list_survives_grouped_batch() {
+    let provider = Rc::new(RefCell::new(VecProvider {
+        entries: vec!["alias 1='cd -1'".to_string(), "HISTORY_MARKER".to_string()],
+    }));
+    let mut executor = Executor::new();
+    executor.set_history_provider(provider.clone());
+    executor.set_env("HISTSIZE", "500");
+
+    let out = std::env::temp_dir().join(format!("rubash-508-{}-out.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let out_str = out.to_string_lossy().replace('\\', "/");
+
+    // The `;` group is the shape niubash's interactive reader routes
+    // through this driver (a `history 1` line whose `1` matches an alias
+    // takes the same route). `history 1` must still list the provider's
+    // last entry.
+    let code = rubash::script_driver::run_script_with_history_at_line_offset(
+        &mut executor,
+        &format!("alias 1='cd -1'\nhistory 1 >{out_str}\n"),
+        0,
+        None,
+    );
+    assert_eq!(code, 0);
+
+    // The batch must not have installed a scratch list over the provider.
+    assert!(
+        executor.get_session_history().is_none(),
+        "a provider-backed shell must not gain a shadow session history"
+    );
+
+    let body = std::fs::read_to_string(&out).expect("history listing output file");
+    assert!(
+        body.contains("HISTORY_MARKER"),
+        "`history 1` inside the batch must list the provider's entry: {body:?}"
+    );
+
+    // A second batch still sees the provider's list — the wipe used to be
+    // permanent because the installed scratch shadowed it.
+    let _ = std::fs::remove_file(&out);
+    let code = rubash::script_driver::run_script_with_history_at_line_offset(
+        &mut executor,
+        &format!("history >{out_str}\n"),
+        0,
+        None,
+    );
+    assert_eq!(code, 0);
+    let body = std::fs::read_to_string(&out).expect("history listing output file");
+    assert!(
+        body.contains("HISTORY_MARKER"),
+        "`history` after the batch must still list the provider's entries: {body:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Without a host provider the fresh scratch still installs as the shell's
+/// list (GNU's per-shell history list), so `history` inside the batch reads
+/// the same list the group's recording writes to.
+#[test]
+fn providerless_batch_still_installs_fresh_session() {
+    let mut executor = Executor::new();
+    let code = rubash::script_driver::run_script_with_history_at_line_offset(
+        &mut executor,
+        "echo seed\n",
+        0,
+        None,
+    );
+    assert_eq!(code, 0);
+    assert!(executor.get_session_history().is_some());
+}
+
+/// Same #508 root on the PROMPT_COMMAND path: the runner's empty-session
+/// arm installed a per-prompt scratch over the host provider, emptying
+/// `history`/`fc` for the rest of the session. With a provider installed
+/// the scratch is used for expansion/record mechanics only and never
+/// becomes the shell's list.
+#[test]
+fn prompt_command_does_not_shadow_provider_list() {
+    let provider = Rc::new(RefCell::new(VecProvider {
+        entries: vec!["HISTORY_MARKER".to_string()],
+    }));
+    let mut executor = Executor::new();
+    executor.set_history_provider(provider.clone());
+    executor.set_env("PROMPT_COMMAND", "__pc_ran=1");
+    assert_eq!(executor.execute_prompt_command(), Some(0));
+    assert_eq!(executor.get_env("__pc_ran"), Some("1"));
+    assert!(
+        executor.get_session_history().is_none(),
+        "PROMPT_COMMAND must not leave a scratch session over the provider"
+    );
+}
+
+/// Without a host provider the PROMPT_COMMAND scratch still installs, so
+/// `history` inside the runner sees the shell's live list (bashhist.c:
+/// the runner acts on the current shell's history list).
+#[test]
+fn prompt_command_scratch_installs_without_provider() {
+    let mut executor = Executor::new();
+    executor.set_env("PROMPT_COMMAND", "__pc_ran=1");
+    assert_eq!(executor.execute_prompt_command(), Some(0));
+    assert!(executor.get_session_history().is_some());
+}
+
 /// Without a host provider the engine's session history is the list
 /// (rubash's own interactive stdin path).
 #[test]
