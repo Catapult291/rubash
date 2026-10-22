@@ -964,6 +964,7 @@ fn run_history_group(
     let posix = executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
     let cmdhist = shopt_state_enabled(executor, "cmdhist", true);
     let lithist = shopt_state_enabled(executor, "lithist", false);
+    let histverify = shopt_state_enabled(executor, "histverify", false);
     let control = executor
         .get_env("HISTCONTROL")
         .unwrap_or_default()
@@ -1041,6 +1042,18 @@ fn run_history_group(
                 record_texts.push(Some(result.text));
                 // Print-only (:p) lines are never executed; use exec_parts so
                 // the group text omits them entirely.
+                modified_any = true;
+            }
+            1 if histverify => {
+                // shopt -s histverify (bashhist.c pre_process_line hands
+                // the expanded line back to readline for verification
+                // instead of executing it): a script has no editor to
+                // verify with, so the line is held and discarded — not
+                // echoed, not executed, not recorded (rubash#1072; GNU
+                // runs the script to completion with only the
+                // un-expanded lines producing output).
+                exec_parts.push(String::new());
+                record_texts.push(None);
                 modified_any = true;
             }
             status => {
@@ -4329,6 +4342,18 @@ pub fn pre_process_interactive_line(executor: &mut Executor, line: &str) -> Inte
             eprintln!("{}", result.text);
             if raw_preadded && !result.text.is_empty() {
                 executor.history_provider_replace_last(line, Some(result.text));
+            }
+            InteractiveExpansion::Discard
+        }
+        1 if shopt_state_enabled(executor, "histverify", false) => {
+            // shopt -s histverify: the expanded line goes back to the
+            // editor for verification instead of executing (bashhist.c
+            // pre_process_line's hist_verify redisplay). The host owns
+            // the edit buffer, so the in-repo contract is: do not execute,
+            // and record the EXPANDED text the way the :p arm records its
+            // printed line (rubash#1072).
+            if raw_preadded {
+                executor.history_provider_replace_last(line, Some(result.text.clone()));
             }
             InteractiveExpansion::Discard
         }
