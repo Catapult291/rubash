@@ -814,6 +814,17 @@ pub struct Executor {
     /// assignment expansion error sites, reset at each execute_ast loop
     /// iteration, consulted by maybe_run_error_trap.
     pub(crate) command_expansion_failed: Cell<bool>,
+    /// rubash#1164: GNU samples `was_error_trap` (execute_cmd.c:914/851 —
+    /// signal_is_trapped(ERROR_TRAP) && !signal_is_ignored) BEFORE a
+    /// command executes and adjudicates that command's failure against the
+    /// sample, reading the action string at fire time. A trap INSTALLED by
+    /// the command itself (a function that sets an ERR trap in its body,
+    /// then fails via its action's `return`) therefore does not re-fire
+    /// for the enclosing call. The ast_exec list loop refreshes this per
+    /// command; execute_ast_inner saves/restores it across nested lists.
+    /// None means no enclosing command is being adjudicated (direct
+    /// dispatch paths) — the runner then falls back to live presence.
+    pub(crate) err_trap_armed_sample: Cell<Option<bool>>,
     /// Nesting depth of `execute_ast_inner`: a nested list (function body,
     /// loop body, sourced text, ...) unwinds silently while an evalerror
     /// abort is pending; only the reader-level loop skips to the next

@@ -1570,8 +1570,19 @@ impl Executor {
         // propagates — other action-level states keep the historical
         // swallow here.
         let exit_unwind = matches!(result, Err(ExecuteError::ExitCode(_)));
+        // rubash#1164: a `return` inside the ERR action targets the frame
+        // the trap fired in (GNU runs the action in the interrupted
+        // function's context, so return_catch is live): when the trap
+        // fired while a function or sourced script was on the stack
+        // (trap_return_context > 0), the Return unwind must reach that
+        // frame instead of being swallowed — the function's remaining
+        // body is skipped and it returns the action's status. At the top
+        // level the return builtin itself errors and produces no unwind,
+        // so a stray Return here keeps the historical swallow.
+        let return_unwind = matches!(result, Err(ExecuteError::Return(_)))
+            && (self.shell_state.function_depth + self.source_nest_depth) > 0;
         self.exit_code = saved_exit;
-        if exit_unwind {
+        if exit_unwind || return_unwind {
             return result;
         }
         Ok(())

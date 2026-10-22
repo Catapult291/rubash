@@ -119,7 +119,13 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get() + 1);
+        // rubash#1164: a nested list (function body, compound body) samples
+        // was_error_trap per its own commands; the enclosing command's
+        // sample must be intact when its adjudication runs after the
+        // nested list returns.
+        let saved_err_trap_sample = self.err_trap_armed_sample.get();
         let result = self.execute_ast_inner_body(commands);
+        self.err_trap_armed_sample.set(saved_err_trap_sample);
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get().saturating_sub(1));
         // A trapped list tail with no following commands never reaches the
@@ -325,6 +331,14 @@ impl Executor {
             // error never suppresses the ERR trap this command earns by
             // failing (GNU run_error_trap is per execute_simple_command).
             self.command_expansion_failed.set(false);
+            // rubash#1164: sample was_error_trap for THIS command before it
+            // executes (execute_cmd.c:914) — adjudication below and inside
+            // dispatch consults the sample, so a trap this command installs
+            // (e.g. in a function body) cannot fire for the command itself.
+            self.err_trap_armed_sample.set(Some(matches!(
+                crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR"),
+                Some(ref action) if !action.is_empty()
+            )));
             // issue #485: the comsub $? overlay (word_expansion_comsub_exit)
             // belongs to ONE command's word expansion, exactly like GNU's
             // last_command_exit_value write in subst.c command_substitute —
