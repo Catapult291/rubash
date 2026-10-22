@@ -892,6 +892,18 @@ impl Executor {
 
     pub fn set_shell_option(&mut self, name: &str, enabled: bool) {
         crate::builtins::set::set_shell_option(&mut self.shell_state.env_vars, name, enabled);
+        // Startup-facing entry (CLI --posix/-o, invocation apply, sh
+        // argv0): GNU initialize_bashopts (shopt.def) snapshots $BASHOPTS
+        // AFTER startup option processing, so a startup posix flip lands
+        // in the snapshot. The runtime `set` builtin uses the free
+        // function directly and must NOT re-snapshot (rubash#1055:
+        // posix_initialize bypasses set_bashopts at runtime).
+        if name == "posix" {
+            let bashopts = crate::builtins::shopt::bashopts_value(&self.shell_state.env_vars);
+            self.shell_state
+                .env_vars
+                .insert("BASHOPTS".to_string(), bashopts);
+        }
     }
 
     /// GNU shell.c:1587-1601 (open_shell_script): a script filename that is
