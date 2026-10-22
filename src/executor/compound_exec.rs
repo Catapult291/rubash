@@ -2703,6 +2703,25 @@ impl Executor {
             .name
             .clone()
             .unwrap_or_else(|| "COPROC".to_string());
+        // GNU execute_cmd.c execute_coproc validates an explicit NAME
+        // before anything is spawned: valid_identifier fails ->
+        // err_invalidid (`` `<name>': not a valid identifier ``) and
+        // EXECUTION_FAILURE, and no coprocess is created (rubash#1153:
+        // `coproc "" { echo hi; }` printed the same text but exited 0
+        // after spawning). The default COPROC name never takes this
+        // branch, and a nameref name is a valid identifier itself — its
+        // target is adjudicated at bind time below.
+        if let Some(name) = &coproc_cmd.name {
+            if !is_shell_name(name) {
+                eprintln!(
+                    "{}`{}': not a valid identifier",
+                    self.diagnostic_prefix(),
+                    name
+                );
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         use std::process::{Command, Stdio};
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)

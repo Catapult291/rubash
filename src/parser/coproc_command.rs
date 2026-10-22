@@ -25,9 +25,16 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
                 || is_keyword(tokens, i + 1, "{")
                 || is_keyword(tokens, i + 1, "(")
                 || is_coproc_shell_command_start(tokens, i + 1);
-            if !lookahead.value.starts_with('-')
-                && (next_is_compound || is_coproc_simple_command_start(next_after))
-            {
+            // GNU parse.y:1125-1175 coproc grammar: `COPROC WORD
+            // shell_command` — WORD is the coproc NAME only when what
+            // follows is a compound/shell command. Before a SIMPLE
+            // command there is no name production at all: `coproc CP
+            // echo hi` is the unnamed form running the simple command
+            // `CP echo hi` (the child reports `CP: command not found`
+            // and the fds bind as COPROC). A builtin-name allowlist
+            // here stole the first word of the simple command as a
+            // name (rubash#1153).
+            if !lookahead.value.starts_with('-') && next_is_compound {
                 name = Some((lookahead.value.clone(), lookahead.raw.clone()));
                 i += 1; // consume the name
             }
@@ -180,31 +187,6 @@ pub(super) fn parse_coproc_command(tokens: &[Token], start: usize) -> Option<(Co
         None,
     ));
     Some(finish_coproc_command(command, tokens, i))
-}
-
-fn is_coproc_simple_command_start(token: Option<&Token>) -> bool {
-    token.is_some_and(|token| {
-        matches!(
-            token.value.as_str(),
-            "builtin"
-                | "command"
-                | "echo"
-                | "eval"
-                | "exec"
-                | "export"
-                | "printf"
-                | "pwd"
-                | "read"
-                | "set"
-                | "shift"
-                | "test"
-                | "true"
-                | "false"
-                | "type"
-                | "unset"
-                | "wait"
-        )
-    })
 }
 
 fn finish_coproc_command(
