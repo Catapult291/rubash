@@ -643,7 +643,25 @@ impl Executor {
                     stack
                 }
             }
-            "BASH_ARGV" => self.bash_argv_view(),
+            "BASH_ARGV" => {
+                // rubash#1110 item 4: GNU execute_cmd.c (execute_function)
+                // pushes the call args into BASH_ARGV only under
+                // debugging_mode; at compat <= 44 without extdebug the
+                // array stays empty even though BASH_ARGC is populated
+                // (the #1051 writer-side gating keeps the stacks unpushed
+                // without extdebug; this read-side gate covers the
+                // compat <= 44 statement directly).
+                if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+                    && !crate::builtins::shopt::option_enabled(
+                        &self.shell_state.env_vars,
+                        "extdebug",
+                    )
+                {
+                    Vec::new()
+                } else {
+                    self.bash_argv_view()
+                }
+            }
             "BASH_ARGC" => self.bash_argc_view(),
             "BASH_LINENO" => self.bash_lineno_view(),
             "BASH_SOURCE" => {
@@ -733,6 +751,17 @@ impl Executor {
                 return Some(format_indexed_array_values(self.bash_argc_view()))
             }
             "BASH_ARGV" => {
+                // rubash#1110 item 4: same compat <= 44 gate as the direct
+                // view in dynamic_stack_array_values — empty without
+                // extdebug (execute_cmd.c pushes args only when debugging).
+                if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+                    && !crate::builtins::shopt::option_enabled(
+                        &self.shell_state.env_vars,
+                        "extdebug",
+                    )
+                {
+                    return Some(format_indexed_array_values(Vec::new()));
+                }
                 return Some(format_indexed_array_values(self.bash_argv_view()))
             }
             "BASH_LINENO" => return Some(format_indexed_array_values(self.bash_lineno_view())),
