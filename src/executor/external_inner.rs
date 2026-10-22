@@ -522,11 +522,23 @@ impl Executor {
                 self.finish_external_error(cmd, &stderr, status)?;
                 return Ok(());
             }
+            // GNU findcmd.c:279-293 + execute_cmd.c shell_execve: with
+            // PATH unset the name is never searched, so the failure is
+            // the execve ENOENT text, not "command not found" — bash
+            // switches diagnostic on PATH being unset (rubash#1145).
+            let not_found_message = if crate::executor::path::path_is_unset(
+                &self.shell_state.env_vars,
+            ) {
+                "No such file or directory"
+            } else {
+                "command not found"
+            };
             writeln!(
                 &mut stderr,
-                "{}{}: command not found",
+                "{}{}: {}",
                 self.diagnostic_prefix(),
-                name
+                name,
+                not_found_message
             )?;
             self.finish_external_error(cmd, &stderr, 127)?;
             return Ok(());

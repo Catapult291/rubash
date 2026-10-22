@@ -664,7 +664,13 @@ impl Executor {
                     ),
                     None => (
                         not_found_word.clone(),
-                        ": command not found".to_string(),
+                        // With PATH unset the name is never searched, so
+                        // GNU reports the execve ENOENT text (rubash#1145).
+                        if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                            ": No such file or directory".to_string()
+                        } else {
+                            ": command not found".to_string()
+                        },
                         127,
                     ),
                 };
