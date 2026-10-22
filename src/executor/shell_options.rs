@@ -1935,8 +1935,10 @@ fn tcp_stream_file(stream: std::net::TcpStream) -> File {
 /// Connected TCP stream as a std File (rubash#1026).
 #[cfg(windows)]
 fn tcp_stream_file(stream: std::net::TcpStream) -> File {
-    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-    unsafe { File::from_raw_socket(stream.into_raw_socket()) }
+    // A SOCKET is a kernel handle: File adopts it through FromRawHandle
+    // (FromRawSocket is only implemented for the std socket types, not File).
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    unsafe { File::from_raw_handle(stream.into_raw_socket() as _) }
 }
 
 /// Connected UDP socket as a std File (rubash#1026).
@@ -1949,6 +1951,6 @@ fn udp_socket_file(socket: std::net::UdpSocket) -> File {
 /// Connected UDP socket as a std File (rubash#1026).
 #[cfg(windows)]
 fn udp_socket_file(socket: std::net::UdpSocket) -> File {
-    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-    unsafe { File::from_raw_socket(socket.into_raw_socket()) }
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    unsafe { File::from_raw_handle(socket.into_raw_socket() as _) }
 }

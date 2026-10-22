@@ -1354,7 +1354,10 @@ impl Executor {
 fn spawn_error_diagnostic(program: &PathBuf, error: &io::Error) -> (String, i32) {
     const EX_NOTFOUND: i32 = 127;
     const EX_NOEXEC: i32 = 126;
-    if error.raw_os_error() != Some(libc::ENOENT) {
+    // ENOENT on unix and ERROR_FILE_NOT_FOUND on Windows share the value 2;
+    // no libc dependency is needed for this classification.
+    const OS_ERROR_FILE_NOT_FOUND: i32 = 2;
+    if error.raw_os_error() != Some(OS_ERROR_FILE_NOT_FOUND) {
         return (crate::posix_errors::message(error).to_string(), EX_NOEXEC);
     }
     // errno == ENOENT: the status is EX_NOTFOUND unless the file itself
