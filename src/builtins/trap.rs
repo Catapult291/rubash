@@ -847,6 +847,33 @@ pub(crate) fn clear_error_trap(env_vars: &mut VarTable) {
     store_trap_list(env_vars, signals);
 }
 
+/// GNU execute_cmd.c:5291-5303 (execute_function): shell functions inherit
+/// the RETURN trap only when function tracing is on globally (functrace) or
+/// for the function itself (`declare -ft`, trace_p) — and never while the
+/// DEBUG trap is executing (signal_in_progress (DEBUG_TRAP)). Otherwise the
+/// inherited action is removed for the body (restore_default_signal), so
+/// `trap -p RETURN` inside an untraced body reports nothing. A trap the
+/// body installs is global (set_signal) and survives the call.
+pub(crate) fn clear_return_trap(env_vars: &mut VarTable) {
+    env_vars.remove(&trap_key("RETURN"));
+    let mut signals = trap_list(env_vars);
+    signals.remove("RETURN");
+    store_trap_list(env_vars, signals);
+}
+
+/// GNU execute_cmd.c uw_maybe_set_return_trap (trap.c:786-789,
+/// trap_if_untrapped): at function exit the saved RETURN action is restored
+/// only when the body left the trap untrapped — a body install (or a body
+/// `trap - RETURN` after an inherited... no: entry removal means a body
+/// `trap - RETURN` is a no-op and the saved action comes back, GNU probe
+/// v4) persists. Restoring only when unset is exactly trap_if_untrapped.
+pub(crate) fn maybe_restore_return_trap(env_vars: &mut VarTable, action: String) {
+    if env_vars.contains_key(&trap_key("RETURN")) {
+        return;
+    }
+    set_trap(env_vars, "RETURN", &action);
+}
+
 /// GNU execute_cmd.c restore_default_signal(DEBUG_TRAP) at function entry:
 /// remove the inherited DEBUG trap for the function body.
 pub(crate) fn clear_debug_trap(env_vars: &mut VarTable) {

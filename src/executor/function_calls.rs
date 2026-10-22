@@ -548,6 +548,20 @@ impl Executor {
         if saved_err_action.is_some() && !errtrace {
             crate::builtins::trap::clear_error_trap(&mut self.shell_state.env_vars);
         }
+        // GNU execute_cmd.c:5291-5303: functions inherit the RETURN trap
+        // only when tracing is on globally (functrace) or for the function
+        // itself (`declare -ft`, trace_p) — and never while the DEBUG trap
+        // is executing. Otherwise the inherited action is removed for the
+        // body; a trap the body installs is global and last-set-wins, so a
+        // nested inner install still fires at the OUTER return (rubash#1105:
+        // outer return runs B, not A or nothing).
+        let saved_return_action =
+            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "RETURN");
+        let return_trap_removed =
+            saved_return_action.is_some() && (!function_traced || self.debug_trap_running);
+        if return_trap_removed {
+            crate::builtins::trap::clear_return_trap(&mut self.shell_state.env_vars);
+        }
         let definition_line = self
             .shell_state
             .function_definition_locations
@@ -737,7 +751,22 @@ impl Executor {
                 self.set_current_line_value(line);
             }
         }
-        self.run_function_return_trap()?;
+        let trap_return_status = self.run_function_return_trap()?;
+        // GNU execute_cmd.c run_unwind_frame ("function_calling") AFTER the
+        // run_return_trap fires: uw_maybe_set_return_trap restores the saved
+        // action only when the body left the trap untrapped
+        // (trap_if_untrapped). Restoring before the fire would make an
+        // untraced function wrongly fire the inherited trap; restoring only
+        // when removed mirrors the unwind-protect registration (traced
+        // functions register none, so a body `trap - RETURN` there persists).
+        if return_trap_removed {
+            if let Some(action) = saved_return_action {
+                crate::builtins::trap::maybe_restore_return_trap(
+                    &mut self.shell_state.env_vars,
+                    action,
+                );
+            }
+        }
         {
             self.shell_state.function_depth -= 1;
             self.restore_function_locals();
@@ -811,11 +840,20 @@ impl Executor {
             Err(ExecuteError::ExpansionFailure(status))
                 if !self.inside_compound_condition.get() =>
             {
-                self.exit_code = status;
+                self.exit_code = trap_return_status.unwrap_or(status);
                 Ok(())
             }
             Err(ExecuteError::Return(status)) => {
-                self.exit_code = status;
+                // A `return N` absorbed from the RETURN trap action ran
+                // after the body completed, so it wins over the body's own
+                // return (rubash#1106: run once, trap's status stands).
+                self.exit_code = trap_return_status.unwrap_or(status);
+                Ok(())
+            }
+            Ok(()) => {
+                if let Some(status) = trap_return_status {
+                    self.exit_code = status;
+                }
                 Ok(())
             }
             other => other,

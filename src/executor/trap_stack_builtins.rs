@@ -153,7 +153,6 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
-        self.note_return_trap_scope(&cmd.words[1..]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let status = crate::builtins::trap::execute_with_io(

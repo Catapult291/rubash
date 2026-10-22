@@ -1499,7 +1499,7 @@ impl Executor {
         Ok(())
     }
 
-    pub(crate) fn run_function_return_trap(&mut self) -> Result<(), ExecuteError> {
+    pub(crate) fn run_function_return_trap(&mut self) -> Result<Option<i32>, ExecuteError> {
         // GNU execute_cmd.c:5295 (execute_function): while the DEBUG trap is
         // executing (signal_in_progress (DEBUG_TRAP)), a function does not
         // inherit the RETURN trap at all (restore_default_signal(RETURN_TRAP)
@@ -1507,68 +1507,26 @@ impl Executor {
         // DEBUG trap handler function itself returns
         // (dbg-support.tests: no "return lineno" lines for print_debug_trap).
         if self.debug_trap_running {
-            return Ok(());
+            return Ok(None);
         }
-        // Bash only fires a RETURN trap for function returns when the
-        // function inherits the DEBUG/RETURN traps. GNU execute_cmd.c:5291-
-        // 5293: "Shell functions inherit the RETURN trap if function
-        // tracing is on globally or on individually for this function" —
-        // the gate is `trace_p (var) == 0 && function_trace_mode == 0`
-        // (execute_cmd.c:5295; function_trace_mode is the functrace set -o
-        // flag, NOT debugging_mode — shopt extdebug reaches it only through
-        // the functrace it enables, shopt.def:621). trace_p(var) is the
-        // per-function attribute `declare -ft name` sets, so a traced
-        // function fires the RETURN trap even with the global option off
-        // (rubash#343: `declare -ft f; trap 'echo R' RETURN; f` prints R).
-        // The name stack is still holding this call's frame at the fire
-        // site (function_calls.rs pops it after run_function_return_trap).
-        let current_function_traced = self
-            .shell_state
-            .function_name_stack
-            .first()
-            .is_some_and(|name| self.function_has_trace_attribute(name));
-        let traced =
-            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "functrace")
-                || current_function_traced;
-        let function_scoped = self
-            .shell_state
-            .env_vars
-            .get("__RUBASH_RETURN_TRAP_FUNCTION")
-            .zip(self.shell_state.function_name_stack.first())
-            .is_some_and(|(registered, current)| registered == current);
-        if !traced && !function_scoped {
-            return Ok(());
-        }
-        self.run_return_trap()
-    }
-
-    pub(in crate::executor) fn note_return_trap_scope(&mut self, args: &[String]) {
-        let mut index = usize::from(args.first().map(String::as_str) == Some("--"));
-        let Some(action) = args.get(index) else {
-            return;
-        };
-        if action != "-" && action.starts_with('-') {
-            return;
-        }
-        index += 1;
-        let has_return = args[index..].iter().any(|signal| {
-            signal
-                .strip_prefix("SIG")
-                .unwrap_or(signal)
-                .eq_ignore_ascii_case("RETURN")
-        });
-        if !has_return {
-            return;
-        }
-        if action == "-" {
-            self.shell_state
-                .env_vars
-                .remove("__RUBASH_RETURN_TRAP_FUNCTION");
-        } else if let Some(function) = self.shell_state.function_name_stack.first() {
-            self.shell_state.env_vars.insert(
-                "__RUBASH_RETURN_TRAP_FUNCTION".to_string(),
-                function.clone(),
-            );
+        // GNU execute_cmd.c:5377-5407: the fire itself is unconditional —
+        // run_return_trap runs whatever trap_list[RETURN_TRAP] currently
+        // holds. Inheritance scoping happens at ENTRY (execute_function
+        // removes the inherited trap for untraced functions; see
+        // execute_function_dispatch), not here, so a nested body install is
+        // global last-set-wins: the outer return fires it too (rubash#1105).
+        // The old function-scoped gate (__RUBASH_RETURN_TRAP_FUNCTION:
+        // outer-must-match) dropped the outer fire.
+        //
+        // A `return N` inside the RETURN action would recurse forever in GNU
+        // (trap.c _run_trap_internal rethrows through return_catch and
+        // execute_cmd.c:5377 refires because the from_return_trap setter is
+        // #if 0'd out — probe p1106 hangs bash 5.3.20): absorb it once as
+        // the function's status instead of hanging (rubash#1106).
+        match self.run_return_trap() {
+            Err(ExecuteError::Return(status)) => Ok(Some(status)),
+            Ok(()) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 

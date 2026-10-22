@@ -2279,6 +2279,12 @@ impl Executor {
         // Direct-stdout builtins inside the function consult the thread-local
         // capture, which belongs to an enclosing pipeline stage when this
         // substitution runs inside one; give the call its own capture.
+        // GNU trap.c reset_or_restore_signal_handlers (~1480): the forked
+        // command-substitution child resets every inherited non-ignored
+        // trap, so a parent trap cannot fire inside the substitution. The
+        // in-place call runs on this executor, but the wholesale state
+        // restore at the end rolls the parent's trap table back.
+        crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
         let (thread_captured, result) = crate::executor::shell_options::capture_stdout(|| {
             // GNU runs `$(f)` through command_substitute → parse_and_execute
             // → evalstring, whose reader bumps indirection_level
@@ -2301,16 +2307,40 @@ impl Executor {
             })
         });
         self.fd_table = saved_fd_table;
+        // GNU subst.c:7340-7341: the child ends with `rc = run_exit_trap ();
+        // exit (rc);` — an EXIT trap the function installed runs HERE, its
+        // stdout joining the capture and its status becoming the
+        // substitution's status (rubash#1104: `x=$(f)` with `trap ... EXIT`
+        // inside f captures the trap output). It must run before
+        // restore_flat_subshell, the in-place fork boundary that discards
+        // the child's trap table — the same shape as the AST substitution
+        // tail above. A bare `return` from the EXIT action cannot re-fire
+        // anything (no function frame is exiting here); absorb it into the
+        // status like the body-result arms do.
+        let body_status = match &result {
+            Ok(()) => self.exit_code,
+            Err(ExecuteError::Return(status))
+            | Err(ExecuteError::ExitCode(status))
+            | Err(ExecuteError::ExpansionFailure(status)) => *status,
+            Err(_) => 1,
+        };
+        let mut trap_status: Option<i32> = None;
+        let (trap_thread_captured, _) = crate::executor::shell_options::capture_stdout(|| {
+            if let Ok(exit_status) = self.run_exit_trap_for_status(body_status) {
+                trap_status = Some(exit_status);
+            }
+        });
         let mut output = self.stdout_capture.take().unwrap_or_default();
         output.extend_from_slice(&thread_captured);
+        output.extend_from_slice(&trap_thread_captured);
         self.stdout_capture = saved_capture;
         let status = match result {
-            Ok(()) => self.exit_code,
-            Err(ExecuteError::Return(status)) => status,
+            Ok(()) => trap_status.unwrap_or(self.exit_code),
+            Err(ExecuteError::Return(status)) => trap_status.unwrap_or(status),
             Err(ExecuteError::ExitCode(status)) | Err(ExecuteError::ExpansionFailure(status)) => {
-                status
+                trap_status.unwrap_or(status)
             }
-            Err(_) => 1,
+            Err(_) => trap_status.unwrap_or(1),
         };
         self.restore_flat_subshell(saved_state, saved_dir);
         // Same rubash#485 reap contract as the AST substitution tail above:
