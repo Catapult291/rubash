@@ -2025,9 +2025,9 @@ impl Executor {
                             rng_state ^= rng_state >> 27;
                             let v = (rng_state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 58) as u8;
                             match v % 62 {
-                                0..=25 => (b'a' + v % 62) as char,
-                                26..=51 => (b'A' + v % 62 - 26) as char,
-                                _ => (b'0' + v % 62 - 52) as char,
+                                0..=25 => char::from(b'a' + v % 62),
+                                26..=51 => char::from(b'A' + v % 62 - 26),
+                                _ => char::from(b'0' + v % 62 - 52),
                             }
                         })
                         .collect();

@@ -1319,7 +1319,7 @@ fn snarf_hosts_from_file(path: &str, out: &mut Vec<String>, depth: usize) -> boo
         let line = line.trim_end_matches('\r');
         let bytes = line.as_bytes();
         let mut i = 0;
-        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() || bytes[i] == b'#' {
@@ -1340,19 +1340,19 @@ fn snarf_hosts_from_file(path: &str, out: &mut Vec<String>, depth: usize) -> boo
         // an IPv6 address (leading `:`/hex letter) is kept as a name,
         // exactly as GNU's DIGIT check behaves.
         if bytes[i].is_ascii_digit() {
-            while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
         }
         while i < bytes.len() {
-            while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
             if i >= bytes.len() || bytes[i] == b'#' {
                 break;
             }
             let start = i;
-            while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
             if i > start {
