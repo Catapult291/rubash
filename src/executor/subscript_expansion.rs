@@ -114,7 +114,26 @@ impl Executor {
     }
 
     fn expand_subscript_string_inner(&self, raw: &str, preserve_ansi_backslashes: bool) -> String {
-        // rubash#XXX fast lane: `prefix$name+suffix` with exactly one plain
+        // whitelist literal fast lane: a subscript of plain bytes needs no
+        // expansion work at all. GNU subst.c:11063 expand_subscript_string
+        // -> expand_string runs one word expansion with W_NOSPLIT2 |
+        // W_NOPROCSUB (no field splitting, no pathname expansion, no
+        // process substitution); with no introducer present (`$`, backtick)
+        // and no quoting/escape syntax (`'`, `"`, `\`), the mask pass is
+        // identity, the walker copies every byte verbatim (its quote,
+        // backtick, paren, brace and tilde arms cannot fire — the admitted
+        // set holds none of those bytes and never starts with `~`), and
+        // the tail marker strips are no-ops (no sentinel byte can reach
+        // them: sentinels are C0 controls / PUA / E300s, all outside the
+        // admitted ASCII set). So the result is the input bytes unchanged.
+        // Whitelist admission (rubash#117): any other byte falls through
+        // to the full path unchanged. `=`/`[`/`]`/`@`/whitespace/non-ASCII
+        // are deliberately excluded — they cost nothing to re-check and
+        // keep this proof to one paragraph.
+        if is_plain_literal_subscript(raw) {
+            return raw.to_string();
+        }
+        // whitelist fast lane: `prefix$name+suffix` with exactly one plain
         // `$name` read and literal text around it. The walker below would
         // copy the literal bytes verbatim (no field splitting, no pathname
         // expansion, no re-scan of results — subst.c:11063
@@ -2030,6 +2049,18 @@ fn split_subscript_plain_name(raw: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     Some((prefix, name, suffix))
+}
+
+/// Whether `raw` is a wholly-literal subscript: non-empty ASCII bytes from
+/// the closed literal set (alphanumerics plus `_. - + / : ,`). Used by
+/// the literal fast lane in `expand_subscript_string_inner` and by the
+/// element-write prepare path to recognize a key that needs no expansion
+/// at all. See the lane's proof for why the slow path is identity here.
+pub(in crate::executor) fn is_plain_literal_subscript(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'+' | b'/' | b':' | b',')
+        })
 }
 
 fn mask_subscript_escapes(raw: &str) -> String {

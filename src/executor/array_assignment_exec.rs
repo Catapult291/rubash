@@ -35,6 +35,24 @@ impl Executor {
         // (rubash#618 fast lane). Whitelist: any of those bytes falls through to
         // the full path.
         if !raw_subscript.contains(['$', '`', '~', '\'', '"', '\\', '[', ']', '=']) {
+            // Wholly-literal key ([whitelist]: the key IS the raw text (the
+            // literal fast lane proves it — same closed set, same identity).
+            // When the value splices too (fast_assignment_plain_splice, same
+            // proof as the word funnel it replaces here), emit the synthetic
+            // word directly and skip the whole-word roundtrip entirely.
+            // Otherwise fall through (None) to the ordinary path unchanged.
+            // Dynamic arrays keep the readable subscript (see below).
+            if is_plain_literal_subscript(raw_subscript)
+                && !matches!(name, "BASH_ALIASES" | "BASH_CMDS" | "DIRSTACK")
+            {
+                if let Some(spliced) = self.fast_assignment_plain_splice(&assignment.value) {
+                    return Some(format!(
+                        "{name}[{}]{}{spliced}",
+                        super::arithmetic::encode_arithmetic_assoc_key(raw_subscript),
+                        assignment.operator
+                    ));
+                }
+            }
             return None;
         }
         // Expand only for the associative branch: expand_subscript_string
@@ -162,60 +180,83 @@ impl Executor {
                     .iter()
                     .any(|quote| quote.kind != crate::parser::QuoteKind::Backslash)
         });
-        let name = match self.nameref_resolution(name) {
-            NamerefResolution::Target(target) => {
-                // GNU assign_array_element -> find_variable_nameref_for_create
-                // (variables.c:2199-2203) requires a bare identifier:
-                // `ref[k]=v` where ref -> `XXX[0]` fails sh_invalidid, while
-                // a scalar `ref=v` forwards to the element. The caller raises
-                // evalerror on nonzero exit_code, discarding the list.
-                if parse_array_subscript(&target).is_some() {
+        // Fuse the per-write attribute probes ([whitelist]: GNU reads one
+        // SHELL_VAR flag word (variables.c); rubash keeps one VarAttrs per
+        // name, so a single attr_of answers nameref/readonly/assoc/integer
+        // together instead of four SipHash probes. An unmarked base skips
+        // nameref resolution AND its NotNameref String alloc via the borrow
+        // below; a marked base takes the unchanged resolution path and
+        // re-fetches flags for the resolved target. attr_of().flag(key)
+        // is exactly what is_marked_var consults for these keys, so the
+        // verdicts are identical.
+        let pre_attrs = self.shell_state.env_vars.attr_of(name);
+        let name_owned: String;
+        let name: &str = if pre_attrs.nameref {
+            match self.nameref_resolution(name) {
+                NamerefResolution::Target(target) => {
+                    // GNU assign_array_element -> find_variable_nameref_for_create
+                    // (variables.c:2199-2203) requires a bare identifier:
+                    // `ref[k]=v` where ref -> `XXX[0]` fails sh_invalidid, while
+                    // a scalar `ref=v` forwards to the element. The caller raises
+                    // evalerror on nonzero exit_code, discarding the list.
+                    if parse_array_subscript(&target).is_some() {
+                        eprintln!(
+                            "{}`{target}': not a valid identifier",
+                            self.diagnostic_prefix()
+                        );
+                        self.exit_code = 1;
+                        return true;
+                    }
+                    name_owned = target;
+                    &name_owned
+                }
+                NamerefResolution::Circular => {
                     eprintln!(
-                        "{}`{target}': not a valid identifier",
+                        "{}warning: {}: circular name reference",
+                        self.diagnostic_prefix(),
+                        name
+                    );
+                    self.exit_code = 1;
+                    return true;
+                }
+                NamerefResolution::MaxDepth => {
+                    eprintln!(
+                        "{}warning: {}: maximum nameref depth (8) exceeded",
+                        self.diagnostic_prefix(),
+                        name
+                    );
+                    self.exit_code = 1;
+                    return true;
+                }
+                // GNU arrayfunc.c:270-275 bind_array_variable ->
+                // variables.c:2182 find_variable_nameref_for_create: an element
+                // assignment whose operand base resolves to an uncreated nameref
+                // target fails sh_invalidid on the last nameref's cell text and
+                // leaves the nameref untouched (`typeset -n ref; ref[0]=foo`
+                // reports `': not a valid identifier`, ref stays `declare -n ref`
+                // rather than becoming an array).
+                NamerefResolution::Unresolved => {
+                    let cell = self.last_nameref_cell(name).unwrap_or_default();
+                    eprintln!(
+                        "{}`{cell}': not a valid identifier",
                         self.diagnostic_prefix()
                     );
                     self.exit_code = 1;
                     return true;
                 }
-                target
+                NamerefResolution::NotNameref => name,
             }
-            NamerefResolution::Circular => {
-                eprintln!(
-                    "{}warning: {}: circular name reference",
-                    self.diagnostic_prefix(),
-                    name
-                );
-                self.exit_code = 1;
-                return true;
-            }
-            NamerefResolution::MaxDepth => {
-                eprintln!(
-                    "{}warning: {}: maximum nameref depth (8) exceeded",
-                    self.diagnostic_prefix(),
-                    name
-                );
-                self.exit_code = 1;
-                return true;
-            }
-            // GNU arrayfunc.c:270-275 bind_array_variable ->
-            // variables.c:2182 find_variable_nameref_for_create: an element
-            // assignment whose operand base resolves to an uncreated nameref
-            // target fails sh_invalidid on the last nameref's cell text and
-            // leaves the nameref untouched (`typeset -n ref; ref[0]=foo`
-            // reports `': not a valid identifier`, ref stays `declare -n ref`
-            // rather than becoming an array).
-            NamerefResolution::Unresolved => {
-                let cell = self.last_nameref_cell(name).unwrap_or_default();
-                eprintln!(
-                    "{}`{cell}': not a valid identifier",
-                    self.diagnostic_prefix()
-                );
-                self.exit_code = 1;
-                return true;
-            }
-            NamerefResolution::NotNameref => name.to_string(),
+        } else {
+            name
         };
-        let name = name.as_str();
+        // Flags for the resolved name: the pre-fetch is valid only when no
+        // resolution ran (same name, no intervening mutation — resolution
+        // itself only reads).
+        let attrs = if pre_attrs.nameref {
+            self.shell_state.env_vars.attr_of(name)
+        } else {
+            pre_attrs
+        };
         if name == "BASH_ALIASES" {
             // TODO(variables.c/alias.c): BASH_ALIASES is a dynamic
             // associative array backed by the alias table. Keep this narrow
@@ -295,14 +336,12 @@ impl Executor {
             self.exit_code = 1;
             return true;
         }
-        if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name) {
+        if attrs.readonly {
             eprintln!("{}{}: readonly variable", self.diagnostic_prefix(), name);
             self.exit_code = 1;
             return true;
         }
-        if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name)
-            || self.is_assoc_parameter_array(name)
-        {
+        if attrs.assoc || self.is_assoc_parameter_array(name) {
             // GNU arrayfunc.c:392-408 assign_array_element_internal: the
             // subscript gets exactly one expand_subscript_string pass and
             // the result is the literal key — a `$(...)` produced by that
@@ -343,7 +382,7 @@ impl Executor {
             // every key. `+=` and a non-`(...)` storage still take the canonical
             // path below, which reads the current binding or rebuilds the cell.
             if !append {
-                let stored = if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
+                let stored = if attrs.integer {
                     self.eval_integer_assignment_value(value).to_string()
                 } else {
                     value.to_string()
@@ -420,7 +459,7 @@ impl Executor {
                         (entry_key == &key).then_some(entry_value.as_str())
                     })
                     .unwrap_or_default();
-                if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
+                if attrs.integer {
                     // GNU bind_array_variable att_integer append adds the two
                     // expressions arithmetically (wheat[foo bar]+=7 with
                     // wheat[foo bar]=9 stores 16, not the concat-eval 97).
@@ -437,7 +476,7 @@ impl Executor {
             // array carries the integer attribute, the value is evaluated as an
             // arithmetic expression before being stored (assoc.tests:
             // declare -Ai chaff; chaff[one]=3+7 stores 10, not 3+7).
-            let value = if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
+            let value = if attrs.integer {
                 self.eval_integer_assignment_value(&value).to_string()
             } else {
                 value
@@ -692,7 +731,7 @@ impl Executor {
                     .cloned()
                     .unwrap_or_default()
             };
-            if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
+            if attrs.integer {
                 (eval_arith_value(&current_element) + eval_arith_value(value)).to_string()
             } else {
                 append_scalar_value(&current_element, value)
@@ -700,7 +739,7 @@ impl Executor {
         } else {
             value.to_string()
         };
-        let element = if is_marked_var(&self.shell_state.env_vars, INTEGER_VARS, name) {
+        let element = if attrs.integer {
             eval_arith_value(&element).to_string()
         } else {
             element

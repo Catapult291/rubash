@@ -167,7 +167,7 @@ mod shift_echo_builtins;
 mod source_type_state;
 pub(crate) mod subscript_expansion;
 pub(in crate::executor) use subscript_expansion::{
-    IndexedSubscript, OperandSubscriptMode, SubscriptSource,
+    is_plain_literal_subscript, IndexedSubscript, OperandSubscriptMode, SubscriptSource,
 };
 mod temporary_assignments;
 mod trap_exec;

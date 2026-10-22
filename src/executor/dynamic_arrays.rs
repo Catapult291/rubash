@@ -140,6 +140,35 @@ pub(in crate::executor) fn groups_words() -> Vec<String> {
 
 impl Executor {
     pub(in crate::executor) fn dynamic_parameter_value(&self, name: &str) -> Option<String> {
+        // Hot-path reorder: the UNSET_DYNAMIC_VARS probe below is a
+        // SipHash over the name, paid on EVERY variable read (the assoc
+        // `k$i` key/value fast lanes resolve `i` through here twice per
+        // iteration). A non-dynamic name can never produce a value here —
+        // the match below yields None for it either way — so admit only
+        // the dynamic-name class first and keep the mark check (GNU
+        // variables.c:3839 unbind_variable) for that class. Outcomes are
+        // identical in all four combinations (dynamic/non-dynamic x
+        // marked/unmarked); only the hash count changes.
+        if !matches!(
+            name,
+            "SECONDS"
+                | "EPOCHSECONDS"
+                | "EPOCHREALTIME"
+                | "RANDOM"
+                | "SRANDOM"
+                | "BASHPID"
+                | "BASH_SUBSHELL"
+                | "BASH_ARGV0"
+                | "FUNCNAME"
+                | "GROUPS"
+                | "LINENO"
+                | "BASH_COMMAND"
+                | "SHELLOPTS"
+                | "BASHOPTS"
+                | "PIPESTATUS"
+        ) {
+            return None;
+        }
         // GNU variables.c:3839 unbind_variable: `unset -v` unbinds a
         // dynamic variable for the rest of the shell's lifetime.
         if is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, name) {

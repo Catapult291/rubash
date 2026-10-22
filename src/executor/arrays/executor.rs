@@ -155,7 +155,25 @@ impl Executor {
     fn array_element_parameter_value_uncached(&self, expression: &str) -> Option<String> {
         let (array_name, key) = parse_array_subscript(expression)?;
 
-        let storage_name = self.resolved_variable_name(array_name)?;
+        // Fuse the per-read attribute probes (same discipline
+        // as the element-write path): one attr_of answers nameref/assoc
+        // together instead of two SipHash probes, and an unmarked base
+        // skips resolved_variable_name's NotNameref String alloc via the
+        // borrow below. assoc-ness is always judged on the STORAGE
+        // (resolved) name, exactly as before: without a nameref the two
+        // names are identical, with one the mark is re-checked below.
+        let pre_attrs = self.shell_state.env_vars.attr_of(array_name);
+        let storage_cow: std::borrow::Cow<'_, str> = if pre_attrs.nameref {
+            std::borrow::Cow::Owned(self.resolved_variable_name(array_name)?)
+        } else {
+            std::borrow::Cow::Borrowed(array_name)
+        };
+        let storage_name = storage_cow.as_ref();
+        let assoc_marked = if pre_attrs.nameref {
+            is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, storage_name)
+        } else {
+            pre_attrs.assoc
+        };
         // rubash#375: the six dynamic stack arrays divert to the live view
         // before any storage string is rendered — GNU keeps them as real
         // ARRAY objects (variables.c INIT_DYNAMIC_VAR), so an element read
@@ -167,7 +185,6 @@ impl Executor {
         // so subscript semantics (arithmetic side effects, `$(())`
         // memoization, quoting rules) are identical; only the element
         // fetch and the storage render are skipped.
-        let assoc_marked = is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &storage_name);
         let dynamic_values = if assoc_marked {
             None
         } else {

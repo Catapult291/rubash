@@ -154,6 +154,16 @@ impl Executor {
                 };
                 return format!("{name}={marker}{expanded}");
             }
+            // whitelist fast lane: `name=literal+$name` resolves through
+            // fast_assignment_plain_splice (provable splice, see its
+            // admission proof) instead of the hoist + embedded-walker +
+            // tilde pipeline below. Only non-compound values qualify (the
+            // compound marker byte is outside the splice's closed set).
+            if !compound_assignment {
+                if let Some(spliced) = self.fast_assignment_plain_splice(raw_value) {
+                    return format!("{name}={spliced}");
+                }
+            }
             if let Some(expanded) = self.expand_compound_positional_at_assignment(raw_value, false)
             {
                 let marker = if compound_assignment {

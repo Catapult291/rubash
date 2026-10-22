@@ -368,33 +368,53 @@ impl Executor {
     }
 
     pub(in crate::executor) fn shell_variable_value(&self, name: &str) -> Option<String> {
-        let name = match self.nameref_resolution(name) {
-            NamerefResolution::Target(target) => target,
-            NamerefResolution::Circular => {
-                eprintln!(
-                    "{}warning: {}: circular name reference",
-                    self.diagnostic_prefix(),
-                    name
-                );
-                // GNU variables.c:2036-2046: circular refs inside a function
-                // resolve at the global scope without namerefs.
-                return self.circular_fallback_value(name);
+        // Fuse the per-read attribute probes ([whitelist]: GNU reads one
+        // SHELL_VAR flag word per lookup (variables.c); the five probes
+        // below (nameref, array, declared-unset, assoc, array) each paid a
+        // SipHash. One attr_of answers them together. An unmarked name
+        // skips nameref resolution AND the NotNameref String alloc via the
+        // borrow; a marked name takes the unchanged resolution path and
+        // re-fetches flags for its target (attr_of().flag(key) is exactly
+        // what is_marked_var consults, so the verdicts are identical;
+        // resolution only reads, so the pre-fetch stays valid whenever the
+        // name is unchanged).
+        let pre_attrs = self.shell_state.env_vars.attr_of(name);
+        let owned: String;
+        let (name, attrs): (&str, crate::shell::var_table::VarAttrs) = if pre_attrs.nameref {
+            match self.nameref_resolution(name) {
+                NamerefResolution::Target(target) => {
+                    owned = target;
+                    let attrs = self.shell_state.env_vars.attr_of(&owned);
+                    (&owned, attrs)
+                }
+                NamerefResolution::Circular => {
+                    eprintln!(
+                        "{}warning: {}: circular name reference",
+                        self.diagnostic_prefix(),
+                        name
+                    );
+                    // GNU variables.c:2036-2046: circular refs inside a function
+                    // resolve at the global scope without namerefs.
+                    return self.circular_fallback_value(name);
+                }
+                NamerefResolution::MaxDepth => {
+                    // GNU find_variable_nameref (variables.c:2022-2023): a chain
+                    // past NAMEREF_MAX resolves to nothing — the variable
+                    // expands unset after the depth warning.
+                    eprintln!(
+                        "{}warning: {}: maximum nameref depth (8) exceeded",
+                        self.diagnostic_prefix(),
+                        name
+                    );
+                    return None;
+                }
+                // GNU: find_variable on an unresolvable nameref returns NULL —
+                // the parameter is unset, not set-but-null (C3).
+                NamerefResolution::Unresolved => return None,
+                NamerefResolution::NotNameref => (name, pre_attrs),
             }
-            NamerefResolution::MaxDepth => {
-                // GNU find_variable_nameref (variables.c:2022-2023): a chain
-                // past NAMEREF_MAX resolves to nothing — the variable
-                // expands unset after the depth warning.
-                eprintln!(
-                    "{}warning: {}: maximum nameref depth (8) exceeded",
-                    self.diagnostic_prefix(),
-                    name
-                );
-                return None;
-            }
-            // GNU: find_variable on an unresolvable nameref returns NULL —
-            // the parameter is unset, not set-but-null (C3).
-            NamerefResolution::Unresolved => return None,
-            NamerefResolution::NotNameref => name.to_string(),
+        } else {
+            (name, pre_attrs)
         };
         // GNU find_variable_nameref -> find_variable_internal resolves an
         // `arr[@]`/`arr[*]` cell to the array; scalar `${ref}` then reads
@@ -416,7 +436,7 @@ impl Executor {
                 return Some(values.join(&self.ifs_first_char_separator()));
             }
         }
-        if let Some(value) = self.array_element_parameter_value(&name) {
+        if let Some(value) = self.array_element_parameter_value(name) {
             return Some(value);
         }
         // GNU semantics (variables.c array_value): once a variable has been
@@ -424,13 +444,9 @@ impl Executor {
         // to `${a[0]}`.  The scalar value in `shell_state.variables` is stale
         // and must not short-circuit the array lookup.  `unset a[0]` removes
         // element 0 from the array storage, so `${a}` must return empty.
-        if is_marked_array_var(&self.shell_state.env_vars, &name) {
-            return self
-                .shell_state
-                .env_vars
-                .get(&name)
-                .and_then(|value| self.scalar_parameter_value(&name, value));
-        }
+        // The old is_marked_array_var arm is folded into the fused tail
+        // below: it ran env.get + scalar_parameter_value, exactly the
+        // fallthrough code, so the separate branch was redundant.
         // GNU builtins/declare.def:800-812: a valueless `declare
         // [-irux...] NAME` binds a NULL cell (variables.c:1912 var_isset is
         // `var->value != 0`) and sets att_invisible, so `${V+set}` /
@@ -438,22 +454,27 @@ impl Executor {
         // a value. The DECLARED_UNSET_VARS mark records that state; the
         // empty scalar materialized into the typed store by
         // sync_typed_attributes must not override it (rubash#409).
-        if is_marked_var(&self.shell_state.env_vars, DECLARED_UNSET_VARS, &name)
-            && !self.shell_state.env_vars.contains_key(&name)
-        {
+        if attrs.declared_unset && !self.shell_state.env_vars.contains_key(name) {
             return None;
         }
         if let Some(crate::shell::Variable {
             value: crate::shell::ShellValue::Scalar(value),
             ..
-        }) = self.shell_state.variables.get(&name)
+        }) = self.shell_state.variables.get(name)
         {
             return Some(value.clone());
         }
-        self.shell_state
-            .env_vars
-            .get(&name)
-            .and_then(|value| self.scalar_parameter_value(&name, value))
+        // Same verdicts as scalar_parameter_value (assoc `0`-key, array
+        // element 0, else the stored bytes) answered from the fused flags.
+        self.shell_state.env_vars.get(name).and_then(|value| {
+            if attrs.assoc {
+                assoc_value_at(value, "0")
+            } else if attrs.array {
+                array_value_at(value, 0)
+            } else {
+                Some(value.to_string())
+            }
+        })
     }
 
     pub(in crate::executor) fn scalar_parameter_value(
