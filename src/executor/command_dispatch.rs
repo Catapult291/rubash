@@ -188,6 +188,30 @@ impl Executor {
             for name in &absorbed {
                 self.mark_exported(name);
             }
+            // rubash#1110 item 2: at compat <= 44 the absorbed tempvar is
+            // converted in the GLOBAL context even inside a function (the
+            // pre-4.4 set_var_attribute behavior bash 4.4 gated behind
+            // compat44): `v=inner export v` on a frame local promotes the
+            // binding out of the frame — later writes in the function go
+            // to the global, and the frame pop restores nothing for the
+            // name. Drop the name from the nearest local scope snapshot
+            // so restore_function_locals leaves the live binding in place.
+            if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+                && self.shell_state.function_depth > 0
+            {
+                for name in &absorbed {
+                    if let Some(index) = self.visible_local_scope_index(name) {
+                        self.shell_state.local_var_scopes[index].remove(name);
+                        if let Some(scope) = self.shell_state.local_attr_scopes.get_mut(index) {
+                            scope.remove(name);
+                        }
+                        if let Some(scope) = self.shell_state.local_typed_scopes.get_mut(index)
+                        {
+                            scope.remove(name);
+                        }
+                    }
+                }
+            }
         } else if self.posix_mode_enabled() && self.shell_state.function_depth > 0 {
             // GNU execute_cmd.c:4892-4894 → variables.c:4662
             // merge_temporary_env → variables.c:4485 push_posix_temp_var:
