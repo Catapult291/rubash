@@ -1544,6 +1544,7 @@ impl Executor {
             pending_scalar_assignment: false,
             suppress_errexit: self.suppress_errexit,
             command_builtin_depth: self.command_builtin_depth,
+            standard_path_scope: self.standard_path_scope.clone(),
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
             line_env_os_value: std::cell::RefCell::new(None),

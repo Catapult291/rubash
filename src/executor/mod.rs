@@ -550,6 +550,13 @@ pub struct Executor {
     /// the posix ERREXIT for `command eval '...broken...'` — errors8.sub
     /// `command eval '( '` must not exit the shell.
     command_builtin_depth: usize,
+    /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
+    /// standard path for the re-dispatched command's OWN lookup only.
+    /// Set for the duration of the re-dispatch and consulted by the
+    /// simple-command execution lookup; the shell's $PATH variable —
+    /// and therefore child environments and nested builtins' PATH
+    /// reads — is never mutated (rubash#1047).
+    standard_path_scope: Option<String>,
     debug_trap_running: bool,
     /// rubash#375: parse-once cache for the DEBUG trap action. GNU parses a
     /// trap action once at `trap` invocation (trap.c read_trap_action) and

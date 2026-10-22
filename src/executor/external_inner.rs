@@ -1,6 +1,24 @@
 use super::*;
 
 impl Executor {
+    /// The simple-command execution lookup. Under a `command -p`
+    /// re-dispatch (standard_path_scope set) the lookup walks the
+    /// standard path — by substituting PATH in a throwaway copy of the
+    /// env map, never in the shell's own variables (rubash#1047).
+    pub(in crate::executor) fn find_scoped_user_command(
+        &self,
+        name: &str,
+    ) -> Option<std::path::PathBuf> {
+        match &self.standard_path_scope {
+            Some(standard) => {
+                let mut env_vars = self.shell_state.env_vars.clone();
+                env_vars.insert("PATH".to_string(), standard.clone());
+                find_user_command(name, &env_vars)
+            }
+            None => find_user_command(name, &self.shell_state.env_vars),
+        }
+    }
+
     pub(in crate::executor) fn execute_env_command(
         &mut self,
         cmd: &CommandNode,
@@ -442,7 +460,7 @@ impl Executor {
             return Ok(());
         }
 
-        let Some(program) = find_user_command(&cmd.words[0], &self.shell_state.env_vars) else {
+        let Some(program) = self.find_scoped_user_command(&cmd.words[0]) else {
             let mut stderr = Vec::new();
             // GNU findcmd.c:385-386 (search_for_command): a name containing
             // a slash is never PATH-searched — it goes straight to execve,
