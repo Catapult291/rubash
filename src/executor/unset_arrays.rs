@@ -763,8 +763,14 @@ impl Executor {
                 SubscriptSource::ExpandedOnce(&subscript)
             }) {
                 IndexedSubscript::Index(index) => index,
-                // GNU: `unset 'a[]'` is a silent no-op.
-                IndexedSubscript::Empty => return Some(0),
+                // GNU: a literally empty `unset 'a[]'` is a silent
+                // no-op. But an expanded-to-empty subscript evaluates
+                // to 0 (arrayfunc.c:1141 unbind_array_element ->
+                // array_expand_index -> expr.c:417 evalexp -> subexpr
+                // returns 0 on empty text), so `unset 'a[$j]'` with an
+                // empty $j unsets element 0. (#1009)
+                IndexedSubscript::Empty if subscript.is_empty() => return Some(0),
+                IndexedSubscript::Empty => 0,
                 IndexedSubscript::Error => {
                     // A nounset trap aborts with the fatal status; other
                     // failures keep status 1 (rubash#639).
@@ -817,7 +823,13 @@ impl Executor {
         }) {
             IndexedSubscript::Index(0) => {}
             IndexedSubscript::Index(_) => return None,
-            IndexedSubscript::Empty => return Some(0),
+            // Same expanded-to-empty rule as the element arm above:
+            // `unset 'v[$j]'` with an empty $j unsets the whole
+            // variable (subscript 0 IS the variable,
+            // arrayfunc.c:1218-1231); a literal `unset 'v[]'` is a
+            // silent no-op. (#1009)
+            IndexedSubscript::Empty if subscript.is_empty() => return Some(0),
+            IndexedSubscript::Empty => {}
             IndexedSubscript::Error => {
                 // Same nounset-abort routing (rubash#639).
                 self.raise_nounset_subscript_abort();
