@@ -3036,11 +3036,7 @@ impl Executor {
             else {
                 return Ok(None);
             };
-            print_time(
-                &self.shell_state.env_vars,
-                time_command.posix_format,
-                started,
-            );
+            self.print_time_shell(time_command.posix_format, started);
             let status = if time_command.inverted {
                 invert_exit_status(status)
             } else {
