@@ -1277,6 +1277,13 @@ fn sync_ordered_redirect_targets(command: &mut CommandNode) {
 }
 
 fn raw_word_contains_process_substitution(raw: &str) -> bool {
+    // Whitelist admission (rubash#117 discipline): the DFA below only
+    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
+    // can fire, so skip the char-collect + scan. A present pair runs the
+    // full quote-aware scan unchanged.
+    if !raw.contains("<(") && !raw.contains(">(") {
+        return false;
+    }
     let chars = raw.chars().collect::<Vec<_>>();
     let mut index = 0usize;
     let mut single = false;

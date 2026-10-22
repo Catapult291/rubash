@@ -114,31 +114,27 @@ impl Executor {
         // (ARRAYREF_FLAG prefix — arrayref.rs); the syntactic flag was
         // already captured in `arrayref_flags` above, so strip the prefix
         // here before any name/subscript consumer sees it.
-        let names: Vec<(usize, String)> = args
+        // Borrowed names (no per-operand String alloc): the strip above
+        // only trims the in-band ARRAYREF flag prefix, so the result
+        // borrows `args` for the rest of this call.
+        let names: Vec<(usize, &str)> = args
             .iter()
             .enumerate()
             .filter(|(_, arg)| !arg.starts_with('-'))
-            .map(|(index, arg)| {
-                (
-                    index,
-                    crate::builtins::arrayref::take_arrayref_flag(arg)
-                        .1
-                        .to_string(),
-                )
-            })
+            .map(|(index, arg)| (index, crate::builtins::arrayref::take_arrayref_flag(arg).1))
             .collect();
 
         let mut function_status = 0;
         if !variable_only {
             for (_, name) in &names {
-                let variable_exists = self.shell_state.env_vars.contains_key(name)
-                    || self.shell_state.variables.get(name).is_some();
+                let variable_exists = self.shell_state.env_vars.contains_key(*name)
+                    || self.shell_state.variables.get(*name).is_some();
                 if !function_only && variable_exists {
                     continue;
                 }
                 if marked_env_names(&self.shell_state.env_vars, READONLY_FUNCTIONS)
                     .iter()
-                    .any(|readonly| readonly == name)
+                    .any(|readonly| readonly.as_str() == *name)
                 {
                     writeln!(
                         stderr,
@@ -148,9 +144,9 @@ impl Executor {
                     function_status = 1;
                     continue;
                 }
-                self.shell_state.functions.remove(name);
-                self.shell_state.function_definition_redirects.remove(name);
-                self.shell_state.function_def_infos.remove(name);
+                self.shell_state.functions.remove(*name);
+                self.shell_state.function_definition_redirects.remove(*name);
+                self.shell_state.function_def_infos.remove(*name);
                 unmark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
                 unmark_env_name(
                     &mut self.shell_state.env_vars,
@@ -164,10 +160,12 @@ impl Executor {
             return Ok(function_status);
         }
 
-        let mut variable_args: Vec<String> = args
+        // Borrowed flag args (no per-operand String clone): every later
+        // consumer only reads them.
+        let mut variable_args: Vec<&str> = args
             .iter()
             .filter(|arg| arg.starts_with('-') && arg.as_str() != "-f")
-            .cloned()
+            .map(String::as_str)
             .collect();
         // GNU set.def:930-931/965-966: each failed name increments
         // posix_utility_error, so the first failure is reported while the
@@ -308,7 +306,7 @@ impl Executor {
             // (SHELLOPTS/BASHOPTS) keep their attribute and fall through
             // to the readonly diagnostic below.
             if matches!(
-                name.as_str(),
+                name,
                 "BASH_SOURCE" | "BASH_LINENO" | "BASH_ARGC" | "BASH_ARGV"
             ) {
                 writeln!(
@@ -327,12 +325,14 @@ impl Executor {
             variable_args.push(name);
         }
 
-        let variable_status = crate::builtins::set::unset_with_stderr(
-            variable_args.iter().map(String::as_str),
-            &mut self.shell_state.env_vars,
-            stderr,
-        )
-        .map_err(ExecuteError::from)?;
+        let variable_status = {
+            crate::builtins::set::unset_with_stderr(
+                variable_args.iter().copied(),
+                &mut self.shell_state.env_vars,
+                stderr,
+            )
+            .map_err(ExecuteError::from)?
+        };
         // GNU builtins/set.def:995-1000: unsetting through a nameref removes
         // the referenced variable and keeps the nameref; drop the referenced
         // variable from the typed owner too so parameter expansion does not
@@ -342,7 +342,7 @@ impl Executor {
                 if let Some(cell) = self
                     .shell_state
                     .env_vars
-                    .get(name)
+                    .get(*name)
                     .filter(|cell| is_shell_name(cell))
                     .cloned()
                 {
@@ -361,7 +361,7 @@ impl Executor {
         // variable turns the ignoreeof option off (the option tracks
         // "the variable is set").
         for name in variable_args.iter().filter(|a| !a.starts_with('-')) {
-            if matches!(name.as_str(), "IGNOREEOF" | "ignoreeof") {
+            if matches!(*name, "IGNOREEOF" | "ignoreeof") {
                 crate::builtins::set::sync_shell_option_flag(
                     &mut self.shell_state.env_vars,
                     "ignoreeof",

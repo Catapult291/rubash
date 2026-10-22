@@ -296,6 +296,24 @@ impl Executor {
         word_metadata: &[crate::parser::WordMetadata],
         command_name: &str,
     ) -> Result<Vec<String>, ()> {
+        // Whitelist fast path (rubash#117 discipline): a plain operand
+        // list — no option words, no `[` subscript brackets, no `(`
+        // compound parens, no compound-assignment marker — provably
+        // passes every operand through unchanged: the `-a`/`-A` hints
+        // need dash words, the subscript rewrite needs `[` on the LHS,
+        // the compound arm needs `(`/marker/hints (or declare-family
+        // array targets, which need `(` too), and the pending overlay
+        // is only consumed by the compound arm. Any doubtful shape
+        // runs the full rewrite below.
+        let plain = args.iter().all(|arg| {
+            !arg.starts_with('-')
+                && !arg.contains('[')
+                && !arg.contains('(')
+                && !arg.contains(crate::executor::markers::COMPOUND_ASSIGNMENT_MARKER)
+        });
+        if plain {
+            return Ok(args.to_vec());
+        }
         // Whether the operand list carries `-A` (set form); an unmarked
         // variable declared with -A takes the assoc element rules.
         let mut parse_options = true;

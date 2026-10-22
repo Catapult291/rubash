@@ -1671,7 +1671,9 @@ impl Executor {
             crate::executor::markers::QUOTED_NULL_MARKER_STR,
             "",
         );
-        Some(vec![strip_ifs_protection_markers(&restored.into_owned())])
+        Some(vec![
+            strip_ifs_protection_markers(&restored.into_owned()).into_owned()
+        ])
     }
 
     fn expand_simple_substitution_fragments(
@@ -2085,8 +2087,19 @@ impl Executor {
             }
         }
         if let Some(raw) = raw {
-            if let Some(values) = self.expand_simple_substitution_fragments(cmd, index, word, raw) {
-                return values;
+            // Whitelist admission (rubash#117 discipline): the fragment
+            // splitter only yields a substitution fragment when
+            // `scan_substitution_spans` finds a span, which needs `$(` or
+            // a backtick in the raw text. Without either byte the call
+            // provably returns None (single non-substitution fragment),
+            // so skip its Vec + String allocations on plain `$name`
+            // words. A present byte runs the full splitter unchanged.
+            if raw.contains("$(") || raw.contains('`') {
+                if let Some(values) =
+                    self.expand_simple_substitution_fragments(cmd, index, word, raw)
+                {
+                    return values;
+                }
             }
         }
         if let Some(raw_substitution) = raw
@@ -2583,10 +2596,10 @@ impl Executor {
             {
                 return vec![prepared];
             }
-            return vec![strip_ifs_protection_markers(&expanded)];
+            return vec![strip_ifs_protection_markers(&expanded).into_owned()];
         }
         if assignment_builtin_receives_assignment_word(cmd, index, word) {
-            return vec![strip_ifs_protection_markers(&expanded)];
+            return vec![strip_ifs_protection_markers(&expanded).into_owned()];
         }
         // An unquoted ${arr[@]@K}/${arr[@]@Q} word needs no special path:
         // the generic `expanded` text already carries the transform result
@@ -2597,14 +2610,14 @@ impl Executor {
         } else if raw_word_contains_process_substitution(raw)
             && expanded_word_has_process_substitution(&expanded)
         {
-            vec![strip_ifs_protection_markers(&expanded)]
+            vec![strip_ifs_protection_markers(&expanded).into_owned()]
         } else if let Some(values) = self.field_split_word_with_quoted_empty_suffix(raw, &expanded)
         {
             values
         } else if self.splits_unquoted_expanded_word(
             cmd,
             index,
-            &decode_command_substitution_payload(&expanded),
+            &decode_command_substitution_payload_cow(&expanded),
         ) {
             // Command-substitution output arrives payload-protected (control
             // bytes such as \n ride U+E319<hex>; sentinel payloads, rubash#840).
@@ -2612,7 +2625,10 @@ impl Executor {
             // expanded word before any of this protection is undone — so
             // decode here for the split decision and the split itself. The
             // no-split path keeps the protected form and decodes later.
-            let decoded = decode_command_substitution_payload(&expanded);
+            // Borrowed when the word carries no payload (the common
+            // loop-operand case): the owned decode below only runs for
+            // real substitution output.
+            let decoded = decode_command_substitution_payload_cow(&expanded);
             // GNU field-splits the expanded value without interpreting its
             // backslashes: a value like a\ b keeps the backslash in the
             // field and still splits on the space (a\ + b), whereas
@@ -2629,7 +2645,7 @@ impl Executor {
                 self.shell_state.env_vars.get("IFS").map(String::as_str),
             )
         } else {
-            vec![strip_ifs_protection_markers(&expanded)]
+            vec![strip_ifs_protection_markers(&expanded).into_owned()]
         }
     }
 
@@ -3641,6 +3657,13 @@ fn raw_word_contains_process_substitution(raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return false;
     };
+    // Whitelist admission (rubash#117 discipline): the DFA below only
+    // reports `<(`/`>(` outside quotes. Without either byte pair no arm
+    // can fire, so skip the char-collect + scan. A present pair runs the
+    // full quote-aware scan unchanged.
+    if !raw.contains("<(") && !raw.contains(">(") {
+        return false;
+    }
     let chars = raw.chars().collect::<Vec<_>>();
     let mut index = 0usize;
     let mut single = false;
@@ -3918,6 +3941,12 @@ pub(in crate::executor) fn raw_word_is_fully_single_quoted(raw: Option<&str>) ->
     // single-quoted spans cover every character. A naive starts/ends check
     // misread ''"$@"'' and ''$v'' (single spans around unquoted content) as
     // literal data, so the word reached argv unexpanded (quote4.sub).
+    // Whitelist admission: tiling from position 0 needs the first byte to
+    // be `'`, so skip the Vec<char> collect on every unquoted word (the
+    // loop-body common case). A leading `'` runs the full tiler unchanged.
+    if !raw.as_bytes().starts_with(b"'") {
+        return false;
+    }
     let chars: Vec<char> = raw.chars().collect();
     if chars.len() < 2 || chars[0] != '\'' {
         return false;
@@ -5218,10 +5247,20 @@ fn mark_quoted_ifs_from_raw(raw: &str, cooked_with_marks: &str, ifs: &str, posix
 /// needed) and must not leak into command arguments or assignment values.
 /// The ANSI-C_IFS_GUARD pairs (decoded `$'...'` blanks, rubash#379) drop
 /// their guard the same way, keeping the blank itself.
-fn strip_ifs_protection_markers(value: &str) -> String {
-    crate::executor::markers::strip_ansi_c_ifs_guard(
+fn strip_ifs_protection_markers(value: &str) -> std::borrow::Cow<'_, str> {
+    // Borrowing form (same contract as markers::cow_replace): a word
+    // carrying neither IFS_GLUE nor an ANSI_C_IFS_GUARD pair is returned
+    // borrowed, sparing the hot tail (every expanded operand) two
+    // allocations + two scans. A marked word keeps the exact old
+    // pipeline (glue removal, then guard strip).
+    if !value.contains(crate::executor::markers::IFS_GLUE)
+        && !value.contains(crate::executor::markers::ANSI_C_IFS_GUARD)
+    {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    std::borrow::Cow::Owned(crate::executor::markers::strip_ansi_c_ifs_guard(
         &value.replace(crate::executor::markers::IFS_GLUE, ""),
-    )
+    ))
 }
 
 fn field_split_escaped_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {

@@ -803,6 +803,15 @@ pub(in crate::executor) struct SubstitutionSpan {
 
 #[allow(dead_code)]
 pub(in crate::executor) fn scan_substitution_spans(raw: &str) -> Vec<SubstitutionSpan> {
+    // Whitelist admission (rubash#117 discipline): a span can only open on
+    // `$(` or a backtick (the quote arms below only skip). With neither
+    // byte present the scan provably finds nothing, so skip the
+    // char-collect + DFA and the caller's fragment Vec stays empty-cost.
+    // A present byte only runs the full scan — a false admission costs
+    // speed, never a missed span.
+    if !raw.contains("$(") && !raw.contains('`') {
+        return Vec::new();
+    }
     let chars: Vec<(usize, char)> = raw.char_indices().collect();
     let mut spans = Vec::new();
     let mut index = 0usize;

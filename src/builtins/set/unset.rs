@@ -219,7 +219,9 @@ where
         return Ok(EXECUTION_SUCCESS);
     }
 
-    let unset_name = unset_name.to_string();
+    // Borrowed (no alloc): every consumer below takes `&str`, and the
+    // owned cell (when the operand was a nameref) outlives the call.
+    let unset_name: &str = unset_name;
     // GNU variables.c:5778 { "GLOBIGNORE", sv_globignore } ->
     // pathexp.c:507-515 setup_glob_ignore: unsetting GLOBIGNORE takes the
     // `v == 0` branch and turns dotfile matching OFF — the effect shares
