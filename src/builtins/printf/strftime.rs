@@ -74,7 +74,11 @@ pub(super) fn strftime_subset(format: &str, time: &LocalTimeParts) -> String {
                 time.hour, time.minute, time.second
             )),
             other => {
-                output.push('%');
+                // GNU parse.y `case 'D'` / printf.def `%()T` delegate to the
+                // system strftime; glibc drops an unknown `%x` to the bare
+                // `x` (probe-verified on bash 5.3.20: `\D{%N}` -> `N`,
+                // `%( %N)T` -> `N`). `%%` stays `%` (arm above); a trailing
+                // lone `%` is kept verbatim (arm above).
                 output.push(other);
             }
         }
