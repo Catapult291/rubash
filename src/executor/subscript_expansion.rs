@@ -417,6 +417,27 @@ impl Executor {
             }
             return result;
         }
+        // Pure-variable fast path, the `&self` twin of the mutable lane in
+        // `eval_indexed_subscript_expression`: one scalar load instead of the
+        // whole-table clone, the full parse and the whole-map write diff.
+        // Queued subscript writes shadow the base table (same-word
+        // left-to-right side effects), so a non-empty queue stays slow.
+        // The hit is memoized like the slow path's result so the layered
+        // passes evaluate the subscript once per word.
+        if crate::executor::expand_braced_indices::PENDING_SUBSCRIPT_WRITES
+            .with(|pending| pending.borrow().is_empty())
+        {
+            if let Some(index) = crate::executor::arithmetic::plain_variable_subscript_index(
+                &resolved,
+                &self.shell_state.env_vars,
+            ) {
+                let result = IndexedSubscript::Index(index);
+                if let Some(key) = memo_key {
+                    crate::executor::expand_braced_indices::sub_idx_store(key, result);
+                }
+                return result;
+            }
+        }
         let overlaid =
             crate::executor::expand_braced_indices::env_vars_with_pending_subscript_writes(
                 &self.shell_state.env_vars,
