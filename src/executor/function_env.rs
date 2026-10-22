@@ -193,124 +193,20 @@ fn redirect_suffix_text(def_redirects: &[crate::parser::Redirect]) -> String {
 }
 
 pub(in crate::executor) fn exported_function_command_text(command: &CommandNode) -> Option<String> {
-    if function_definition_command_uses_source_text(command) {
-        let line = bash_command_source_text(command);
-        if !line.trim().is_empty() {
-            return Some(line);
-        }
-    }
-
-    if command.words.is_empty() && command.assignments.is_empty() {
-        return None;
-    }
-    if command.words.is_empty() {
-        return Some(function_assignment_text(command));
-    }
-
-    let mut line = command.words.join(" ");
-    if let Some(delimiter) = &command.heredoc_delimiter {
-        line.push_str(" <<");
-        line.push_str(delimiter);
-    }
-    append_exported_redirect(&mut line, command.redirect_in.as_ref(), "<");
-    let combined = command
-        .redirect_out
-        .as_ref()
-        .filter(|redirect| {
-            matches!(
-                redirect.kind,
-                crate::parser::RedirectKind::CombinedOutput
-                    | crate::parser::RedirectKind::CombinedAppend
-            )
-        })
-        .or_else(|| {
-            command.redirect_err_append.as_ref().filter(|redirect| {
-                matches!(
-                    redirect.kind,
-                    crate::parser::RedirectKind::CombinedOutput
-                        | crate::parser::RedirectKind::CombinedAppend
-                )
-            })
-        });
-    if let Some(redirect) = combined {
-        let op = if redirect.kind == crate::parser::RedirectKind::CombinedAppend {
-            "&>>"
-        } else {
-            "&>"
-        };
-        append_exported_redirect(&mut line, Some(redirect), op);
+    // rubash#1029: render through the same ast_print printer `declare -f`
+    // uses (print_cmd.c make_command_string in GNU serves both). The old
+    // hand-rolled renderer joined the quote-stripped expansion values in
+    // command.words/assignments, which dropped every quote and leaked
+    // the lexer's carrier markers (\037/\021) into BASH_FUNC_*%% — any
+    // child re-parsing the value got a corrupted function. The printer
+    // renders from word_metadata/assignment_raws with value re-quoting
+    // where no raw survives, so the exportstr re-parses to the same body.
+    let text = crate::parser::ast_print::pretty_print_command(command);
+    let text = text.trim_end_matches('\n');
+    if text.trim().is_empty() {
+        None
     } else {
-        append_exported_redirect(
-            &mut line,
-            command.redirect_out.as_ref(),
-            command
-                .redirect_out
-                .as_ref()
-                .filter(|redirect| redirect.clobber)
-                .map(|_| ">|")
-                .unwrap_or(">"),
-        );
-        append_exported_redirect(&mut line, command.append.as_ref(), ">>");
-        append_exported_redirect(
-            &mut line,
-            command.redirect_err.as_ref(),
-            command
-                .redirect_err
-                .as_ref()
-                .filter(|redirect| redirect.clobber)
-                .map(|_| "2>|")
-                .unwrap_or("2>"),
-        );
-        append_exported_redirect(&mut line, command.redirect_err_append.as_ref(), "2>>");
-    }
-    if let (Some(body), Some(delimiter)) = (&command.heredoc, &command.heredoc_delimiter) {
-        let body = body
-            .strip_prefix(crate::lexer::QUOTED_HEREDOC_MARKER)
-            .unwrap_or(body);
-        line.push('\n');
-        line.push_str(body);
-        line.push_str(delimiter);
-        return Some(line);
-    }
-
-    if let Some(here_string) = &command.here_string {
-        Some(format!("{} <<< {}", command.words.join(" "), here_string))
-    } else {
-        Some(line)
-    }
-}
-
-pub(in crate::executor) fn function_assignment_text(command: &CommandNode) -> String {
-    let mut assignments = command.assignments.iter().collect::<Vec<_>>();
-    assignments.sort_by(|(left, _), (right, _)| left.cmp(right));
-    assignments
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(in crate::executor) fn append_exported_redirect(
-    line: &mut String,
-    redirect: Option<&Redirect>,
-    op: &str,
-) {
-    if let Some(redirect) = redirect {
-        line.push(' ');
-        if redirect.target.starts_with('&') {
-            if redirect.fd.is_none()
-                && matches!(op, "<" | ">")
-                && redirect.target[1..].chars().all(|ch| ch.is_ascii_digit())
-            {
-                line.push_str(if op == "<" { "0" } else { "1" });
-            }
-            line.push_str(op);
-            line.push_str(&redirect.target);
-        } else {
-            line.push_str(op);
-            line.push(' ');
-            line.push_str(&redirect.target);
-        }
+        Some(text.to_string())
     }
 }
 
