@@ -108,11 +108,11 @@ pub(in crate::executor) fn env_derived_dynamic_parameter_value(
                 .get(SECONDS_OFFSET)
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
-            Some(
-                (current_epoch_seconds() - start + offset)
-                    .max(0)
-                    .to_string(),
-            )
+            // GNU variables.c get_seconds: the value is a plain
+            // time_t difference plus the assignment offset — a negative
+            // assignment (`SECONDS=-100`) reads back negative and ticks
+            // up through zero; there is no clamp at 0 (rubash#1083).
+            Some((current_epoch_seconds() - start + offset).to_string())
         }
         _ => None,
     }
