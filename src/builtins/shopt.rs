@@ -382,6 +382,20 @@ fn set_option_inner(
     // value GNU's parser would.
     if name == "extglob" {
         crate::lexer::set_parse_extended_glob(enabled);
+        // rubash#1093: record the line whose execution enabled extglob so
+        // the executor can tell a runtime flip on an EARLIER line (GNU's
+        // read-execute cadence parses later lines with the gate on) from
+        // a same-line `shopt -s extglob; case ...` unit (GNU parses the
+        // whole line first and rejects the pattern).
+        if enabled {
+            let line = env_vars
+                .get("__RUBASH_CURRENT_LINE")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string());
+            env_vars.insert("__RUBASH_EXTGLOB_ENABLED_LINE".to_string(), line);
+        } else {
+            env_vars.remove("__RUBASH_EXTGLOB_ENABLED_LINE");
+        }
     }
     match name {
         "xpg_echo" => XPG_ECHO.store(enabled, Ordering::Relaxed),
