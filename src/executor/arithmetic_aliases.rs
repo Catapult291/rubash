@@ -169,6 +169,16 @@ impl Executor {
     }
 
     pub(in crate::executor) fn report_arithmetic_error_raw_display(&self, raw_display: &str) {
+        // GNU expr.c:1190-1216 expr_streval: an unbound variable under
+        // `set -u` reports `name: unbound variable` at the trap site and
+        // jumps straight out — evalerror never runs, so no second
+        // diagnostic may be synthesized from the expression text. The
+        // text heuristics below misread a postfix `u++`/`u--` whose
+        // operand trapped as a trailing-operator syntax error
+        // (rubash#1150: `((u++))` printed both lines).
+        if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
         if self.report_subscript_eval_failure() {
             return;
         }
@@ -202,6 +212,12 @@ impl Executor {
     }
 
     pub(in crate::executor) fn report_let_arithmetic_error(&self, expression: &str) {
+        // GNU expr.c:1190-1216 expr_streval: the nounset trap already
+        // reported the unbound variable and jumped out — no evalerror
+        // follows (rubash#1150, `let u++` double-reported).
+        if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
         // GNU expr.c: a failed array SUBSCRIPT eval (nested evalexp inside
         // array_expand_index) names the subscript, not the let operand.
         if self.report_subscript_eval_failure() {
