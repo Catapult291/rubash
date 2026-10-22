@@ -443,13 +443,21 @@ impl Executor {
     /// wordlist completion.
     pub fn complete_line(&self, line: &str, cursor: usize) -> Vec<String> {
         let function_names: Vec<String> = self.shell_state.functions.keys().cloned().collect();
+        // Job completion names are the command's first word only
+        // (rubash#1052; same rule as the compgen path in job_builtins).
         let job_names: Vec<String> = self
             .shell_state
             .job_table
             .jobs
             .values()
             .filter(|job| job.background)
-            .map(|job| job.command.clone())
+            .map(|job| {
+                job.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         crate::builtins::complete::complete_line_candidates(
             line,

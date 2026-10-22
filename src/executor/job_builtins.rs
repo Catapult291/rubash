@@ -2267,13 +2267,22 @@ impl Executor {
             return Ok(status);
         }
         let function_names: Vec<String> = self.shell_state.functions.keys().cloned().collect();
+        // GNU job completion names a job by its command name only (the
+        // first word — `%sleep`, pcomplete.c it_jobs / jobs.c job names),
+        // not the full command line (rubash#1052).
         let job_names: Vec<String> = self
             .shell_state
             .job_table
             .jobs
             .values()
             .filter(|job| job.background)
-            .map(|job| job.command.clone())
+            .map(|job| {
+                job.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         // compgen's dynamic inputs — complete.def:669 compgen_builtin drives
         // pcomplete.c:1251 gen_compspec_completions, which runs the -F
