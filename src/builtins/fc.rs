@@ -202,6 +202,16 @@ where
 
     let count = entries.len();
     if count == 0 {
+        // GNU fc.def: the execute form (`fc -s`, and `fc -e -` which sets
+        // execute=1 at fc.def:243-246) resolves its command through
+        // fc_gethist and reports "no command found" (EXECUTION_FAILURE)
+        // when the list is empty, while the list/edit forms return
+        // EXECUTION_SUCCESS on an empty list (fc.def:318-319
+        // `if (hlist == 0) return (EXECUTION_SUCCESS)`) (rubash#1123).
+        if execute || editor.as_deref() == Some("-") {
+            writeln!(stderr, "{diagnostic_prefix}fc: no command found")?;
+            return Ok(FcResult::Status(EXECUTION_FAILURE));
+        }
         return Ok(FcResult::Status(EXECUTION_SUCCESS));
     }
 
@@ -577,6 +587,18 @@ mod tests {
         let (out, _, result) = run_fc(&["-l"], &[]);
         expect_status(&result, EXECUTION_SUCCESS);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_fc_s_empty_history_no_command_found() {
+        // rubash#1123: GNU fc.def's execute form reports "no command
+        // found" (rc 1) on an empty history; the list form above stays 0.
+        let (_, stderr, result) = run_fc(&["-s"], &[]);
+        expect_status(&result, EXECUTION_FAILURE);
+        assert_eq!(stderr, "fc: no command found\n");
+        let (_, stderr, result) = run_fc(&["-e", "-"], &[]);
+        expect_status(&result, EXECUTION_FAILURE);
+        assert_eq!(stderr, "fc: no command found\n");
     }
 
     // --- string specification ---

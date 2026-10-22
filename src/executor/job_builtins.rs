@@ -1017,16 +1017,18 @@ impl Executor {
             self.ordered_background_jobs()
         } else {
             let mut selected = Vec::new();
+            // GNU jobs.def jobs_builtin: each operand goes through
+            // get_job_spec; a bad spec is sh_badjob'd and counted in
+            // any_failed, and the builtin returns
+            // `any_failed ? EXECUTION_FAILURE : EXECUTION_SUCCESS`
+            // (jobs.def:174). The rubash#549 leniency is only about the
+            // MESSAGE/resolution (a bare operand warns about the missing
+            // `%' and is then resolved as if it had one), not the status:
+            // GNU 5.3.20 probes give rc=1 for `jobs %99`, `jobs 99`,
+            // `jobs foo` and `jobs %99 %1`, rc=0 when every operand
+            // resolves (rubash#1123).
+            let mut any_failed = false;
             for job in requested_jobs {
-                // rubash#549 (cell 1): GNU jobs.def's bad-spec path is
-                // lenient. An operand without the leading `%' draws
-                // `warning: N: job specification requires leading `%'` and
-                // is then resolved AS IF the `%' were there (probe
-                // 2026-10-12, GNU 5.3.0: `sleep 5 & jobs 1` warns and lists
-                // job 1; `jobs 5`/`jobs 1x` warn then report `N: no such
-                // job`). Every listing failure — bare or `%N` — leaves the
-                // builtin's status at 0 (`jobs %5`, `jobs 1 %2` probes all
-                // return 0); only a usage error exits 2.
                 let (spec, report) = if job.starts_with('%') {
                     (job.clone(), job.clone())
                 } else {
@@ -1048,6 +1050,7 @@ impl Executor {
                         }
                     }
                 } else {
+                    any_failed = true;
                     writeln!(
                         stderr,
                         "{}jobs: {report}: no such job",
@@ -1059,7 +1062,7 @@ impl Executor {
             // jobs.c:2231 list_one_job: explicit jobspec listing is followed
             // by cleanup_dead_jobs — a listed dead job leaves the table.
             self.shell_state.job_table.cleanup_dead_jobs();
-            return Ok((output, 0));
+            return Ok((output, i32::from(any_failed)));
         };
         let output = self.render_background_jobs(options, jobs);
         // jobs.def:137-141 JSTATE_ANY (plain `jobs`, `-l`, `-p`, `-n`): after
