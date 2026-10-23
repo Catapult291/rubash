@@ -1627,6 +1627,80 @@ fn skip_backtick_corrected(chars: &[char], mut index: usize) -> Option<usize> {
     None
 }
 
+/// Balanced `${...}` unit scan starting at the opening `{` (the character
+/// right after `$`). Returns `(end, newlines, closed)`: the index past the
+/// matching `}` (the buffer end when unclosed), the newline count inside the
+/// scanned span, and whether the unit closed. Quote/escape/nesting handling
+/// is the walk's top-level `${` arm below (GNU parse.y:3877
+/// parse_matched_pair ('{', '}', P_FIRSTCLOSE|P_DOLBRACE)).
+fn skip_braced_unit_scan(chars: &[char], open: usize) -> (usize, usize, bool) {
+    let mut depth = 1usize;
+    let mut scan = open + 1;
+    let mut newlines = 0usize;
+    let mut closed = false;
+    let mut scan_single = false;
+    let mut scan_double = false;
+    let mut scan_ansi = false;
+    let mut scan_escaped = false;
+    while scan < chars.len() {
+        let c = chars[scan];
+        if c == '\n' {
+            newlines += 1;
+        }
+        if scan_escaped {
+            scan_escaped = false;
+            scan += 1;
+            continue;
+        }
+        if scan_ansi {
+            if c == '\\' {
+                scan_escaped = true;
+            } else if c == '\'' {
+                scan_ansi = false;
+            }
+            scan += 1;
+            continue;
+        }
+        if scan_single {
+            if c == '\'' {
+                scan_single = false;
+            }
+            scan += 1;
+            continue;
+        }
+        if scan_double {
+            if c == '\\' {
+                scan_escaped = true;
+            } else if c == '"' {
+                scan_double = false;
+            }
+            scan += 1;
+            continue;
+        }
+        match c {
+            '\\' => scan_escaped = true,
+            '\'' => scan_single = true,
+            '"' => scan_double = true,
+            '$' if chars.get(scan + 1) == Some(&'\'') => {
+                scan_ansi = true;
+                scan += 1;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    closed = true;
+                    scan += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    (scan, newlines, closed)
+}
+
 /// Standalone corrected `skip_parenthesized_unit`: given the char slice and
 /// the index of the opening `(` (the one right after `$`), return the index
 /// past the matching `)` or `None` if unbalanced.  Uses the corrected
@@ -2099,6 +2173,37 @@ fn unclosed_array_subscript_walk(
             continue;
         }
         if double {
+            // GNU parse.y:3877 parse_matched_pair quote recursion
+            // (parse.y:4044-4051) + parse_dollar_word (parse.y:4158-4168):
+            // inside double quotes `$(...)`, `${...}` and `` `...` `` stay
+            // grouping constructs scanned by recursive matched-pair calls
+            // with FRESH quote state — an inner `"` never closes the outer
+            // `"` (issue #1335 Cylon.sh `x="$(printf "a[")"` died as a
+            // phantom `]`-EOF: the inner quote flipped this flag, `a`
+            // became a command-position identifier word, and `[` opened a
+            // subscript hunt). Skip them as balanced units; anything else
+            // keeps the literal handling below. Unclosed units fall through
+            // to it, exactly like the top-level `$()` arm does.
+            if ch == '$' && chars.get(index + 1) == Some(&'(') {
+                if let Some(end) = skip_parenthesized_unit_corrected(&chars, index + 1) {
+                    line += chars[index..end].iter().filter(|c| **c == '\n').count();
+                    index = end;
+                    continue;
+                }
+            } else if ch == '$' && chars.get(index + 1) == Some(&'{') {
+                let (end, newlines, closed) = skip_braced_unit_scan(&chars, index + 1);
+                if closed {
+                    line += newlines;
+                    index = end;
+                    continue;
+                }
+            } else if ch == '`' {
+                if let Some(end) = skip_backtick_corrected(&chars, index) {
+                    line += chars[index..end].iter().filter(|c| **c == '\n').count();
+                    index = end;
+                    continue;
+                }
+            }
             if ch == '\\' {
                 escaped = true;
             } else if ch == '"' {
@@ -2177,68 +2282,12 @@ fn unclosed_array_subscript_walk(
                 // (rubash#532). An UNCLOSED `${` falls out of the skip with
                 // the subscript hunt untouched: the generic close-char scan
                 // then owns the `}` EOF, exactly like `echo ${x`.
-                let mut depth = 1usize;
-                let mut scan = index + 2;
-                let mut scan_single = false;
-                let mut scan_double = false;
-                let mut scan_ansi = false;
-                let mut scan_escaped = false;
-                while scan < chars.len() {
-                    let c = chars[scan];
-                    if c == '\n' {
-                        line += 1;
-                    }
-                    if scan_escaped {
-                        scan_escaped = false;
-                        scan += 1;
-                        continue;
-                    }
-                    if scan_ansi {
-                        if c == '\\' {
-                            scan_escaped = true;
-                        } else if c == '\'' {
-                            scan_ansi = false;
-                        }
-                        scan += 1;
-                        continue;
-                    }
-                    if scan_single {
-                        if c == '\'' {
-                            scan_single = false;
-                        }
-                        scan += 1;
-                        continue;
-                    }
-                    if scan_double {
-                        if c == '\\' {
-                            scan_escaped = true;
-                        } else if c == '"' {
-                            scan_double = false;
-                        }
-                        scan += 1;
-                        continue;
-                    }
-                    match c {
-                        '\\' => scan_escaped = true,
-                        '\'' => scan_single = true,
-                        '"' => scan_double = true,
-                        '$' if chars.get(scan + 1) == Some(&'\'') => {
-                            scan_ansi = true;
-                            scan += 1;
-                        }
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                scan += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    scan += 1;
-                }
-                index = scan;
+                // The unit scan is skip_braced_unit_scan (shared with the
+                // double-quote arm above); an unclosed body scans to the
+                // buffer end here, preserving the old fall-through.
+                let (end, newlines, _) = skip_braced_unit_scan(&chars, index + 1);
+                line += newlines;
+                index = end;
                 word.clear();
                 continue;
             }

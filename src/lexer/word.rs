@@ -721,19 +721,19 @@ impl<'a> Lexer<'a> {
     }
 
     fn looks_like_array_element_assignment(&self) -> bool {
-        let rest = &self.input[self.position..];
-        if self.position == 0
-            || self.input.as_bytes()[self.position - 1] != b'[' && !rest.starts_with('[')
-        {
-            return false;
-        }
-        let open = if rest.starts_with('[') {
-            self.position
-        } else {
-            return false;
-        };
-        let name_end = open;
-        let mut name_start = name_end;
+        // GNU parse.y:5633-5651 read_token_word: the `[` subscript arm
+        // decides AT the `[` from the word assembled SO FAR
+        // (`token_index > 0 && assignment_acceptable && token_is_ident`,
+        // parse.y:5636, token_is_ident at parse.y:5291 = valid_identifier
+        // over the whole prefix — no name-length limit), then consumes the
+        // matched span via parse_matched_pair P_ARRAYSUB. This predicate used
+        // to require the scan position itself to sit AT the `[`, but it runs
+        // once at word-start+1, so only single-character names ever armed
+        // the subscript path and `ab[((n))]=x` broke at the paren
+        // (issue #1335 linux_exploit_suggester.sh `EXPLOITS[((n++))]=...`).
+        // Fix the invariant: locate the candidate shape from the word start
+        // (identifier `[` balanced `]` `=`), wherever the `[` sits.
+        let mut name_start = self.position;
         while name_start > 0 {
             let ch = self.input.as_bytes()[name_start - 1] as char;
             if ch == '_' || ch.is_ascii_alphanumeric() {
@@ -742,15 +742,25 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let name = &self.input[name_start..name_end];
-        let mut name_chars = name.chars();
-        let Some(first) = name_chars.next() else {
-            return false;
-        };
-        if !(first == '_' || first.is_ascii_alphabetic()) {
+        let rest = &self.input[name_start..];
+        let mut name_len = 0usize;
+        for (offset, ch) in rest.char_indices() {
+            if offset == 0 {
+                if !(ch == '_' || ch.is_ascii_alphabetic()) {
+                    return false;
+                }
+                name_len = ch.len_utf8();
+            } else if ch == '_' || ch.is_ascii_alphanumeric() {
+                name_len = offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if name_len == 0 {
             return false;
         }
-        if !name_chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        let rest = &rest[name_len..];
+        if !rest.starts_with('[') {
             return false;
         }
         let mut depth = 1usize;
@@ -834,7 +844,9 @@ impl<'a> Lexer<'a> {
         }
         close
             .and_then(|offset| rest.get(offset + 1..))
-            .is_some_and(|tail| tail.starts_with('='))
+            // GNU parse.y:5653 token_is_assignment: both `=` and `+=` make
+            // the word an assignment.
+            .is_some_and(|tail| tail.starts_with('=') || tail.starts_with("+="))
     }
 
     fn word_so_far_ends_extglob_operator(&self, start: usize) -> bool {
