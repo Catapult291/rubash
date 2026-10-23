@@ -2225,6 +2225,80 @@ fn skip_backtick_unit(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
+/// Balanced `${...}` unit scan starting at the opening `{` (the character
+/// right after `$`). Port of the skip.rs oracle's `skip_braced_unit_scan`
+/// (GNU parse.y:3877 parse_matched_pair ('{', '}', P_DOLBRACE)) so the
+/// subscript residual stays byte-identical with the oracle by construction.
+/// Returns `(end, newlines, closed)`; unclosed units fall through to the
+/// caller (which parks, S2f/S3 pattern).
+fn skip_braced_unit_scan_residual(chars: &[char], open: usize) -> (usize, usize, bool) {
+    let mut depth = 1usize;
+    let mut scan = open + 1;
+    let mut newlines = 0usize;
+    let mut closed = false;
+    let mut scan_single = false;
+    let mut scan_double = false;
+    let mut scan_ansi = false;
+    let mut scan_escaped = false;
+    while scan < chars.len() {
+        let c = chars[scan];
+        if c == '\n' {
+            newlines += 1;
+        }
+        if scan_escaped {
+            scan_escaped = false;
+            scan += 1;
+            continue;
+        }
+        if scan_ansi {
+            if c == '\\' {
+                scan_escaped = true;
+            } else if c == '\'' {
+                scan_ansi = false;
+            }
+            scan += 1;
+            continue;
+        }
+        if scan_single {
+            if c == '\'' {
+                scan_single = false;
+            }
+            scan += 1;
+            continue;
+        }
+        if scan_double {
+            if c == '\\' {
+                scan_escaped = true;
+            } else if c == '"' {
+                scan_double = false;
+            }
+            scan += 1;
+            continue;
+        }
+        match c {
+            '\\' => scan_escaped = true,
+            '\'' => scan_single = true,
+            '"' => scan_double = true,
+            '$' if chars.get(scan + 1) == Some(&'\'') => {
+                scan_ansi = true;
+                scan += 1;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    closed = true;
+                    scan += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    (scan, newlines, closed)
+}
+
 /// Residual unclosed `$(` depth after scanning `input` — how many top-level
 /// `)` tokens a multi-line substitution still needs. Used by the parser's
 /// stray-`)` guard: a `)` token is a legitimate closer while this is > 0.
@@ -3821,6 +3895,57 @@ pub(crate) fn subscript_residuals_advance(
             continue;
         }
         if state.double {
+            // Mirror of the skip.rs oracle's double arm (rubash#1335 Cylon
+            // shape, GNU parse.y:3877 matched-pair quote recursion):
+            // `$(...)`, `${...}` and backquotes inside double quotes are
+            // grouping constructs with FRESH quote state — an inner `"`
+            // never closes the outer one. Skip closed units as balanced
+            // spans; an unclosed unit parks here (S2f/S3 pattern) and falls
+            // through literally, exactly like the oracle does.
+            if ch == '$' && chars.get(index + 1) == Some(&'(') {
+                if let Some((end, decided)) = skip_parenthesized_unit_corrected_ex(chars, index + 1)
+                {
+                    if !decided && park.is_none() {
+                        park = Some(SubscriptResidualPark {
+                            pos: index,
+                            snapshot: state.clone(),
+                        });
+                    }
+                    index = end;
+                    continue;
+                }
+                if park.is_none() {
+                    park = Some(SubscriptResidualPark {
+                        pos: index,
+                        snapshot: state.clone(),
+                    });
+                }
+            } else if ch == '$' && chars.get(index + 1) == Some(&'{') {
+                let (end, newlines, closed) = skip_braced_unit_scan_residual(chars, index + 1);
+                if closed {
+                    state.line += newlines;
+                    index = end;
+                    continue;
+                }
+                if park.is_none() {
+                    park = Some(SubscriptResidualPark {
+                        pos: index,
+                        snapshot: state.clone(),
+                    });
+                }
+            } else if ch == '`' {
+                if let Some(end) = skip_backtick_unit(chars, index) {
+                    state.line += chars[index..end].iter().filter(|c| **c == '\n').count();
+                    index = end;
+                    continue;
+                }
+                if park.is_none() {
+                    park = Some(SubscriptResidualPark {
+                        pos: index,
+                        snapshot: state.clone(),
+                    });
+                }
+            }
             if ch == '\\' {
                 state.escaped = true;
             } else if ch == '"' {
@@ -3955,6 +4080,35 @@ pub(crate) fn subscript_residuals_advance(
                         '\\' => scan_escaped = true,
                         '\'' => scan_single = true,
                         '"' => scan_double = true,
+                        // Same comsub-awareness as the outer double arm
+                        // (rubash#1335): inner units own their quotes.
+                        '$' if chars.get(scan + 1) == Some(&'(') => {
+                            if let Some((end, _)) =
+                                skip_parenthesized_unit_corrected_ex(chars, scan + 1)
+                            {
+                                state.line +=
+                                    chars[scan..end].iter().filter(|c| **c == '\n').count();
+                                scan = end;
+                                continue;
+                            }
+                        }
+                        '$' if chars.get(scan + 1) == Some(&'{') => {
+                            let (end, newlines, closed) =
+                                skip_braced_unit_scan_residual(chars, scan + 1);
+                            if closed {
+                                state.line += newlines;
+                                scan = end;
+                                continue;
+                            }
+                        }
+                        '`' => {
+                            if let Some(end) = skip_backtick_unit(chars, scan) {
+                                state.line +=
+                                    chars[scan..end].iter().filter(|c| **c == '\n').count();
+                                scan = end;
+                                continue;
+                            }
+                        }
                         '$' if chars.get(scan + 1) == Some(&'\'') => {
                             scan_ansi = true;
                             scan += 1;
@@ -5644,6 +5798,11 @@ mod subscript_residual_incremental_tests {
         assert_incremental_matches_full(&["# a[b", "c"]);
         // $'...' ANSI-C bodies.
         assert_incremental_matches_full(&["echo $'a[b'", "x[y"]);
+        // Inner quotes inside dquoted comsub units must not flip the
+        // outer dquote state (skip.rs fix for rubash#1335 Cylon shape).
+        assert_incremental_matches_full(&["x=\"$(printf \"a[\")\"", "echo hi"]);
+        assert_incremental_matches_full(&["echo \"a $(printf \"b[\") c\"", "echo hi"]);
+        assert_incremental_matches_full(&["x=${v:-\"$(printf \"a[\")\"}", "echo hi"]);
     }
 
     #[test]
