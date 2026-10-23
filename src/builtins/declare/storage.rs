@@ -175,9 +175,10 @@ pub(super) fn quote_declare_value(value: &str) -> String {
     // scalar and ansic_quote would re-encode it as UTF-8 octal escapes —
     // `$'\x81'` rendered as $'\302\201' where GNU strtrans.c ansic_quote
     // escapes the single byte 0x81 as \201 (rubash#540).
-    let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-        .expect("raw-byte sentinel is a valid char");
-    if value.contains(sentinel) {
+    // Only a genuine E000+payload pair marks stored raw bytes: a literal
+    // user U+E000 is printable data (GNU renders `x="<E000>"`), so the
+    // byte-view path gates on has_raw_byte_marker_pair (rubash#1060).
+    if crate::executor::substitution_metadata::has_raw_byte_marker_pair(value) {
         return crate::executor::ansic_quote(value);
     }
     let visible = display_text(value);
@@ -200,9 +201,7 @@ pub(super) fn quote_array_element_value(value: &str) -> String {
     // instead (the same boundary executor/arrays/storage.rs ansic_quote
     // uses for storage rendering), so the element renders as $'\021!'
     // exactly like GNU array_to_assign.
-    let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-        .expect("raw-byte sentinel is a valid char");
-    if value.contains(sentinel) {
+    if crate::executor::substitution_metadata::has_raw_byte_marker_pair(value) {
         return crate::executor::ansic_quote(value);
     }
     let visible = display_text(value);

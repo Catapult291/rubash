@@ -358,9 +358,10 @@ pub(super) fn shell_quote_form(value: &str, altform: bool) -> String {
     // ansic_quote over the byte string; unicode3.sub payload
     // $'5\247@3\231+...'). The marker chars themselves are private-use and
     // never is_control(), so they must be decoded before the quote decision.
-    let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-        .expect("raw-byte sentinel is a valid char");
-    if value.contains(sentinel) {
+    // rubash#1060: only a genuine E000+payload pair marks stored raw bytes;
+    // a literal user U+E000 falls through to the char paths and renders
+    // verbatim like any printable PUA char (GNU sh_backslash_quote).
+    if crate::executor::substitution_metadata::has_raw_byte_marker_pair(value) {
         let bytes =
             crate::executor::substitution_metadata::decode_raw_byte_markers(value.as_bytes());
         return ansi_c_shell_quote_bytes(&bytes);
