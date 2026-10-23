@@ -3053,7 +3053,7 @@ fn windows_console_size_of(_handle: *mut std::ffi::c_void) -> Option<(i32, i32)>
 /// CONOUT$ so it works even when stdin/stdout/stderr are all redirected,
 /// with the std handles as fallbacks for consoles without a CONOUT$ open.
 #[cfg(windows)]
-fn process_console_size() -> Option<(i32, i32)> {
+pub(crate) fn process_console_size() -> Option<(i32, i32)> {
     use std::os::windows::io::AsRawHandle;
     if let Ok(conout) = std::fs::OpenOptions::new()
         .read(true)
@@ -3081,7 +3081,7 @@ fn process_console_size() -> Option<(i32, i32)> {
 }
 
 #[cfg(not(windows))]
-fn process_console_size() -> Option<(i32, i32)> {
+pub(crate) fn process_console_size() -> Option<(i32, i32)> {
     None
 }
 
