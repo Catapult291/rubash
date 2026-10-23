@@ -33,6 +33,11 @@ pub(in crate::executor) fn rubash_spawn_inherited_state(key: &str) -> bool {
         "__RUBASH_DIR_STACK",
         "__RUBASH_DISABLED_BUILTINS",
         "__RUBASH_GETOPTS_OFFSET",
+        // A GNU fork keeps the variable context stack, so a local that
+        // shadows an exported outer binding keeps the shadowed name's
+        // child-env contribution — the LOCAL_EXPORT_ENV stash is that
+        // model's transport across the respawn (rubash#970).
+        "__RUBASH_LOCAL_EXPORT_ENV",
         "__RUBASH_ULIMIT_C",
         "__RUBASH_ULIMIT_F",
         "__RUBASH_ULIMIT_N",

@@ -279,6 +279,12 @@ impl Executor {
                 }
             }
             for (name, value) in local_export_env_values(&self.shell_state.env_vars) {
+                // Same rule as apply_child_environment: the stash stands
+                // in for the shadowed outer binding only while the local
+                // is not itself a live export candidate (rubash#970).
+                if !local_export_env_entry_applies(&self.shell_state.env_vars, &name) {
+                    continue;
+                }
                 env_vars.insert(name, value);
             }
             // GNU `env` is an external binary that inherits the shell's OS

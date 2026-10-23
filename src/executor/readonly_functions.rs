@@ -268,6 +268,12 @@ impl Executor {
             }
         }
         for (name, value) in local_export_env_values(&self.shell_state.env_vars) {
+            // The stash yields to a bound exported local — the env-vars
+            // loop above already wrote the local's own value
+            // (local_export_env_entry_applies, rubash#970).
+            if !local_export_env_entry_applies(&self.shell_state.env_vars, &name) {
+                continue;
+            }
             if is_valid_process_env(&name, &value) {
                 process.env(&name, self.child_env_value(&name, &value));
             }
