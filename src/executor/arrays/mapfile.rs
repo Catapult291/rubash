@@ -49,11 +49,23 @@ pub(in crate::executor) fn split_mapfile_input(
                 continue;
             }
             let end = if strip { index } else { index + 1 };
-            values.push(input[start..end].to_string());
+            // GNU mapfile.def: input is C-string, truncate at first NUL
+            // (rubash#1420).
+            let segment = &input[start..end];
+            let value = match segment.find('\0') {
+                Some(pos) => segment[..pos].to_string(),
+                None => segment.to_string(),
+            };
+            values.push(value);
             start = index + 1;
         }
         if start < input.len() {
-            values.push(input[start..].to_string());
+            let segment = &input[start..];
+            let value = match segment.find('\0') {
+                Some(pos) => segment[..pos].to_string(),
+                None => segment.to_string(),
+            };
+            values.push(value);
         }
         return values;
     }
@@ -70,11 +82,29 @@ pub(in crate::executor) fn split_mapfile_input(
             continue;
         }
         let end = if strip { index } else { index + 1 };
-        values.push(bytes_to_shell_text(&bytes[start..end]));
+        // GNU mapfile.def: truncate at first NUL (rubash#1420), except when
+        // NUL is the delimiter (delim==0, already handled by `strip`).
+        let segment = &bytes[start..end];
+        let filtered: Vec<u8> = if delim == 0 {
+            segment.to_vec()
+        } else if let Some(pos) = segment.iter().position(|&b| b == 0) {
+            segment[..pos].to_vec()
+        } else {
+            segment.to_vec()
+        };
+        values.push(bytes_to_shell_text(&filtered));
         start = index + 1;
     }
     if start < bytes.len() {
-        values.push(bytes_to_shell_text(&bytes[start..]));
+        let segment = &bytes[start..];
+        let filtered: Vec<u8> = if delim == 0 {
+            segment.to_vec()
+        } else if let Some(pos) = segment.iter().position(|&b| b == 0) {
+            segment[..pos].to_vec()
+        } else {
+            segment.to_vec()
+        };
+        values.push(bytes_to_shell_text(&filtered));
     }
     values
 }
