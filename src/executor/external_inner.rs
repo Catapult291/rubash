@@ -835,16 +835,15 @@ impl Executor {
         }
         #[cfg(unix)]
         {
-            // GNU deferral is the correct model here (jobs.c:3064
-            // wait_for): while a real foreground child runs, a trapped
-            // signal is only RECORDED (trap.c trap_handler) and its
-            // trap dispatches at the command boundary when wait_for
-            // returns — which is immediate when the child itself dies
-            // from a group-delivered signal (rubash#1034's ^C case).
-            // Untrapped terminating signals stay SIG_DFL at the kernel
-            // and kill this process inside waitpid directly. So a
-            // blocking wait is faithful on unix; the sliced observer
-            // loop exists for platforms without kernel delivery.
+            // GNU jobs.c:3086-3102 wait_for installs wait_sigint_handler
+            // for the wait: the handler only records (trap.c
+            // trap_handler sets pending_traps[SIGINT]) instead of dying,
+            // and after the wait the shell reports the dead child's
+            // 128+SIGINT status and continues. Without this, SIG_DFL
+            // kills an interactive shell inside waitpid on Ctrl-C
+            // (rubash#1250; GNU survives with rc=130). Non-interactive
+            // shells keep SIG_DFL and die like GNU scripts do.
+            let _sigint_guard = ForegroundWaitSigintGuard::hold_if_interactive_untrapped(self);
             child.wait().map_err(ExecuteError::IoError)
         }
     }
@@ -1366,6 +1365,156 @@ impl Executor {
             message
         )?;
         self.finish_external_error(cmd, &stderr, status)
+    }
+}
+
+#[cfg(unix)]
+/// Holds SIGINT at SIG_IGN across one foreground blocking wait when the
+/// shell is interactive and SIGINT has no trap installed (kernel
+/// disposition is SIG_DFL). GNU jobs.c:3086-3102 wait_for swaps in
+/// wait_sigint_handler for the wait so an interactive shell never dies
+/// mid-wait; rubash#1250 is that missing swap (Ctrl-C killed niu -i
+/// inside waitpid). Restores SIG_DFL on drop; no child is spawned while
+/// the guard lives, so nothing inherits the ignore. Trapped SIGINT keeps
+/// its handler (disposition != DFL) so trap recording is untouched, and
+/// entry-ignored SIGINT stays ignored.
+struct ForegroundWaitSigintGuard {
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ForegroundWaitSigintGuard {
+    fn hold_if_interactive_untrapped(executor: &Executor) -> Self {
+        if !foreground_sigint_needs_protection(executor) {
+            return Self { armed: false };
+        }
+        unsafe {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            ignore.sa_flags = 0;
+            ignore.sa_mask = std::mem::zeroed();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                ignore.sa_restorer = None;
+            }
+            if libc::sigaction(libc::SIGINT, &ignore, std::ptr::null_mut()) == 0 {
+                return Self { armed: true };
+            }
+        }
+        Self { armed: false }
+    }
+}
+
+/// Shared predicate for both foreground SIGINT guards (rubash#1250): the
+/// shell is interactive (same definition as the interactive-discard rule,
+/// so the two can never drift) and SIGINT sits at SIG_DFL — i.e. no trap
+/// installed (a handler means the trap path owns the delivery) and not
+/// entry-ignored.
+#[cfg(unix)]
+pub(in crate::executor) fn foreground_sigint_needs_protection(executor: &Executor) -> bool {
+    executor.expansion_error_is_interactive_discard() && sigint_disposition_is_default()
+}
+
+#[cfg(unix)]
+fn sigint_disposition_is_default() -> bool {
+    // sigaction(null) queries without installing (same probe as
+    // kill.rs entry-ignored snapshot): only SIG_DFL means "no trap
+    // installed, would die" — a handler (trapped) or SIG_IGN
+    // (entry-ignored) must be left alone.
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } != 0 {
+        return false;
+    }
+    current.sa_sigaction == libc::SIG_DFL
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundWaitSigintGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        unsafe {
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            dfl.sa_flags = 0;
+            dfl.sa_mask = std::mem::zeroed();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                dfl.sa_restorer = None;
+            }
+            libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut());
+        }
+    }
+}
+
+/// SIGINT guard for builtins that block in-process (rubash#1250: the
+/// `sleep` fast path, which is what the issue's `sleep 30` repro actually
+/// exercises — `sleep` is a rubash builtin). SIG_IGN would be WRONG here:
+/// GNU's sleep is an external child that DIES from the pgroup SIGINT and
+/// the shell reports 130, while an ignored SIGINT would let the builtin
+/// sleep run to completion with rc=0. So this guard routes untrapped SIGINT
+/// to the mailbox handler and HOLDS it there (kill::hold_fg_sigint) for
+/// the wait: the delivery becomes an observable pending entry, the slice
+/// loop's observe_signals_while_blocked converts it to Err(ExitCode(130))
+/// via the same untrapped path external deaths take, and Drop restores
+/// Default. Trapped SIGINT keeps its handler (predicate false, mailbox
+/// path untouched); non-interactive shells keep SIG_DFL and die like GNU
+/// scripts. (A pthread_sigmask BLOCK was tried first and reverted: the
+/// process is multithreaded, so a per-thread mask cannot stop delivery
+/// to the DFL main thread — verified by probe, guard armed yet shell
+/// still died.)
+#[cfg(unix)]
+pub(in crate::executor) struct ForegroundBuiltinSigintGuard {
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ForegroundBuiltinSigintGuard {
+    pub(in crate::executor) fn hold_if_interactive_untrapped(executor: &Executor) -> Self {
+        if !foreground_sigint_needs_protection(executor) {
+            return Self { armed: false };
+        }
+        crate::builtins::kill::hold_fg_sigint();
+        Self { armed: true }
+    }
+
+    /// Consume a pending untrapped SIGINT for this wait (true = caller aborts
+    /// with 128+SIGINT). Gated on armed: a TRAPPED SIGINT must flow through
+    /// observe_signals_while_blocked so its action runs — stealing it here
+    /// would silently drop the trap. kernel_handler_installed rejects stale
+    /// registry flags (same stale rule observe uses); anything else goes
+    /// back for the trapped-abort check and observe.
+    pub(in crate::executor) fn take_sigint_abort(&self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        let pending =
+            crate::builtins::kill::take_pending_signals_now(std::process::id()).unwrap_or_default();
+        if pending.is_empty() {
+            return false;
+        }
+        let mut rest = Vec::new();
+        let mut interrupted = false;
+        for signal in pending {
+            if signal == libc::SIGINT && crate::builtins::kill::kernel_handler_installed(signal) {
+                interrupted = true;
+            } else {
+                rest.push(signal);
+            }
+        }
+        crate::builtins::kill::requeue_pending_signals(rest);
+        interrupted
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundBuiltinSigintGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        crate::builtins::kill::release_fg_sigint();
     }
 }
 

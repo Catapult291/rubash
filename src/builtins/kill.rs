@@ -1691,7 +1691,7 @@ impl KillResultExt for Result<(), &'static str> {
 mod kernel_signals {
     use signal_hook::iterator::Signals;
     use std::io;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     static KERNEL_SIGNALS: OnceLock<Mutex<Signals>> = OnceLock::new();
@@ -1861,6 +1861,19 @@ mod kernel_signals {
         // capture_entry_and_policy (fd-free).
         let mut signals_guard = None;
         for &(sig, ref want) in dispositions {
+            // rubash#1250: a foreground builtin wait (sleep fast path)
+            // holds untrapped SIGINT at the mailbox handler so the
+            // delivery becomes an observable abort instead of a DFL
+            // death. The hold outranks the trap table's Default wish
+            // until released — without this, every per-slice
+            // reconcile from observe_signals_while_blocked would flip
+            // the routing back to SIG_DFL mid-sleep.
+            if FG_INT_HOLD.load(Ordering::Relaxed)
+                && sig == libc::SIGINT as i32
+                && matches!(want, Disposition::Default)
+            {
+                continue;
+            }
             let target = match want {
                 Disposition::Handler => 2u8,
                 Disposition::Ignore => 1u8,
@@ -1919,6 +1932,29 @@ mod kernel_signals {
     /// swallows, so neither can produce a legitimate pending entry.
     pub(super) fn handler_installed(sig: i32) -> bool {
         MANAGED.contains(&sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
+    }
+
+    /// rubash#1250: foreground-builtin SIGINT hold. While set, the
+    /// reconcile above refuses to route SIGINT back to Default, so a
+    /// builtin wait's temporary mailbox routing survives the per-slice
+    /// reconciles from observe_signals_while_blocked. Single-threaded
+    /// executor: no concurrent trap-table mutation can interleave, and
+    /// the hold only ever arms when SIGINT is untrapped (a trapped
+    /// signal keeps its handler and never reaches the hold).
+    static FG_INT_HOLD: AtomicBool = AtomicBool::new(false);
+
+    /// Route untrapped SIGINT to the mailbox handler and hold it there.
+    /// Deliveries become observable pending entries (aborted as 128+SIGINT
+    /// by the waiter's slice loop) instead of DFL deaths.
+    pub(super) fn hold_fg_sigint() {
+        FG_INT_HOLD.store(true, Ordering::SeqCst);
+        reconcile(&[(libc::SIGINT as i32, Disposition::Handler)]);
+    }
+
+    /// Release the hold: clear the flag first so the Default wish applies.
+    pub(super) fn release_fg_sigint() {
+        FG_INT_HOLD.store(false, Ordering::SeqCst);
+        reconcile(&[(libc::SIGINT as i32, Disposition::Default)]);
     }
 
     static ENTRY_CAPTURED: std::sync::Once = std::sync::Once::new();
@@ -2121,6 +2157,21 @@ fn reset_contains(reset: &str, short: &str) -> bool {
 #[cfg(unix)]
 pub fn kernel_handler_installed(signal: i32) -> bool {
     kernel_signals::handler_installed(signal)
+}
+
+/// rubash#1250: hold untrapped SIGINT at the mailbox handler across a
+/// foreground builtin wait (the `sleep` fast path). While held, the
+/// reconcile above will not route SIGINT back to Default.
+#[cfg(unix)]
+pub fn hold_fg_sigint() {
+    kernel_signals::hold_fg_sigint()
+}
+
+/// rubash#1250: release the foreground SIGINT hold (restores Default,
+/// honoring the entry-ignore policy like any other Default wish).
+#[cfg(unix)]
+pub fn release_fg_sigint() {
+    kernel_signals::release_fg_sigint()
 }
 
 /// rubash#866: the reserved `__RUBASH_*` namespace key that used to carry
