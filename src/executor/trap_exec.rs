@@ -2962,6 +2962,23 @@ impl Executor {
         } else {
             strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(body)).to_string()
         };
+        // A here-string's stored word is the lexer's transport text:
+        // `$'p\nq\n'` carries ANSI_C_IFS_GUARD pairs around every decoded
+        // blank (lexer/quotes.rs — field-split transport, GNU's CTLESC-
+        // quoted bytes) and the DATA_* carriers hold its literal
+        // quote/dollar bytes. Once the text crosses into the fd byte
+        // channel there is no later strip boundary, so the guards leak
+        // into every consumer of the descriptor (rubash#1208: `exec
+        // 3<<<$'p\nq\n'` + `mapfile -u 3` stored "p<U+E401>" elements).
+        // Resolve them at the entry boundary like the fd-0 here-string
+        // path does (expand_here_string_mut's decode tail).
+        let input = if redirect.here_string {
+            crate::executor::markers::strip_ansi_c_ifs_guard(
+                &crate::executor::markers::decode_word_position_carriers(&input),
+            )
+        } else {
+            input
+        };
         Some((fd, input))
     }
 
