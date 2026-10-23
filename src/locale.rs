@@ -543,16 +543,21 @@ pub fn decode_to_visible_text(text: &str) -> String {
                 // (markers::push_literal_char): emit the char alone.
                 out.push(chars.next().unwrap_or(ch));
             }
-            c if c as u32 == RAW_BYTE_MARKER_ESCAPE => match chars.next() {
-                Some(next) if next as u32 == RAW_BYTE_MARKER_ESCAPE => out.push(c),
+            c if c as u32 == RAW_BYTE_MARKER_ESCAPE => match chars.clone().next() {
+                Some(next) if next as u32 == RAW_BYTE_MARKER_ESCAPE => {
+                    chars.next();
+                    out.push(c);
+                }
                 Some(next)
                     if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next as u32)) =>
                 {
+                    chars.next();
                     out.push(byte_char(next as u32 - RAW_BYTE_MARKER_FIRST));
                 }
-                // E000 + <non-payload char> is a stray introducer: emit
-                // the char alone (recovery; nothing produces this).
-                Some(next) => out.push(next),
+                // E000 + <non-payload char> is user data, not a marker:
+                // a literal U+E000 that reached the boundary unescaped
+                // (rubash#1060). Emit it; `next` decodes on its own.
+                Some(_) => out.push(c),
                 None => out.push(c),
             },
             DEFERRED_COMPOUND_BODY

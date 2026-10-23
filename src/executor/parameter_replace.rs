@@ -675,17 +675,19 @@ pub(in crate::executor) fn shell_reusable_quote(value: &str) -> String {
     // characters; decode them to the byte view first so the ansic form
     // quotes per GNU strtrans.c ansic_quote (one octal escape per
     // non-printable byte, printable multibyte runs verbatim).
-    let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
-        .expect("raw-byte sentinel is a valid char");
-    if value.contains(sentinel) {
+    // Only a genuine E000+payload pair marks stored raw bytes (rubash#1060):
+    // a literal user U+E000 decodes through to a printable PUA char and
+    // takes the normal char paths below.
+    if crate::executor::substitution_metadata::has_raw_byte_marker_pair(value) {
         let bytes =
             crate::executor::substitution_metadata::decode_raw_byte_markers(value.as_bytes());
         return ansic_quote_bytes(&bytes);
     }
-    if ansic_should_quote_value(value) {
-        ansic_quote_value(value)
+    let visible = crate::locale::decode_to_visible_text(value);
+    if ansic_should_quote_value(&visible) {
+        ansic_quote_value(&visible)
     } else {
-        shell_single_quote_assignment_value(value)
+        shell_single_quote_assignment_value(&visible)
     }
 }
 

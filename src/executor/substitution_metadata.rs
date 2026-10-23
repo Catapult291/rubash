@@ -101,6 +101,26 @@ fn push_u32cconv_byte(output: &mut String, byte: u32) {
     output.push_str(&encode_raw_byte_marker(byte as u8));
 }
 
+/// True when `value` holds a genuine raw-byte marker pair: E000 followed
+/// by a payload char (E001..=E100). A lone E000, a doubled E000 (the
+/// literal-char escape), and E000 before any other char are all user data
+/// — `$'\uE000'` is printable PUA text, not a marker (rubash#1060). Quote
+/// gates that route to the byte-octal form (`$'\201'`) must use this test,
+/// not `value.contains(E000)`, or a literal E000 is misquoted/dropped.
+pub(crate) fn has_raw_byte_marker_pair(value: &str) -> bool {
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch as u32 == RAW_BYTE_MARKER_ESCAPE
+            && chars.next().is_some_and(|next| {
+                (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next as u32))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn push_raw_byte_marker(output: &mut String, byte: u8) {
     output.push(char::from_u32(RAW_BYTE_MARKER_ESCAPE).expect("sentinel is valid"));
     output.push(char::from_u32(RAW_BYTE_MARKER_FIRST + byte as u32).expect("marker char is valid"));
@@ -349,12 +369,13 @@ pub(crate) fn shell_text_to_raw_bytes(text: &str) -> Vec<u8> {
                 chars.next();
                 output.push((next as u32 - RAW_BYTE_MARKER_FIRST) as u8);
             }
-            // E000 + <non-payload char> is a stray introducer: emit the
-            // char, drop the escape (recovery; nothing produces this).
-            Some(next) => {
-                chars.next();
+            // E000 + <non-payload char> is user data, not a marker: a
+            // literal U+E000 that reached the boundary unescaped (rubash
+            // #1060). GNU has no sentinel concept — the char is literal,
+            // so emit it and let `next` be processed normally.
+            Some(_) => {
                 let mut encoded = [0; 4];
-                output.extend_from_slice(next.encode_utf8(&mut encoded).as_bytes());
+                output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
             }
             _ => {
                 let mut encoded = [0; 4];
@@ -378,28 +399,31 @@ pub(crate) fn shell_text_to_raw_bytes(text: &str) -> Vec<u8> {
 /// children then re-encoded through the system codepage as GBK mojibake.
 pub(crate) fn decode_raw_byte_markers_to_byte_chars(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch as u32 != RAW_BYTE_MARKER_ESCAPE {
             output.push(ch);
             continue;
         }
-        match chars.next() {
+        match chars.peek().copied() {
             Some(next) if next as u32 == RAW_BYTE_MARKER_ESCAPE => {
                 // E000 E000 is an escaped literal U+E000 in user data.
+                chars.next();
                 output.push(ch);
             }
             Some(next)
                 if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next as u32)) =>
             {
+                chars.next();
                 output.push(
                     char::from_u32(next as u32 - RAW_BYTE_MARKER_FIRST)
                         .expect("raw-byte marker payload maps to a valid Latin-1 code point"),
                 );
             }
-            // E000 + <non-payload char> is a stray introducer (recovery;
-            // nothing produces this): keep the payload char.
-            Some(next) => output.push(next),
+            // E000 + <non-payload char> is user data, not a marker: a
+            // literal U+E000 that reached the boundary unescaped (rubash
+            // #1060). Emit it and leave `next` for the loop.
+            Some(_) => output.push(ch),
             None => output.push(ch),
         }
     }
@@ -450,11 +474,12 @@ pub(crate) fn decode_raw_byte_markers(bytes: &[u8]) -> Vec<u8> {
                 output.push((next_ch as u32 - RAW_BYTE_MARKER_FIRST) as u8);
                 index += char_len + next_len;
             }
-            // E000 + <non-payload char> is a stray introducer: emit the
-            // char, drop the escape (recovery; nothing produces this).
-            Some((_next_ch, next_len)) => {
-                output.extend_from_slice(&bytes[index + char_len..index + char_len + next_len]);
-                index += char_len + next_len;
+            // E000 + <non-payload char> is user data, not a marker: a
+            // literal U+E000 that reached the boundary unescaped (rubash
+            // #1060). Emit the E000 bytes; the next char decodes on its own.
+            Some(_) => {
+                output.extend_from_slice(&bytes[index..index + char_len]);
+                index += char_len;
             }
             _ => {
                 output.extend_from_slice(&bytes[index..index + char_len]);
