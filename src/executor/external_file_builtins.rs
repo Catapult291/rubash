@@ -752,6 +752,11 @@ fn current_local_year() -> i64 {
 }
 
 #[cfg(unix)]
+// `libc::time_t` is deprecated on musl/ohos targets and the niubash
+// cross-target checks compile this crate with `-D warnings`; see the twin in
+// printf/zone.rs. The value domain is an epoch second count that
+// `localtime_r` consumes unchanged, so allow the alias locally.
+#[allow(deprecated)]
 fn local_utc_offset_seconds(epoch: i64) -> i64 {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let time = epoch as libc::time_t;
