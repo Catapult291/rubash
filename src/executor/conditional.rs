@@ -779,6 +779,18 @@ impl Executor {
         // bound to the EMPTY string, not left unset — `${#BASH_REMATCH[@]}`
         // counts it and `${BASH_REMATCH[i]+x}` reports it set (rubash#1059,
         // optional groups and the untaken side of an alternation alike).
+        //
+        // rubash#1365: if BASH_REMATCH is readonly, GNU refuses the store
+        // (variables.c: bind_variable), emits "BASH_REMATCH: readonly
+        // variable" on stderr, and keeps the stale value. The match itself
+        // still succeeds.
+        if self.shell_state.env_vars.is_marked(
+            crate::executor::READONLY_VARS,
+            "BASH_REMATCH",
+        ) {
+            eprintln!("{}BASH_REMATCH: readonly variable", self.error_prefix());
+            return;
+        }
         let entries: BTreeMap<usize, String> = captures
             .into_iter()
             .enumerate()
