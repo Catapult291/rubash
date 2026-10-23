@@ -332,6 +332,12 @@ fn assign_printf_output(
     mut variables: Option<&mut VariableStore>,
     stderr: &mut dyn Write,
 ) -> io::Result<Option<i32>> {
+    // GNU printf.def -v: the value is a C string, truncated at the first
+    // NUL byte (rubash#1418).
+    let output = match output.find('\0') {
+        Some(pos) => output[..pos].to_string(),
+        None => output,
+    };
     // GNU variables.c:2201-2204 find_variable_nameref_for_assignment ->
     // valid_nameref_value: binding a value into a valueless nameref stores
     // it as the new cell, so the output text is validated as a nameref
