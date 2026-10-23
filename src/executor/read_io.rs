@@ -46,6 +46,14 @@ impl Executor {
             line.pop();
             let Some(next) = self.read_input_for_command(cmd, read_fd, silent, '\n', None, false)
             else {
+                // GNU read.def:802-830: the `\<newline>` pair is swallowed
+                // and reading continues; a continuation that hits EOF is
+                // still an unterminated record (eof=1), so the builtin
+                // fails with status 1 even though the partial value is
+                // assigned (`printf 'a\\\n' | read x` -> x=a, rc=1). The
+                // recursive call above reset read_eof_no_delimiter before
+                // its transports answered EOF as "no record" — restore it.
+                self.read_eof_no_delimiter = true;
                 break;
             };
             line.push_str(&next);
