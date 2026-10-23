@@ -2253,6 +2253,17 @@ impl Executor {
                 char_limit,
                 exact_char_limit,
             ) {
+                // GNU read.def: input is a C string, truncate at first NUL
+                // (rubash#1419). The `-d ''` case stops at NUL (delimiter),
+                // so only truncate when delimiter is not NUL.
+                let line = if delimiter != '\0' {
+                    match line.find('\0') {
+                        Some(pos) => line[..pos].to_string(),
+                        None => line,
+                    }
+                } else {
+                    line
+                };
                 let line = if !raw && delimiter == '\n' && char_limit.is_none() && !exact_char_limit
                 {
                     self.continue_read_line_after_backslash(cmd, read_fd, silent, line)
