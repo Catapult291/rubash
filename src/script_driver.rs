@@ -156,6 +156,27 @@ pub fn run_script_with_history_at_line_offset(
     line_offset: usize,
     redirect_cmd: Option<&CommandNode>,
 ) -> i32 {
+    run_script_with_history_at_line_offset_tracked(executor, contents, line_offset, redirect_cmd).0
+}
+
+/// Same grouped run as [`run_script_with_history_at_line_offset`], also
+/// reporting whether the run ended in a TOP-LEVEL UNWIND a caller driving a
+/// live shell must honor — the classification documented on
+/// [`run_script_with_history_in_tracked`]: a real `exit`/FatalFunctionError
+/// jump or the errexit break, with the parse-abort discard excluded.
+///
+/// niubash's interactive reader route feeds every `;`/`&&`/alias-bearing
+/// submission through this driver (niubash R1). The untracked wrapper drops
+/// the second half of the result, so the REPL saw only a plain status for
+/// `true; exit 3` and kept prompting after the engine had already unwound.
+/// GNU's jump_to_top_level ends reader_loop (evalstring.c:618-619); the host
+/// needs this flag to do the same.
+pub fn run_script_with_history_at_line_offset_tracked(
+    executor: &mut Executor,
+    contents: &str,
+    line_offset: usize,
+    redirect_cmd: Option<&CommandNode>,
+) -> (i32, bool) {
     let session = Rc::new(RefCell::new(SessionHistory::new()));
     // builtins/history.def operates on the shell's ONE history list. When
     // the host owns that list through a HistoryProvider (niubash's REPL —
@@ -173,7 +194,6 @@ pub fn run_script_with_history_at_line_offset(
         line_offset,
         install_session,
     )
-    .0
 }
 
 /// Same grouped driver with a host-owned session history (data plane).

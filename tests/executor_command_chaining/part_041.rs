@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 #[test]
-fn test_exit_help_redirects_output_and_exits_usage() {
+fn test_exit_help_redirects_output_and_reports_usage() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-exit-help-redirect-output.txt";
     let _ = fs::remove_file(output_path);
@@ -14,7 +14,10 @@ fn test_exit_help_redirects_output_and_exits_usage() {
 
     let result = executor.execute_ast(&ast);
 
-    assert!(matches!(result, Err(ExecuteError::ExitCode(2))));
+    // GNU CHECK_HELPOPT returns EX_USAGE from the builtin without
+    // jump_to_top_level: the help prints, $? becomes 2, and the caller
+    // keeps going (`bash -c 'exit --help; echo AFTER'` prints AFTER).
+    assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 2);
     let output = fs::read_to_string(output_path).unwrap();
     assert!(output.starts_with("exit: exit [n]\n"));
@@ -23,7 +26,7 @@ fn test_exit_help_redirects_output_and_exits_usage() {
 }
 
 #[test]
-fn test_exit_help_appends_output_and_exits_usage() {
+fn test_exit_help_appends_output_and_reports_usage() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-exit-help-append-output.txt";
     let _ = fs::remove_file(output_path);
@@ -35,7 +38,9 @@ fn test_exit_help_appends_output_and_exits_usage() {
 
     let result = executor.execute_ast(&ast);
 
-    assert!(matches!(result, Err(ExecuteError::ExitCode(2))));
+    // Same GNU CHECK_HELPOPT shape as the redirect test above: help only
+    // reports the usage status, it does not unwind the command list.
+    assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 2);
     let output = fs::read_to_string(output_path).unwrap();
     assert!(output.starts_with("before\nexit: exit [n]\n"));

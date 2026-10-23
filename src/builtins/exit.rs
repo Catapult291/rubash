@@ -45,7 +45,13 @@ where
 
     if args[0] == "--help" {
         print_help(stdout)?;
-        return Ok(ExitAction::Exit(EX_USAGE));
+        // GNU builtins/exit.def exit_builtin: CHECK_HELPOPT prints the help
+        // and RETURNS EX_USAGE from the builtin itself — the builtin's
+        // nonzero status never reaches jump_to_top_level, so the shell
+        // CONTINUES (probe: `bash -c 'exit --help; echo AFTER'` prints
+        // AFTER, and an interactive `exit --help' keeps prompting). Only a
+        // parsed status word takes the EXITPROG path below.
+        return Ok(ExitAction::Continue(EX_USAGE));
     }
 
     // GNU builtins/common.c get_exitstat (bash 5.3): ISOPTION(word, '-')
