@@ -1294,6 +1294,7 @@ impl Executor {
                 if signal == crate::builtins::kill::SIGQUIT_NUMBER {
                     continue;
                 }
+                self.exit_code = 128 + signal;
                 return Err(ExecuteError::ExitCode(128 + signal));
             };
             if action.is_empty() {
@@ -1450,7 +1451,12 @@ impl Executor {
                 // sig.c:333: every shell ignores SIGQUIT for itself; an
                 // untrapped delivery while blocked is dropped, not fatal.
                 None if signal == crate::builtins::kill::SIGQUIT_NUMBER => {}
-                None => return Err(ExecuteError::ExitCode(128 + signal)),
+                None => {
+                    // Record $? before the unwind so an interactive host that
+                    // only maps ExitCode(code) still reports 130 after Ctrl+C.
+                    self.exit_code = 128 + signal;
+                    return Err(ExecuteError::ExitCode(128 + signal));
+                }
             }
         }
         crate::builtins::kill::requeue_pending_signals(trapped);
