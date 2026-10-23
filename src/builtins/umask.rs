@@ -114,6 +114,16 @@ where
             }
         };
         env_vars.insert("__RUBASH_UMASK".to_string(), format!("{mask:04o}"));
+        // GNU builtins/umask.def umask_builtin applies the mask to the
+        // process (so children inherit it for file creation), not just to
+        // the display value (rubash#1014 set-side: `umask 022; touch f`
+        // must make 644). Unix-only: Windows has no process umask.
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::umask(mask as libc::mode_t);
+            }
+        }
         if symbolic {
             // Bash's symbolic form is already human-readable; `-p` only
             // changes the octal form into a reusable command and is ignored
@@ -318,7 +328,40 @@ fn class_permissions(bits: u32) -> String {
 mod tests {
     use super::*;
 
+    /// Restores the process umask on drop. The `umask <mode>` builtin
+    /// changes the REAL process mask (GNU behavior); lib tests share one
+    /// process, so every test that sets a mask must restore the entry
+    /// mask or later file-creating tests inherit a restrictive umask
+    /// and fail with EACCES.
+    struct UmaskGuard {
+        #[cfg_attr(not(unix), allow(dead_code))]
+        saved: u32,
+    }
+    impl UmaskGuard {
+        fn take() -> Self {
+            // SAFETY: read-restore dance, same as production code.
+            #[cfg(unix)]
+            let saved = unsafe {
+                let mask = libc::umask(0);
+                libc::umask(mask);
+                mask as u32
+            };
+            #[cfg(not(unix))]
+            let saved = 0o022;
+            UmaskGuard { saved }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.saved as libc::mode_t);
+            }
+        }
+    }
+
     fn run(mode: &str, initial: &str) -> (i32, String, String) {
+        let _guard = UmaskGuard::take();
         let mut env = VarTable::from(HashMap::from([(
             String::from("__RUBASH_UMASK"),
             initial.to_string(),
