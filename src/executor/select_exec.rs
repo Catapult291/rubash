@@ -341,6 +341,23 @@ impl Executor {
         // Returns the raw physical line WITHOUT the trailing newline plus
         // whether it is an unterminated EOF tail; None is clean EOF with
         // no bytes.
+        //
+        // GNU do_redirections binds the compound's fd 0 before the select
+        // loop runs and select_query's read_builtin consumes THAT
+        // descriptor (read.def:294): `done < file` binds the FileFd from
+        // bind_command_fd0_input, `done <&N` binds a dup of fd N through
+        // open_compound_numbered_input_redirects. Both must be served
+        // record-wise off the fd table — reading the raw process stdin
+        // instead reported an instant EOF (rubash#1204). A buffered
+        // record still reports EOF-no-delimiter like GNU's unterminated
+        // tail.
+        if self.fd_table.fd0_bound_away_from_process_stdin() {
+            self.fd_table.read_eof_no_delimiter = false;
+            return match self.fd_table.read_text(0, '\n', None, false) {
+                Some(line) => Some((line, self.fd_table.read_eof_no_delimiter)),
+                None => None,
+            };
+        }
         if !has_stdin {
             // Raw handle read like GNU zread: io::stdin() owns a process-wide
             // BufReader that would prefetch the whole stream and break the
