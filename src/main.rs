@@ -1534,13 +1534,34 @@ fn start_debugger(executor: &mut Executor) {
     }
 }
 
+/// GNU error.c get_name_for_error: startup-file diagnostics use
+/// base_pathname(shell_name) — the text after the last path separator.
+fn startup_shell_name(executor: &Executor) -> String {
+    let name = executor.get_env("__RUBASH_SHELL_NAME").unwrap_or("bash");
+    name.rsplit(['/', '\\']).next().unwrap_or(name).to_string()
+}
+
 fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     let path = executor.resolve_shell_path(init_file);
+    // GNU builtins/evalfile.c:135-139 (evalfile_internal): a startup file
+    // that is a directory reports `<file>: is a directory` (lowercase,
+    // unlike strerror's `Is a directory`) through internal_error/
+    // builtin_error. Test the metadata first: on Windows the open failure
+    // surfaces as PermissionDenied, not IsADirectory. rubash#1246.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+        eprintln!(
+            "{}: {}: is a directory",
+            startup_shell_name(executor),
+            init_file
+        );
+        return 1;
+    }
     let contents = match rubash::script_driver::read_script_bytes(&path) {
         Ok(contents) => contents,
         Err(e) => {
             eprintln!(
-                "rubash: {}: {}",
+                "{}: {}: {}",
+                startup_shell_name(executor),
                 init_file,
                 rubash::posix_errors::message(&e)
             );
@@ -1689,7 +1710,11 @@ fn diagnose_bash_env_directory(executor: &mut Executor) {
     };
     let path = executor.resolve_shell_path(&bash_env);
     if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-        eprintln!("rubash: {bash_env}: Is a directory");
+        // GNU builtins/evalfile.c:135-139: lowercase `is a directory`.
+        eprintln!(
+            "{}: {bash_env}: is a directory",
+            startup_shell_name(executor)
+        );
     }
 }
 

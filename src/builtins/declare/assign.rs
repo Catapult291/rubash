@@ -495,15 +495,12 @@ where
         let (value, compound_marked) =
             if let Some(compound) = value.strip_prefix(COMPOUND_ASSIGNMENT_MARKER) {
                 (compound, true)
-            } else if value.is_empty() && var_name == "assoc" {
-                // TODO(parse.y/array.c): The current parser can split compound
-                // assignment words after `declare -A`. Preserve builtins5.sub's
-                // declaration shape until compound assignments remain atomic.
-                ("([one]=one [two]=two [three]=three)", true)
-            } else if value.is_empty() && var_name == "array" {
-                // TODO(parse.y/array.c): Same narrow bridge for `declare -a`.
-                ("(one two three)", true)
             } else {
+                // rubash#1225: never fabricate an array body for a bare
+                // `name=` operand. GNU declare.def:966-980 passes the empty
+                // assignment through bind_array_variable(name, 0, ""), which
+                // creates only element 0; the fabricated `assoc`/`array`
+                // bodies were a left-over golden-test bridge.
                 (value, false)
             };
         let value = if append {
@@ -666,11 +663,16 @@ where
             // (array19.sub: `declare -l foo="$value"` keeps [1]/[2]).
             if !append && !compound_marked {
                 let current = variables.get(var_name).cloned().unwrap_or_default();
-                if variables.is_marked(ASSOC_VARS, var_name) {
+                if assoc || variables.is_marked(ASSOC_VARS, var_name) {
                     let element = format!("([0]={})", quote_assoc_storage_value(value));
                     append_assoc_value(&current, &element, integer, variables)
                 } else {
-                    let is_indexed = variables.is_marked(ARRAY_VARS, var_name)
+                    // GNU arrayfunc.c find_or_make_array_variable: an explicit
+                    // `-a`/-A flag makes the target an array before the value
+                    // is bound, so `declare -a a=` stores element 0 (empty)
+                    // rather than a scalar "" (rubash#1225).
+                    let is_indexed = array
+                        || variables.is_marked(ARRAY_VARS, var_name)
                         || current.starts_with(STORAGE_WORD_PREFIX)
                         || (current.starts_with('(') && current.ends_with(')'));
                     if is_indexed {

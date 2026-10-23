@@ -733,6 +733,18 @@ impl Executor {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::set::is_shell_option(name) {
                     crate::builtins::set::set_shell_option(env_vars, name, true);
+                } else {
+                    // GNU set.def:594-604 parse_shellopts -> set_minus_o_option
+                    // -> sh_invalidoptname: an inherited SHELLOPTS name that
+                    // is not a `set -o` option is diagnosed, not ignored
+                    // (rubash#1246). Initialization runs before the first
+                    // input line, hence `line 0`.
+                    let shell_name = env_vars
+                        .get("__RUBASH_SHELL_NAME")
+                        .map(String::as_str)
+                        .unwrap_or("bash");
+                    let shell_name = shell_name.rsplit(['/', '\\']).next().unwrap_or(shell_name);
+                    eprintln!("{shell_name}: line 0: {name}: invalid option name");
                 }
             }
         }

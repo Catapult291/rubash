@@ -52,16 +52,54 @@ pub fn home_value(env_vars: &HashMap<String, String>) -> String {
 }
 
 pub fn expand_word_prefix(word: &str, env_vars: &HashMap<String, String>) -> Option<String> {
-    if let Some(rest) = word.strip_prefix("~/") {
-        return Some(format!("{}/{}", home_value(env_vars), rest));
+    let rest = word.strip_prefix('~')?;
+    // GNU general.c:1185-1238 bash_tilde_find_word / lib/tilde/tilde.c:361
+    // isolate_tilde_prefix: the tilde-prefix ends at the first unquoted `/`
+    // (or `:` in an assignment value); the remainder glues verbatim. The
+    // prefix — not the whole word — is what the special-expansion hook and
+    // getpwnam see, so `~+/x` and `~root/x` share one path (rubash#1232).
+    let end = rest.find(['/', ':']).unwrap_or(rest.len());
+    let (prefix, tail) = (&rest[..end], &rest[end..]);
+    if prefix.is_empty() {
+        // A bare `~` or leading `~/` always consults HOME (tilde.c:344-358).
+        return Some(format!("{}{}", home_value(env_vars), tail));
     }
+    if let Some(value) = expand_special_tilde_prefix(prefix, env_vars) {
+        return Some(format!("{value}{tail}"));
+    }
+    let home = passwd_home_for_user(prefix, env_vars)?;
+    Some(format!("{home}{tail}"))
+}
 
-    match word {
-        "~" => Some(home_value(env_vars)),
-        "~+" => env_vars.get("PWD").cloned(),
-        "~-" => env_vars.get("OLDPWD").cloned(),
-        _ => expand_user_tilde_word(word, env_vars),
+/// GNU general.c:1119-1136 bash_special_tilde_expansions: the pre-expansion
+/// hook runs before getpwnam and owns `~+` (PWD), `~-` (OLDPWD) and the
+/// directory stack forms `~N`, `~+N`, `~-N`. GNU
+/// builtins/pushd.def:596-642 get_dirstack_index resolves +N from the top
+/// (0 = PWD) and -N from the bottom (0 = last stack element); an
+/// out-of-range index returns NULL so the word stays literal.
+fn expand_special_tilde_prefix(prefix: &str, env_vars: &HashMap<String, String>) -> Option<String> {
+    match prefix {
+        "+" => return env_vars.get("PWD").cloned(),
+        "-" => return env_vars.get("OLDPWD").cloned(),
+        _ => {}
     }
+    let (from_right, digits) = match prefix.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, prefix.strip_prefix('+').unwrap_or(prefix)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let index: i64 = digits.parse().ok()?;
+    // DIRSTACK is stored cwd-first in rubash (GNU's pushd_directory_list is
+    // cwd-last); len-1-index is the same element in both conventions.
+    let stack = crate::builtins::pushd::load_stack(env_vars);
+    let len = stack.len() as i64;
+    let logical = if from_right { len - 1 - index } else { index };
+    if logical < 0 || logical >= len {
+        return None;
+    }
+    stack.get(logical as usize).cloned()
 }
 
 /// GNU lib/tilde/tilde.c:361-410: `~user` and `~user/rest` resolve the user
@@ -241,31 +279,32 @@ pub(crate) fn expand_tilde_segment(segment: &str, env_vars: &HashMap<String, Str
         return segment.to_string();
     };
 
-    if rest.is_empty() || rest.starts_with('/') {
+    // The `:` split already happened in expand_assignment_tilde_value, so
+    // only `/` terminates the prefix here (GNU bash_tilde_find_word flags=1
+    // is equivalent to this per-segment view).
+    let end = rest.find('/').unwrap_or(rest.len());
+    let (prefix, tail) = (&rest[..end], &rest[end..]);
+    if prefix.is_empty() {
         // GNU glue_prefix_and_suffix (tilde.c:304-317): the $HOME prefix
         // glues even when it is the empty string — `HOME=; a=~/x` binds
         // "/x", not the verbatim word. Only a missing fallback (no HOME and
         // no passwd stand-in) leaves the segment verbatim.
         return match tilde_home(env_vars) {
-            Some(home) => format!("{home}{rest}"),
+            Some(home) => format!("{home}{tail}"),
             None => segment.to_string(),
         };
     }
 
+    // GNU general.c:1119-1136: the same special-prefix hook applies inside
+    // assignment values (`x=~/a:~+/b`, `x=~+1`) (rubash#1232).
+    if let Some(value) = expand_special_tilde_prefix(prefix, env_vars) {
+        return format!("{value}{tail}");
+    }
+
     // GNU lib/tilde/tilde.c:361-410: `~user[/rest]` resolves through
-    // getpwnam. Within an assignment segment the user name ends at `/`
-    // (the PATH-style `:` split already happened in
-    // expand_assignment_tilde_value); an unresolvable user keeps the
-    // segment verbatim.
-    let (user, tail) = match rest.find('/') {
-        Some(index) => (&rest[..index], Some(&rest[index..])),
-        None => (rest, None),
-    };
-    match passwd_home_for_user(user, env_vars) {
-        Some(home) => match tail {
-            Some(tail) => format!("{home}{tail}"),
-            None => home,
-        },
+    // getpwnam. An unresolvable user keeps the segment verbatim.
+    match passwd_home_for_user(prefix, env_vars) {
+        Some(home) => format!("{home}{tail}"),
         None => segment.to_string(),
     }
 }

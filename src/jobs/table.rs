@@ -18,6 +18,11 @@ pub struct ProcessEntry {
     pub pid: u32,
     pub state: ProcessState,
     pub exit_status: Option<i32>,
+    /// GNU jobs.h PROCESS.status: the WSTOPSIG of the stop that put this
+    /// process in the stopped state. jobs.c:1968 printable_job_status reads
+    /// it back for the long format (`Stopped (signal)`) and for POSIX-mode
+    /// standard output (`Stopped(SIGSTOP)`).
+    pub stop_signal: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +115,7 @@ impl JobTable {
                         pid,
                         state: ProcessState::Running,
                         exit_status: None,
+                        stop_signal: None,
                     },
                 )
             })
@@ -303,13 +309,14 @@ impl JobTable {
         self.pid_to_job.get(&pid).copied()
     }
 
-    pub fn mark_stopped(&mut self, pid: u32) {
+    pub fn mark_stopped(&mut self, pid: u32, signal: i32) {
         let Some(job_id) = self.pid_to_job.get(&pid).copied() else {
             return;
         };
         if let Some(job) = self.jobs.get_mut(&job_id) {
             if let Some(process) = job.processes.get_mut(&pid) {
                 process.state = ProcessState::Stopped;
+                process.stop_signal = Some(signal);
             }
             job.notified = false;
         }
@@ -326,6 +333,7 @@ impl JobTable {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             if let Some(process) = job.processes.get_mut(&pid) {
                 process.state = ProcessState::Running;
+                process.stop_signal = None;
             }
         }
         // jobs.c start_job/set_job_running: a Running transition does not
@@ -568,7 +576,7 @@ mod tests {
     fn stopped_and_continued_processes_update_job_state() {
         let mut table = JobTable::default();
         let job = table.register_process(20, "sleep", true, 20);
-        table.mark_stopped(20);
+        table.mark_stopped(20, 19);
         assert_eq!(table.jobs[&job].state, ProcessState::Stopped);
         table.mark_running(20);
         assert_eq!(table.jobs[&job].state, ProcessState::Running);

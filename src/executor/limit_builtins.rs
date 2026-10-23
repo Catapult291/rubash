@@ -128,10 +128,18 @@ impl Executor {
                 stderr.extend(signal_stderr);
                 continue;
             }
-            if request.signal == 18 {
+            // GNU job state only learns about stops through waitchld with
+            // WUNTRACED, which runs only in monitor mode (jobs.c:4064
+            // waitchld `waitpid_flags |= WUNTRACED` under job_control).
+            // Without `set -m` a SIGSTOPped job stays "Running" in GNU's
+            // table, so `jobs -r` lists it and `jobs -s` does not
+            // (rubash#1247). kill(2) itself never rewrites job state.
+            let job_control =
+                crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor");
+            if job_control && request.signal == 18 {
                 self.shell_state.job_table.mark_running(pid);
-            } else if matches!(request.signal, 19 | 20) {
-                self.shell_state.job_table.mark_stopped(pid);
+            } else if job_control && matches!(request.signal, 19 | 20 | 21 | 22) {
+                self.shell_state.job_table.mark_stopped(pid, request.signal);
             } else if operand.starts_with('%') && self.jobspec_death_is_unreported(request.signal) {
                 // rubash#796: a jobspec kill of a DONT_REPORT signal is the
                 // kill builtin's own doing, and GNU's non-interactive reader

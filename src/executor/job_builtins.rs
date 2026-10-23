@@ -378,23 +378,52 @@ impl Executor {
                 .values()
                 .any(|job| job.background)
         {
-            let pids = self
+            let jobs = self
                 .shell_state
                 .job_table
                 .jobs
                 .values()
                 .filter(|job| job.background)
-                .flat_map(|job| job.pids.iter().copied())
+                .map(|job| {
+                    (
+                        job.id,
+                        job.pids.last().copied().unwrap_or_default(),
+                        job.state,
+                        job.pids.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
-            for pid in pids {
-                // wait.def:238-245 wait_for_any_job + :328-331: a trapped
-                // signal interrupts the no-operand wait too, returning
-                // 128+sig.
-                if let WaitPidOutcome::Interrupted(interrupt) =
-                    self.wait_for_background_pid(pid, false)?
-                {
-                    self.write_buffered_builtin_output(cmd, &[], &[])?;
-                    return Ok(interrupt);
+            // GNU jobs.c:2803-2824 wait_for_background_pids: every stopped job
+            // gets `builtin_warning ("job %d[%d] stopped")` before the wait
+            // loop starts (rubash#1246).
+            let mut stderr = Vec::new();
+            for (job_number, last_pid, state, _) in &jobs {
+                if *state == crate::jobs::ProcessState::Stopped {
+                    writeln!(
+                        stderr,
+                        "{}wait: warning: job {}[{}] stopped",
+                        self.diagnostic_prefix(),
+                        job_number,
+                        last_pid
+                    )?;
+                }
+            }
+            for (_, _, state, pids) in jobs {
+                // GNU jobs.c:2822-2829 waits only RUNNING background jobs;
+                // a stopped job is reported by the warning above and skipped.
+                if state == crate::jobs::ProcessState::Stopped {
+                    continue;
+                }
+                for pid in pids {
+                    // wait.def:238-245 wait_for_any_job + :328-331: a trapped
+                    // signal interrupts the no-operand wait too, returning
+                    // 128+sig.
+                    if let WaitPidOutcome::Interrupted(interrupt) =
+                        self.wait_for_background_pid(pid, false)?
+                    {
+                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                        return Ok(interrupt);
+                    }
                 }
             }
             // rubash#1022: GNU's no-operand wait also reaps finished
@@ -406,7 +435,7 @@ impl Executor {
             // left alone: GNU would block, but an unkillable block here
             // could hang the shell, so they stay signallable instead.
             self.sweep_procsub_placeholders();
-            self.write_buffered_builtin_output(cmd, &[], &[])?;
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
             // Bash's no-operand wait reports success after waiting for all
             // current jobs; individual statuses require an explicit operand.
             return Ok(0);
@@ -1371,6 +1400,27 @@ impl Executor {
             }
             let state_text = state_text_opt.unwrap_or_else(|| "Unknown".to_string());
 
+            // GNU jobs.c:1986-1993 printable_job_status: the LONG format does
+            // not take the `STOPPED (j) && format == 0` shortcut; it falls
+            // through to the WIFSTOPPED arm and prints j_strsignal(WSTOPSIG)
+            // — `Stopped (signal)` for SIGSTOP, `Stopped (tty input)` for
+            // SIGTTIN. rubash#1246.
+            let long_state_text = if state_text == "Stopped" {
+                job_id
+                    .and_then(|id| self.shell_state.job_table.jobs.get(&id))
+                    .and_then(|entry| {
+                        entry
+                            .processes
+                            .values()
+                            .find(|process| process.state == crate::jobs::ProcessState::Stopped)
+                    })
+                    .and_then(|process| process.stop_signal)
+                    .map(crate::builtins::kill::signal_death_description)
+                    .unwrap_or_else(|| state_text.clone())
+            } else {
+                state_text.clone()
+            };
+
             // GNU jobs.c:2118-2120 pretty_print_pipeline: the trailing ` &`
             // is printed only while the job is RUNNING and not foreground —
             // the stored command text never contains it.
@@ -1406,7 +1456,7 @@ impl Executor {
                 // `[1]+ 17063` (rubash#233: the old `{marker}  {pid}` shape
                 // printed a fixed two spaces with a left-aligned pid).
                 output.push_str(&format!(
-                    "[{job_number}]{marker} {pid:>5} {state_text:<27}{source}{async_suffix}\n"
+                    "[{job_number}]{marker} {pid:>5} {long_state_text:<27}{source}{async_suffix}\n"
                 ));
             } else {
                 output.push_str(&format!(

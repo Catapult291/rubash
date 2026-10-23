@@ -376,8 +376,18 @@ fn push_ansi_c_codepoint(output: &mut String, value: u32) {
     // E000-escape them at this entry so the decode boundary restores the
     // char instead of reading it as a marker (governance 3.1 user_reachable
     // rule; the E1xx byte-pair/UTF-8 mixed-decoding ambiguity).
-    for ch in decoded.chars() {
-        crate::executor::markers::push_literal_char(output, ch);
+    //
+    // A value with no Unicode scalar form (lone surrogates, out-of-range
+    // \Uxxxx) comes back from u32cconv_utf8_text already encoded as
+    // raw-byte marker pairs (GNU's 3/4-byte wctomb form, e.g. ED A0 80 for
+    // U+D800). Those marker chars must pass through untouched — escaping
+    // them again turned them into user-visible U+E000 text (rubash#1234).
+    if char::from_u32(value).is_some() {
+        for ch in decoded.chars() {
+            crate::executor::markers::push_literal_char(output, ch);
+        }
+    } else {
+        output.push_str(&decoded);
     }
 }
 
