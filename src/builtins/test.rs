@@ -917,6 +917,16 @@ fn file_mode_has_bit(path: &str, env_vars: &crate::shell::var_table::VarTable, b
 /// faccessat(AT_FDCWD, path, mode, AT_EACCESS) on Linux glibc builds —
 /// the effective-uid access check, so `test -x /etc/hostname` is false
 /// for the 644 file even when running as root (kernel X_OK rule).
+///
+/// Android/bionic: the 4-arg faccessat returns EINVAL for EVERY nonzero
+/// flag (the faccessat2 syscall is seccomp-filtered on Android), and the
+/// platform linux/fcntl.h resolves AT_EACCESS to 0 — so the GNU build
+/// for this platform (Termux bash config.h: HAVE_FACCESSAT=1) compiles
+/// the same eaccess.c:203 call but ends up running faccessat(..., 0), a
+/// plain real-ids access(2). Real and effective ids are always equal
+/// for app processes (no setuid), so access() IS the effective-id check
+/// GNU lands on; when the ids ever differ, do the stat-based check GNU
+/// itself falls back to (eaccess.c:223-233 -> sh_stataccess).
 #[cfg(unix)]
 fn test_unix_eaccess(
     operand: &str,
@@ -927,13 +937,66 @@ fn test_unix_eaccess(
     let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return false;
     };
-    // bionic's <fcntl.h> ships AT_EACCESS (0x200, same value as the Linux
-    // uapi), but the libc crate's android module doesn't re-export it.
     #[cfg(target_os = "android")]
-    let at_eaccess: std::os::raw::c_int = 0x200;
+    {
+        if unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() } {
+            unsafe { libc::access(cpath.as_ptr(), mode) == 0 }
+        } else {
+            sh_stataccess(&path, mode)
+        }
+    }
     #[cfg(not(target_os = "android"))]
-    let at_eaccess = libc::AT_EACCESS;
-    unsafe { libc::faccessat(libc::AT_FDCWD, cpath.as_ptr(), mode, at_eaccess) == 0 }
+    {
+        unsafe { libc::faccessat(libc::AT_FDCWD, cpath.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+    }
+}
+
+/// Port of GNU sh_stataccess (lib/sh/eaccess.c:136-165): what access(2)
+/// does, but checked against the EFFECTIVE uid and gid — and without
+/// telling root that every file is executable. Reached on Android only
+/// when real != effective ids, the same corner where GNU uses it.
+#[cfg(target_os = "android")]
+fn sh_stataccess(path: &std::path::Path, mode: std::os::raw::c_int) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        // Root can read or write any file, and execute any file that has
+        // any one of the execute bits set.
+        if mode & libc::X_OK == 0 {
+            return true;
+        }
+        if metadata.permissions().mode() & 0o111 != 0 {
+            return true;
+        }
+    }
+
+    let mut shifted = mode;
+    if metadata.uid() == euid {
+        shifted <<= 6;
+    } else if group_member(metadata.gid()) {
+        shifted <<= 3;
+    }
+    metadata.permissions().mode() & shifted as u32 != 0
+}
+
+/// Port of GNU group_member (general.c:1334): is `gid` the real gid, the
+/// effective gid, or one of the supplementary groups.
+#[cfg(target_os = "android")]
+fn group_member(gid: libc::gid_t) -> bool {
+    if gid == unsafe { libc::getgid() } || gid == unsafe { libc::getegid() } {
+        return true;
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return false;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    filled > 0 && groups[..filled as usize].contains(&gid)
 }
 
 #[cfg(not(unix))]
