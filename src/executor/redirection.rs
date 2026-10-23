@@ -419,6 +419,17 @@ impl Executor {
             // (GNU applies the redirector's own dup2 before the move's
             // close, redir.c:1153-1166), so the ordered fd effects of THIS
             // entry are recorded only after its checks pass. ----
+            // rubash#1396: `>&-` / `<&-` (CloseOutput/CloseInput) close the
+            // fd. Mark it closed in `opened` so a later `2>&1` sees the
+            // closed fd and fails with EBADF (GNU redir.c:798-803).
+            if matches!(
+                redirect.kind,
+                crate::parser::RedirectKind::CloseOutput
+                    | crate::parser::RedirectKind::CloseInput
+            ) {
+                opened.insert(redirector, false);
+                continue;
+            }
             if !(file_open_kind || is_dup_kind) {
                 // Non-file, non-dup kinds (heredocs etc.) carry no fd
                 // effects for the scan either.
