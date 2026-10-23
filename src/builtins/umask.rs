@@ -381,8 +381,10 @@ mod tests {
         )]));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // GNU: flags must precede the mode operand (rubash#1381: trailing
+        // flags after the mode are ignored, not parsed).
         let status = execute_with_io(
-            &vec![mode.to_string(), "-S".to_string()],
+            &vec!["-S".to_string(), mode.to_string()],
             &mut env,
             &mut stdout,
             &mut stderr,
