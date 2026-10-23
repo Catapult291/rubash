@@ -545,13 +545,21 @@ where
         return Ok(2);
     }
 
-    let mut status = 0;
+    // GNU kill.def:87-268: only real kill_pid attempts move the counters
+    // — any_succeeded for a delivered signal, any_failed for a failed
+    // delivery. sh_badpid/DUP_JOB diagnostics touch neither counter, so
+    // `kill -0 pid badspec` still returns 0. The final status is
+    // `any_succeeded ? 0 : 1` (posix: `any_failed == 0 ? 0 : 1`).
+    let mut any_succeeded = false;
+    let mut any_failed = false;
     for operand in &args[operands_start..] {
         if signal == 0 && matches!(operand.as_str(), "-1" | "0") {
             // Windows cannot address a Unix process group through
             // OpenProcess, but signal 0 is only an existence probe. These
             // group targets are valid Bash operands and do not require a
-            // native termination call.
+            // native termination call — GNU's kill(0|-1, 0) probe itself
+            // succeeds, so they count as delivered.
+            any_succeeded = true;
             continue;
         }
 
@@ -563,7 +571,6 @@ where
                 "{}kill: `{operand}': not a pid or valid job spec",
                 diagnostic_prefix()
             )?;
-            status = 1;
             continue;
         };
 
@@ -581,26 +588,36 @@ where
         // existence probe, so the shell can answer it from its own group
         // context without attempting to terminate a process.
         if pid == 0 && signal == 0 {
+            any_succeeded = true;
             continue;
         }
 
         match deliver_rubash_signal(pid, signal) {
-            Ok(true) => continue,
+            Ok(true) => {
+                any_succeeded = true;
+                continue;
+            }
             Ok(false) => {}
             Err(error) => {
                 writeln!(stderr, "{}kill: ({pid}) - {error}", diagnostic_prefix())?;
-                status = 1;
+                any_failed = true;
                 continue;
             }
         }
 
         if let Err(message) = signal_process(pid, signal) {
             writeln!(stderr, "{}kill: ({pid}) - {message}", diagnostic_prefix())?;
-            status = 1;
+            any_failed = true;
+        } else {
+            any_succeeded = true;
         }
     }
 
-    Ok(status)
+    Ok(if posix {
+        i32::from(any_failed)
+    } else {
+        i32::from(!any_succeeded)
+    })
 }
 
 fn write_kill_usage<E>(stderr: &mut E) -> io::Result<()>

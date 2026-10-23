@@ -643,6 +643,33 @@ fn pipeline_command_source_text(pipeline_command: &PipelineCommand) -> String {
         .join(" | ")
 }
 
+/// The per-stage printed commands GNU records on a job's `j->pipe`
+/// PROCESS list (jobs.c:643 REVERSE_LIST — first stage first), which is
+/// what builtins/common.c:632 get_job_by_name matches `%name`/`%?name`
+/// against. A `a | b` job contributes `["a", "b"]`; `!`/`time` are
+/// pipeline flags, not stage text, so they unwrap before the stage
+/// split. Anything else contributes its whole printed command.
+pub(in crate::executor) fn bash_job_stage_commands(cmd: &CommandNode) -> Vec<String> {
+    let mut inner = cmd;
+    loop {
+        if let Some(inverted_command) = &inner.inverted_command {
+            inner = &inverted_command.command;
+        } else if let Some(time_command) = &inner.time_command {
+            inner = &time_command.command;
+        } else {
+            break;
+        }
+    }
+    if let Some(pipeline_command) = &inner.pipeline_command {
+        return pipeline_command
+            .stages
+            .iter()
+            .map(bash_command_source_text)
+            .collect();
+    }
+    vec![bash_command_source_text(cmd)]
+}
+
 fn and_or_list_source_text(and_or_list: &AndOrListCommand) -> String {
     let mut text = String::new();
     for (index, command) in and_or_list.commands.iter().enumerate() {

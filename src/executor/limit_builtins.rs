@@ -41,7 +41,11 @@ impl Executor {
         });
         if !should_handle {
             let mut stderr = Vec::new();
-            let mut status = 0;
+            // GNU kill.def:87-268 counters — see the tracked loop below:
+            // probe/delivery attempts decide any_succeeded/any_failed,
+            // spec diagnostics feed neither.
+            let mut any_succeeded = false;
+            let mut any_failed = false;
             for operand in request.operands {
                 let Some(pid) = operand.parse::<u32>().ok() else {
                     // Not a u32 pid or job spec — fall through to kill::execute_with_io
@@ -49,6 +53,9 @@ impl Executor {
                     return Ok(None);
                 };
                 if request.check_only && pid == 0 {
+                    // GNU kill(0, 0) probes the shell's own group and
+                    // succeeds — it counts as a delivered probe.
+                    any_succeeded = true;
                     continue;
                 }
                 if !process_exists(pid) {
@@ -57,33 +64,74 @@ impl Executor {
                         "{}kill: ({pid}) - No such process",
                         self.diagnostic_prefix()
                     )?;
-                    status = 1;
+                    any_failed = true;
+                } else {
+                    any_succeeded = true;
                 }
             }
             self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-            if status != 0 || request.check_only {
-                return Ok(Some(status));
+            if any_failed || request.check_only {
+                return Ok(Some(if self.posix_mode_enabled() {
+                    i32::from(any_failed)
+                } else {
+                    i32::from(!any_succeeded)
+                }));
             }
             return Ok(None);
         }
 
         let mut stderr = Vec::new();
-        let mut status = 0;
+        // GNU kill.def:87-268: only real kill_pid attempts move the
+        // counters — any_succeeded for a delivered signal, any_failed for
+        // a failed delivery (ESRCH etc.). Spec-layer diagnostics
+        // (sh_badjob/sh_badpid/DUP_JOB via CONTINUE_OR_FAIL) touch
+        // neither counter, so `kill -0 %1 %?dup` returns 0 while
+        // `kill -0 %?dup` alone returns 1. The final status is
+        // `any_succeeded ? 0 : 1` (posix: `any_failed == 0 ? 0 : 1`).
+        let mut any_succeeded = false;
+        let mut any_failed = false;
         for operand in request.operands {
-            let Some(pid) = self.resolve_background_job(&operand) else {
-                writeln!(
-                    stderr,
-                    "{}kill: {operand}: no such job",
-                    self.diagnostic_prefix()
-                )?;
-                // Bash posix-mode quirk (rubash#1054): a jobspec that
-                // names no job still prints the diagnostic, but the kill
-                // builtin's status stays 0 in posix mode. An invalid PID
-                // operand keeps status 1 in both modes.
-                if !(operand.starts_with('%') && self.posix_mode_enabled()) {
-                    status = 1;
+            let (pid, tracked_job) = match self.resolve_background_job_operand(&operand) {
+                super::job_builtins::JobOperandResolution::Pid(pid) => (pid, true),
+                super::job_builtins::JobOperandResolution::Ambiguous => {
+                    // GNU kill.def:226-232 + builtins/common.c:672-679:
+                    // DUP_JOB is INVALID_JOB, but kill skips sh_badjob
+                    // for it — the get_job_by_name diagnostic is the
+                    // whole report ("kill: name: ambiguous job spec").
+                    writeln!(
+                        stderr,
+                        "{}kill: {}: ambiguous job spec",
+                        self.diagnostic_prefix(),
+                        super::job_builtins::jobspec_match_name(&operand)
+                    )?;
+                    continue;
                 }
-                continue;
+                super::job_builtins::JobOperandResolution::NoMatch => {
+                    if operand.starts_with('%') {
+                        // kill.def:227-229 sh_badjob — message only.
+                        writeln!(
+                            stderr,
+                            "{}kill: {operand}: no such job",
+                            self.diagnostic_prefix()
+                        )?;
+                        continue;
+                    }
+                    match operand.parse::<u32>() {
+                        // kill.def:194-216: a numeric operand takes the
+                        // pid path even outside the jobs table — the
+                        // delivery below decides the counters.
+                        Ok(pid) => (pid, false),
+                        Err(_) => {
+                            // kill.def:205-216 sh_badpid — message only.
+                            writeln!(
+                                stderr,
+                                "{}kill: `{operand}': not a pid or valid job spec",
+                                self.diagnostic_prefix()
+                            )?;
+                            continue;
+                        }
+                    }
+                }
             };
 
             if request.check_only {
@@ -111,7 +159,9 @@ impl Executor {
                         "{}kill: ({pid}) - No such process",
                         self.diagnostic_prefix()
                     )?;
-                    status = 1;
+                    any_failed = true;
+                } else {
+                    any_succeeded = true;
                 }
                 continue;
             }
@@ -124,8 +174,15 @@ impl Executor {
                 &mut signal_stderr,
             )?;
             if signal_status != 0 {
-                status = signal_status;
+                any_failed = true;
                 stderr.extend(signal_stderr);
+                continue;
+            }
+            any_succeeded = true;
+            if !tracked_job {
+                // A bare numeric pid outside the jobs table has no
+                // job-table side effects (GNU kill_pid is a plain
+                // signal delivery).
                 continue;
             }
             if request.signal == 18 {
@@ -159,6 +216,15 @@ impl Executor {
         }
 
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        // kill.def:265-268: posixly_correct fails on any_failed, the
+        // default mode on no successes at all — spec diagnostics feed
+        // neither counter (rubash#1054's jobspec exemption is the same
+        // rule, only stated for % specs).
+        let status = if self.posix_mode_enabled() {
+            i32::from(any_failed)
+        } else {
+            i32::from(!any_succeeded)
+        };
         Ok(Some(status))
     }
 

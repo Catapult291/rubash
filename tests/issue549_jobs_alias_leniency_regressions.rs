@@ -80,7 +80,7 @@ fn bare_number_spec_warns_and_lists_the_matching_job() {
 #[test]
 fn bare_number_spec_without_a_match_warns_and_reports_no_such_job() {
     let (stdout, stderr, rc) = run_with_held_stdin("sleep 5 & jobs 5; echo rc=$?");
-    assert_eq!(stdout, "rc=0\n");
+    assert_eq!(stdout, "rc=1\n");
     assert!(
         stderr.contains("jobs: warning: 5: job specification requires leading `%'"),
         "stderr: {stderr:?}"
@@ -95,7 +95,7 @@ fn bare_number_spec_without_a_match_warns_and_reports_no_such_job() {
 #[test]
 fn non_number_bare_spec_gets_the_same_treatment() {
     let (stdout, stderr, rc) = run_with_held_stdin("sleep 5 & jobs 1x; echo rc=$?");
-    assert_eq!(stdout, "rc=0\n");
+    assert_eq!(stdout, "rc=1\n");
     assert!(
         stderr.contains("jobs: warning: 1x: job specification requires leading `%'"),
         "stderr: {stderr:?}"
@@ -108,9 +108,9 @@ fn non_number_bare_spec_gets_the_same_treatment() {
 }
 
 #[test]
-fn percent_spec_failure_keeps_rc_zero() {
+fn percent_spec_failure_reports_rc_one() {
     let (stdout, stderr, rc) = run_with_held_stdin("sleep 5 & jobs %5; echo rc=$?");
-    assert_eq!(stdout, "rc=0\n");
+    assert_eq!(stdout, "rc=1\n");
     assert!(
         stderr.contains("jobs: %5: no such job"),
         "stderr: {stderr:?}"
@@ -123,7 +123,7 @@ fn mixed_spec_warning_precedes_the_listing() {
     // GNU's stderr is unbuffered and its stdout table buffered, so in a
     // merged capture the warning precedes the job line (jobs 1 probe).
     let (stdout, stderr, rc) = run_with_held_stdin("sleep 5 & jobs 1 %2; echo rc=$?");
-    let merged_order = stdout.contains("sleep 5") && stdout.contains("rc=0");
+    let merged_order = stdout.contains("sleep 5") && stdout.contains("rc=1");
     assert!(merged_order, "stdout: {stdout:?}");
     assert!(
         stderr.contains("jobs: warning: 1: job specification requires leading `%'"),
@@ -180,9 +180,11 @@ fn alias_missing_name_without_p_reports_not_found() {
 }
 
 #[test]
-fn jobs_with_no_jobs_and_bare_number_stays_silent_rc_zero() {
+fn jobs_with_no_jobs_and_bare_number_reports_no_such_job_rc_one() {
+    // GNU jobs.def:174: jobs_builtin returns any_failed ? EXECUTION_FAILURE,
+    // verified on GNU 5.3.20 (`jobs 5` with an empty table -> rc=1).
     let (stdout, stderr, rc) = run("jobs 1; echo rc=$?");
-    assert_eq!(stdout, "rc=0\n");
+    assert_eq!(stdout, "rc=1\n");
     assert!(
         stderr.contains("jobs: warning: 1: job specification requires leading `%'"),
         "stderr: {stderr:?}"

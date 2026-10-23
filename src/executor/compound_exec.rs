@@ -554,11 +554,12 @@ impl Executor {
                         &self.shell_state.env_vars,
                         "monitor",
                     );
-                    self.shell_state.job_table.register_process(
+                    self.shell_state.job_table.register_process_with_stages(
                         pid,
                         display_source.clone(),
                         true,
                         async_job_pgrp(pid, job_control),
+                        bash_job_stage_commands(&background_command.command),
                     );
                     self.shell_state.job_table.set_job_control(pid, job_control);
                     self.shell_state.last_background_pid = Some(pid);
@@ -946,11 +947,12 @@ impl Executor {
         self.background_children.insert(pid, child);
         let job_control =
             crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor");
-        self.shell_state.job_table.register_process(
+        self.shell_state.job_table.register_process_with_stages(
             pid,
             display_source.clone(),
             true,
             async_job_pgrp(pid, job_control),
+            bash_job_stage_commands(&background_command.command),
         );
         self.shell_state.job_table.set_job_control(pid, job_control);
         self.shell_state.last_background_pid = Some(pid);
@@ -3139,11 +3141,12 @@ impl Executor {
                         &self.shell_state.env_vars,
                         "monitor",
                     );
-                    let job_id = self.shell_state.job_table.register_process(
+                    let job_id = self.shell_state.job_table.register_process_with_stages(
                         pid,
                         bash_command_source_text(cmd),
                         true,
                         async_job_pgrp(pid, job_control),
+                        bash_job_stage_commands(cmd),
                     );
                     self.shell_state.job_table.set_job_control(pid, job_control);
                     // GNU coproc.c: the coproc is an async child, so $!
