@@ -492,6 +492,15 @@ pub fn login_profile_files(home: &str, exists: impl Fn(&str) -> bool) -> Vec<Str
 /// in place of the personal rc. `exists` is injected for host-independent
 /// tests. Login shells never take this branch: the profile chain replaces
 /// it entirely (shell.c:1833 `if (login_shell) ... else if (interactive)`).
+///
+/// rubash#1158 (owner decision: compatible reading): after GNU's own
+/// ~/.bashrc, a ~/.niubashrc sibling is listed when it exists — niu's own
+/// config runs LAST so it overrides whatever the migration-path .bashrc
+/// set. GNU sources no .niubashrc; the sibling is a product extension on
+/// top of the GNU list, and only an existing file enters the list, so a
+/// bash-only home stays byte-identical to GNU. `--rcfile` keeps GNU's
+/// replacement semantics for the WHOLE personal-rc slot (shell.c
+/// bashrc_file): it suppresses both candidates.
 pub fn nonlogin_interactive_files(
     home: &str,
     rc_override: Option<&str>,
@@ -505,9 +514,11 @@ pub fn nonlogin_interactive_files(
     match rc_override {
         Some(rc) => files.push(rc.to_string()),
         None => {
-            let personal = format!("{home}/.bashrc");
-            if exists(&personal) {
-                files.push(personal);
+            for name in [".bashrc", ".niubashrc"] {
+                let candidate = format!("{home}/{name}");
+                if exists(&candidate) {
+                    files.push(candidate);
+                }
             }
         }
     }
@@ -1001,6 +1012,40 @@ mod tests {
             set(&["/etc/bash.bashrc"]),
         );
         assert_eq!(files, vec!["/etc/bash.bashrc", "custom.rc"]);
+    }
+
+    #[test]
+    fn nonlogin_interactive_chain_runs_bashrc_then_niubashrc() {
+        // rubash#1158 compatible reading: ~/.bashrc is the GNU migration
+        // path and ~/.niubashrc (niu's own config) runs after it so it
+        // overrides; each candidate enters only when it exists.
+        let set = |present: &[&str]| {
+            let owned: Vec<String> = present.iter().map(|p| p.to_string()).collect();
+            move |p: &str| owned.iter().any(|candidate| candidate == p)
+        };
+        let files = crate::invocation::nonlogin_interactive_files(
+            "/home/u",
+            None,
+            set(&["/home/u/.bashrc", "/home/u/.niubashrc"]),
+        );
+        assert_eq!(files, vec!["/home/u/.bashrc", "/home/u/.niubashrc"]);
+
+        // .niubashrc alone is a valid personal rc (existing niu users).
+        let files = crate::invocation::nonlogin_interactive_files(
+            "/home/u",
+            None,
+            set(&["/home/u/.niubashrc"]),
+        );
+        assert_eq!(files, vec!["/home/u/.niubashrc"]);
+
+        // --rcfile replaces the WHOLE personal slot — neither default is
+        // sourced alongside it (GNU bashrc_file semantics, #1158 design).
+        let files = crate::invocation::nonlogin_interactive_files(
+            "/home/u",
+            Some("custom.rc"),
+            set(&["/home/u/.bashrc", "/home/u/.niubashrc"]),
+        );
+        assert_eq!(files, vec!["custom.rc"]);
     }
 }
 
