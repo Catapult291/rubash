@@ -2,4 +2,4 @@
 
 pub mod table;
 
-pub use table::{JobEntry, JobId, JobTable, ProcessState};
+pub use table::{JobEntry, JobId, JobTable, JobspecMatch, ProcessState};

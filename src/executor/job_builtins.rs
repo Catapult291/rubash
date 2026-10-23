@@ -11,6 +11,24 @@ enum WaitPidOutcome {
     Interrupted(i32),
 }
 
+/// `resolve_background_job` with GNU's three-way get_job_spec result
+/// kept: `Ambiguous` is DUP_JOB (jobs.h:207, builtins/common.c:672-679)
+/// — a name spec matched more than once, and the builtin reports
+/// `{name}: ambiguous job spec` instead of "no such job".
+pub(in crate::executor) enum JobOperandResolution {
+    Pid(u32),
+    Ambiguous,
+    NoMatch,
+}
+
+/// The name GNU prints in `{builtin}: {name}: ambiguous job spec` —
+/// get_job_by_name (builtins/common.c:673) sees the spec stripped of
+/// its `%` marker and of `?` for the substring form.
+pub(in crate::executor) fn jobspec_match_name(spec: &str) -> &str {
+    let body = spec.strip_prefix('%').unwrap_or(spec);
+    body.strip_prefix('?').unwrap_or(body)
+}
+
 impl Executor {
     pub(in crate::executor) fn execute_times(
         &mut self,
@@ -98,7 +116,8 @@ impl Executor {
                 // process-GROUP ID (jobs.c:649), not the job pid — and a bad
                 // spec is NOT an error: it passes through unchanged and the
                 // command still runs (rubash#1096).
-                let words = self.expand_jobs_x_words(words);
+                let words = self.expand_jobs_x_words(words, &mut stderr)?;
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                 let mut command = cmd.clone();
                 command.words = words;
                 self.execute_command(&command)?;
@@ -107,32 +126,57 @@ impl Executor {
         }
     }
 
-    fn expand_jobs_x_words(&self, words: Vec<String>) -> Vec<String> {
-        words
-            .into_iter()
-            .map(|word| {
-                if !word.starts_with('%') {
-                    return word;
+    fn expand_jobs_x_words(
+        &self,
+        words: Vec<String>,
+        stderr: &mut Vec<u8>,
+    ) -> Result<Vec<String>, ExecuteError> {
+        let mut expanded = Vec::with_capacity(words.len());
+        for word in words {
+            if !word.starts_with('%') {
+                expanded.push(word);
+                continue;
+            }
+            // GNU only resolves live jobs here (get_job_by_jid over the
+            // jobs array — no bgpids/completed-status fallback, which is
+            // a wait-only path). INVALID_JOB passes through unchanged —
+            // and DUP_JOB still reports the get_job_by_name diagnostic
+            // (builtins/common.c:673, this_shell_builtin is `jobs`).
+            match self.resolve_background_pgrp(&word) {
+                Ok(pgrp) => expanded.push(pgrp.to_string()),
+                Err(JobOperandResolution::Ambiguous) => {
+                    writeln!(
+                        stderr,
+                        "{}jobs: {}: ambiguous job spec",
+                        self.diagnostic_prefix(),
+                        jobspec_match_name(&word)
+                    )?;
+                    expanded.push(word);
                 }
-                // GNU only resolves live jobs here (get_job_by_jid over the
-                // jobs array — no bgpids/completed-status fallback, which is
-                // a wait-only path). INVALID_JOB passes through unchanged.
-                self.resolve_background_pgrp(&word)
-                    .map(|pgrp| pgrp.to_string())
-                    .unwrap_or(word)
-            })
-            .collect()
+                Err(_) => expanded.push(word),
+            }
+        }
+        Ok(expanded)
     }
 
     /// Resolve a `%`-spec to its job's recorded process-group ID
     /// (jobs.c:649 j->pgrp), the value `jobs -x` substitutes.
-    fn resolve_background_pgrp(&self, spec: &str) -> Option<u32> {
-        let job_id = self.shell_state.job_table.resolve_jobspec(spec)?;
+    fn resolve_background_pgrp(&self, spec: &str) -> Result<u32, JobOperandResolution> {
+        let job_id = match self.shell_state.job_table.resolve_jobspec(spec) {
+            crate::jobs::table::JobspecMatch::Job(job_id) => job_id,
+            crate::jobs::table::JobspecMatch::Ambiguous => {
+                return Err(JobOperandResolution::Ambiguous);
+            }
+            crate::jobs::table::JobspecMatch::NoMatch => {
+                return Err(JobOperandResolution::NoMatch);
+            }
+        };
         self.shell_state
             .job_table
             .jobs
             .get(&job_id)
             .map(|entry| entry.pgrp)
+            .ok_or(JobOperandResolution::NoMatch)
     }
 
     pub(in crate::executor) fn execute_wait(
@@ -300,17 +344,36 @@ impl Executor {
             let mut stderr = Vec::new();
             let mut candidates: Vec<u32> = Vec::new();
             for operand in &request.operands {
-                if let Some(pid) = self.resolve_background_job(operand) {
-                    if !candidates.contains(&pid) {
-                        candidates.push(pid);
+                match self.resolve_background_job_operand(operand) {
+                    JobOperandResolution::Pid(pid) => {
+                        if !candidates.contains(&pid) {
+                            candidates.push(pid);
+                        }
                     }
-                } else {
-                    write_wait_operand_error(
-                        operand,
-                        &self.diagnostic_prefix(),
-                        &self.error_prefix(),
-                        &mut stderr,
-                    )?;
+                    JobOperandResolution::Ambiguous => {
+                        // GNU wait.def:368-377 set_waitlist: DUP_JOB is
+                        // INVALID_JOB — the get_job_by_name diagnostic
+                        // prints, then sh_badjob reports the spec.
+                        writeln!(
+                            stderr,
+                            "{}wait: {}: ambiguous job spec",
+                            self.diagnostic_prefix(),
+                            jobspec_match_name(operand)
+                        )?;
+                        writeln!(
+                            stderr,
+                            "{}wait: {operand}: no such job",
+                            self.diagnostic_prefix()
+                        )?;
+                    }
+                    JobOperandResolution::NoMatch => {
+                        write_wait_operand_error(
+                            operand,
+                            &self.diagnostic_prefix(),
+                            &self.error_prefix(),
+                            &mut stderr,
+                        )?;
+                    }
                 }
             }
             if !request.operands.is_empty() && candidates.is_empty() {
@@ -431,22 +494,74 @@ impl Executor {
         }
 
         if cmd.words.len() == 2 {
-            if let Some(pid) = self.resolve_background_job(&cmd.words[1]) {
-                match self.wait_for_background_pid(pid, true)? {
+            match self.resolve_background_job_operand(&cmd.words[1]) {
+                JobOperandResolution::Pid(pid) => match self.wait_for_background_pid(pid, true)? {
                     WaitPidOutcome::Status(status) | WaitPidOutcome::Interrupted(status) => {
                         self.write_buffered_builtin_output(cmd, &[], &[])?;
                         return Ok(status);
                     }
                     WaitPidOutcome::NotFound => {}
+                },
+                JobOperandResolution::Ambiguous => {
+                    // GNU wait.def:300-311: a DUP_JOB jobspec is
+                    // INVALID_JOB — the get_job_by_name diagnostic is the
+                    // whole report (no sh_badjob), status 127.
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        stderr,
+                        "{}wait: {}: ambiguous job spec",
+                        self.diagnostic_prefix(),
+                        jobspec_match_name(&cmd.words[1])
+                    )?;
+                    self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    return Ok(127);
                 }
-            } else if let Ok(pid) = cmd.words[1].parse::<u32>() {
-                match self.wait_for_background_pid(pid, true)? {
-                    WaitPidOutcome::Status(status) | WaitPidOutcome::Interrupted(status) => {
-                        self.write_buffered_builtin_output(cmd, &[], &[])?;
-                        return Ok(status);
+                JobOperandResolution::NoMatch => {
+                    if let Ok(pid) = cmd.words[1].parse::<u32>() {
+                        match self.wait_for_background_pid(pid, true)? {
+                            WaitPidOutcome::Status(status)
+                            | WaitPidOutcome::Interrupted(status) => {
+                                self.write_buffered_builtin_output(cmd, &[], &[])?;
+                                return Ok(status);
+                            }
+                            WaitPidOutcome::NotFound => {}
+                        }
                     }
-                    WaitPidOutcome::NotFound => {}
                 }
+            }
+        }
+
+        // Reaching the pure-builtin fallback means no operand resolved.
+        // That path cannot see the job table, so ambiguous `%`-specs are
+        // diagnosed here — in operand order, mirroring builtins/wait.rs —
+        // before it reports the rest (wait.def:294-311 per-operand).
+        if let Some(operands) = wait_background_operands(&cmd.words[1..]) {
+            if operands.iter().any(|operand| operand.starts_with('%')) {
+                let mut stderr = Vec::new();
+                let mut status = 0;
+                for operand in &operands {
+                    status = match self.resolve_background_job_operand(operand) {
+                        JobOperandResolution::Ambiguous => {
+                            writeln!(
+                                stderr,
+                                "{}wait: {}: ambiguous job spec",
+                                self.diagnostic_prefix(),
+                                jobspec_match_name(operand)
+                            )?;
+                            127
+                        }
+                        JobOperandResolution::Pid(_) | JobOperandResolution::NoMatch => {
+                            write_wait_operand_error(
+                                operand,
+                                &self.diagnostic_prefix(),
+                                &self.error_prefix(),
+                                &mut stderr,
+                            )?
+                        }
+                    };
+                }
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                return Ok(status);
             }
         }
 
@@ -561,22 +676,44 @@ impl Executor {
     ) -> Result<i32, ExecuteError> {
         let resolved = operands
             .iter()
-            .map(|operand| (operand.clone(), self.resolve_background_job(operand)))
+            .map(|operand| {
+                (
+                    operand.clone(),
+                    self.resolve_background_job_operand(operand),
+                )
+            })
             .collect::<Vec<_>>();
         let mut stderr = Vec::new();
         let mut status = 0;
         let mut last_pid = None;
 
-        for (operand, pid) in resolved {
-            let Some(pid) = pid else {
-                status = write_wait_operand_error(
-                    &operand,
-                    &self.diagnostic_prefix(),
-                    &self.error_prefix(),
-                    &mut stderr,
-                )?;
-                last_pid = None;
-                continue;
+        for (operand, resolution) in resolved {
+            let pid = match resolution {
+                JobOperandResolution::Pid(pid) => pid,
+                JobOperandResolution::Ambiguous => {
+                    // GNU wait.def:300-311: DUP_JOB is INVALID_JOB — the
+                    // get_job_by_name diagnostic is the whole report,
+                    // status 127 (POSIX 4.70.2).
+                    writeln!(
+                        stderr,
+                        "{}wait: {}: ambiguous job spec",
+                        self.diagnostic_prefix(),
+                        jobspec_match_name(&operand)
+                    )?;
+                    status = 127;
+                    last_pid = None;
+                    continue;
+                }
+                JobOperandResolution::NoMatch => {
+                    status = write_wait_operand_error(
+                        &operand,
+                        &self.diagnostic_prefix(),
+                        &self.error_prefix(),
+                        &mut stderr,
+                    )?;
+                    last_pid = None;
+                    continue;
+                }
             };
             match self.wait_for_background_pid(pid, true)? {
                 WaitPidOutcome::Interrupted(interrupt_status) => {
@@ -1272,23 +1409,45 @@ impl Executor {
                     )?;
                     (format!("%{job}"), job.clone())
                 };
-                if let Some(pid) = self.resolve_background_job(&spec) {
-                    if let Some(job_id) = self.shell_state.job_table.pid_to_job.get(&pid).copied() {
-                        if let Some(entry) = self.shell_state.job_table.jobs.get(&job_id) {
-                            selected.push((
-                                self.background_job_number(pid),
-                                pid,
-                                entry.command.clone(),
-                            ));
+                match self.resolve_background_job_operand(&spec) {
+                    JobOperandResolution::Pid(pid) => {
+                        if let Some(job_id) =
+                            self.shell_state.job_table.pid_to_job.get(&pid).copied()
+                        {
+                            if let Some(entry) = self.shell_state.job_table.jobs.get(&job_id) {
+                                selected.push((
+                                    self.background_job_number(pid),
+                                    pid,
+                                    entry.command.clone(),
+                                ));
+                            }
                         }
                     }
-                } else {
-                    any_failed = true;
-                    writeln!(
-                        stderr,
-                        "{}jobs: {report}: no such job",
-                        self.diagnostic_prefix()
-                    )?;
+                    JobOperandResolution::Ambiguous => {
+                        // GNU jobs.def:158-164: DUP_JOB is INVALID_JOB —
+                        // the get_job_by_name diagnostic prints, then
+                        // sh_badjob reports the spec itself.
+                        any_failed = true;
+                        writeln!(
+                            stderr,
+                            "{}jobs: {}: ambiguous job spec",
+                            self.diagnostic_prefix(),
+                            jobspec_match_name(&spec)
+                        )?;
+                        writeln!(
+                            stderr,
+                            "{}jobs: {report}: no such job",
+                            self.diagnostic_prefix()
+                        )?;
+                    }
+                    JobOperandResolution::NoMatch => {
+                        any_failed = true;
+                        writeln!(
+                            stderr,
+                            "{}jobs: {report}: no such job",
+                            self.diagnostic_prefix()
+                        )?;
+                    }
                 }
             }
             let output = self.render_background_jobs(options, selected);
@@ -1482,45 +1641,65 @@ impl Executor {
             crate::builtins::disown::DisownAction::Jobs { specs, nohup_only } => {
                 let mut status = 0;
                 for job in specs {
-                    if let Some(pid) = self.resolve_disown_job(&job) {
-                        if nohup_only {
-                            // GNU jobs.c:1548 nohup_job: J_NOHUP mark
-                            // only — the job stays in the table, so
-                            // `jobs` still lists it and `wait %N` still
-                            // finds it (rubash#1048).
-                            if let Some(job_id) =
-                                self.shell_state.job_table.pid_to_job.get(&pid).copied()
-                            {
-                                if let Some(entry) =
-                                    self.shell_state.job_table.jobs.get_mut(&job_id)
-                                {
-                                    entry.nohup = true;
-                                }
-                            }
-                        } else {
-                            self.background_children.remove(&pid);
-                            self.close_coproc_endpoints(pid);
-                            self.fd_table.close(pid);
-                            self.shell_state.job_table.remove_job_by_pid(pid);
-                        }
-                    } else {
-                        // GNU jobs.def:283-289 disown_builtin: non-numeric
-                        // operands go through get_job_spec, which warns when
-                        // the spec lacks a leading `%` (common.c:705-710)
-                        // before failing with "no such job".
-                        if !job.starts_with('%') && job.parse::<u32>().is_err() {
+                    match self.resolve_disown_job_operand(&job) {
+                        JobOperandResolution::Ambiguous => {
+                            // GNU jobs.def:287-291: DUP_JOB takes the
+                            // INVALID_JOB arm — the get_job_by_name
+                            // diagnostic prints, then sh_badjob too.
                             writeln!(
                                 stderr,
-                                "{}disown: warning: {job}: job specification requires leading `%'",
+                                "{}disown: {}: ambiguous job spec",
+                                self.diagnostic_prefix(),
+                                jobspec_match_name(&job)
+                            )?;
+                            writeln!(
+                                stderr,
+                                "{}disown: {job}: no such job",
                                 self.diagnostic_prefix()
                             )?;
+                            status = 1;
                         }
-                        writeln!(
-                            stderr,
-                            "{}disown: {job}: no such job",
-                            self.diagnostic_prefix()
-                        )?;
-                        status = 1;
+                        JobOperandResolution::NoMatch => {
+                            // GNU jobs.def:283-289 disown_builtin: non-numeric
+                            // operands go through get_job_spec, which warns when
+                            // the spec lacks a leading `%` (common.c:705-710)
+                            // before failing with "no such job".
+                            if !job.starts_with('%') && job.parse::<u32>().is_err() {
+                                writeln!(
+                                    stderr,
+                                    "{}disown: warning: {job}: job specification requires leading `%'",
+                                    self.diagnostic_prefix()
+                                )?;
+                            }
+                            writeln!(
+                                stderr,
+                                "{}disown: {job}: no such job",
+                                self.diagnostic_prefix()
+                            )?;
+                            status = 1;
+                        }
+                        JobOperandResolution::Pid(pid) => {
+                            if nohup_only {
+                                // GNU jobs.c:1548 nohup_job: J_NOHUP mark
+                                // only — the job stays in the table, so
+                                // `jobs` still lists it and `wait %N` still
+                                // finds it (rubash#1048).
+                                if let Some(job_id) =
+                                    self.shell_state.job_table.pid_to_job.get(&pid).copied()
+                                {
+                                    if let Some(entry) =
+                                        self.shell_state.job_table.jobs.get_mut(&job_id)
+                                    {
+                                        entry.nohup = true;
+                                    }
+                                }
+                            } else {
+                                self.background_children.remove(&pid);
+                                self.close_coproc_endpoints(pid);
+                                self.fd_table.close(pid);
+                                self.shell_state.job_table.remove_job_by_pid(pid);
+                            }
+                        }
                     }
                 }
                 status
@@ -1563,24 +1742,35 @@ impl Executor {
         true
     }
 
-    pub(in crate::executor) fn resolve_background_job(&self, job: &str) -> Option<u32> {
+    /// GNU wait.def:294-311 / kill.def:226 / fg_bg.def:143 — the jobspec
+    /// operand funnels through get_job_spec; `Ambiguous` (DUP_JOB)
+    /// keeps its identity so callers can print
+    /// `{name}: ambiguous job spec` rather than "no such job".
+    pub(in crate::executor) fn resolve_background_job_operand(
+        &self,
+        job: &str,
+    ) -> JobOperandResolution {
         if job.starts_with('%') {
-            let job_id = self.shell_state.job_table.resolve_jobspec(job)?;
-            return self
-                .shell_state
-                .job_table
-                .jobs
-                .get(&job_id)?
-                .pids
-                .last()
-                .copied();
+            return match self.shell_state.job_table.resolve_jobspec(job) {
+                crate::jobs::table::JobspecMatch::Job(job_id) => self
+                    .shell_state
+                    .job_table
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|entry| entry.pids.last().copied())
+                    .map_or(JobOperandResolution::NoMatch, JobOperandResolution::Pid),
+                crate::jobs::table::JobspecMatch::Ambiguous => JobOperandResolution::Ambiguous,
+                crate::jobs::table::JobspecMatch::NoMatch => JobOperandResolution::NoMatch,
+            };
         }
-        let pid = job.parse::<u32>().ok()?;
+        let Some(pid) = job.parse::<u32>().ok() else {
+            return JobOperandResolution::NoMatch;
+        };
         // rubash#1022: pending procsub placeholders (a still-open persistent
         // `>(...)` — no recorded status yet) resolve like completed ones so
         // `kill -0`/`kill` reach the forked child; `wait` on one still
         // reports "not a child" (127) instead of blocking forever.
-        (self.shell_state.job_table.pid_to_job.contains_key(&pid)
+        if self.shell_state.job_table.pid_to_job.contains_key(&pid)
             || self
                 .shell_state
                 .job_table
@@ -1590,8 +1780,25 @@ impl Executor {
                 .shell_state
                 .job_table
                 .procsub_placeholders
-                .contains(&pid))
-        .then_some(pid)
+                .contains(&pid)
+        {
+            JobOperandResolution::Pid(pid)
+        } else {
+            JobOperandResolution::NoMatch
+        }
+    }
+
+    pub(in crate::executor) fn resolve_background_job(&self, job: &str) -> Option<u32> {
+        if job.starts_with('%') {
+            return match self.resolve_background_job_operand(job) {
+                JobOperandResolution::Pid(pid) => Some(pid),
+                JobOperandResolution::Ambiguous | JobOperandResolution::NoMatch => None,
+            };
+        }
+        match self.resolve_background_job_operand(job) {
+            JobOperandResolution::Pid(pid) => Some(pid),
+            JobOperandResolution::Ambiguous | JobOperandResolution::NoMatch => None,
+        }
     }
 
     /// GNU jobs.def:283-289 disown_builtin: a numeric operand resolves by
@@ -1602,17 +1809,21 @@ impl Executor {
     /// consumed (jobs.c:3438 wait_for_job J_NOTIFIED + delete) is therefore
     /// "no such job" for disown (rc 1). Contrast wait_for_single_pid
     /// (jobs.c:2741), which DOES fall back to bgp_search — the wait path
-    /// keeps resolve_background_job's completed_statuses arm.
-    fn resolve_disown_job(&self, job: &str) -> Option<u32> {
+    /// keeps resolve_background_job's completed_statuses arm. The
+    /// DUP_JOB (ambiguous) arm is kept too — jobs.def:287-291 reports
+    /// the ambiguous diagnostic AND `sh_badjob` for it.
+    fn resolve_disown_job_operand(&self, job: &str) -> JobOperandResolution {
         if job.starts_with('%') {
-            return self.resolve_background_job(job);
+            return self.resolve_background_job_operand(job);
         }
-        let pid = job.parse::<u32>().ok()?;
-        self.shell_state
-            .job_table
-            .pid_to_job
-            .contains_key(&pid)
-            .then_some(pid)
+        let Some(pid) = job.parse::<u32>().ok() else {
+            return JobOperandResolution::NoMatch;
+        };
+        if self.shell_state.job_table.pid_to_job.contains_key(&pid) {
+            JobOperandResolution::Pid(pid)
+        } else {
+            JobOperandResolution::NoMatch
+        }
     }
 
     fn background_job_number(&self, pid: u32) -> usize {
@@ -1688,9 +1899,23 @@ impl Executor {
         stderr: &mut Vec<u8>,
     ) -> Result<i32, ExecuteError> {
         let job = jobs.first().map(String::as_str);
-        let Some(pid) = self.resolve_requested_background_job(job) else {
-            self.write_job_not_found("fg", job, stderr)?;
-            return Ok(1);
+        let pid = match self.resolve_requested_background_job(job) {
+            JobOperandResolution::Pid(pid) => pid,
+            JobOperandResolution::Ambiguous => {
+                // GNU fg_bg.def:144-152: DUP_JOB skips sh_badjob — the
+                // get_job_by_name diagnostic is the whole report.
+                writeln!(
+                    stderr,
+                    "{}fg: {}: ambiguous job spec",
+                    self.diagnostic_prefix(),
+                    job.map_or("current", jobspec_match_name)
+                )?;
+                return Ok(1);
+            }
+            JobOperandResolution::NoMatch => {
+                self.write_job_not_found("fg", job, stderr)?;
+                return Ok(1);
+            }
         };
 
         // GNU fg_bg.def:154-160 — a job started without job control
@@ -1782,95 +2007,111 @@ impl Executor {
 
         let mut status = 0;
         for job in requested {
-            if let Some(pid) = self.resolve_requested_background_job(job) {
-                if !self.shell_state.job_table.job_control_for_pid(pid) {
-                    let job_id = self.shell_state.job_table.job_id_for_pid(pid).unwrap_or(0);
+            match self.resolve_requested_background_job(job) {
+                JobOperandResolution::Pid(pid) => {
+                    if !self.shell_state.job_table.job_control_for_pid(pid) {
+                        let job_id = self.shell_state.job_table.job_id_for_pid(pid).unwrap_or(0);
+                        writeln!(
+                            stderr,
+                            "{}bg: job {} started without job control",
+                            self.diagnostic_prefix(),
+                            job_id
+                        )?;
+                        status = 1;
+                        continue;
+                    }
+                    let Some(job_id) = self.shell_state.job_table.job_id_for_pid(pid) else {
+                        self.write_job_not_found("bg", job, stderr)?;
+                        status = 1;
+                        continue;
+                    };
+                    // GNU jobs.c:3837-3843 start_job: same comsub gate as fg.
+                    if self.shell_state.in_command_substitution.get() {
+                        writeln!(stderr, "{}bg: no current jobs", self.diagnostic_prefix())?;
+                        status = 1;
+                        continue;
+                    }
+                    // GNU jobs.c:3849-3855 start_job: `bg` on an already-running
+                    // job is a diagnostic but NOT an error under XPG6/SUSv3 —
+                    // the message prints and status stays 0.
+                    let already_running = self
+                        .shell_state
+                        .job_table
+                        .jobs
+                        .get(&job_id)
+                        .is_some_and(|entry| entry.state == crate::jobs::ProcessState::Running);
+                    if already_running {
+                        writeln!(
+                            stderr,
+                            "{}bg: job {} already in background",
+                            self.diagnostic_prefix(),
+                            job_id
+                        )?;
+                        continue;
+                    }
+                    // GNU jobs.c:3826 start_job(foreground=0): print the
+                    // "[N]± command &" line with the pre-reset +/− marker
+                    // (jobs.c:3872-3899), SIGCONT the process group
+                    // (jobs.c:3926-3928), then reset_current (jobs.c:3949).
+                    let marker = if posixly {
+                        " "
+                    } else if self.shell_state.job_table.current_job() == Some(job_id) {
+                        "+ "
+                    } else if self.shell_state.job_table.previous_job() == Some(job_id) {
+                        "- "
+                    } else {
+                        " "
+                    };
+                    let (command, pids) = self
+                        .shell_state
+                        .job_table
+                        .jobs
+                        .get(&job_id)
+                        .map(|entry| (entry.command.clone(), entry.pids.clone()))
+                        .unwrap_or_default();
+                    writeln!(stdout, "[{job_id}]{marker}{command} &")?;
+                    // SIGCONT follows the target numbering (18 Linux / 19
+                    // Darwin) via kill::SIGCONT_NUMBER — see the fg twin above
+                    // (jobs.c:3928).
+                    for member in &pids {
+                        let _ = crate::builtins::kill::send_signal(
+                            *member,
+                            crate::builtins::kill::SIGCONT_NUMBER,
+                        );
+                    }
+                    self.shell_state.job_table.mark_running(pid);
+                    if let Some(entry) = self.shell_state.job_table.jobs.get_mut(&job_id) {
+                        entry.background = true;
+                        entry.foreground = false;
+                    }
+                    self.shell_state.job_table.reset_current();
+                }
+                JobOperandResolution::Ambiguous => {
+                    // GNU fg_bg.def:144-152: DUP_JOB skips sh_badjob —
+                    // the get_job_by_name diagnostic is the whole report.
                     writeln!(
                         stderr,
-                        "{}bg: job {} started without job control",
+                        "{}bg: {}: ambiguous job spec",
                         self.diagnostic_prefix(),
-                        job_id
+                        job.map_or("current", jobspec_match_name)
                     )?;
                     status = 1;
-                    continue;
                 }
-                let Some(job_id) = self.shell_state.job_table.job_id_for_pid(pid) else {
+                JobOperandResolution::NoMatch => {
                     self.write_job_not_found("bg", job, stderr)?;
                     status = 1;
-                    continue;
-                };
-                // GNU jobs.c:3837-3843 start_job: same comsub gate as fg.
-                if self.shell_state.in_command_substitution.get() {
-                    writeln!(stderr, "{}bg: no current jobs", self.diagnostic_prefix())?;
-                    status = 1;
-                    continue;
                 }
-                // GNU jobs.c:3849-3855 start_job: `bg` on an already-running
-                // job is a diagnostic but NOT an error under XPG6/SUSv3 —
-                // the message prints and status stays 0.
-                let already_running = self
-                    .shell_state
-                    .job_table
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|entry| entry.state == crate::jobs::ProcessState::Running);
-                if already_running {
-                    writeln!(
-                        stderr,
-                        "{}bg: job {} already in background",
-                        self.diagnostic_prefix(),
-                        job_id
-                    )?;
-                    continue;
-                }
-                // GNU jobs.c:3826 start_job(foreground=0): print the
-                // "[N]± command &" line with the pre-reset +/− marker
-                // (jobs.c:3872-3899), SIGCONT the process group
-                // (jobs.c:3926-3928), then reset_current (jobs.c:3949).
-                let marker = if posixly {
-                    " "
-                } else if self.shell_state.job_table.current_job() == Some(job_id) {
-                    "+ "
-                } else if self.shell_state.job_table.previous_job() == Some(job_id) {
-                    "- "
-                } else {
-                    " "
-                };
-                let (command, pids) = self
-                    .shell_state
-                    .job_table
-                    .jobs
-                    .get(&job_id)
-                    .map(|entry| (entry.command.clone(), entry.pids.clone()))
-                    .unwrap_or_default();
-                writeln!(stdout, "[{job_id}]{marker}{command} &")?;
-                // SIGCONT follows the target numbering (18 Linux / 19
-                // Darwin) via kill::SIGCONT_NUMBER — see the fg twin above
-                // (jobs.c:3928).
-                for member in &pids {
-                    let _ = crate::builtins::kill::send_signal(
-                        *member,
-                        crate::builtins::kill::SIGCONT_NUMBER,
-                    );
-                }
-                self.shell_state.job_table.mark_running(pid);
-                if let Some(entry) = self.shell_state.job_table.jobs.get_mut(&job_id) {
-                    entry.background = true;
-                    entry.foreground = false;
-                }
-                self.shell_state.job_table.reset_current();
-            } else {
-                self.write_job_not_found("bg", job, stderr)?;
-                status = 1;
             }
         }
         Ok(status)
     }
 
-    fn resolve_requested_background_job(&self, job: Option<&str>) -> Option<u32> {
+    fn resolve_requested_background_job(&self, job: Option<&str>) -> JobOperandResolution {
         match job {
-            Some(job) => self.resolve_background_job(job),
-            None => self.current_background_pid(),
+            Some(job) => self.resolve_background_job_operand(job),
+            None => self
+                .current_background_pid()
+                .map_or(JobOperandResolution::NoMatch, JobOperandResolution::Pid),
         }
     }
 

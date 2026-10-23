@@ -32,6 +32,12 @@ pub struct JobEntry {
     /// (jobs.c:2459-2461 `pipeline_pgrp = shell_pgrp`).
     pub pgrp: u32,
     pub command: String,
+    /// GNU jobs.c: each PROCESS in `j->pipe` carries its own printed
+    /// command text, and builtins/common.c:632 get_job_by_name matches
+    /// `%name`/`%?name` against those per-stage strings — never against
+    /// the joined `command`. For a pipeline `a | b` this is `["a", "b"]`;
+    /// for a plain command it is `[command]` verbatim.
+    pub stage_commands: Vec<String>,
     pub state: ProcessState,
     pub exit_status: Option<i32>,
     pub background: bool,
@@ -46,6 +52,18 @@ pub struct JobEntry {
     /// control (`set -m`) was active. fg/bg must refuse jobs without it
     /// (fg_bg.def:159 "job %d started without job control").
     pub job_control: bool,
+}
+
+/// GNU builtins/common.c:689 get_job_spec result, with jobs.h:206-208
+/// mapped onto variants: `Job` is a valid slot, `Ambiguous` is DUP_JOB
+/// (get_job_by_name counted more than one match — the caller reports
+/// `{name}: ambiguous job spec`), `NoMatch` is NO_JOB/BAD_JOBSPEC
+/// (the caller reports `{spec}: no such job`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobspecMatch {
+    Job(JobId),
+    Ambiguous,
+    NoMatch,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -76,7 +94,24 @@ impl JobTable {
         background: bool,
         pgrp: u32,
     ) -> JobId {
-        self.register_pipeline(vec![pid], command, background, pgrp)
+        let command = command.into();
+        let stage_commands = vec![command.clone()];
+        self.register_pipeline_stages(vec![pid], command, background, pgrp, stage_commands)
+    }
+
+    /// `register_process` plus the per-stage printed commands GNU records
+    /// on `j->pipe` (builtins/common.c:632 get_job_by_name matches them).
+    /// Pass the output of `bash_job_stage_commands`; a plain command
+    /// contributes just its own text.
+    pub fn register_process_with_stages(
+        &mut self,
+        pid: u32,
+        command: impl Into<String>,
+        background: bool,
+        pgrp: u32,
+        stage_commands: Vec<String>,
+    ) -> JobId {
+        self.register_pipeline_stages(vec![pid], command, background, pgrp, stage_commands)
     }
 
     pub fn register_pipeline(
@@ -85,6 +120,19 @@ impl JobTable {
         command: impl Into<String>,
         background: bool,
         pgrp: u32,
+    ) -> JobId {
+        let command = command.into();
+        let stage_commands = vec![command.clone()];
+        self.register_pipeline_stages(pids, command, background, pgrp, stage_commands)
+    }
+
+    pub fn register_pipeline_stages(
+        &mut self,
+        pids: Vec<u32>,
+        command: impl Into<String>,
+        background: bool,
+        pgrp: u32,
+        stage_commands: Vec<String>,
     ) -> JobId {
         // GNU jobs.c:586-614 alloc_job_entry: a non-interactive shell scans
         // forward from js.j_lastj and takes the first free slot — the job
@@ -114,6 +162,15 @@ impl JobTable {
                 )
             })
             .collect();
+        let command = command.into();
+        // get_job_by_name needs one entry per pipeline stage (GNU's
+        // j->pipe PROCESS list); a caller that cannot describe them keeps
+        // the joined text so the list is never empty.
+        let stage_commands = if stage_commands.is_empty() {
+            vec![command.clone()]
+        } else {
+            stage_commands
+        };
         let entry = JobEntry {
             id,
             pids: pids.clone(),
@@ -122,7 +179,8 @@ impl JobTable {
             // control, else the shell's own pgrp).
             pgrp,
             processes,
-            command: command.into(),
+            command,
+            stage_commands,
             state: ProcessState::Running,
             exit_status: None,
             background,
@@ -140,32 +198,70 @@ impl JobTable {
         id
     }
 
-    pub fn resolve_jobspec(&self, spec: &str) -> Option<JobId> {
+    /// GNU builtins/common.c:689 get_job_spec. A name spec (`%name` /
+    /// `%?name`) goes through get_job_by_name (common.c:632), which
+    /// COUNTS matches and reports DUP_JOB (`Ambiguous` here) when more
+    /// than one fires.
+    pub fn resolve_jobspec(&self, spec: &str) -> JobspecMatch {
+        // common.c:704-712: strip the leading `%` (a word without one
+        // takes the same path after the caller's
+        // "job specification requires leading `%'" warning).
         let body = spec.strip_prefix('%').unwrap_or(spec);
-        if body.is_empty() || matches!(body, "%" | "+") {
-            return self
+        // common.c:714-718: `DIGIT (*word) && all_digits (word)` — a
+        // pure digit spec is a slot index; out-of-range or empty slots
+        // are NO_JOB. The map-key check subsumes both tests.
+        if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
+            return match body.parse::<JobId>() {
+                Ok(id) if self.jobs.contains_key(&id) => JobspecMatch::Job(id),
+                _ => JobspecMatch::NoMatch,
+            };
+        }
+        // common.c:720-738: the switch is on the FIRST byte, so `%+x`
+        // is the current job and `%-x` the previous one.
+        match body.chars().next() {
+            None | Some('%') | Some('+') => self
                 .current_job
-                .or_else(|| self.jobs.keys().next_back().copied());
+                .or_else(|| self.jobs.keys().next_back().copied())
+                .map_or(JobspecMatch::NoMatch, JobspecMatch::Job),
+            Some('-') => self
+                .previous_job
+                .map_or(JobspecMatch::NoMatch, JobspecMatch::Job),
+            Some('?') => self.get_job_by_name(&body[1..], true),
+            Some(_) => self.get_job_by_name(body, false),
         }
-        if body == "-" {
-            return self.previous_job;
+    }
+
+    /// GNU builtins/common.c:632 get_job_by_name as get_job_spec drives
+    /// it (never JM_FIRSTMATCH/JM_EXACT/JM_STOPPED). Jobs scan
+    /// newest-first (`i = js.j_jobslots - 1; i >= 0; i--`); each job's
+    /// PROCESS commands scan from `j->pipe`. The counting is quirky by
+    /// construction: the matched `p` is NOT advanced before `job` is
+    /// assigned, so a first match on any stage other than `j->pipe`
+    /// (`index != 0`) loops back onto the same process and is
+    /// ambiguous with itself, while a match on `j->pipe` counts one.
+    /// `%?name` is strcasestr (case-insensitive); a bare `%name` is an
+    /// STREQN prefix on the stage text.
+    fn get_job_by_name(&self, name: &str, substring: bool) -> JobspecMatch {
+        let mut job = None;
+        let folded = name.to_ascii_lowercase();
+        for (id, entry) in self.jobs.iter().rev() {
+            for (index, command) in entry.stage_commands.iter().enumerate() {
+                let matched = if substring {
+                    command.to_ascii_lowercase().contains(&folded)
+                } else {
+                    command.starts_with(name)
+                };
+                if !matched {
+                    continue;
+                }
+                if job.is_some() || index != 0 {
+                    return JobspecMatch::Ambiguous;
+                }
+                job = Some(*id);
+                break;
+            }
         }
-        if let Some(id) = body.strip_prefix('?') {
-            return self
-                .jobs
-                .iter()
-                .rev()
-                .find(|(_, job)| job.command.contains(id))
-                .map(|(id, _)| *id);
-        }
-        if let Ok(id) = body.parse::<JobId>() {
-            return self.jobs.contains_key(&id).then_some(id);
-        }
-        self.jobs
-            .iter()
-            .rev()
-            .find(|(_, job)| job.command.starts_with(body))
-            .map(|(id, _)| *id)
+        job.map_or(JobspecMatch::NoMatch, JobspecMatch::Job)
     }
 
     pub fn current_job(&self) -> Option<JobId> {
@@ -547,9 +643,44 @@ mod tests {
         let mut table = JobTable::default();
         let first = table.register_process(1, "one", true, 1);
         let second = table.register_process(2, "two", true, 2);
-        assert_eq!(table.resolve_jobspec("%+"), Some(second));
-        assert_eq!(table.resolve_jobspec("%-"), Some(first));
-        assert_eq!(table.resolve_jobspec("%1"), Some(first));
+        assert_eq!(table.resolve_jobspec("%+"), JobspecMatch::Job(second));
+        assert_eq!(table.resolve_jobspec("%-"), JobspecMatch::Job(first));
+        assert_eq!(table.resolve_jobspec("%1"), JobspecMatch::Job(first));
+    }
+
+    #[test]
+    fn name_jobspecs_count_matches_like_get_job_by_name() {
+        // GNU builtins/common.c:632-684: two jobs matching `%?pat` or
+        // `%pat` is DUP_JOB, reported as `{name}: ambiguous job spec`;
+        // a single match resolves newest-first (rubash#1302).
+        let mut table = JobTable::default();
+        table.register_process(1, "sleep 50", true, 1);
+        let second = table.register_process(2, "sleep 51", true, 2);
+        assert_eq!(table.resolve_jobspec("%?sleep"), JobspecMatch::Ambiguous);
+        assert_eq!(table.resolve_jobspec("%sleep"), JobspecMatch::Ambiguous);
+        // strcasestr — the `%?` form folds case.
+        assert_eq!(table.resolve_jobspec("%?SLEEP"), JobspecMatch::Ambiguous);
+        assert_eq!(table.resolve_jobspec("%?51"), JobspecMatch::Job(second));
+        assert_eq!(table.resolve_jobspec("%?zzz"), JobspecMatch::NoMatch);
+    }
+
+    #[test]
+    fn name_jobspec_match_beyond_first_stage_is_self_ambiguous() {
+        // common.c:656-679: the matched `p` is not advanced before `job`
+        // is checked, so a match on any stage other than j->pipe makes
+        // the job ambiguous with itself (`sleep 50 | sleep 51` + `%?51`),
+        // while a first-stage match counts once (`%?sleep` resolves).
+        let mut table = JobTable::default();
+        let job = table.register_process_with_stages(
+            1,
+            "sleep 50 | sleep 51",
+            true,
+            1,
+            vec!["sleep 50".to_string(), "sleep 51".to_string()],
+        );
+        assert_eq!(table.resolve_jobspec("%?sleep"), JobspecMatch::Job(job));
+        assert_eq!(table.resolve_jobspec("%?51"), JobspecMatch::Ambiguous);
+        assert_eq!(table.resolve_jobspec("%sleep"), JobspecMatch::Job(job));
     }
 
     #[test]
@@ -581,8 +712,8 @@ mod tests {
         table.register_process(31, "second", true, 31);
         assert!(table.remove_job_by_pid(31));
         assert!(!table.pid_to_job.contains_key(&31));
-        assert_eq!(table.resolve_jobspec("%+"), Some(first));
-        assert_eq!(table.resolve_jobspec("%1"), Some(first));
+        assert_eq!(table.resolve_jobspec("%+"), JobspecMatch::Job(first));
+        assert_eq!(table.resolve_jobspec("%1"), JobspecMatch::Job(first));
         assert!(table.remove_job(first));
         assert!(table.jobs.is_empty());
     }
