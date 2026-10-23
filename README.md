@@ -228,6 +228,19 @@ real binary (~0.4 ms in-process after; 3208-row replay byte-identical,
 [WinuxCmd#1269](https://github.com/unixwin/WinuxCmd/pull/1269)). Face B of
 #800 — `read` on EOF, ~4.8 s/call — is still open.
 
+## Milestones
+
+<p align="center">
+  <img src="assets/milestone-timeline.svg" alt="The Climb — rubash milestone timeline: from a 3,427-line GNU-suite diff on 2026-09-09 to 83/83 upstream suites passing on 2026-10-12" width="880" />
+</p>
+
+Four and a half months from `chore: init` to a ledger that reads 83/83 against
+GNU's own corpus — with the ecosystem wall (bashdb, ble.sh, oh-my-bash,
+bash-completion, nvm, git's own `t/test-lib.sh`) pinned as CI fixtures behind
+it. Both core maintainers are upstream contributors to Microsoft's
+Coreutils-for-Windows project ([microsoft/coreutils](https://github.com/microsoft/coreutils)),
+vcpkg, and winget-pkgs.
+
 ## Architecture
 
 ```
@@ -353,4 +366,4 @@ Issues, compatibility reproductions, focused regression tests, and implementatio
 
 ---
 
-*Last updated: 2026-10-22*
+*Last updated: 2026-10-23*
