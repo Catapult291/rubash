@@ -895,6 +895,17 @@ pub fn standard_path(_env_vars: &HashMap<String, String>) -> String {
 
     #[cfg(all(unix, target_os = "android"))]
     {
+        // GNU-on-Android has no confstr(); Termux bash resolves `command -p`
+        // against the Termux prefix, not /bin (probed GNU 5.3.20:
+        // `command -p` finds $PREFIX/bin tools like ls/sh/python3, but NOT
+        // /bin/getconf or /system/bin/toybox — rubash#1172; and a clean
+        // `env -i` shell reports PATH=$PREFIX/bin:.). Mirror that exactly:
+        // $PREFIX/bin plus trailing dot when the environment provides
+        // PREFIX, else the generic fallback (better than nothing on
+        // non-Termux bionic).
+        if let Some(prefix) = _env_vars.get("PREFIX").filter(|prefix| !prefix.is_empty()) {
+            return format!("{prefix}/bin:.");
+        }
         "/bin:/usr/bin:/sbin:/usr/sbin".to_string()
     }
 
