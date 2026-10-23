@@ -94,12 +94,18 @@ where
     let mut status = EXECUTION_SUCCESS;
     let mut saw_set = false;
     let mut saw_unset = false;
+    // GNU builtins/shopt.def:313: `-q` is QFLAG (quiet), independent of the
+    // set/unset mode — `shopt -s -q opt` SETS opt silently (rubash#1357).
+    let mut quiet = false;
+    // GNU builtins/bashgetopt.c:84-89: a bare `--` ends option parsing.
+    let mut parsing_options = true;
 
     for arg in args {
-        if arg == "--" {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
             continue;
         }
-        if arg.starts_with('-') && arg != "-" {
+        if parsing_options && arg.starts_with('-') && arg != "-" {
             for option in arg[1..].chars() {
                 match option {
                     's' => {
@@ -110,7 +116,7 @@ where
                         mode = ShoptMode::Unset;
                         saw_unset = true;
                     }
-                    'q' => mode = ShoptMode::Query,
+                    'q' => quiet = true,
                     'p' => print = true,
                     'o' => use_set_options = true,
                     other => {
@@ -126,6 +132,7 @@ where
                 }
             }
         } else {
+            parsing_options = false;
             names.push(arg.as_str());
         }
     }
@@ -142,10 +149,14 @@ where
     }
 
     if use_set_options {
-        return execute_set_option_mode(mode, print, &names, env_vars, stdout, stderr);
+        return execute_set_option_mode(mode, print, quiet, &names, env_vars, stdout, stderr);
     }
 
     if names.is_empty() {
+        // GNU shopt.def list_shopts/list_some_shopts with QFLAG: no output.
+        if quiet {
+            return Ok(EXECUTION_SUCCESS);
+        }
         match mode {
             ShoptMode::Set if print => {
                 print_shopts_by_state(env_vars, true, true, stdout)?;
@@ -156,7 +167,7 @@ where
             ShoptMode::Unset => {
                 print_shopts_by_state(env_vars, false, false, stdout)?;
             }
-            ShoptMode::List | ShoptMode::Query => {
+            ShoptMode::List => {
                 print_all_shopts(env_vars, print, stdout)?;
             }
             // GNU builtins/shopt.def shopt_builtin: bare `shopt -s` (no
@@ -193,8 +204,13 @@ where
                     writeln!(stderr, "{}{diagnostic}", diagnostic_prefix())?;
                 }
             }
-            ShoptMode::Query if !option_enabled(env_vars, name) => status = EXECUTION_FAILURE,
-            ShoptMode::Query => {}
+            // GNU shopt.def list_shopts with QFLAG: no output, rc reflects
+            // whether every queried option is on.
+            ShoptMode::List if quiet => {
+                if !option_enabled(env_vars, name) {
+                    status = EXECUTION_FAILURE;
+                }
+            }
             ShoptMode::List if print => {
                 if !option_enabled(env_vars, name) {
                     status = EXECUTION_FAILURE;
@@ -216,6 +232,7 @@ where
 fn execute_set_option_mode<W, E>(
     mode: ShoptMode,
     print: bool,
+    quiet: bool,
     names: &[&str],
     env_vars: &mut crate::shell::var_table::VarTable,
     stdout: &mut W,
@@ -236,6 +253,11 @@ where
     // and `shopt -o`, at byte 20 for plain `shopt`.
     const MINUS_O_PRINT_WIDTH: usize = crate::builtins::set::SET_O_PRINT_WIDTH;
     if names.is_empty() {
+        // GNU shopt.def list_shopt_o_options/list_some_o_options with QFLAG:
+        // no output.
+        if quiet {
+            return Ok(EXECUTION_SUCCESS);
+        }
         match mode {
             ShoptMode::Set if print => {
                 crate::builtins::set::print_shell_options_by_state(
@@ -297,18 +319,17 @@ where
                 {
                     status = EXECUTION_FAILURE;
                 }
-                crate::builtins::set::print_shell_option(
-                    env_vars,
-                    name,
-                    print,
-                    crate::builtins::set::SHOPT_O_PRINT_WIDTH,
-                    stdout,
-                )?;
+                // GNU shopt.def list_shopt_o_options with QFLAG: no output.
+                if !quiet {
+                    crate::builtins::set::print_shell_option(
+                        env_vars,
+                        name,
+                        print,
+                        crate::builtins::set::SHOPT_O_PRINT_WIDTH,
+                        stdout,
+                    )?;
+                }
             }
-            ShoptMode::Query if !crate::builtins::set::shell_option_enabled(env_vars, name) => {
-                status = EXECUTION_FAILURE;
-            }
-            ShoptMode::Query => {}
             ShoptMode::List | ShoptMode::Set | ShoptMode::Unset => {}
         }
     }
@@ -321,7 +342,6 @@ enum ShoptMode {
     List,
     Set,
     Unset,
-    Query,
 }
 
 /// GNU builtins/shopt.def:180-181 binds `array_expand_once` and
