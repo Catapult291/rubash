@@ -195,9 +195,11 @@ impl Executor {
                 .unwrap_or_else(|| "#? ".to_string());
             let mut prompt = Vec::new();
             if show_menu {
-                for (i, value) in values.iter().enumerate() {
-                    writeln!(&mut prompt, "{}) {}", i + 1, value)?;
-                }
+                // GNU execute_cmd.c:3375-3418 print_select_list: the menu
+                // wraps into columns against COLS (general.c:1461
+                // default_columns), printed column-major with tab-aligned
+                // column offsets — not one item per line.
+                self.write_select_menu(&mut prompt, values)?;
             }
             write!(&mut prompt, "{ps3}")?;
             self.write_default_stderr(&prompt)?;
@@ -414,6 +416,119 @@ impl Executor {
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), stdin_offset.to_string());
         Some((input, at_eof))
+    }
+
+    /// GNU general.c:1461 default_columns: COLUMNS when it parses to a
+    /// positive int, else the process console width (winsize.c
+    /// get_new_window_size), else 80.
+    fn select_default_columns(&self) -> usize {
+        if let Some(cols) = self
+            .shell_state
+            .env_vars
+            .get("COLUMNS")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|cols| *cols > 0)
+        {
+            return cols as usize;
+        }
+        if let Some((_, cols)) = crate::script_driver::process_console_size() {
+            if cols > 0 {
+                return cols as usize;
+            }
+        }
+        80
+    }
+
+    /// GNU execute_cmd.c:3375-3418 print_select_list — the column-major
+    /// menu layout `select_query` prints before PS3. Column count comes
+    /// from COLS / max_elem_len; separators are produced by `indent`
+    /// (execute_cmd.c:3356), which advances to the next tab stop when one
+    /// is crossed and pads with spaces otherwise (tabsize = 8).
+    fn write_select_menu(&self, prompt: &mut Vec<u8>, values: &[String]) -> std::io::Result<()> {
+        const TABSIZE: usize = 8;
+        const RP_SPACE_LEN: usize = 2;
+        let number_len = |value: usize| -> usize {
+            match value {
+                0..=9 => 1,
+                10..=99 => 2,
+                100..=999 => 3,
+                1000..=9999 => 4,
+                10000..=99999 => 5,
+                _ => 6,
+            }
+        };
+        let displen = |value: &str| value.chars().count();
+
+        let cols_width = self.select_default_columns();
+        let list_len = values.len();
+        let mut max_elem_len = values.iter().map(|value| displen(value)).max().unwrap_or(0);
+        let indices_len = number_len(list_len);
+        max_elem_len += indices_len + RP_SPACE_LEN + 2;
+
+        let mut cols = if max_elem_len > 0 {
+            cols_width / max_elem_len
+        } else {
+            1
+        };
+        if cols == 0 {
+            cols = 1;
+        }
+        let mut rows = if list_len > 0 {
+            list_len / cols + usize::from(list_len % cols != 0)
+        } else {
+            1
+        };
+        cols = if list_len > 0 {
+            list_len / rows + usize::from(list_len % rows != 0)
+        } else {
+            1
+        };
+        if rows == 1 {
+            rows = cols;
+            cols = 1;
+        }
+        let _ = cols;
+        let first_column_indices_len = number_len(rows);
+
+        for row in 0..rows {
+            let mut ind = row;
+            let mut pos = 0usize;
+            loop {
+                let this_indices_len = if pos == 0 {
+                    first_column_indices_len
+                } else {
+                    indices_len
+                };
+                write!(
+                    prompt,
+                    "{:>width$}) {}",
+                    ind + 1,
+                    values[ind],
+                    width = this_indices_len
+                )?;
+                let elem_len = displen(&values[ind]) + this_indices_len + RP_SPACE_LEN;
+                ind += rows;
+                if ind >= list_len {
+                    break;
+                }
+                // indent(pos + elem_len, pos + max_elem_len): tabs to the
+                // next stop while one is crossed, spaces otherwise.
+                let mut from = pos + elem_len;
+                let to = pos + max_elem_len;
+                while from < to {
+                    if to / TABSIZE > from / TABSIZE {
+                        prompt.push(b'\t');
+                        from += TABSIZE - from % TABSIZE;
+                    } else {
+                        prompt.push(b' ');
+                        from += 1;
+                    }
+                }
+                pos += max_elem_len;
+            }
+            prompt.push(b'\n');
+        }
+        Ok(())
     }
 
     fn execute_select_body(
