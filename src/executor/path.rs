@@ -1208,12 +1208,14 @@ pub fn external_command_for_named_program(
             // with rubash#592; /mnt/d/x was already there (#444).
             //
             // unixwin/niubash#346 ("coreutils own the shell tree"): the
-            // bundled coreutils (WinuxCmd, `posix_aware`) resolve the shell
-            // namespace themselves — WinuxCmd's native_path shell-tree layer
-            // mirrors shell_path_to_windows — so they receive these
-            // spellings verbatim and skip this funnel. Every other child
-            // class (native exes, cmd, MSYS/Cygwin tools) is untouched and
-            // still gets the native form.
+            // bundled coreutils (WinuxCmd hardlink applets, `posix_aware`)
+            // resolve the shell namespace themselves — WinuxCmd's
+            // native_path shell-tree layer mirrors shell_path_to_windows —
+            // so they receive these spellings verbatim and skip this funnel.
+            // Third-party tree members (rg/bat/fd/shim) are NOT posix_aware
+            // and take this funnel (D6). Every other child class (native
+            // exes, cmd, MSYS/Cygwin tools) is untouched and still gets the
+            // native form.
             #[cfg(windows)]
             if !posix_aware {
                 if let Some(translated) =
@@ -1843,30 +1845,112 @@ fn under_winuxcmd_tree(program: &Path) -> bool {
 /// POSIX argv (`/d/...`, `/tmp/...`, `/dev/...`). GNU never rewrites argv
 /// (execute_cmd.c:6119-6127 shell_execve: `execve (command, args, env)`),
 /// so such children must receive the shell word bytes verbatim and own
-/// path resolution themselves. Determinable by the engine in three ways:
-/// the winuxcmd dispatcher route, the env-configured WinuxCmd
-/// installation root (WINUXCMD_HOME / the dispatcher's tree), or the
-/// per-program winuxcmd.exe marker probe.
+/// path resolution themselves.
+///
+/// Two routes:
+/// 1. the winuxcmd dispatcher itself (`winuxcmd.exe`);
+/// 2. an applet hardlink of that same file under a known WinuxCmd root
+///    (WINUXCMD_HOME / the dispatcher's tree / the per-tree marker probe).
+///
+/// The second route used to be "any executable under the tree". That was
+/// true while the tree only held coreutils hardlinks of winuxcmd.exe
+/// (niubash#346: they own the shell-tree layer). Since 1.4.0 the same
+/// directory also ships third-party flat packages (rg / bat / fd / git /
+/// ...) and winuxcmd-shim forwarders: they have no POSIX path layer, so
+/// handing them a verbatim `/tmp/f` or `/mnt/c/...` is a silent ENOENT
+/// (or fd's silent empty result). Those members now classify as native
+/// and take the engine translation funnel.
 #[cfg(windows)]
 fn posix_aware_child(program: &Path, env_vars: &HashMap<String, String>) -> bool {
     if is_winuxcmd_dispatcher(program) {
         return true;
     }
-    if let Some(home) = env_vars
+    is_winuxcmd_applet(program, env_vars)
+}
+
+/// niubash#346 refined (D6): whether `program` is a hardlink of the tree's
+/// `winuxcmd.exe` — the only class that owns the shell-tree layer. Path
+/// membership under a WinuxCmd root is necessary but not sufficient: a
+/// separate file in the same directory (rg, bat, fd, shim) is native.
+#[cfg(windows)]
+fn is_winuxcmd_applet(program: &Path, env_vars: &HashMap<String, String>) -> bool {
+    let under_tree = if let Some(home) = env_vars
         .get("WINUXCMD_HOME")
         .filter(|value| !value.is_empty())
     {
-        if path_starts_with_ignore_case(program, Path::new(home)) {
-            return true;
-        }
-    }
-    if let Some(dispatcher) = find_winuxcmd_dispatcher(env_vars) {
+        path_starts_with_ignore_case(program, Path::new(home))
+    } else if let Some(dispatcher) = find_winuxcmd_dispatcher(env_vars) {
         let root = winuxcmd_installation_root_from_path(&dispatcher);
-        if path_starts_with_ignore_case(program, &root) {
-            return true;
-        }
+        path_starts_with_ignore_case(program, &root)
+    } else {
+        under_winuxcmd_tree(program)
+    };
+    if !under_tree {
+        return false;
     }
-    under_winuxcmd_tree(program)
+    let root = winuxcmd_installation_root_from_path(program);
+    let dispatcher = {
+        let nested = root.join("usr").join("bin").join("winuxcmd.exe");
+        if nested.is_file() {
+            nested
+        } else {
+            root.join("winuxcmd.exe")
+        }
+    };
+    if !dispatcher.is_file() || !program.is_file() {
+        return false;
+    }
+    same_windows_file(program, &dispatcher)
+}
+
+/// Windows file identity for hardlink detection: (volume serial, file
+/// index). Same pair as `builtins/test.rs` `file_identity` for `[ f -ef g ]`.
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // DesiredAccess 0 queries metadata without requiring data access;
+    // FILE_FLAG_BACKUP_SEMANTICS lets directories resolve an identity too.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    (ok != 0).then(|| {
+        (
+            info.dwVolumeSerialNumber,
+            ((info.nFileIndexHigh as u64) << 32) | u64::from(info.nFileIndexLow),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn same_windows_file(left: &Path, right: &Path) -> bool {
+    match (file_identity(left), file_identity(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -4798,7 +4882,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn posix_aware_child_detection_routes() {
-        // Route 1: the winuxcmd dispatcher itself.
+        // Route 1: the winuxcmd dispatcher itself (name match; no file needed).
         assert!(posix_aware_child(
             Path::new(r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe"),
             &HashMap::new()
@@ -4809,55 +4893,110 @@ mod tests {
         ));
 
         // Route 2: under the env-configured WinuxCmd root (WINUXCMD_HOME is
-        // set by Executor::set_winuxcmd_path); case and separators must not
-        // matter (host-provided strings).
+        // set by Executor::set_winuxcmd_path). Only hardlinks of winuxcmd.exe
+        // count as applets; a separate third-party file in the same tree is
+        // native (D6: rg/bat/fd have no shell-tree layer).
+        let home_root = std::env::temp_dir().join("rubash-optb-wcmd-home");
+        let _ = fs::remove_dir_all(&home_root);
+        let home_bin = home_root.join("usr").join("bin");
+        fs::create_dir_all(&home_bin).unwrap();
+        fs::write(home_bin.join("winuxcmd.exe"), b"MZ").unwrap();
+        fs::hard_link(home_bin.join("winuxcmd.exe"), home_bin.join("ls.exe")).unwrap();
+        fs::write(home_bin.join("rg.exe"), b"third-party").unwrap();
+
         let mut env = HashMap::new();
         env.insert(
             "WINUXCMD_HOME".to_string(),
-            r"c:\Tools\WinuxCmd".to_string(),
+            home_root.to_string_lossy().into_owned(),
         );
-        assert!(posix_aware_child(
-            Path::new(r"C:\tools\winuxcmd\usr\bin\ls.exe"),
-            &env
-        ));
+        assert!(posix_aware_child(&home_bin.join("ls.exe"), &env));
         assert!(
-            !posix_aware_child(Path::new(r"C:\tools\winuxcmd-other\x.exe"), &env),
-            "component-boundary: a longer sibling directory must not match"
+            !posix_aware_child(&home_bin.join("rg.exe"), &env),
+            "third-party tree member must not be POSIX-aware"
         );
         assert!(!posix_aware_child(
-            Path::new(r"D:\elsewhere\node.exe"),
+            &home_root.join("winuxcmd-other").join("x.exe"),
             &env
         ));
+        assert!(!posix_aware_child(Path::new(r"D:\elsewhere\node.exe"), &env));
 
         // Route 3: the per-tree winuxcmd.exe marker probe — a WinuxCmd
         // installation reached through PATH without any env configuration.
-        // The probe derives the root from the resolved program's own path
-        // (winuxcmd_installation_root_from_path), so the program file must
-        // exist exactly as a resolved spawn target would.
         let root = std::env::temp_dir().join("rubash-optb-wcmd-tree");
+        let _ = fs::remove_dir_all(&root);
         let usr_bin = root.join("usr").join("bin");
-        std::fs::create_dir_all(&usr_bin).unwrap();
-        std::fs::write(usr_bin.join("winuxcmd.exe"), b"MZ").unwrap();
-        std::fs::write(usr_bin.join("printf.exe"), b"MZ").unwrap();
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::write(usr_bin.join("winuxcmd.exe"), b"MZ").unwrap();
+        fs::hard_link(usr_bin.join("winuxcmd.exe"), usr_bin.join("printf.exe")).unwrap();
+        fs::write(usr_bin.join("fd.exe"), b"third-party").unwrap();
         assert!(posix_aware_child(
             &usr_bin.join("printf.exe"),
             &HashMap::new()
         ));
+        assert!(!posix_aware_child(
+            &usr_bin.join("fd.exe"),
+            &HashMap::new()
+        ));
+
         // Flat (legacy) installation layout: marker directly in the root.
         let flat = std::env::temp_dir().join("rubash-optb-wcmd-flat");
-        std::fs::create_dir_all(&flat).unwrap();
-        std::fs::write(flat.join("winuxcmd.exe"), b"MZ").unwrap();
-        std::fs::write(flat.join("printf.exe"), b"MZ").unwrap();
+        let _ = fs::remove_dir_all(&flat);
+        fs::create_dir_all(&flat).unwrap();
+        fs::write(flat.join("winuxcmd.exe"), b"MZ").unwrap();
+        fs::hard_link(flat.join("winuxcmd.exe"), flat.join("printf.exe")).unwrap();
         assert!(posix_aware_child(&flat.join("printf.exe"), &HashMap::new()));
+
         // A plain directory without the marker stays native.
         let plain = std::env::temp_dir().join("rubash-optb-plain-tree");
+        let _ = fs::remove_dir_all(&plain);
         let plain_bin = plain.join("usr").join("bin");
-        std::fs::create_dir_all(&plain_bin).unwrap();
-        std::fs::write(plain_bin.join("node.exe"), b"MZ").unwrap();
+        fs::create_dir_all(&plain_bin).unwrap();
+        fs::write(plain_bin.join("node.exe"), b"MZ").unwrap();
         assert!(!posix_aware_child(
             &plain_bin.join("node.exe"),
             &HashMap::new()
         ));
+
+        let _ = fs::remove_dir_all(&home_root);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&flat);
+        let _ = fs::remove_dir_all(&plain);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn third_party_tree_member_translates_shell_tree_operands() {
+        // D6: rg/bat/fd live under the WinuxCmd tree as standalone binaries.
+        // They must take the native funnel: `/tmp/f` and `/mnt/c/...` become
+        // Windows spellings before CreateProcess, not verbatim POSIX words.
+        let root = std::env::temp_dir().join("rubash-d6-third-party");
+        let _ = fs::remove_dir_all(&root);
+        let usr_bin = root.join("usr").join("bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::write(usr_bin.join("winuxcmd.exe"), b"MZ").unwrap();
+        fs::hard_link(usr_bin.join("winuxcmd.exe"), usr_bin.join("ls.exe")).unwrap();
+        fs::write(usr_bin.join("rg.exe"), b"third-party").unwrap();
+
+        let env_vars = i164_rooted_env(&root);
+        let rg = usr_bin.join("rg.exe");
+        let ls = usr_bin.join("ls.exe");
+
+        // Applet keeps the shell-tree spelling verbatim.
+        assert_eq!(child_argv(&ls, &["/tmp"], &env_vars), vec!["/tmp".to_string()]);
+
+        // Third-party gets a native path for the same operand.
+        let rg_tmp = child_argv(&rg, &["/tmp"], &env_vars);
+        assert_eq!(rg_tmp.len(), 1);
+        assert!(
+            !rg_tmp[0].starts_with('/'),
+            "third-party /tmp must translate, got {}",
+            rg_tmp[0]
+        );
+
+        let rg_mnt = child_argv(&rg, &["/mnt/c/Windows"], &env_vars);
+        assert_eq!(rg_mnt, vec![r"C:\Windows".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]
@@ -4942,7 +5081,7 @@ mod tests {
         fs::create_dir_all(&usr_bin).unwrap();
         fs::create_dir_all(root.join("etc")).unwrap();
         fs::write(usr_bin.join("winuxcmd.exe"), b"MZ").unwrap();
-        fs::write(usr_bin.join("ls.exe"), b"MZ").unwrap();
+        fs::hard_link(usr_bin.join("winuxcmd.exe"), usr_bin.join("ls.exe")).unwrap();
         fs::write(root.join("etc").join("i164.conf"), b"i164\n").unwrap();
         root
     }
@@ -5461,7 +5600,7 @@ mod tests {
         fs::create_dir_all(usr_bin.join("dirboth")).unwrap();
         fs::create_dir_all(root.join("etc")).unwrap();
         fs::write(usr_bin.join("winuxcmd.exe"), b"MZ").unwrap();
-        fs::write(usr_bin.join("seq.exe"), b"MZ").unwrap();
+        fs::hard_link(usr_bin.join("winuxcmd.exe"), usr_bin.join("seq.exe")).unwrap();
         fs::write(usr_bin.join("dirboth.exe"), b"MZ").unwrap();
         fs::write(root.join("etc").join("i177.conf"), b"one\n").unwrap();
         root
