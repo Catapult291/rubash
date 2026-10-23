@@ -124,7 +124,7 @@ fn background_paren_absorbable(command: &CommandNode, consumed: &[bool]) -> bool
 /// 131072 bytes), so compare the raw byte length. Either way the caller
 /// switches to the temp-file transport (__RUBASH_CMD_FILE).
 #[cfg(windows)]
-fn respawn_source_needs_file(exe: &std::path::Path, source: &str) -> bool {
+pub(in crate::executor) fn respawn_source_needs_file(exe: &std::path::Path, source: &str) -> bool {
     const CMDLINE_LIMIT: usize = 32_767;
     // Headroom for the exe path, the "-c " separator and quoting growth.
     const HEADROOM: usize = 256;
@@ -133,14 +133,17 @@ fn respawn_source_needs_file(exe: &std::path::Path, source: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn respawn_source_needs_file(_exe: &std::path::Path, source: &str) -> bool {
+pub(in crate::executor) fn respawn_source_needs_file(_exe: &std::path::Path, source: &str) -> bool {
     const ARG_STRLEN_LIMIT: usize = 131_072;
     const HEADROOM: usize = 256;
     source.len() + HEADROOM > ARG_STRLEN_LIMIT
 }
 
 #[cfg(not(any(unix, windows)))]
-fn respawn_source_needs_file(_exe: &std::path::Path, _source: &str) -> bool {
+pub(in crate::executor) fn respawn_source_needs_file(
+    _exe: &std::path::Path,
+    _source: &str,
+) -> bool {
     false
 }
 
@@ -1620,7 +1623,7 @@ impl Executor {
 
     /// Exportable-function prelude shared by both background source forms
     /// (print_cmd-style `name() { ...; }; ` definitions ahead of the body).
-    fn background_function_prelude(&self) -> String {
+    pub(in crate::executor) fn background_function_prelude(&self) -> String {
         let mut source = String::new();
         for (name, body) in &self.shell_state.functions {
             if is_exportable_function_name(name) {
@@ -1648,7 +1651,10 @@ impl Executor {
     /// removes the file after reading it
     /// (rubash::invocation::materialize_command_file); a spawn failure removes
     /// it in the caller instead.
-    fn write_respawn_command_file(&self, source: &str) -> Result<PathBuf, ExecuteError> {
+    pub(in crate::executor) fn write_respawn_command_file(
+        &self,
+        source: &str,
+    ) -> Result<PathBuf, ExecuteError> {
         let path = self.respawn_command_temp_path()?;
         fs::write(&path, source.as_bytes())?;
         Ok(path)
@@ -4122,7 +4128,7 @@ fn parameter_expansion_assigns(raw: &str) -> bool {
     false
 }
 
-fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
+pub(in crate::executor) fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
     let current = std::env::current_exe().ok()?;
     let deps = current.parent()?;
     if deps.file_name().and_then(|name| name.to_str()) != Some("deps") {
