@@ -857,12 +857,18 @@ fn parse_long_options(
                 // reads plain lines.
                 executor.set_env("__RUBASH_NO_EDITING", "1");
             }
-            // "debug" | "dump-po-strings" | "dump-strings":
-            // accepted, no Windows counterpart today. --debug sets GNU's
-            // vestigial `debugging` variable (shell.c:255) with no
-            // user-visible effect — the name is NOT ours to repurpose; the
-            // native debugger (rubash#497) will own it when it lands.
-            "debug" => {}
+            // "dump-po-strings" | "dump-strings": accepted, no Windows
+            // counterpart today.
+            // GNU shell.c:255: --debug writes the `debugging` variable that
+            // NO code in bash ever reads — a write-only fossil, so the flag
+            // carries zero observable GNU behavior to conflict with. niu
+            // extension: --debug arms extdebug from the first command, the
+            // DEBUG-trap substrate a script debugger needs when it cannot
+            // edit the script (the same gate predicate rubash#497's native
+            // debugger builds on; that work upgrades this meaning in place).
+            "debug" => {
+                executor.set_shopt_option("extdebug", true);
+            }
             // GNU shell.c:257: --debugger sets debugging_mode; the bashdb
             // starter runs at startup (start_debugger, shell.c:764/:795).
             "debugger" => {
