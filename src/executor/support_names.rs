@@ -27,53 +27,6 @@ pub(in crate::executor) fn is_special_parameter_name(name: &str) -> bool {
 /// 5.3.20); $BASH_VERSION is `5.3.20(1)-release`, VERSINFO[2] is 20.
 const BASH_COMPAT_VERSION: &str = "5.3.20";
 
-/// GNU variables.c sv_bashcompat / set_compatibility_level: assigning
-/// BASH_COMPAT sets shell_compatibility_level (default 53 for bash-5.3);
-/// accepted spellings are `NN' (44, 51) and `N.N' (5.1). An unparseable
-/// or out-of-range value leaves the level unchanged — model the parsed
-/// level directly, defaulting to the 5.3 level.
-pub(in crate::executor) fn shell_compatibility_level_value(
-    env_vars: &HashMap<String, String>,
-) -> u32 {
-    let Some(raw) = env_vars.get("BASH_COMPAT") else {
-        return 53;
-    };
-    let raw = raw.trim();
-    let level = if let Some((major, minor)) = raw.split_once('.') {
-        format!("{}{}", major.trim(), minor.trim())
-    } else {
-        raw.to_string()
-    };
-    level.parse::<u32>().unwrap_or(53)
-}
-
-/// The effective `shell_compatibility_level` for behavior gates: a set
-/// compatNN shopt flag wins (GNU builtins/shopt.def:654-708
-/// set_compatibility_level makes the flags mutually exclusive and
-/// rebinds BASH_COMPAT; rubash#1107's sync gap means the flag and the
-/// variable can disagree on this base, and the flag is what the user
-/// explicitly toggled last via shopt), else the BASH_COMPAT parse above.
-/// GNU's priority chain over multiple set flags is 31,32,40,...,44
-/// (shopt.def:676-689), mirrored here.
-pub(in crate::executor) fn shell_compatibility_level_flag_aware(
-    env_vars: &HashMap<String, String>,
-) -> u32 {
-    for (flag, level) in [
-        ("compat31", 31),
-        ("compat32", 32),
-        ("compat40", 40),
-        ("compat41", 41),
-        ("compat42", 42),
-        ("compat43", 43),
-        ("compat44", 44),
-    ] {
-        if crate::builtins::shopt::option_enabled(env_vars, flag) {
-            return level;
-        }
-    }
-    shell_compatibility_level_value(env_vars)
-}
-
 /// The `$BASH_VERSION` value the executor seeds (`5.3.20(1)-release` — the
 /// `-release` suffix is part of it, version.c's shell_version_string). Pub
 /// so `usage::show_shell_help`/`show_shell_version` fall back to the same

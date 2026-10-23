@@ -655,7 +655,7 @@ impl Executor {
     /// emit_assignment_diag routes through the builtin's buffered stderr when
     /// a caller opted in (GNU builtin_error ordering/redirection), otherwise
     /// writes process stderr directly like eprintln!.
-    fn emit_assignment_diag(&mut self, line: String) {
+    pub(in crate::executor) fn emit_assignment_diag(&mut self, line: String) {
         if self.buffer_assignment_diagnostics {
             self.pending_assignment_diagnostics
                 .extend_from_slice(line.as_bytes());
@@ -664,7 +664,7 @@ impl Executor {
         }
     }
 
-    fn assignment_diagnostic_prefix(&self) -> String {
+    pub(in crate::executor) fn assignment_diagnostic_prefix(&self) -> String {
         match &self.assignment_command_name {
             Some(command) => format!("{}{command}: ", self.diagnostic_prefix()),
             None => self.diagnostic_prefix(),
@@ -712,7 +712,29 @@ impl Executor {
                 .get("GLOBIGNORE")
                 .is_some_and(|value| !value.is_empty())
             {
-                crate::builtins::shopt::set_option(&mut self.shell_state.env_vars, "dotglob", true);
+                let _ = crate::builtins::shopt::set_option(
+                    &mut self.shell_state.env_vars,
+                    "dotglob",
+                    true,
+                );
+            }
+        }
+        // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: assigning
+        // BASH_COMPAT re-syncs the compatNN shopt flags (and resets the
+        // level to default on an unparseable/out-of-range value, keeping
+        // the raw string). The diagnostic goes through the assignment
+        // prologue like any bind-hook error; the assignment itself still
+        // succeeds (verified oracle: `BASH_COMPAT=99` is status 0).
+        if result && base == "BASH_COMPAT" {
+            if let Err(diagnostic) = crate::builtins::shopt::sync_compat_flags_from_bash_compat(
+                &mut self.shell_state.env_vars,
+            ) {
+                // GNU sv_shcompat errors never carry a command segment
+                // (internal_error, verified oracle: even `read BASH_COMPAT`
+                // reports bare `BASH_COMPAT: ...`), so the plain
+                // diagnostic_prefix is used, not the assignment one.
+                let line = format!("{}{diagnostic}\n", self.diagnostic_prefix());
+                self.emit_assignment_diag(line);
             }
         }
         result

@@ -921,7 +921,8 @@ impl Executor {
         if !crate::builtins::shopt::is_supported_option(name) {
             return false;
         }
-        crate::builtins::shopt::set_option(&mut self.shell_state.env_vars, name, enabled);
+        let _ = crate::builtins::shopt::set_option(&mut self.shell_state.env_vars, name, enabled);
+        self.sync_shopt_rebound_var();
         true
     }
 

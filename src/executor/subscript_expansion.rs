@@ -519,6 +519,10 @@ impl Executor {
     ) -> Result<String, ()> {
         let expand_once =
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "array_expand_once");
+        // GNU test.c:664-675: `-v` sets AV_ATSTARKEYS iff the derived
+        // compat level is above 51.
+        let atstarkeys =
+            crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 51;
         self.rewrite_operand_subscript_typed(
             operand,
             if expand_once {
@@ -529,6 +533,7 @@ impl Executor {
             None,
             false,
             false,
+            atstarkeys,
         )
     }
 
@@ -547,6 +552,9 @@ impl Executor {
             None,
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "array_expand_once"),
             oneword,
+            // Bind paths (printf -v/wait -p) always encode assoc `@`/`*`
+            // literally — the AV_ATSTARKEYS/compat split is `-v`-only.
+            true,
         )
     }
 
@@ -599,7 +607,18 @@ impl Executor {
                 {
                     let content = &operand[rname.len() + 1..operand.len() - 1];
                     let assoc = is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, rname);
-                    if content.is_empty() || (!assoc && matches!(content, "@" | "*")) {
+                    // GNU test.c:664-675 (`-v` adds AV_ATSTARKEYS iff the
+                    // level is above 51) + arrayfunc.c:1511-1515: without
+                    // AV_ATSTARKEYS (compat) assoc `@`/`*` takes the
+                    // whole-array branch, so it passes through for the
+                    // `[@]` fast path in builtins/test/variable.rs;
+                    // otherwise it encodes as a literal key below.
+                    let whole_array = matches!(content, "@" | "*")
+                        && (!assoc
+                            || crate::builtins::shopt::compatibility_level(
+                                &self.shell_state.env_vars,
+                            ) <= 51);
+                    if content.is_empty() || whole_array {
                         return Ok(operand.to_string());
                     }
                     if assoc {
@@ -624,10 +643,16 @@ impl Executor {
             return Ok(operand.to_string());
         }
         let assoc = is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name);
-        // GNU test.def/test_variable: for an ASSOCIATIVE array `@`/`*` are
-        // ordinary literal keys (`[[ -v assoc[@] ]]` tests key `@`); only an
-        // indexed array's `@`/`*` mean the whole array.
-        if !assoc && matches!(subscript, "@" | "*") {
+        // GNU test.c:664-675 (`-v` adds AV_ATSTARKEYS iff the level is
+        // above 51) + arrayfunc.c:1511-1515: the whole-array branch runs
+        // for indexed `@`/`*` in every mode, and for assoc `@`/`*` only
+        // WITHOUT AV_ATSTARKEYS (compat) — those pass through for the
+        // `[@]` fast path in builtins/test/variable.rs, while default-mode
+        // assoc `@`/`*` falls through to the literal-key encoding below.
+        let whole_array = matches!(subscript, "@" | "*")
+            && (!assoc
+                || crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 51);
+        if whole_array {
             return Ok(operand.to_string());
         }
         // TEST_ARRAYEXP implies the raw token ended with `]` (flag-1 needs
@@ -727,6 +752,10 @@ impl Executor {
             None,
             crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "array_expand_once"),
             false,
+            // Element stores (declare/read family) always encode assoc
+            // `@`/`*` literally — the AV_ATSTARKEYS/compat split is
+            // `-v`-only.
+            true,
         )
     }
 
@@ -743,6 +772,10 @@ impl Executor {
     /// at execute_cmd.c:4027). With VA_NOEXPAND|VA_ONEWORD an assoc
     /// operand's subscript closes at the LAST `]` (`printf -v A[$k]` with
     /// k=`]` stores key `]`).
+    /// `atstarkeys` is GNU test.c's AV_ATSTARKEYS (`-v`: set iff
+    /// `shell_compatibility_level > 51`): with it, assoc `@`/`*` encode as
+    /// literal keys; without it (compat) they pass through for the
+    /// whole-array branch. Bind-path callers always pass true.
     pub(in crate::executor) fn rewrite_operand_subscript_typed(
         &mut self,
         operand: &str,
@@ -750,6 +783,7 @@ impl Executor {
         assoc: Option<bool>,
         noexpand: bool,
         oneword: bool,
+        atstarkeys: bool,
     ) -> Result<String, ()> {
         // W_ARRAYREF arrives in-band as an ARRAYREF_FLAG prefix on the
         // operand text (execute_cmd.c:4366 fix_arrayref_words); callers
@@ -796,11 +830,17 @@ impl Executor {
         };
         let is_assoc =
             assoc.unwrap_or_else(|| is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, name));
-        // GNU test.c/expr.c: for an ASSOCIATIVE base, `@` and `*` are
-        // ordinary subscript keys (`test -v 'assoc[@]'` tests the `@`
-        // element); only indexed arrays treat them as whole-array
-        // subscripts that bypass element resolution.
-        if !is_shell_name(name) || (!is_assoc && matches!(subscript, "@" | "*")) {
+        // GNU test.c:664-675 (`-v`: `aflags |= AV_ATSTARKEYS` iff
+        // `shell_compatibility_level > 51`) + arrayfunc.c:1511-1515
+        // array_value_internal: the whole-array branch runs when
+        // `(isassoc == 0 || !(flags & AV_ATSTARKEYS)) && ALL_ELEMENT_SUB`.
+        // Indexed `@`/`*` always passes through (element resolution is
+        // bypassed in every mode); assoc `@`/`*` passes through only
+        // WITHOUT AV_ATSTARKEYS (compat: the `[@]` fast path in
+        // builtins/test/variable.rs reports any-element), and encodes as
+        // a literal key below otherwise. Bind-path callers (printf/read/
+        // declare element stores) always encode literally.
+        if !is_shell_name(name) || (matches!(subscript, "@" | "*") && (!is_assoc || !atstarkeys)) {
             return Ok(operand.to_string());
         }
         if mode != OperandSubscriptMode::AlwaysExpand {

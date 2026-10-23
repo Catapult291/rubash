@@ -62,6 +62,32 @@ pub fn export(
     Ok(status)
 }
 
+/// GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: a builtin operand
+/// rebinding BASH_COMPAT re-syncs the compatNN shopt flags. The hook runs
+/// on every rebinding — even a value-identical one (verified oracle:
+/// repeated `export BASH_COMPAT=99` re-reports) — and its error carries no
+/// command prefix and never fails the builtin.
+fn sync_bash_compat_flags<W>(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    operands: &[&str],
+    stderr: &mut W,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let binds = operands
+        .iter()
+        .any(|operand| crate::builtins::shopt::binds_bashcompat_operand(operand));
+    if binds {
+        if let Err(diagnostic) =
+            crate::builtins::shopt::sync_compat_flags_from_bash_compat(env_vars)
+        {
+            writeln!(stderr, "{}{diagnostic}", diagnostic_prefix())?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute `readonly` with arguments after the command name.
 pub fn readonly(
     args: &[String],
@@ -201,6 +227,8 @@ where
         }
     }
 
+    sync_bash_compat_flags(env_vars, &args[index..], stderr)?;
+
     Ok(status)
 }
 
@@ -288,6 +316,7 @@ where
             return Ok(EXECUTION_FAILURE);
         }
     }
+    sync_bash_compat_flags(env_vars, &args[index..], stderr)?;
     Ok(status)
 }
 

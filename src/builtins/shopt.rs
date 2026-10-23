@@ -3,8 +3,13 @@
 //! GNU Bash source ownership:
 // - builtins/shopt.def
 
+mod compat;
 mod support;
 
+pub(crate) use compat::{
+    binds_bashcompat_operand, derived_level, flag_for_level, is_compat_flag, level_for_flag,
+    parse_bash_compat_value, DEFAULT_COMPAT_LEVEL,
+};
 pub(crate) use support::is_supported_option;
 pub(crate) use support::SHOPT_OPTIONS;
 use support::{default_state, print_all_shopts, print_shopt, print_shopts_by_state};
@@ -178,8 +183,16 @@ where
         }
 
         match mode {
-            ShoptMode::Set => set_option(env_vars, name, true),
-            ShoptMode::Unset => set_option(env_vars, name, false),
+            ShoptMode::Set => {
+                if let Some(diagnostic) = set_option(env_vars, name, true) {
+                    writeln!(stderr, "{}{diagnostic}", diagnostic_prefix())?;
+                }
+            }
+            ShoptMode::Unset => {
+                if let Some(diagnostic) = set_option(env_vars, name, false) {
+                    writeln!(stderr, "{}{diagnostic}", diagnostic_prefix())?;
+                }
+            }
             ShoptMode::Query if !option_enabled(env_vars, name) => status = EXECUTION_FAILURE,
             ShoptMode::Query => {}
             ShoptMode::List if print => {
@@ -335,6 +348,83 @@ pub(crate) fn option_enabled(env_vars: &HashMap<String, String>, name: &str) -> 
     }
 }
 
+/// The single derived `shell_compatibility_level` (see `compat.rs`): a set
+/// compatNN shopt flag wins, else the strict `BASH_COMPAT` parse, else the
+/// 5.3 default. Every level-keyed behavior (`unset` `VA_ALLOWALL`,
+/// `test -v` `AV_ATSTARKEYS`, `=~` quoted-RHS mode) reads this — never
+/// `BASH_COMPAT` or a compatNN flag directly.
+pub(crate) fn compatibility_level(env_vars: &HashMap<String, String>) -> u32 {
+    derived_level(
+        |flag| option_enabled(env_vars, flag),
+        env_vars.get("BASH_COMPAT").map(String::as_str),
+    )
+}
+
+/// GNU `variables.c:6460-6508 sv_shcompat()` port for `BASH_COMPAT`
+/// assignments (bare, `declare`/`export`/`local`, prefix, `read`, ...):
+/// re-derive the shopt compat flags from the bound value. The raw value is
+/// kept verbatim (GNU rebinds nothing on this path — even `"99"` stays
+/// while the level resets to default). Returns the
+/// `compatibility value out of range` diagnostic for the caller to emit;
+/// the assignment itself still succeeds (status 0, verified oracle).
+pub(crate) fn sync_compat_flags_from_bash_compat(
+    env_vars: &mut crate::shell::var_table::VarTable,
+) -> Result<(), String> {
+    // Fast path (executor spawns hit this on every construction): with no
+    // BASH_COMPAT binding and no compat flag set there is nothing to sync.
+    // The flag scan stays on the allocation-free static path while
+    // SHOPT_STATE is absent (state_contains's None arm).
+    if !env_vars.contains_key("BASH_COMPAT")
+        && !compat::COMPAT_FLAGS
+            .iter()
+            .any(|(flag, _)| option_enabled(env_vars, flag))
+    {
+        return Ok(());
+    }
+    let level = match env_vars.get("BASH_COMPAT").cloned() {
+        None => DEFAULT_COMPAT_LEVEL,
+        Some(ref raw) if raw.is_empty() => DEFAULT_COMPAT_LEVEL,
+        Some(raw) => match parse_bash_compat_value(&raw) {
+            Some(level) => level,
+            None => {
+                set_active_compat_flag(env_vars, None);
+                return Err(format!(
+                    "BASH_COMPAT: {raw}: compatibility value out of range"
+                ));
+            }
+        },
+    };
+    set_active_compat_flag(env_vars, flag_for_level(level));
+    Ok(())
+}
+
+/// `unset BASH_COMPAT` — `sv_shcompat()`'s `v == 0` arm: default level,
+/// all compat flags off. The variable itself stays removed (no rebind).
+pub(crate) fn clear_compat_flags(env_vars: &mut crate::shell::var_table::VarTable) {
+    set_active_compat_flag(env_vars, None);
+}
+
+/// Write exactly one active compat flag (or none), clearing the rest —
+/// the `set_compatibility_opts()` half of the sync.
+fn set_active_compat_flag(env_vars: &mut crate::shell::var_table::VarTable, active: Option<&str>) {
+    let mut current = state(env_vars);
+    for (flag, _) in compat::COMPAT_FLAGS {
+        current.remove(*flag);
+    }
+    if let Some(flag) = active {
+        current.insert(flag.to_string());
+    }
+    store_state(env_vars, current, true);
+}
+
+/// First set compat flag in GNU priority order (`shopt.def:676-689`).
+fn first_set_compat_level(env_vars: &HashMap<String, String>) -> Option<u32> {
+    compat::COMPAT_FLAGS
+        .iter()
+        .find(|(flag, _)| option_enabled(env_vars, flag))
+        .map(|(_, level)| *level)
+}
+
 /// Allocation-free membership test against the serialized shopt state.
 /// Equivalent to `state(env_vars).contains(name)`: the set is exactly the
 /// nonempty `$__RUBASH_SHOPT_STATE` segments, so splitting the serialized
@@ -357,8 +447,8 @@ pub(crate) fn set_option(
     env_vars: &mut crate::shell::var_table::VarTable,
     name: &str,
     enabled: bool,
-) {
-    set_option_inner(env_vars, name, enabled, true);
+) -> Option<String> {
+    set_option_inner(env_vars, name, enabled, true)
 }
 
 /// GNU general.c:103-128 posix_initialize writes the posix_vars C
@@ -372,8 +462,8 @@ pub(crate) fn set_option_from_posix_walk(
     env_vars: &mut crate::shell::var_table::VarTable,
     name: &str,
     enabled: bool,
-) {
-    set_option_inner(env_vars, name, enabled, false);
+) -> Option<String> {
+    set_option_inner(env_vars, name, enabled, false)
 }
 
 fn set_option_inner(
@@ -381,7 +471,7 @@ fn set_option_inner(
     name: &str,
     enabled: bool,
     rebind_bashopts: bool,
-) {
+) -> Option<String> {
     // rubash#131: keep the parse-time extglob gate in step with the runtime
     // shopt (GNU builtins/shopt.def updates extglob_flag; reset_parser
     // parse.y:3502 propagates it into the parser's extended_glob). Later
@@ -434,6 +524,16 @@ fn set_option_inner(
     // report the same value.
     let name = canonical_shopt_name(name);
 
+    // GNU `builtins/shopt.def:654-708 set_compatibility_level()`: compatNN
+    // flags are mutually exclusive and rebind BASH_COMPAT — a plain state
+    // insert would leave siblings on and the level stale (rubash#1107).
+    // Returns the bind-hook diagnostic for the caller to emit (a readonly
+    // BASH_COMPAT refuses the rebind but the flag is still set, and the
+    // status stays 0 — verified oracle).
+    if is_compat_flag(name) {
+        return apply_shopt_compat_change(env_vars, name, enabled);
+    }
+
     let mut state = state(env_vars);
     state.remove("assoc_expand_once");
     if enabled {
@@ -441,6 +541,81 @@ fn set_option_inner(
     } else {
         state.remove(name);
     }
+    store_state(env_vars, state, rebind_bashopts);
+    None
+}
+
+/// GNU `builtins/shopt.def:654-708 set_compatibility_level()`: setting a
+/// compat flag clears every sibling and rebinds `BASH_COMPAT` to the flag's
+/// level; unsetting falls back through the remaining flags in priority
+/// order, keeps a flag-less 45..52 level (`oldval > 44 && level < default`
+/// — e.g. `BASH_COMPAT=51; shopt -u compat44` stays at 51), else restores
+/// the default and rebinds `BASH_COMPAT` to it (even when unsetting an
+/// already-off flag, verified oracle).
+fn apply_shopt_compat_change(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    name: &str,
+    enabled: bool,
+) -> Option<String> {
+    // `oldval` predates the toggle (`shopt.def:661` — toggle_shopts already
+    // flipped the C int before the set-func runs).
+    let old_level = compatibility_level(env_vars);
+    let mut current = state(env_vars);
+    if enabled {
+        for (flag, _) in compat::COMPAT_FLAGS {
+            current.remove(*flag);
+        }
+        current.insert(name.to_string());
+    } else {
+        current.remove(name);
+    }
+    store_state(env_vars, current, true);
+    // GNU `shopt.def:675-693` priority chain over what remains.
+    let new_level = if enabled {
+        level_for_flag(name).unwrap_or(DEFAULT_COMPAT_LEVEL)
+    } else {
+        first_set_compat_level(env_vars).unwrap_or_else(|| {
+            if old_level > 44 && old_level < DEFAULT_COMPAT_LEVEL {
+                old_level
+            } else {
+                DEFAULT_COMPAT_LEVEL
+            }
+        })
+    };
+    // GNU bind_variable refuses a readonly BASH_COMPAT (sh_readonly): the
+    // rebind is skipped but the flag change above stands and the status
+    // stays 0 (toggle_shopts ignores the set-func return; verified oracle
+    // reports `BASH_COMPAT: readonly variable` with rc 0 and the flag on).
+    if env_vars.is_marked(crate::executor::types::READONLY_VARS, "BASH_COMPAT") {
+        return Some("BASH_COMPAT: readonly variable".to_string());
+    }
+    env_vars.insert("BASH_COMPAT".to_string(), new_level.to_string());
+    None
+}
+
+fn state(env_vars: &HashMap<String, String>) -> HashSet<String> {
+    let Some(value) = env_vars.get(SHOPT_STATE) else {
+        return default_state();
+    };
+    value
+        .split(DATA_DOLLAR)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Persist a mutated shopt state: normalize back to ABSENT when it equals
+/// the defaults (perf: keeps every option_enabled lookup on the
+/// allocation-free static path — a single redundant startup write used to
+/// flip ALL lookups to the serialized split-scan, ~1us per simple
+/// command), then rebind BASHOPTS (GNU shopt.def toggle_shopts ->
+/// set_bashopts, so an exported BASHOPTS carries live state to child
+/// shells — invocation1.sub:28-31).
+fn store_state(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    state: HashSet<String>,
+    rebind_bashopts: bool,
+) {
     // Normalization (perf): a state equal to the defaults is stored as
     // ABSENT, keeping every option_enabled lookup on the allocation-free
     // static path (state_contains's None arm). A single redundant startup
@@ -462,17 +637,6 @@ fn set_option_inner(
         let bashopts = bashopts_value(env_vars);
         env_vars.insert("BASHOPTS".to_string(), bashopts);
     }
-}
-
-fn state(env_vars: &HashMap<String, String>) -> HashSet<String> {
-    let Some(value) = env_vars.get(SHOPT_STATE) else {
-        return default_state();
-    };
-    value
-        .split(DATA_DOLLAR)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn serialize_state(state: &HashSet<String>) -> String {
@@ -507,7 +671,7 @@ mod tests {
         assert!(!option_enabled(&env_vars, "assoc_expand_once"));
         assert!(!option_enabled(&env_vars, "array_expand_once"));
 
-        set_option(&mut env_vars, "assoc_expand_once", true);
+        let _ = set_option(&mut env_vars, "assoc_expand_once", true);
 
         assert!(option_enabled(&env_vars, "assoc_expand_once"));
         assert!(option_enabled(&env_vars, "array_expand_once"));
@@ -516,7 +680,7 @@ mod tests {
         assert!(!state(&env_vars).contains("assoc_expand_once"));
 
         // Unsetting either name clears the shared flag for both.
-        set_option(&mut env_vars, "array_expand_once", false);
+        let _ = set_option(&mut env_vars, "array_expand_once", false);
 
         assert!(!option_enabled(&env_vars, "assoc_expand_once"));
         assert!(!option_enabled(&env_vars, "array_expand_once"));
@@ -532,7 +696,7 @@ mod tests {
         let mut env_vars = fresh_env();
         assert!(env_vars.get(SHOPT_STATE).is_none());
 
-        set_option(&mut env_vars, "expand_aliases", false);
+        let _ = set_option(&mut env_vars, "expand_aliases", false);
         assert!(env_vars.get(SHOPT_STATE).is_none());
         assert!(!option_enabled(&env_vars, "expand_aliases"));
         // BASHOPTS still renders (from the default state, identically).
@@ -540,11 +704,11 @@ mod tests {
 
         // A real deviation still materializes, and clearing it removes
         // the entry again.
-        set_option(&mut env_vars, "expand_aliases", true);
+        let _ = set_option(&mut env_vars, "expand_aliases", true);
         assert!(option_enabled(&env_vars, "expand_aliases"));
         assert!(env_vars.get(SHOPT_STATE).is_some());
 
-        set_option(&mut env_vars, "expand_aliases", false);
+        let _ = set_option(&mut env_vars, "expand_aliases", false);
         assert!(!option_enabled(&env_vars, "expand_aliases"));
         assert!(env_vars.get(SHOPT_STATE).is_none());
     }
@@ -557,13 +721,13 @@ mod tests {
             .split(':')
             .any(|name| name == "assoc_expand_once" || name == "array_expand_once"));
 
-        set_option(&mut env_vars, "assoc_expand_once", true);
+        let _ = set_option(&mut env_vars, "assoc_expand_once", true);
 
         let bashopts = bashopts_value(&env_vars);
         assert!(bashopts.split(':').any(|name| name == "assoc_expand_once"));
         assert!(bashopts.split(':').any(|name| name == "array_expand_once"));
 
-        set_option(&mut env_vars, "array_expand_once", false);
+        let _ = set_option(&mut env_vars, "array_expand_once", false);
 
         let bashopts = bashopts_value(&env_vars);
         assert!(!bashopts.split(':').any(|name| name == "assoc_expand_once"));
@@ -574,7 +738,7 @@ mod tests {
     fn other_shopts_keep_independent_names() {
         let mut env_vars = fresh_env();
 
-        set_option(&mut env_vars, "dotglob", true);
+        let _ = set_option(&mut env_vars, "dotglob", true);
 
         assert!(option_enabled(&env_vars, "dotglob"));
         assert!(state(&env_vars).contains("dotglob"));

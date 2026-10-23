@@ -228,7 +228,13 @@ where
     // the dotglob cell with the shopt, so the write lands in the same
     // option storage (it clobbers even an explicit `shopt -s dotglob`).
     if unset_name == "GLOBIGNORE" {
-        crate::builtins::shopt::set_option(env_vars, "dotglob", false);
+        let _ = crate::builtins::shopt::set_option(env_vars, "dotglob", false);
+    }
+    // GNU variables.c:6460-6483 sv_shcompat: `unset BASH_COMPAT` takes the
+    // `v == 0` branch — default level, all compatNN flags off. The variable
+    // stays removed (unlike the shopt path, nothing rebinds it).
+    if unset_name == "BASH_COMPAT" {
+        crate::builtins::shopt::clear_compat_flags(env_vars);
     }
     env_vars.remove(&unset_name);
     // Process-env removal is existence-gated, not name-gated (#916/#917):

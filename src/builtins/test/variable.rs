@@ -13,7 +13,29 @@ pub(crate) fn variable_is_set(operand: &str, env_vars: &crate::shell::var_table:
         let arrays = marked_vars(env_vars, ARRAY_VARS);
         let assocs = marked_vars(env_vars, ASSOC_VARS);
         if assocs.iter().any(|marked| marked == name) {
-            return false;
+            // GNU test.c:664-681 unary_operator `-v` (test.def -v): the
+            // operand already went through word expansion once, so
+            // `a[@]`/`a[*]` arrive with AV_ALLOWALL. Under the default
+            // level (`shell_compatibility_level > 51`) AV_ATSTARKEYS is
+            // added and the subscript is a LITERAL key — `test -v 'm[@]'`
+            // checks key `@`. Under compat (`<= 51`,
+            // `arrayfunc.c:1511-1545 array_value_internal`) the whole-array
+            // branch runs instead: any-element (non-empty) semantics.
+            // Verified oracle matrix: default non-empty-no-@-key is false,
+            // compat is true; empty is false in both; literal `@` key is
+            // true in both. `[[ -v ]]` shares this function
+            // (conditional.rs) and GNU agrees there too.
+            let key = if operand.ends_with("[@]") { "@" } else { "*" };
+            if crate::builtins::shopt::compatibility_level(env_vars) > 51 {
+                return env_vars
+                    .get(name)
+                    .map(|value| assoc_key_is_set(value, key))
+                    .unwrap_or(false);
+            }
+            return env_vars
+                .get(name)
+                .map(|value| assoc_is_nonempty(value))
+                .unwrap_or(false);
         }
         if arrays.iter().any(|marked| marked == name) {
             return env_vars
@@ -171,6 +193,21 @@ fn array_entries(value: &str) -> Vec<(usize, String)> {
             Some((default_index, strip_array_value_quotes(part).to_string()))
         })
         .collect()
+}
+
+/// GNU `arrayfunc.c:1536-1545 array_value_internal()` compat branch
+/// (`test -v 'm[@]'` with `shell_compatibility_level <= 51`): the
+/// whole-assoc word list is non-empty iff the assoc has any entry.
+fn assoc_is_nonempty(value: &str) -> bool {
+    let value = value.strip_prefix(STORAGE_WORD_PREFIX).unwrap_or(value);
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+
+    split_storage_words(inner).any(|part| part.contains('='))
 }
 
 fn assoc_key_is_set(value: &str, key: &str) -> bool {

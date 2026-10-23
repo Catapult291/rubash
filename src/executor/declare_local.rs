@@ -583,6 +583,10 @@ impl Executor {
                             "array_expand_once",
                         ),
                         false,
+                        // Element stores always encode assoc `@`/`*`
+                        // literally — the AV_ATSTARKEYS/compat split is
+                        // `-v`-only.
+                        true,
                     ) {
                         Ok(rewritten) => rewritten,
                         Err(()) => {

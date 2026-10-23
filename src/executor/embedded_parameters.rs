@@ -574,7 +574,7 @@ impl Executor {
                     // rules. Without this, the body collector below pairs
                     // the quote and swallows the tail into the default word.
                     if self.posix_mode_enabled()
-                        && crate::executor::support_names::shell_compatibility_level_flag_aware(
+                        && crate::builtins::shopt::compatibility_level(
                             &self.shell_state.env_vars,
                         ) > 42
                         && (in_double

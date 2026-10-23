@@ -694,6 +694,16 @@ impl Executor {
         if env_vars.contains_key("POSIXLY_CORRECT") {
             crate::builtins::set::set_shell_option(env_vars, "posix", true);
         }
+        //
+        // GNU variables.c:5760 { "BASH_COMPAT", sv_shcompat }: an inherited
+        // BASH_COMPAT already synced the compatNN flags at import time, but
+        // VarTable imports the process environment verbatim — derive the
+        // flags here instead (before the BASHOPTS loop, which may itself
+        // carry compatNN names additively like initialize_bashopts'
+        // parse_bashopts). Silent: the range diagnostic belongs to bind
+        // time, and this constructor is re-entered for subshells where a
+        // repeat would spam; the level/flags are still exact.
+        let _ = crate::builtins::shopt::sync_compat_flags_from_bash_compat(env_vars);
         if let Some(value) = env_vars.get("SHELLOPTS").cloned() {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::set::is_shell_option(name) {
@@ -704,7 +714,7 @@ impl Executor {
         if let Some(value) = env_vars.get("BASHOPTS").cloned() {
             for name in value.split(':').filter(|name| !name.is_empty()) {
                 if crate::builtins::shopt::is_supported_option(name) {
-                    crate::builtins::shopt::set_option(env_vars, name, true);
+                    let _ = crate::builtins::shopt::set_option(env_vars, name, true);
                 }
             }
         }

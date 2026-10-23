@@ -934,7 +934,7 @@ impl Executor {
                         // rule applies only above compat 42 — at <= 42 a
                         // single quote inside ${...} quotes again, even in
                         // POSIX mode (GNU parse.y compat gate).
-                        && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+                        && crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 42
                         && (matches!(
                             context,
                             SubstitutionQuoteContext::DoubleQuoted

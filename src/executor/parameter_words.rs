@@ -761,7 +761,7 @@ impl Executor {
         // quotes again and the whole-word span below governs.
         if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
             && self.posix_mode_enabled()
-            && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+            && crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 42
         {
             if let Some(rest) = word.strip_prefix("${") {
                 if let Some(close) = matching_parameter_brace_in_context(rest, true, true) {
@@ -794,7 +794,7 @@ impl Executor {
         // embedded walker (posixexp2 case 28).
         let spans_whole_word = if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
             && self.posix_mode_enabled()
-            && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+            && crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) > 42
         {
             braced_parameter_spans_whole_word_in_context(word, true, true)
         } else {
