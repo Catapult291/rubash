@@ -1351,6 +1351,32 @@ impl Executor {
             }
 
             if let Some(redirect) = &cmd.redirect_out {
+                // GNU redir.c: all `>` redirects open in order (each file
+                // created/truncated); only the last receives output (rubash#1392).
+                let mut seen_last = false;
+                for r in cmd.redirects.iter().rev() {
+                    if !matches!(
+                        r.kind,
+                        crate::parser::RedirectKind::Output
+                            | crate::parser::RedirectKind::ClobberOutput
+                    ) {
+                        continue;
+                    }
+                    if r.fd.unwrap_or(1) != 1 {
+                        continue;
+                    }
+                    if seen_last {
+                        let t = self.expand_redirect_target(r);
+                        if crate::executor::execution_misc::redirect_target_fd(&t).is_none()
+                            && !t.starts_with("<(")
+                            && !t.starts_with(">(")
+                        {
+                            let _ = self.create_redirect_output(&t, r.clobber);
+                        }
+                    } else {
+                        seen_last = true;
+                    }
+                }
                 let target = self.expand_redirect_target(redirect);
                 if let Some(result) = self.write_dev_stdio_redirect_output(&target, &output) {
                     result?;
