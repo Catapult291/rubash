@@ -424,6 +424,35 @@ impl Executor {
                     .join(" ");
                 Some(format!("declare -a{exported} {name}=({elements})"))
             }
+            // GNU: `declare -p PIPESTATUS` renders the live array as
+            // `declare -a PIPESTATUS=([0]="1" [1]="0")` (rubash#1363).
+            // A readonly PIPESTATUS keeps the -r flag; if it was never
+            // assigned it renders as a scalar `declare -r PIPESTATUS`.
+            // Unset and not readonly: not found (rubash#1364).
+            "PIPESTATUS" => {
+                let readonly =
+                    is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "PIPESTATUS");
+                let rflag = if readonly { "r" } else { "" };
+                if self.shell_state.pipestatus.is_empty() {
+                    if readonly {
+                        Some(format!("declare -{rflag}{exported} PIPESTATUS"))
+                    } else {
+                        None
+                    }
+                } else {
+                    let elements = self
+                        .shell_state
+                        .pipestatus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, status)| {
+                            format!("[{index}]={}", sh_double_quote_text(&status.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Some(format!("declare -a{rflag}{exported} PIPESTATUS=({elements})"))
+                }
+            }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
             | "BASH_COMMAND" | "HISTCMD" => Some(format!("declare --{exported} {name}={quoted}")),
             _ => None,

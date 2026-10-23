@@ -1659,7 +1659,25 @@ impl Executor {
                     self.exit_code = invert_exit_status(self.exit_code);
                 }
             }
-            self.set_pipestatus([self.exit_code]);
+            // GNU execute_cmd.c:1210-1224: PIPESTATUS is set from the exit
+            // status only for simple commands and the `((...))`/`[[...]]`
+            // compounds (cm_arith/cm_cond) — `if`/`while`/`until`/`for`/
+            // `case`/etc. leave the last pipeline's PIPESTATUS untouched
+            // (rubash#1383 #1384).
+            let is_pipestatus_compound = command.arithmetic_command.is_some()
+                || command.conditional_command.is_some();
+            let is_non_pipestatus_compound = command.if_command.is_some()
+                || command.loop_command.is_some()
+                || command.for_command.is_some()
+                || command.case_command.is_some()
+                || command.select_command.is_some()
+                || command.subshell_command.is_some()
+                || command.function_command.is_some()
+                || command.brace_group.is_some()
+                || command.coproc_command.is_some();
+            if !is_non_pipestatus_compound || is_pipestatus_compound {
+                self.set_pipestatus([self.exit_code]);
+            }
 
             // GNU order (rubash#344): the ERR trap fires for the failed
             // simple command (execute_cmd.c:1000/1166 run_error_trap)

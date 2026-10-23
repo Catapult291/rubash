@@ -1352,6 +1352,16 @@ impl Executor {
     where
         I: IntoIterator<Item = i32>,
     {
+        // GNU variables.c: PIPESTATUS is a normal variable once `readonly`
+        // (or any attribute) is applied — the dynamic update is suppressed
+        // and the frozen value persists (rubash#1364).
+        if self
+            .shell_state
+            .env_vars
+            .is_marked(crate::executor::READONLY_VARS, "PIPESTATUS")
+        {
+            return;
+        }
         self.shell_state.pipestatus.clear();
         self.shell_state.pipestatus.extend(statuses);
         if self.shell_state.pipestatus.is_empty() {
