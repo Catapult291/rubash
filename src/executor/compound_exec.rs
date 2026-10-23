@@ -732,7 +732,16 @@ impl Executor {
         };
         env_map.insert(
             "__RUBASH_BG_DEPTH".to_string(),
-            (if strip_parens {
+            (if strip_parens || background_command.command.subshell_command.is_none() {
+                // GNU execute_cmd.c:1588 execute_in_subshell: the forked
+                // async child runs subshell_level++ for EVERY `&` body
+                // (simple, `{ }`, `( )`, coproc). A stripped paren absorbs
+                // the fork (no in-process bump), and a non-paren body never
+                // bumps in-process, so both seed parent + 1. Only an
+                // UNSTRIPPED paren node still bumps in-process
+                // (execute_subshell_command_with_redirects), so it seeds
+                // the parent level (rubash#1074 remainder: `echo
+                // $BASH_SUBSHELL &` and `{ ...; } &` reported 0).
                 bashpid_base
             } else {
                 parent_depth
