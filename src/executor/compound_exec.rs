@@ -2768,7 +2768,11 @@ impl Executor {
 
         if !ran_body {
             self.exit_code = 0;
-        } else if self.exit_code != 0 && !ended_by_break {
+        } else if !ended_by_break {
+            // GNU execute_cmd.c execute_while_or_until returns body_status
+            // unconditionally — the loop's status is the last body command's,
+            // not the final condition test's (rubash#1358: `until` exiting
+            // on a true condition must still report the body's status).
             self.exit_code = last_body_status;
         }
         Ok(())
