@@ -771,6 +771,26 @@ pub fn send_signal(pid: u32, signal: i32) -> Result<(), &'static str> {
     signal_process(pid, signal)
 }
 
+/// Record a console `CTRL_C_EVENT` into this process's self-signal queue.
+///
+/// The niubash host owns `SetConsoleCtrlHandler` on Windows and must not
+/// terminate the shell; it calls this so the engine's wait-slice and
+/// command-boundary polls (`observe_signals_while_blocked` /
+/// `run_pending_signal_traps`) observe Ctrl+C the same way they would a
+/// mailbox SIGINT from another process. Without it, an in-process wait
+/// such as `sleep_interruptibly` never sees the console event and the
+/// command runs to completion (niubash D8).
+///
+/// Unix: no-op — the kernel `signal_hook` backend already receives SIGINT
+/// for the process; a second injection would double-dispatch.
+pub fn note_console_ctrl_c() {
+    #[cfg(not(unix))]
+    {
+        // Linux mailbox wire format: SIGINT = 2.
+        queue_self_signal(2);
+    }
+}
+
 /// Install this process's signal-receiving backend.
 ///
 /// Windows: a per-process `{pid}.alive` marker in the shared

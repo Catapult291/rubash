@@ -830,7 +830,14 @@ impl Executor {
                 {
                     return Ok(status);
                 }
-                self.observe_signals_while_blocked()?;
+                if let Err(error) = self.observe_signals_while_blocked() {
+                    // Untrapped SIGINT (console CTRL_C via note_console_ctrl_c,
+                    // or a mailbox delivery) aborts the wait. Reap the child so
+                    // it does not linger when the console event did not kill it.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
             }
         }
         #[cfg(unix)]
