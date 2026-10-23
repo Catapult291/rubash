@@ -875,133 +875,123 @@ impl Executor {
         output: &OutputProcessSubstitution,
     ) -> Result<(), ExecuteError> {
         let input = fs::read(&output.path).unwrap_or_default();
-        // rubash#1024: the body executes on this executor (not a subshell
-        // clone), so its per-command CURRENT_LINE stamps would leak the
-        // body-local lines into the parent shell. Bracket the run with the
-        // enclosing command's lines the way the fd-0 save/restore above
-        // brackets the input redirection.
-        let old_current_line = self
-            .shell_state
-            .env_vars
-            .get("__RUBASH_CURRENT_LINE")
-            .cloned();
-        let old_cmd_start_line = self
-            .shell_state
-            .env_vars
-            .get("__RUBASH_CMD_START_LINE")
-            .cloned();
-        let ast = super::command_substitution::parse_procsub_body(self, &output.source);
-        let old_stdin = self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
-        let old_offset = self
-            .shell_state
-            .env_vars
-            .get(FUNCTION_STDIN_OFFSET)
-            .cloned();
-        let old_fd0 = self.fd_table.entries.get(&0).cloned();
-        let fd0_key = fd_stdin_key(0);
-        let fd0_offset_key = fd_stdin_offset_key(0);
-        let fd0_dynamic_key = fd_dynamic_input_key(0);
-        let fd0_closed_key = fd_closed_key(0);
-        let old_fd0_stdin = self.shell_state.env_vars.get(&fd0_key).cloned();
-        let old_fd0_offset = self.shell_state.env_vars.get(&fd0_offset_key).cloned();
-        let old_fd0_dynamic = self.shell_state.env_vars.get(&fd0_dynamic_key).cloned();
-        let old_fd0_closed = self.shell_state.env_vars.get(&fd0_closed_key).cloned();
-        self.set_fd_input_bytes(0, input.clone(), false);
-        if std::str::from_utf8(&input).is_ok() {
-            self.shell_state.env_vars.insert(
-                FUNCTION_STDIN.to_string(),
-                crate::executor::substitution_metadata::bytes_to_shell_text(&input),
+        // GNU subst.c:6362 process_substitute runs the `>(...)` consumer as a
+        // FORKED async child (FORK_ASYNC|FORK_PROCSUB): it reads the
+        // substitution pipe as its fd 0 concurrently with the commands that
+        // follow, and the parent never blocks on it — the child is reaped
+        // only by `wait`/SIGCHLD (jobs.c procsub_add). Rubash's carrier is a
+        // temp file rather than a live pipe, so the body runs as a detached
+        // `rubash -c` child fed by an OS pipe carrying the captured bytes: a
+        // slow or looping consumer (`sleep`, `while read`) can no longer
+        // stall the parent's next command (rubash#1220), and the child's own
+        // `exit`/traps/variables stay child-local by construction (subst.c
+        // 6421 restore_original_signals, :6628 exit).
+        self.spawn_output_process_substitution_child(&output.source, input)
+    }
+
+    /// Spawn the `>(body)` consumer detached, the stand-in for GNU's
+    /// process_substitute fork. `input` is the bytes the owning command
+    /// wrote into the temp carrier; they stream to the child's fd 0 over an
+    /// OS pipe from a writer thread, so a slow reader paces the writer
+    /// exactly like GNU's pipe. Registration matches `cmd &` minus the job
+    /// listing (GNU parks procsub children on a separate list — jobs.c
+    /// procsub_add keeps them off `jobs`): the handle lands in
+    /// `background_children` so `wait $!` and a bare `wait` reap it, and $!
+    /// names the real child pid (subst.c:6478 procsub_add -> last_procsub_pid
+    /// -> last_made_pid via execute_cmd.c).
+    fn spawn_output_process_substitution_child(
+        &mut self,
+        body: &str,
+        input: Vec<u8>,
+    ) -> Result<(), ExecuteError> {
+        let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
+            .map(std::path::PathBuf::from)
+            .or_else(test_rubash_binary_from_current_exe)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| "rubash".into());
+        // The forked child keeps the parent's functions
+        // (background_function_prelude serializes them ahead of the body),
+        // so `>(myfunc)` resolves the same definition GNU's fork would see.
+        let mut source = self.background_function_prelude();
+        source.push_str(body);
+        // Same environment transport as the `cmd &` respawn
+        // (compound_exec.rs execute_background_ast_command): the process env
+        // merged with the shell's env_vars, `__RUBASH_*` keys crossing only
+        // through the spawn-inherited whitelist, and the parent's caught
+        // traps cancelled for the child (subst.c:6421).
+        let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (key, value) in &self.shell_state.env_vars {
+            if !key.starts_with("__RUBASH_") || rubash_spawn_inherited_state(key) {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
+        env_map.retain(|key, _| {
+            !(key.starts_with("__RUBASH_TRAP") && key != crate::builtins::trap::TRAP_ORIG_IGNORES)
+        });
+        env_map.insert("__RUBASH_SHELL_PID".to_string(), self.shell_pid.to_string());
+        // subst.c:6609 subshell_level++ — the procsub child runs one level
+        // deeper than the parent for $BASH_SUBSHELL/$BASHPID.
+        env_map.insert(
+            "__RUBASH_SUBSHELL_DEPTH".to_string(),
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
+        env_map.insert(
+            "__RUBASH_BG_BASHPID_BASE".to_string(),
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
+        // Script identity for the body's `script: line N:` diagnostics —
+        // the same markers the `&` respawn forwards.
+        if let Some(script_name) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
+            env_map.insert("__RUBASH_SCRIPT_NAME".to_string(), script_name.clone());
+            env_map.insert(
+                "__RUBASH_CURRENT_LINE".to_string(),
+                self.shell_state
+                    .env_vars
+                    .get("__RUBASH_CURRENT_LINE")
+                    .cloned()
+                    .unwrap_or_else(|| "1".to_string()),
             );
-        } else {
-            self.shell_state.env_vars.remove(FUNCTION_STDIN);
         }
-        self.shell_state
-            .env_vars
-            .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
-        // GNU subst.c:6362 process_substitute FORKS the `>(...)` body: the
-        // child runs restore_original_signals (subst.c:6421 — the parent's
-        // caught traps are cancelled) and ends through `exit(rc)`
-        // (subst.c:6628-6629), so an `exit N` in the body terminates only
-        // the child and the parent's trap table and $? are untouched.
-        // Rubash runs the body inline on this executor; scope the trap
-        // table for the run, snapshot the parent's $?, and absorb the
-        // body's terminal error into the registered status below instead
-        // of propagating it (rubash#1219).
-        let saved_traps: Vec<(String, String)> = self
-            .shell_state
-            .env_vars
-            .iter()
-            .filter(|(key, _)| key.starts_with("__RUBASH_TRAP"))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let saved_exit_code = self.exit_code;
-        crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
-        let result = self.execute_ast(&ast);
-        // GNU process_substitute forks for `>(...)` as well (subst.c:6362),
-        // so $! points at that child and `wait $!` reports its status. The
-        // substitution body ran inline on this executor; register its status
-        // the same way the input form does.
-        let status = match &result {
-            Ok(()) => self.exit_code,
-            Err(ExecuteError::ExitCode(code))
-            | Err(ExecuteError::ExpansionFailure(code))
-            | Err(ExecuteError::Return(code)) => *code,
-            _ => 1,
-        };
-        self.register_process_substitution_status(status);
-        // Restore the parent's trap table and $?: whatever the body armed
-        // (or took) dies with the forked child.
-        self.shell_state
-            .env_vars
-            .retain(|key, _| !key.starts_with("__RUBASH_TRAP"));
-        for (key, value) in saved_traps {
-            self.shell_state.env_vars.insert(key, value);
+        // GNU setup_async_signals (subst.c:6424): the async child ignores
+        // SIGINT/SIGQUIT while job control is off — the entry-ignore marker
+        // the `&` respawn stamps.
+        #[cfg(unix)]
+        if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor") {
+            env_map.insert(
+                crate::builtins::kill::ASYNC_CHILD_ENV_KEY.to_string(),
+                "1".to_string(),
+            );
         }
-        self.exit_code = saved_exit_code;
-        match old_fd0 {
-            Some(entry) => {
-                self.fd_table.entries.insert(0, entry);
-            }
-            None => {
-                self.fd_table.entries.remove(&0);
+        let mut spawn_args = vec!["-c".to_string(), source.clone()];
+        if respawn_source_needs_file(&exe, &source) {
+            if let Ok(path) = self.write_respawn_command_file(&source) {
+                env_map.insert(
+                    "__RUBASH_CMD_FILE".to_string(),
+                    path.to_string_lossy().into_owned(),
+                );
+                spawn_args[1] = String::new();
             }
         }
-        restore_optional_env_var(&mut self.shell_state.env_vars, &fd0_key, old_fd0_stdin);
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            &fd0_offset_key,
-            old_fd0_offset,
-        );
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            &fd0_dynamic_key,
-            old_fd0_dynamic,
-        );
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            &fd0_closed_key,
-            old_fd0_closed,
-        );
-        restore_optional_env_var(&mut self.shell_state.env_vars, FUNCTION_STDIN, old_stdin);
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            FUNCTION_STDIN_OFFSET,
-            old_offset,
-        );
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            "__RUBASH_CURRENT_LINE",
-            old_current_line,
-        );
-        restore_optional_env_var(
-            &mut self.shell_state.env_vars,
-            "__RUBASH_CMD_START_LINE",
-            old_cmd_start_line,
-        );
-        // The body's outcome already landed in the registered status: the
-        // forked GNU child cannot propagate `exit`/`return`/Break-style
-        // unwinds or expansion failures to the parent — absorb them here.
-        let _ = result;
+        let mut process = std::process::Command::new(&exe);
+        process
+            .args(&spawn_args)
+            .envs(&env_map)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        suppress_orphan_console(&mut process);
+        let mut child = process.spawn()?;
+        let pid = child.id();
+        adopt_orphan_console(pid);
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = stdin.write_all(&input);
+            });
+        }
+        self.background_children
+            .insert(pid, crate::fd::SpawnedChild::from(child));
+        self.shell_state.last_background_pid = Some(pid);
         Ok(())
     }
 
