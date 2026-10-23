@@ -391,8 +391,16 @@ impl ShellInvocation {
             // (`shopt -s|-u name`).
             let _ = self.write_shopt_options_listing(executor, &mut std::io::stdout());
         }
-        // self.debug (GNU shell.c:255) is vestigial by design: recorded at
-        // parse, no behavioral effect. --debugger is the behavioral one.
+        // niu extension (GNU shell.c:255's `debugging` variable is
+        // write-only in bash — nothing reads it — so the name carries no
+        // observable GNU behavior to conflict with): --debug arms extdebug
+        // from the first command, the DEBUG-trap substrate a script
+        // debugger needs when it cannot edit the script. rubash#497's
+        // native debugger builds on the same gate predicate and upgrades
+        // this meaning in place.
+        if self.debug {
+            executor.set_shopt_option("extdebug", true);
+        }
         if self.debugger {
             // GNU shell.c:257: --debugger sets debugging_mode only; the
             // bashdb starter file runs at startup (main.rs start_debugger)

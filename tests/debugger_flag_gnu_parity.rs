@@ -172,13 +172,13 @@ fn no_debugger_flag_no_warning() {
     assert!(run.stdout.contains("shopt -u extdebug"));
 }
 
-/// `--debug` mirrors GNU's vestigial flag (shell.c:255 `debugging` var):
-/// accepted, no warning, and — unlike the OLD rubash behavior — it does NOT
-/// arm extdebug. The native debugger (#497) will own the name later.
-/// (rc anchored on `echo`, not `shopt -p`: GNU's own `shopt -p` on an OFF
-/// option exits 1 — verified side by side on WSL 5.3.20 — so ours matches.)
+/// `--debug` is the niu extension (documented in this PR): GNU's shell.c:255
+/// `debugging` variable is write-only — no bash code reads it, so the name
+/// carries no observable GNU behavior to conflict with. niu arms extdebug
+/// from the first command (the DEBUG-trap substrate; #497's native debugger
+/// upgrades this meaning in place). No bashdb attempt, no warning.
 #[test]
-fn debug_flag_is_vestigial_no_op() {
+fn debug_flag_arms_extdebug() {
     let run = spawn(
         &["--debug", "-c", "shopt -p extdebug; echo AFTER"],
         &[],
@@ -192,8 +192,8 @@ fn debug_flag_is_vestigial_no_op() {
         run.stdout
     );
     assert!(
-        run.stdout.contains("shopt -u extdebug") && run.stdout.contains("AFTER"),
-        "extdebug stays OFF and the command ran; stdout:\n{}",
+        run.stdout.contains("shopt -s extdebug") && run.stdout.contains("AFTER"),
+        "extdebug ON and the command ran; stdout:\n{}",
         run.stdout
     );
     assert!(
