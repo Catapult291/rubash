@@ -1471,7 +1471,21 @@ fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     // that echo; everything else interactive (expansion flags, $-) is
     // unaffected (rubash#297).
     executor.set_env("__RUBASH_INTERACTIVE_FLAG_OFF", "1");
+    // Drop any stale parse latch so the check below reflects THIS file.
+    let _ = executor.take_parse_error();
     let status = run_source(executor, &contents, false);
+    // GNU evalstring.c:585-606 (parse_and_execute): a syntax error in a
+    // startup file aborts the rest of THAT file and returns EX_BADUSAGE as
+    // an ordinary value — the shell prints the diagnostic and keeps
+    // starting (verified WSL GNU 5.3.20: `bash --rcfile bad.rc -i -c 'echo
+    // AFTER'` prints the error, runs AFTER, exits 0). The flagged ExitCode
+    // is the reader-discard jump, not jump_to_top_level — consume it like
+    // the `source` builtin's arm (builtins/source/execution.rs) so a broken
+    // rc cannot end startup (rubash#1158). A real `exit` carries no parse
+    // flag and still propagates (rubash#297).
+    if executor.take_parse_error() {
+        executor.take_exit_jump_pending();
+    }
     executor.remove_env("__RUBASH_INTERACTIVE_FLAG_OFF");
     status
 }
@@ -1479,17 +1493,21 @@ fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
 /// GNU shell.c:722 run_startup_files: the login/interactive startup chain.
 /// A login shell sources /etc/profile then the first existing personal
 /// profile (rubash#487); a non-login interactive shell sources
-/// /etc/bash.bashrc + ~/.bashrc (--rcfile replaces the personal rc). A
-/// login shell NEVER takes the rc branch (shell.c:1833 if/else), so
-/// `bash -lc` reads profiles only, and `bash -l -i` reads profiles only.
+/// /etc/bash.bashrc + ~/.bashrc + ~/.niubashrc (--rcfile replaces the
+/// personal rc slot entirely; rubash#1158's .niubashrc sibling is the
+/// owner-decided compatible-reading extension). A login shell NEVER takes
+/// the rc branch (shell.c:1833 if/else), so `bash -lc` reads profiles
+/// only, and `bash -l -i` reads profiles only.
 ///
-/// The chain is a Unix requirement (getty/ssh/chsh login shells must
+/// The login chain is a Unix requirement (getty/ssh/chsh login shells must
 /// inherit the system environment; macOS shares the same
-/// /etc/profile → ~/.bash_profile chain, so the gate is `not(windows)` to
-/// cover the full release matrix). On Windows there is no real login
-/// concept, so -l/--login is accepted and the behavior stays exactly the
-/// pre-existing chain (no sourcing, no regression). `--noprofile` /
-/// `--norc` inhibit their respective branches.
+/// /etc/profile → ~/.bash_profile chain), so it stays `not(windows)`: on
+/// Windows there is no real login concept, -l/--login is accepted, and the
+/// branch sources nothing — the pre-existing no-regression behavior. The
+/// non-login interactive rc branch instead runs on every platform
+/// (rubash#1158: `niu -i` ignored ~/.bashrc because this whole function
+/// was cfg-gated out on Windows). `--noprofile` / `--norc` inhibit their
+/// respective branches.
 ///
 /// Returns Some(exit_status) when a startup file executed `exit`
 /// (rubash#297: nothing after a startup-file exit runs) — the caller must
@@ -1502,53 +1520,71 @@ fn run_startup_files(executor: &mut Executor, rc_override: Option<&str>) -> Opti
     }
     executor.set_env("__RUBASH_STARTUP_FILES_DONE", "1");
     diagnose_bash_env_directory(executor);
-    #[cfg(not(windows))]
-    {
-        let login = executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1");
-        let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
-        let no_profile = executor.get_env("__RUBASH_NO_PROFILE").as_deref() == Some("1");
-        let no_rc = executor.get_env("__RUBASH_NO_RC").as_deref() == Some("1");
-        let home = executor.get_env("HOME").unwrap_or_default();
-        if home.is_empty() {
-            return None;
+    let login = executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1");
+    let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
+    let no_profile = executor.get_env("__RUBASH_NO_PROFILE").as_deref() == Some("1");
+    let no_rc = executor.get_env("__RUBASH_NO_RC").as_deref() == Some("1");
+    let home = executor.get_env("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return None;
+    }
+    let files = {
+        let exists = |path: &str| std::fs::metadata(executor.resolve_shell_path(path)).is_ok();
+        if login {
+            login_profile_branch(&home, no_profile, exists)
+        } else if interactive && !no_rc {
+            rubash::invocation::nonlogin_interactive_files(&home, rc_override, exists)
+        } else {
+            Vec::new()
         }
-        let files = {
-            let exists = |path: &str| std::fs::metadata(executor.resolve_shell_path(path)).is_ok();
-            if login {
-                if no_profile {
-                    Vec::new()
-                } else {
-                    rubash::invocation::login_profile_files(&home, exists)
-                }
-            } else if interactive && !no_rc {
-                rubash::invocation::nonlogin_interactive_files(&home, rc_override, exists)
-            } else {
-                Vec::new()
-            }
-        };
-        // issue312 gate: record the rc override sourced here (verbatim CLI
-        // form, matching nonlogin_interactive_files) so the drivers'
-        // direct run_init_file call can skip it — else interactive shells
-        // source --rcfile twice. Only set when actually included: the
-        // empty-HOME early return above and the non-interactive/login
-        // shapes leave it unset and keep the direct call.
-        if let Some(rc) = rc_override {
-            if files.iter().any(|file| file == rc) {
-                executor.set_env("__RUBASH_SOURCED_RC", rc);
-            }
-        }
-        for file in files {
-            let status = run_init_file(executor, &file);
-            if executor.take_exit_jump_pending() {
-                return Some(status);
-            }
+    };
+    // issue312 gate: record the rc override sourced here (verbatim CLI
+    // form, matching nonlogin_interactive_files) so the drivers'
+    // direct run_init_file call can skip it — else interactive shells
+    // source --rcfile twice. Only set when actually included: the
+    // empty-HOME early return above and the non-interactive/login
+    // shapes leave it unset and keep the direct call.
+    if let Some(rc) = rc_override {
+        if files.iter().any(|file| file == rc) {
+            executor.set_env("__RUBASH_SOURCED_RC", rc);
         }
     }
-    #[cfg(windows)]
-    {
-        let _ = (executor, rc_override);
+    for file in files {
+        let status = run_init_file(executor, &file);
+        if executor.take_exit_jump_pending() {
+            return Some(status);
+        }
     }
     None
+}
+
+/// The login branch of run_startup_files (shell.c:1836-1880
+/// run_login_profile_files): /etc/profile then the FIRST EXISTING of
+/// ~/.bash_profile, ~/.bash_login, ~/.profile, honouring --noprofile. On
+/// Windows the branch is deliberately empty — there is no real login
+/// concept, so -l/--login is accepted and the pre-existing behavior is
+/// kept (no sourcing, no regression; rubash#1158 changes only the
+/// non-login interactive rc branch).
+#[cfg(not(windows))]
+fn login_profile_branch(
+    home: &str,
+    no_profile: bool,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if no_profile {
+        Vec::new()
+    } else {
+        rubash::invocation::login_profile_files(home, exists)
+    }
+}
+
+#[cfg(windows)]
+fn login_profile_branch(
+    _home: &str,
+    _no_profile: bool,
+    _exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    Vec::new()
 }
 
 /// GNU shell.c run_startup_files / maybe_execute_env_file: a
