@@ -8,6 +8,31 @@ impl Executor {
         cmd: &CommandNode,
         output: &[u8],
     ) -> Result<(), ExecuteError> {
+        // GNU redir.c: ALL `>` redirects are opened in order (each file
+        // created/truncated); only the LAST receives the output (rubash#1392).
+        let mut seen_last = false;
+        for redirect in cmd.redirects.iter().rev() {
+            if !matches!(
+                redirect.kind,
+                crate::parser::RedirectKind::Output | crate::parser::RedirectKind::ClobberOutput
+            ) {
+                continue;
+            }
+            if redirect.fd.unwrap_or(1) != 1 {
+                continue;
+            }
+            if seen_last {
+                let target = self.expand_redirect_target(redirect);
+                if crate::executor::execution_misc::redirect_target_fd(&target).is_none()
+                    && !target.starts_with("<(")
+                    && !target.starts_with(">(")
+                {
+                    let _ = self.create_redirect_output(&target, redirect.clobber);
+                }
+            } else {
+                seen_last = true;
+            }
+        }
         if let Some(redirect) = &cmd.redirect_out {
             let target = self.expand_redirect_target(redirect);
             // /dev/std*, /dev/fd/N: resolve as a dup of the aliased fd's
