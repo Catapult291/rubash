@@ -133,6 +133,18 @@ GNU Bash 5.3.x 测试套件 — 83 个文件，true-baseline 实测
 
 **Windows 进程经济学。** 无 console 会话过去每次外部 spawn 都要付一次隐藏 console 分配，~22 ms/子进程（niubash#462）。#913 改为一个会话一个隐藏 console——Windows 11 24H2+/Server 2025 上预分配无窗 console，其他系统认领首个 `CREATE_NO_WINDOW` 子进程的——由 `tests/console_window_gate.rs` 的 14 条回归测试钉死。tput 白名单臂（#884，[#800](https://github.com/unixwin/rubash/issues/800) 的 A 面）对准入的 TERM×能力形状进程内作答，269 行差分矩阵与 GNU ncurses 字节相等：票面探针（64 次 tput 调用）从 1165 ms → 47 ms，零 spawn，由 `tests/issue800_tput_inline_arm_regressions.rs` 钉死。winuxcmd 侧的同族修复去掉了真二进制里 ~17 ms/次 的 i18n 开销（修后进程内 ~0.4 ms；3208 行回放逐字节一致，[WinuxCmd#1269](https://github.com/unixwin/WinuxCmd/pull/1269)）。#800 的 B 面——`read` 撞 EOF ~4.8 s/次——仍然开放。
 
+## 里程碑
+
+<p align="center">
+  <img src="assets/milestone-timeline.svg" alt="The Climb——rubash 里程碑时间线：从 2026-09-09 的 3,427 行 GNU 套件差异到 2026-10-12 的 83/83 全数通过" width="880" />
+</p>
+
+从 `chore: init` 到 GNU 官方语料 83/83，历时四个半月——身后是钉进 CI 夹具的
+生态墙（bashdb、ble.sh、oh-my-bash、bash-completion、nvm、git 自带的
+`t/test-lib.sh`）。两位核心维护者同时也是微软 Windows 版 Coreutils 打包项目
+[microsoft/coreutils](https://github.com/microsoft/coreutils) 以及
+vcpkg/winget-pkgs 的上游贡献者。
+
 ## 架构
 
 ```
@@ -254,4 +266,4 @@ MIT — 详见 [`LICENSE`](LICENSE)。
 
 ---
 
-*最后更新：2026-10-22*
+*最后更新：2026-10-23*
