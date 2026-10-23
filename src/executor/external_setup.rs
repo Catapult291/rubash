@@ -910,6 +910,24 @@ impl Executor {
         self.shell_state
             .env_vars
             .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+        // GNU subst.c:6362 process_substitute FORKS the `>(...)` body: the
+        // child runs restore_original_signals (subst.c:6421 — the parent's
+        // caught traps are cancelled) and ends through `exit(rc)`
+        // (subst.c:6628-6629), so an `exit N` in the body terminates only
+        // the child and the parent's trap table and $? are untouched.
+        // Rubash runs the body inline on this executor; scope the trap
+        // table for the run, snapshot the parent's $?, and absorb the
+        // body's terminal error into the registered status below instead
+        // of propagating it (rubash#1219).
+        let saved_traps: Vec<(String, String)> = self
+            .shell_state
+            .env_vars
+            .iter()
+            .filter(|(key, _)| key.starts_with("__RUBASH_TRAP"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let saved_exit_code = self.exit_code;
+        crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
         let result = self.execute_ast(&ast);
         // GNU process_substitute forks for `>(...)` as well (subst.c:6362),
         // so $! points at that child and `wait $!` reports its status. The
@@ -923,6 +941,15 @@ impl Executor {
             _ => 1,
         };
         self.register_process_substitution_status(status);
+        // Restore the parent's trap table and $?: whatever the body armed
+        // (or took) dies with the forked child.
+        self.shell_state
+            .env_vars
+            .retain(|key, _| !key.starts_with("__RUBASH_TRAP"));
+        for (key, value) in saved_traps {
+            self.shell_state.env_vars.insert(key, value);
+        }
+        self.exit_code = saved_exit_code;
         match old_fd0 {
             Some(entry) => {
                 self.fd_table.entries.insert(0, entry);
@@ -963,7 +990,11 @@ impl Executor {
             "__RUBASH_CMD_START_LINE",
             old_cmd_start_line,
         );
-        result
+        // The body's outcome already landed in the registered status: the
+        // forked GNU child cannot propagate `exit`/`return`/Break-style
+        // unwinds or expansion failures to the parent — absorb them here.
+        let _ = result;
+        Ok(())
     }
 
     /// GNU subst.c:6362 process_substitute(): the substituted word is
