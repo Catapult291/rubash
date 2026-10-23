@@ -431,7 +431,15 @@ impl Executor {
                     .push((PathBuf::from(&temp), DevOperandFlush::Handle(file.handle)));
                 Some(temp)
             }
-            FdWriteEndpoint::ProcessSubstitution { .. } => None,
+            // rubash#1223: `tee >(body)` resolves /dev/fd/N to a write
+            // endpoint backed by the substitution's temp carrier — an
+            // ordinary file the external child can open and write, which
+            // the consumer then reads when finish_process_substitutions
+            // runs it. GNU redir.c: the fd is the write end of the procsub
+            // pipe; the carrier file is rubash's stand-in for it.
+            FdWriteEndpoint::ProcessSubstitution { path, .. } => {
+                Some(path.to_string_lossy().into_owned())
+            }
         }
     }
 

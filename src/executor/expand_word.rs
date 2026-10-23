@@ -159,8 +159,22 @@ impl Executor {
         // strip the body's quoting and expand its parameters at redirect
         // time (`exec 9> >(printf 'a%sb\n' "$v")` mangled to `printf a%snb`
         // before the body ever ran).
-        if (redirect.target.starts_with(">(") || redirect.target.starts_with("<("))
-            && redirect.target.ends_with(')')
+        let operand_is_procsub =
+            |text: &str| (text.starts_with(">(") || text.starts_with("<(")) && text.ends_with(')');
+        // rubash#1223: after process-substitution materialization rewrites
+        // redirect.target to the carrier temp path, target_metadata.raw
+        // still holds the original `>({ cat; })` word. GNU's operand for
+        // that word is ONE field — redir.c:298 redirection_expand ->
+        // expand_word_internal's '<'/'>' cases (subst.c:11349-11378
+        // extract_process_subst -> subst.c:6362 process_substitute) return
+        // the substitution filename directly, and the `{ ...; }` body is
+        // never a brace-expansion candidate. The fields pipeline below
+        // re-expands the raw word through expand_braces_with_optional_raw,
+        // where `{ cat; }` reads as a brace group and the whole raw word
+        // comes back as the "expanded" operand — whitespace -> spurious
+        // `ambiguous redirect`. When the raw operand is a substitution
+        // word the carrier path IS the expansion; return it verbatim.
+        if operand_is_procsub(&redirect.target) || operand_is_procsub(&redirect.target_metadata.raw)
         {
             // rubash#394: while a compound command whose target IS a
             // process substitution is in scope, the substitution's carrier
