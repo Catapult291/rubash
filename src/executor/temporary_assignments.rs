@@ -206,6 +206,26 @@ impl Executor {
                 .flatten()
                 .map(String::as_str);
             let expanded_value = self.expand_assignment_value_with_raw(name, value, raw);
+            // GNU subst.c:13219 expand_word_list_internal ->
+            // shell_expand_word_list (subst.c:13092-13106): a `$((...))`
+            // evalerror inside the assignment prefix's own expansion jumps
+            // DISCARD mid-expansion — the command never runs and the rest of
+            // the command list is abandoned (rubash#1226: `x=$((1/0)) echo
+            // hi` prints only the diagnostic). Consume the flag the failing
+            // expansion left armed, mark the apply failed, and arm the
+            // reader-level abort; the dispatch sites below translate
+            // assignments_failed+pending into the skip-and-abandon Err.
+            if self.shell_state.arithmetic_expansion_error.replace(false) {
+                self.shell_state.arithmetic_fatal_error.set(false);
+                self.shell_state.arithmetic_nonfatal_error.set(false);
+                self.exit_code = 1;
+                // rubash#439: expansion error, not a failed command — no ERR
+                // trap may fire for a command that never ran.
+                self.command_expansion_failed.set(true);
+                self.raise_evalerror_abort();
+                assignments_failed = true;
+                break;
+            }
             if self.xtrace_enabled() {
                 self.assignment_expansion_memo
                     .borrow_mut()
