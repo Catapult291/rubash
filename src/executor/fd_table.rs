@@ -87,8 +87,20 @@ pub(crate) enum FdWriteEndpoint {
     Stdout,
     Stderr,
     File(Rc<FileFd>),
-    CoprocStdin { pid: u32, fd: Rc<FileFd> },
-    ProcessSubstitution { path: PathBuf, command: String },
+    CoprocStdin {
+        pid: u32,
+        fd: Rc<FileFd>,
+    },
+    ProcessSubstitution {
+        path: PathBuf,
+        command: String,
+        /// rubash#1022: fork-placeholder pid registered as $! for a
+        /// persistent `>(...)` output substitution (set at open, completed
+        /// at close). `None` for the per-command temp form, whose $! is
+        /// registered with its finished status at finish time instead.
+        /// Bookkeeping only — excluded from endpoint identity below.
+        procsub_pid: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -878,7 +890,7 @@ impl FdTable {
                     FdWriteEndpoint::CoprocStdin { pid, .. } => {
                         MaterializedWrite::CoprocStdin(*pid)
                     }
-                    FdWriteEndpoint::ProcessSubstitution { path, command } => {
+                    FdWriteEndpoint::ProcessSubstitution { path, command, .. } => {
                         MaterializedWrite::ProcessSubstitution {
                             path: path.clone(),
                             command: command.clone(),
@@ -927,10 +939,12 @@ impl PartialEq for FdWriteEndpoint {
                 Self::ProcessSubstitution {
                     path: p1,
                     command: c1,
+                    ..
                 },
                 Self::ProcessSubstitution {
                     path: p2,
                     command: c2,
+                    ..
                 },
             ) => p1 == p2 && c1 == c2,
             _ => false,

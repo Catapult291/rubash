@@ -90,12 +90,21 @@ impl Executor {
                 // GNU kill -0 is a real liveness probe (kill(2) with sig 0
                 // returns ESRCH for a dead pid), not an unconditional yes.
                 // A pid the job table already marked Completed is dead even
-                // before the process object is reaped.
+                // before the process object is reaped — except a live
+                // procsub placeholder (rubash#1022): its status is recorded
+                // at registration while the forked zombie stays
+                // unreaped (signallable) until an explicit wait or sweep,
+                // exactly like GNU's just-exited procsub.
                 let job_dead = self
                     .shell_state
                     .job_table
                     .completed_statuses
-                    .contains_key(&pid);
+                    .contains_key(&pid)
+                    && !self
+                        .shell_state
+                        .job_table
+                        .procsub_placeholders
+                        .contains(&pid);
                 if job_dead || !process_exists(pid) {
                     writeln!(
                         stderr,

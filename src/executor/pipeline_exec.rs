@@ -604,7 +604,7 @@ impl Executor {
             if error.is_none() {
                 let input = fs::read_to_string(&path).unwrap_or_default();
                 if let Err(output_error) =
-                    self.execute_persistent_output_process_substitution(&source, input)
+                    self.execute_persistent_output_process_substitution(&source, input, None)
                 {
                     error = Some(output_error);
                 }

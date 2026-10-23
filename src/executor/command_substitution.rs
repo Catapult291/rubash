@@ -130,6 +130,38 @@ pub(in crate::executor) fn normalize_comsub_body_statement_lines(
     layout_command_list(&mut ast.commands, seed, &mut boundaries, &mut line, false);
 }
 
+/// Parse an inline-executed process-substitution body with GNU's line
+/// attribution (rubash#1024).
+///
+/// GNU subst.c:6362 process_substitute forks; the child inherits the
+/// parent's line_number and parse_and_execute (builtins/evalstring.c:315)
+/// keeps it for a non-SEVAL_RESETLINE string (line_number--, then the
+/// string reader counts up), so body diagnostics are numbered from the
+/// enclosing command's line. `<(` bodies also go through the
+/// parse_comsub/print_comsub canonical layout (parse.y:4451 + :4632 —
+/// the body is reprinted with its own newlines): a bare newline advances
+/// the canonical line, `;`-joined statements share one, blank runs
+/// collapse, and leading newlines are skipped. That is exactly
+/// normalize_comsub_body_statement_lines, seeded here from the enclosing
+/// command's CURRENT_LINE the way the `$(...)` path seeds from its own
+/// body_start_line.
+pub(in crate::executor) fn parse_procsub_body(
+    executor: &Executor,
+    source: &str,
+) -> crate::parser::Ast {
+    let seed = executor
+        .shell_state
+        .env_vars
+        .get("__RUBASH_CURRENT_LINE")
+        .and_then(|line| line.parse::<usize>().ok())
+        .filter(|line| *line > 0)
+        .unwrap_or(1);
+    let tokens = crate::lexer::tokenize_comsub_body(source, false, seed, false);
+    let mut ast = crate::parser::parse(&tokens);
+    normalize_comsub_body_statement_lines(&mut ast, &tokens);
+    ast
+}
+
 /// Raw source lines that a genuine newline-run statement boundary crosses
 /// INTO (the raw line of the first token after the run). Mirrors the
 /// connector printing of print_cmd.c:294-319: a run of physical line breaks

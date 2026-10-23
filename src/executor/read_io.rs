@@ -614,8 +614,7 @@ impl Executor {
     }
 
     pub(crate) fn process_substitution_output_bytes(&mut self, source: &str) -> Option<Vec<u8>> {
-        let tokens = crate::lexer::tokenize(source);
-        let ast = crate::parser::parse(&tokens);
+        let ast = super::command_substitution::parse_procsub_body(self, source);
         if ast.commands.is_empty() {
             return None;
         }
@@ -652,7 +651,16 @@ impl Executor {
             | Err(ExecuteError::Return(code)) => *code,
             _ => 1,
         };
-        self.register_process_substitution_status(status);
+        let pid = self.register_process_substitution_status(status);
+        // GNU jobs.c: the input procsub's body finished before the outer
+        // command even started, and the SIGCHLD handler reaps it at the
+        // next command boundary — by the time `$!` is observable the child
+        // is gone (rubash#1022: `cat <(echo hi); kill -0 $!` fails on GNU
+        // too). Reap the placeholder now so `kill -0` reports ESRCH the
+        // same way; `wait $!` still reports the recorded status. (The
+        // output form keeps its placeholder live: with /dev/fd pipes the
+        // child outlives the command.)
+        self.reap_procsub_placeholder(pid, true);
 
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
