@@ -1953,3 +1953,41 @@ fn escape_bracket_char(c: char) -> Vec<char> {
         vec![c]
     }
 }
+
+#[cfg(test)]
+mod conditional_pattern_tests {
+    //! rubash#1092: the unquoted `[[ == ]]` RHS keeps `\\` as a literal
+    //! backslash for the matcher (GNU execute_cmd.c COND_BINARY
+    //! patmatch arm + subst.c:4077 cond_expand_word special=1: no quote
+    //! removal; sm_loop.c:121 `\\` arm), while expansion-produced `\`
+    //! keeps its escape meaning. Cooked RHS spellings below mimic the
+    //! lexer: unquoted `a\\b` cooks to `a\x14b` (DATA_BACKSLASH),
+    //! `'a\b'` cooks to `a\b` (span bytes verbatim).
+    use crate::executor::Executor;
+
+    #[test]
+    fn cond_rhs_double_backslash_is_literal_backslash() {
+        let mut executor = Executor::new();
+        // `[[ ab == a\\b ]]`: no match (GNU rc=1).
+        assert!(!executor.conditional_string_binary("ab", "==", "a\u{14}b"));
+        // `[[ 'a\b' == a\\b ]]`: match (GNU rc=0).
+        assert!(executor.conditional_string_binary("a\\b", "==", "a\u{14}b"));
+        // `[[ ab == a\b ]]` (cooked `ab`, like GNU's
+        // pass_next_character consuming the quote): match.
+        assert!(executor.conditional_string_binary("ab", "==", "ab"));
+        // `!=` is the negation over the same pattern reading.
+        assert!(executor.conditional_string_binary("ab", "!=", "a\u{14}b"));
+        assert!(!executor.conditional_string_binary("a\\b", "!=", "a\u{14}b"));
+    }
+
+    #[test]
+    fn cond_rhs_expansion_backslash_keeps_escape_meaning() {
+        let mut executor = Executor::new();
+        executor.set_env("x", "a\\b");
+        // x='a\b'; `[[ ab == $x ]]` matches (GNU rc=0): the value's `\`
+        // is an escape quoting `b`, unlike lex-level `\\`.
+        assert!(executor.conditional_string_binary("ab", "==", "$x"));
+        // ...and it does not match a literal-backslash word.
+        assert!(!executor.conditional_string_binary("a\\b", "==", "$x"));
+    }
+}

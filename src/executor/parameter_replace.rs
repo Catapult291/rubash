@@ -888,6 +888,63 @@ mod tests {
             "x'"
         );
     }
+
+    #[test]
+    fn global_replace_matches_empty_extglob_spans() {
+        // rubash#1091: GNU subst.c pat_subst global loop + match_upattern
+        // MATCH_ANY (p1 ranges down to p itself) replaces the empty match
+        // at every gap, copying one character past it (pat_subst:9286-9304)
+        // — `*(a)`/`?(x)` are not skips. Byte-compared against GNU 5.3.20
+        // (script-file mode).
+        assert_eq!(
+            replace_parameter_pattern("abac", "*(a)", "Q", true, false, false, true),
+            "QQbQQc"
+        );
+        assert_eq!(
+            replace_parameter_pattern("x", "*(y)", "Q", true, false, false, true),
+            "Qx"
+        );
+        assert_eq!(
+            replace_parameter_pattern("aaab", "*(a)", "Q", true, false, false, true),
+            "QQb"
+        );
+        assert_eq!(
+            replace_parameter_pattern("abc", "?(x)", "Q", true, false, false, true),
+            "QaQbQc"
+        );
+        assert_eq!(
+            replace_parameter_pattern("ab", "*(b)", "Q", true, false, false, true),
+            "QaQ"
+        );
+        assert_eq!(
+            replace_parameter_pattern("abac", "*(z)", "Q", true, false, false, true),
+            "QaQbQaQc"
+        );
+        // Single (non-global) replacement keeps longest-at-leftmost: an
+        // empty seed never beats a longer match at the same start, and a
+        // zero-length single match inserts without consuming.
+        assert_eq!(
+            replace_parameter_pattern("abac", "*(a)", "Q", false, false, false, true),
+            "Qbac"
+        );
+        assert_eq!(
+            replace_parameter_pattern("abc", "?(x)", "Q", false, false, false, true),
+            "Qabc"
+        );
+        // `+(...)` never matches empty: no seed, behavior unchanged.
+        assert_eq!(
+            replace_parameter_pattern("aaab", "+(a)", "Q", true, false, false, true),
+            "Qb"
+        );
+        assert_eq!(
+            replace_parameter_pattern("abac", "*", "Q", true, false, false, true),
+            "Q"
+        );
+        assert_eq!(
+            replace_parameter_pattern("abac", "?", "Q", true, false, false, true),
+            "QQQQ"
+        );
+    }
 }
 
 fn replace_with_amp(
