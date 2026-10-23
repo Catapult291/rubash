@@ -566,6 +566,12 @@ impl Executor {
                 "-e" => {
                     index += 1;
                 }
+                // GNU read.def:308: `-E` disables readline (inverse of `-e`).
+                // Rubash has no readline editor for read, so it's a no-op
+                // (rubash#1407).
+                "-E" => {
+                    index += 1;
+                }
                 "-r" => {
                     raw = true;
                     index += 1;
@@ -1251,7 +1257,7 @@ impl Executor {
                 }
                 word if word.starts_with('-')
                     && word.len() > 2
-                    && word[1..].chars().all(|ch| matches!(ch, 'e' | 'r' | 's')) =>
+                    && word[1..].chars().all(|ch| matches!(ch, 'e' | 'E' | 'r' | 's')) =>
                 {
                     raw |= word[1..].contains('r');
                     index += 1;
@@ -2700,7 +2706,9 @@ fn first_invalid_read_option(word: &str) -> Option<char> {
     chars.find(|ch| {
         !matches!(
             ch,
-            'a' | 'd' | 'e' | 'i' | 'n' | 'N' | 'p' | 'r' | 's' | 't' | 'u'
+            // GNU read.def:308 optstring "Eersa:d:i:n:p:t:u:N:" (bash 5.3).
+            // `-E` disables readline editing (inverse of `-e`); rubash#1407.
+            'a' | 'd' | 'e' | 'E' | 'i' | 'n' | 'N' | 'p' | 'r' | 's' | 't' | 'u'
         )
     })
 }
