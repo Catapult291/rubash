@@ -1103,6 +1103,8 @@ impl Executor {
                 path: temp.to_path_buf(),
                 command: String::new(),
                 procsub_pid: None,
+                fork_stdout: None,
+                fork_stderr: None,
             },
             true,
         );

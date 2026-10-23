@@ -87,6 +87,18 @@ pub(crate) fn shift_trap_action_lines(commands: &mut [CommandNode], delta: i64) 
     }
 }
 
+/// Detached `>(...)` carrier: the endpoint popped from its fd by
+/// `Executor::pop_persistent_output_carrier`, awaiting its body run
+/// under the caller's last-writer-close rule.
+struct PoppedCarrier {
+    carrier_path: std::path::PathBuf,
+    target: String,
+    source: String,
+    pending_pid: Option<u32>,
+    fork_stdout: Option<Box<ForkStdio>>,
+    fork_stderr: Option<Box<ForkStdio>>,
+}
+
 impl Executor {
     pub(in crate::executor) fn set_fd_input_text(&mut self, fd: u32, input: String, dynamic: bool) {
         // input is shell text: decode marker pairs back to the raw bytes
@@ -2693,12 +2705,33 @@ impl Executor {
                         if !is_null_device(&path) {
                             self.create_redirect_output(&path, redirect.clobber)?;
                         }
+                        // Replacing fds 1/2 closes their old descriptions:
+                        // pending `>(...)` bodies flush under the
+                        // last-writer rule — one redirect step closes both
+                        // ends, so each distinct carrier runs exactly once
+                        // (closing one fd at a time would defer-then-orphan
+                        // a carrier shared across the pair).
+                        self.close_replaced_output_fds(&[1, 2])?;
                         self.set_fd_output_file(1, path.clone(), false, false)?;
                         self.share_fd_output_file(1, 2, &path, false);
                         continue;
                     }
                     if self.open_persistent_output_process_substitution(fd, &target)? {
                         continue;
+                    }
+                    // GNU redir.c: replacing a descriptor closes the old
+                    // open file description — a pending `>(...)` body sees
+                    // EOF on its pipe and flushes (subst.c:6362 forked it
+                    // during the earlier redirect application). Run it now
+                    // instead of orphaning its buffered bytes under the new
+                    // file (same last-writer rule as the dup path: a
+                    // sibling dup sharing the carrier runs it at its own
+                    // close).
+                    if matches!(
+                        self.fd_table.output_endpoint(fd),
+                        Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                    ) {
+                        self.close_persistent_output_fd(fd)?;
                     }
                     let append = matches!(
                         redirect.kind,
@@ -2718,7 +2751,17 @@ impl Executor {
                     ) {
                         // &>file / &>>file: stderr follows stdout through
                         // the same open file description (redir.c
-                        // r_err_and_out / r_append_err_and_out).
+                        // r_err_and_out / r_append_err_and_out). A pending
+                        // body on fd 2 sees EOF here (its turn under the
+                        // last-writer rule — fd 1 was just rebound above).
+                        if fd != 2
+                            && matches!(
+                                self.fd_table.output_endpoint(2),
+                                Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                            )
+                        {
+                            self.close_persistent_output_fd(2)?;
+                        }
                         self.share_fd_output_file(fd, 2, &target, fd >= 10);
                     }
                 }
@@ -3186,6 +3229,18 @@ impl Executor {
             return Ok(false);
         };
 
+        // GNU redir.c: replacing a descriptor closes the old open file
+        // description — a pending `>(...)` body sees EOF on its pipe and
+        // flushes (subst.c:6362 forked it during the earlier redirect
+        // application). Run the pending body now instead of orphaning
+        // its buffered bytes under the replacement.
+        if matches!(
+            self.fd_table.output_endpoint(fd),
+            Some(FdWriteEndpoint::ProcessSubstitution { .. })
+        ) {
+            self.close_persistent_output_fd(fd)?;
+        }
+
         let path = self.empty_process_substitution_temp()?;
         // rubash#1022: GNU subst.c:6362 forks the procsub at expansion, so
         // $! names it while the body runs. The persistent body only runs at
@@ -3224,6 +3279,8 @@ impl Executor {
                 path: path.clone(),
                 command: source.to_string(),
                 procsub_pid,
+                fork_stdout: self.fork_stdio_snapshot(1),
+                fork_stderr: self.fork_stdio_snapshot(2),
             },
             fd >= 10,
         );
@@ -3237,7 +3294,97 @@ impl Executor {
         Ok(true)
     }
 
-    fn close_persistent_output_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+    /// GNU subst.c:6362 `process_substitute` fork-time stdio snapshot:
+    /// the fds 1/2 write endpoints (plus their rubash#223 capture
+    /// generation records) as of this redirect's application — exactly
+    /// what the forked body inherits. `None` when the fd is closed or
+    /// itself a `>(...)` carrier (a nested carrier's temp file may be
+    /// gone by close time; pointing the body there can only lose
+    /// output, so the close-time table is left alone instead).
+    fn fork_stdio_snapshot(&self, fd: u32) -> Option<Box<ForkStdio>> {
+        let endpoint = self.fd_table.write_endpoint(fd)?;
+        if matches!(endpoint, FdWriteEndpoint::ProcessSubstitution { .. }) {
+            return None;
+        }
+        Some(Box::new(ForkStdio {
+            endpoint,
+            generation: self.fd_table.stdout_alias_generation.get(&fd).cloned(),
+        }))
+    }
+
+    /// Rebind fds 1/2 to fork-time snapshots around a deferred
+    /// persistent-`>(...)` body run; returns the displaced state for
+    /// `restore_fork_stdio`. Fds without a snapshot are left alone.
+    fn install_fork_stdio(
+        &mut self,
+        fork_stdout: &Option<Box<ForkStdio>>,
+        fork_stderr: &Option<Box<ForkStdio>>,
+    ) -> [(u32, Option<FdEntry>, Option<Option<usize>>); 2] {
+        let mut saved = [
+            (
+                1u32,
+                self.fd_table.entries.get(&1).cloned(),
+                self.fd_table.stdout_alias_generation.get(&1).cloned(),
+            ),
+            (
+                2u32,
+                self.fd_table.entries.get(&2).cloned(),
+                self.fd_table.stdout_alias_generation.get(&2).cloned(),
+            ),
+        ];
+        for ((fd, _, _), snapshot) in saved.iter_mut().zip([fork_stdout, fork_stderr]) {
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            let entry = self.fd_table.entries.entry(*fd).or_insert(FdEntry {
+                read: None,
+                write: None,
+                closed: false,
+                dynamic: false,
+            });
+            entry.write = Some(snapshot.endpoint.clone());
+            entry.closed = false;
+            match snapshot.generation {
+                Some(record) => {
+                    self.fd_table.stdout_alias_generation.insert(*fd, record);
+                }
+                None => {
+                    self.fd_table.stdout_alias_generation.remove(fd);
+                }
+            }
+        }
+        saved
+    }
+
+    fn restore_fork_stdio(&mut self, saved: [(u32, Option<FdEntry>, Option<Option<usize>>); 2]) {
+        for (fd, entry, generation) in saved {
+            match entry {
+                Some(entry) => {
+                    self.fd_table.entries.insert(fd, entry);
+                }
+                None => {
+                    self.fd_table.entries.remove(&fd);
+                }
+            }
+            match generation {
+                Some(record) => {
+                    self.fd_table.stdout_alias_generation.insert(fd, record);
+                }
+                None => {
+                    self.fd_table.stdout_alias_generation.remove(&fd);
+                }
+            }
+        }
+    }
+
+    /// Detached `>(...)` carrier: the endpoint popped from its fd by
+    /// `pop_persistent_output_carrier`, awaiting its body run under the
+    /// caller's last-writer-close rule.
+    /// Close the output fd and detach its pending `>(...)` carrier (if
+    /// any) WITHOUT running the body: closes the endpoint, completes
+    /// the coproc bookkeeping, and pops the fd-output ledger keys. The
+    /// caller runs the returned carrier under its own last-writer rule.
+    fn pop_persistent_output_carrier(&mut self, fd: u32) -> Option<PoppedCarrier> {
         let coproc_pid = self
             .fd_table
             .entries
@@ -3258,6 +3405,26 @@ impl Executor {
                     Some(FdWriteEndpoint::ProcessSubstitution { procsub_pid, .. }) => *procsub_pid,
                     _ => None,
                 });
+        // rubash#1336: fork-time stdio (GNU subst.c:6362) travels on the
+        // endpoint itself; the carrier path identifies the shared pipe
+        // for the last-writer-close rule.
+        let carrier = match self
+            .fd_table
+            .entries
+            .get(&fd)
+            .and_then(|entry| entry.write.clone())
+        {
+            Some(FdWriteEndpoint::ProcessSubstitution {
+                path,
+                fork_stdout,
+                fork_stderr,
+                ..
+            }) => Some((path, fork_stdout, fork_stderr)),
+            _ => None,
+        };
+        // Unconditional teardown, exactly as the old close-first-half:
+        // every caller (`>&-`, dup-replace, combined share) closes the
+        // endpoint and drops the ledger keys however it was bound.
         self.fd_table.close_output(fd);
         if let Some(pid) = coproc_pid {
             self.mark_coproc_array_endpoint_closed(pid, fd);
@@ -3267,13 +3434,112 @@ impl Executor {
             .shell_state
             .env_vars
             .remove(&fd_output_process_substitution_key(fd));
-        if let (Some(target), Some(source)) = (target, source) {
-            let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-            let input = fs::read_to_string(&path).unwrap_or_default();
-            self.execute_persistent_output_process_substitution(&source, input, pending_pid)?;
-            let _ = fs::remove_file(path);
+        let (carrier_path, fork_stdout, fork_stderr) = carrier?;
+        let (Some(target), Some(source)) = (target, source) else {
+            return None;
+        };
+        Some(PoppedCarrier {
+            carrier_path,
+            target,
+            source,
+            pending_pid,
+            fork_stdout,
+            fork_stderr,
+        })
+    }
+
+    /// Run a detached carrier's deferred body: feed it the buffered
+    /// bytes as stdin, with fds 1/2 rebound to the fork-time snapshots
+    /// (GNU subst.c:6362), then delete the carrier temp file.
+    fn run_popped_carrier_body(&mut self, carrier: PoppedCarrier) -> Result<(), ExecuteError> {
+        let path = shell_path_to_windows(&carrier.target, &self.shell_state.env_vars);
+        let input = fs::read_to_string(&path).unwrap_or_default();
+        let saved_stdio = self.install_fork_stdio(&carrier.fork_stdout, &carrier.fork_stderr);
+        let result = self.execute_persistent_output_process_substitution(
+            &carrier.source,
+            input,
+            carrier.pending_pid,
+        );
+        self.restore_fork_stdio(saved_stdio);
+        result?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Whether another live fd is still bound to `carrier_path` — the
+    /// pipe stays open (GNU: the body only sees EOF when the last
+    /// write-end closes), so this close must not run the body.
+    fn carrier_still_referenced(&self, except_fd: u32, carrier_path: &std::path::Path) -> bool {
+        self.fd_table.entries.iter().any(|(other, entry)| {
+            *other != except_fd
+                && !entry.closed
+                && matches!(&entry.write,
+                    Some(FdWriteEndpoint::ProcessSubstitution { path: other_path, .. })
+                    if other_path.as_path() == carrier_path)
+        })
+    }
+
+    fn close_persistent_output_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+        let Some(carrier) = self.pop_persistent_output_carrier(fd) else {
+            return Ok(());
+        };
+        // GNU keeps the substitution pipe open while any write-end dup
+        // survives (`exec > >(tee) 2>&1` shares one pipe): only the
+        // last writer's close delivers EOF and runs the body. Otherwise
+        // every dup would re-run the body on an empty (or already
+        // consumed) carrier and duplicate its diagnostics.
+        if self.carrier_still_referenced(fd, &carrier.carrier_path) {
+            return Ok(());
+        }
+        self.run_popped_carrier_body(carrier)
+    }
+
+    /// Close several output fds as one redirect step (e.g. `>&word`
+    /// rebinding fds 1 and 2): each distinct pending `>(...)` carrier
+    /// runs exactly once. Closing one fd at a time would defer-then-
+    /// orphan a carrier shared across the batch (each close sees the
+    /// sibling still referencing it, then the sibling is overwritten
+    /// without ever closing).
+    fn close_replaced_output_fds(&mut self, fds: &[u32]) -> Result<(), ExecuteError> {
+        let mut carriers: Vec<PoppedCarrier> = Vec::new();
+        for &fd in fds {
+            if let Some(carrier) = self.pop_persistent_output_carrier(fd) {
+                if !carriers
+                    .iter()
+                    .any(|other: &PoppedCarrier| other.carrier_path == carrier.carrier_path)
+                {
+                    carriers.push(carrier);
+                }
+            }
+        }
+        for carrier in carriers {
+            self.run_popped_carrier_body(carrier)?;
         }
         Ok(())
+    }
+
+    /// GNU shell.c `exit_shell`: closing the shell closes its descriptors,
+    /// delivering EOF to every pending `>(...)` body (subst.c:6362 forked
+    /// them during redirect application). The deferred model runs each
+    /// distinct carrier body once here so output buffered on persistent
+    /// substitution fds is not silently lost at `exit` / script end.
+    /// Body failures stay async (GNU never folds a procsub child's status
+    /// into the shell's exit status), so errors are absorbed.
+    pub(crate) fn flush_persistent_output_procsubs(&mut self) {
+        let fds: Vec<u32> = self
+            .fd_table
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.closed
+                    && matches!(
+                        entry.write,
+                        Some(FdWriteEndpoint::ProcessSubstitution { .. })
+                    )
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        let _ = self.close_replaced_output_fds(&fds);
     }
 
     fn close_persistent_input_fd(&mut self, fd: u32) {

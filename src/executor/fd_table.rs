@@ -113,6 +113,16 @@ pub(crate) enum FdReadEndpoint {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ForkStdio {
+    pub endpoint: FdWriteEndpoint,
+    /// The `stdout_alias_generation` record contemporary with the
+    /// endpoint (`None` = no record: the live alias). Restored around
+    /// the deferred body run so the body resolves captures exactly as
+    /// the fork-time shell did (rubash#223).
+    pub generation: Option<Option<usize>>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum FdWriteEndpoint {
     Stdout,
     Stderr,
@@ -130,6 +140,19 @@ pub(crate) enum FdWriteEndpoint {
         /// registered with its finished status at finish time instead.
         /// Bookkeeping only — excluded from endpoint identity below.
         procsub_pid: Option<u32>,
+        /// rubash#1336: fork-time stdio for the deferred body (GNU
+        /// subst.c:6362 `process_substitute` forks the body while the
+        /// redirect list is being applied, so the child inherits the
+        /// shell's fds as of that point). The persistent body only runs
+        /// at close; these snapshots rebind fds 1/2 around that run so
+        /// body diagnostics and passthrough land where GNU puts them
+        /// instead of in the redirect's own temp carrier (which is then
+        /// deleted). `None` = leave the close-time table alone
+        /// (nested-`>(...)` carriers whose temp file may already be
+        /// gone — pointing the body there can only lose output).
+        /// Bookkeeping only — excluded from endpoint identity below.
+        fork_stdout: Option<Box<ForkStdio>>,
+        fork_stderr: Option<Box<ForkStdio>>,
     },
 }
 

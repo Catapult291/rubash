@@ -229,7 +229,9 @@ use execution_misc::*;
 use external_setup::{
     command_needs_process_substitution_materialization, ProcessSubstitutionFiles,
 };
-use fd_table::{FdReadEndpoint, FdTable, FdWriteEndpoint, FileFd, MaterializedRead};
+use fd_table::{
+    FdEntry, FdReadEndpoint, FdTable, FdWriteEndpoint, FileFd, ForkStdio, MaterializedRead,
+};
 use function_env::*;
 use local_helpers::*;
 use parameter_case::*;

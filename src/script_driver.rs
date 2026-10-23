@@ -4380,7 +4380,7 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
         }
     }
-    match executor.run_exit_trap_with_status(status) {
+    let code = match executor.run_exit_trap_with_status(status) {
         Ok(code) => code,
         Err(ExecuteError::ExitCode(code)) => code,
         Err(e) => {
@@ -4391,7 +4391,16 @@ pub fn finish_shell(executor: &mut Executor, status: i32, interactive: bool) -> 
             }
             1
         }
-    }
+    };
+    // GNU shell.c `exit_shell`: closing the shell delivers EOF to every
+    // pending `>(...)` body (subst.c:6362 forked them during redirect
+    // application). The deferred model runs each distinct carrier body
+    // once here so output buffered on persistent substitution fds is not
+    // silently lost at `exit` / script end (rubash#1336: the
+    // installIllumioVEN hang asset's `exec > >(tee -a log) 2>&1` banner
+    // vanished without this flush).
+    executor.flush_persistent_output_procsubs();
+    code
 }
 
 /// shell.c:1830-1842 init_interactive + bashhist.c:320-345: create the
