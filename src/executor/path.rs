@@ -2580,6 +2580,18 @@ fn file_is_executable(path: &Path) -> bool {
     unsafe { libc::access(cpath.as_ptr(), libc::X_OK) == 0 }
 }
 
+/// GNU hashcmd.c phash_search: `hash -t` resolves a stored relative path
+/// through its `./`-prefixed form when that form is executable.
+#[cfg(unix)]
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    file_is_executable(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn executable_candidate(path: &Path, env_vars: &HashMap<String, String>) -> Option<PathBuf> {
     // Extensionless names probe every PATHEXT candidate before the bare file
     // (native wrappers like `code.cmd` win over an extensionless `code`).
