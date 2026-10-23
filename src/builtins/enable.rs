@@ -108,9 +108,18 @@ where
     let mut operands = Vec::new();
 
     let mut index = 0;
+    // GNU builtins/bashgetopt.c:76 (NOTOPT) and :84-89: option parsing ends
+    // at the first non-option word or at a bare `--` (consumed, not an
+    // operand); the rest are names. (rubash#1375)
+    let mut parsing_options = true;
     while index < args.len() {
         let arg = &args[index];
-        if arg.starts_with('-') && arg != "-" {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            index += 1;
+            continue;
+        }
+        if parsing_options && arg.starts_with('-') && arg != "-" {
             let mut options = arg[1..].char_indices().peekable();
             while let Some((offset, option)) = options.next() {
                 match option {
@@ -166,6 +175,7 @@ where
                 }
             }
         } else {
+            parsing_options = false;
             operands.push(arg.as_str());
         }
         index += 1;
@@ -212,10 +222,10 @@ where
         return Ok(status);
     }
 
-    // GNU enable with no operands lists builtins in every mode: plain
-    // lists enabled ones, -n lists disabled ones (builtins.tests:
-    // "enable -n | grep test" must show a disabled builtin).
-    if operands.is_empty() {
+    // GNU builtins/enable.def (`if (list == 0 || (flags & PFLAG))`): `-p`
+    // lists even when operands are present — the operands are ignored
+    // (rubash#1397). Plain `enable` with no operands lists in every mode.
+    if operands.is_empty() || reusable {
         if special_only {
             let disabled = disabled_builtins(env_vars);
             for name in SPECIAL_BUILTINS {
