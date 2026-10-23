@@ -382,7 +382,38 @@ where
             return Ok(0);
         }
         let mut status = 0;
-        for value in &args[1..] {
+        let mut i = 1;
+        while i < args.len() {
+            let value = &args[i];
+            // GNU builtins/kill.def:114-132: `-s`/`-n` (separate or attached)
+            // are processed even when `-l` was seen; a trailing `-s` with no
+            // argument is `sh_needarg` ("option requires an argument"),
+            // not "invalid signal specification" (rubash#1399). The consumed
+            // sigspec is not listed.
+            if value == "-s" || value == "-n" {
+                if args.get(i + 1).is_none() {
+                    writeln!(
+                        stderr,
+                        "{}kill: {value}: option requires an argument",
+                        diagnostic_prefix()
+                    )?;
+                    return Ok(1);
+                }
+                i += 2;
+                continue;
+            }
+            let attached = value
+                .strip_prefix("-s")
+                .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+                .or_else(|| {
+                    value
+                        .strip_prefix("-n")
+                        .filter(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                });
+            if attached.is_some() {
+                i += 1;
+                continue;
+            }
             // GNU builtins/common.c:795-810 display_signal_list: a numeric
             // argument is range-checked against NSIG; an IN-RANGE number
             // whose slot has no name (glibc's reserved RT slots 32/33 —
@@ -407,6 +438,7 @@ where
                 } else if let Some(translation) = signal_name(number) {
                     writeln!(stdout, "{translation}")?;
                 }
+                i += 1;
                 continue;
             }
             if let Some(translation) = translate_signal(value) {
@@ -419,6 +451,7 @@ where
                 )?;
                 status = 1;
             }
+            i += 1;
         }
         return Ok(status);
     }
@@ -659,7 +692,8 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
         return Some("EXIT");
     }
 
-    if value == "EXIT" || value == "SIGEXIT" {
+    // DSIG_NOCASE: the EXIT pseudo-signal folds case too.
+    if value.eq_ignore_ascii_case("EXIT") || value.eq_ignore_ascii_case("SIGEXIT") {
         return Some("0");
     }
 
@@ -674,11 +708,12 @@ pub fn translate_signal(value: &str) -> Option<&'static str> {
     signal_number(name)
 }
 
-/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms. POSIX
-/// mode rejects the SIG-prefixed spelling outright; every other value falls
-/// through to the shared [`translate_signal`] table.
+/// The kill signal-spec validator for the `-s`/`-n`/`-SPEC` forms. GNU
+/// kill.def:103 sets DSIG_NOCASE unconditionally but only adds
+/// DSIG_SIGPREFIX when not posixly_correct: names fold case, but a
+/// SIG-prefixed spelling (any case) is rejected in POSIX mode.
 fn sigspec_accepted(value: &str, posix: bool) -> bool {
-    if posix && value.starts_with("SIG") {
+    if posix && value.len() > 3 && value[..3].eq_ignore_ascii_case("SIG") {
         return false;
     }
     translate_signal(value).is_some()
@@ -1336,9 +1371,13 @@ fn signal_name(number: i32) -> Option<&'static str> {
 }
 
 fn signal_number(name: &str) -> Option<&'static str> {
+    // GNU trap.c decode_signal with DSIG_NOCASE (kill.def:103 sets it
+    // unconditionally): signal names fold case (rubash#1367 #1385 #1386).
     SIGNALS
         .iter()
-        .find_map(|(_, number, signal_name)| (*signal_name == name).then_some(*number))
+        .find_map(|(_, number, signal_name)| {
+            signal_name.eq_ignore_ascii_case(name).then_some(*number)
+        })
 }
 
 fn write_signal_list<W>(stdout: &mut W) -> io::Result<()>
