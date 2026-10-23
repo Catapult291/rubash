@@ -84,6 +84,31 @@ pub(in crate::executor) fn local_names(args: &[String]) -> Vec<String> {
     names
 }
 
+/// All operand words for `local`: flags before `--`/the first operand are
+/// skipped, but everything after a bare `--` counts as an operand even when
+/// it looks like a flag (`local -- -p` names `-p`, rubash#1377). Used to
+/// tell "no operands" apart from "operands with invalid names".
+pub(in crate::executor) fn local_operands(args: &[String]) -> Vec<&str> {
+    let mut parsing_options = true;
+    let mut operands = Vec::new();
+    for arg in args {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+        if parsing_options
+            && (arg.starts_with('-') || arg.starts_with('+'))
+            && arg != "-"
+            && arg != "+"
+        {
+            continue;
+        }
+        parsing_options = false;
+        operands.push(arg.as_str());
+    }
+    operands
+}
+
 pub(in crate::executor) fn local_stderr_from_declare(stderr: Vec<u8>) -> Vec<u8> {
     String::from_utf8(stderr)
         .map(|text| text.replace("declare:", "local:").into_bytes())

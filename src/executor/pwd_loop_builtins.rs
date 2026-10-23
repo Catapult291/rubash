@@ -198,6 +198,13 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         let args = &cmd.words[1..];
         let mut stderr = Vec::new();
+        // GNU builtins/common.c get_exitstat: ISOPTION(word, '-') skips a
+        // leading `--` before the status word — `return -- N` returns N
+        // (rubash#1379). Mirrors src/builtins/exit.rs.
+        let args: &[String] = match args.first().map(String::as_str) {
+            Some("--") => &args[1..],
+            _ => args,
+        };
         let status = if let Some(value) = args.first() {
             match value.parse::<i128>() {
                 Ok(value) => crate::builtins::exit::normalize_status(value),
