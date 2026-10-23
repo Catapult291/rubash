@@ -3,10 +3,19 @@ use super::*;
 #[cfg(any(windows, unix))]
 use crate::executor::fd_table::FdEntry;
 
-fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (String, i32) {
+fn timed_read_value(
+    input: &TimedPipelineInput,
+    start: f64,
+    timeout: f64,
+    char_limit: Option<(usize, bool)>,
+) -> (String, i32) {
     if timeout == 0.0 {
         let ready = input.chunks.iter().any(|(at, _)| *at <= start) || input.eof_at <= start;
         return (String::new(), if ready { 0 } else { 1 });
+    }
+    // read.def: a -n/-N quota of 0 is satisfied before any byte arrives.
+    if char_limit.is_some_and(|(limit, _)| limit == 0) {
+        return (String::new(), 0);
     }
 
     let deadline = start + timeout;
@@ -16,24 +25,41 @@ fn timed_read_value(input: &TimedPipelineInput, start: f64, timeout: f64) -> (St
             break;
         }
         value.push_str(chunk);
-        if let Some(newline) = value.find('\n') {
-            value.truncate(newline);
-            // CRLF input (`read -t`): the '\r' that precedes the newline is
-            // part of the terminator on Windows, matching `read`'s non-timed
-            // path. Unix keeps the '\r' — GNU read removes only the '\n'
-            // delimiter (WSL baseline: `printf 'a\r\n' | read x` -> "a\r").
-            if cfg!(windows) && value.ends_with('\r') {
-                value.pop();
+        // GNU read.def:884-886: -n stops at the limit OR the delimiter,
+        // -N ignores the delimiter and reads the quota exactly.
+        if let Some(&(limit, _)) = char_limit.as_ref() {
+            if value.chars().count() >= limit {
+                return (value.chars().take(limit).collect(), 0);
             }
-            return (value, 0);
+        }
+        if char_limit.map(|(_, exact)| !exact).unwrap_or(true) {
+            if let Some(newline) = value.find('\n') {
+                value.truncate(newline);
+                // CRLF input (`read -t`): the '\r' that precedes the newline is
+                // part of the terminator on Windows, matching `read`'s non-timed
+                // path. Unix keeps the '\r' — GNU read removes only the '\n'
+                // delimiter (WSL baseline: `printf 'a\r\n' | read x` -> "a\r").
+                if cfg!(windows) && value.ends_with('\r') {
+                    value.pop();
+                }
+                return (value, 0);
+            }
         }
     }
 
     if input.eof_at <= deadline {
-        return (
-            value.trim_capture_terminator().to_string(),
-            if value.is_empty() { 1 } else { 0 },
-        );
+        return match char_limit {
+            // GNU read.def:949: EOF before -n/-N's quota is an unterminated
+            // record — the partial value is still assigned but the builtin
+            // fails. -N keeps the record raw (no delimiter processing);
+            // -n trims the capture terminator.
+            Some((_, true)) => (value, 1),
+            Some((_, false)) => (value.trim_capture_terminator().to_string(), 1),
+            None => (
+                value.trim_capture_terminator().to_string(),
+                if value.is_empty() { 1 } else { 0 },
+            ),
+        };
     }
 
     (value, 142)
@@ -1143,9 +1169,9 @@ impl Executor {
                         .and_then(|word| self.expand_word(word).parse::<f64>().ok())?;
                 }
                 "read" if !saw_read => {
-                    let (timeout, name) = self.timed_read_options(command)?;
+                    let (timeout, char_limit, name) = self.timed_read_options(command)?;
                     read_name = name;
-                    let (value, status) = timed_read_value(input, at, timeout);
+                    let (value, status) = timed_read_value(input, at, timeout, char_limit);
                     read_value = value;
                     read_status = status;
                     saw_read = true;
@@ -1166,8 +1192,14 @@ impl Executor {
         saw_read.then_some((output, last_status))
     }
 
-    fn timed_read_options(&mut self, command: &CommandNode) -> Option<(f64, String)> {
+    fn timed_read_options(
+        &mut self,
+        command: &CommandNode,
+    ) -> Option<(f64, Option<(usize, bool)>, String)> {
         let mut timeout = None;
+        // (quota, exact): -n stops at the delimiter or the quota, -N
+        // ignores the delimiter (GNU read.def -n/-N).
+        let mut char_limit = None;
         let mut names = Vec::new();
         let mut index = 1usize;
         while index < command.words.len() {
@@ -1178,12 +1210,18 @@ impl Executor {
                     .words
                     .get(index)
                     .and_then(|word| self.expand_word(word).parse::<f64>().ok());
+            } else if word == "-n" || word == "-N" {
+                let exact = word == "-N";
+                index += 1;
+                let operand = command.words.get(index)?;
+                char_limit = Some((self.expand_word(operand).parse::<usize>().ok()?, exact));
             } else if let Some(value) = word.strip_prefix("-t").filter(|value| !value.is_empty()) {
                 timeout = value.parse::<f64>().ok();
-            } else if matches!(
-                word.as_str(),
-                "-a" | "-d" | "-i" | "-n" | "-N" | "-p" | "-u"
-            ) {
+            } else if let Some(value) = word.strip_prefix("-N").filter(|value| !value.is_empty()) {
+                char_limit = Some((value.parse::<usize>().ok()?, true));
+            } else if let Some(value) = word.strip_prefix("-n").filter(|value| !value.is_empty()) {
+                char_limit = Some((value.parse::<usize>().ok()?, false));
+            } else if matches!(word.as_str(), "-a" | "-d" | "-i" | "-p" | "-u") {
                 index += 1;
             } else if word.starts_with('-') {
             } else {
@@ -1193,6 +1231,7 @@ impl Executor {
         }
         Some((
             timeout?,
+            char_limit,
             names
                 .into_iter()
                 .next()
