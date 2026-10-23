@@ -37,41 +37,28 @@ where
         return Ok(EXECUTION_FAILURE);
     }
 
-    let mut print = args.is_empty();
     let mut delete = false;
-    let mut pathname = None;
+    let mut pathname: Option<&str> = None;
     let mut translate = false;
     let mut reusable = false;
-    let mut names = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
     let mut index = 0;
+    // GNU builtins/bashgetopt.c:76 (NOTOPT) and :84-89: option parsing ends
+    // at the first non-option word or at a bare `--` (consumed, not an
+    // operand); everything from there on is a name. Mirrors
+    // `internal_getopt (list, "dlp:rt")` in builtins/hash.def:95.
+    // (rubash#1375 `hash -- ls`, #1389 trailing `--`, #1382 `-p` name tail.)
+    let mut parsing_options = true;
 
     while let Some(arg) = args.get(index) {
-        if arg == "-p" || arg.starts_with("-p") {
-            let value = if arg == "-p" {
-                let Some(value) = args.get(index + 1).map(String::as_str) else {
-                    writeln!(
-                        stderr,
-                        "{}hash: -p: option requires an argument",
-                        script_prefix(env_vars)
-                    )?;
-                    writeln!(
-                        stderr,
-                        "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
-                    )?;
-                    return Ok(EX_USAGE);
-                };
-                index += 1;
-                value
-            } else {
-                &arg[2..]
-            };
-            pathname = Some(value);
-            if let Some(name) = args.get(index + 1) {
-                names.push(name.as_str());
-            }
-            break;
-        } else if let Some(options) = arg.strip_prefix('-') {
-            for option in options.chars() {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            index += 1;
+            continue;
+        }
+        if parsing_options && arg.starts_with('-') && *arg != "-" {
+            let mut chars = arg[1..].char_indices();
+            while let Some((offset, option)) = chars.next() {
                 match option {
                     'r' => {
                         env_vars.remove(HASH_TABLE);
@@ -85,7 +72,30 @@ where
                     't' => translate = true,
                     'l' => {
                         reusable = true;
-                        print = true;
+                    }
+                    'p' => {
+                        // GNU: `-p` takes the rest of the word or the next
+                        // word as its pathname argument (bashgetopt.c).
+                        let value_start = 1 + offset + option.len_utf8();
+                        if value_start < arg.len() {
+                            pathname = Some(&arg[value_start..]);
+                        } else {
+                            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                                writeln!(
+                                    stderr,
+                                    "{}hash: -p: option requires an argument",
+                                    script_prefix(env_vars)
+                                )?;
+                                writeln!(
+                                    stderr,
+                                    "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
+                                )?;
+                                return Ok(EX_USAGE);
+                            };
+                            index += 1;
+                            pathname = Some(value);
+                        }
+                        break;
                     }
                     other => {
                         writeln!(
@@ -102,6 +112,7 @@ where
                 }
             }
         } else {
+            parsing_options = false;
             names.push(arg.as_str());
         }
         index += 1;
@@ -143,32 +154,46 @@ where
                 return Ok(EXECUTION_FAILURE);
             }
         }
-        if let Some(name) = names.first().copied() {
-            if pathname == "/" {
-                writeln!(
-                    stderr,
-                    "{}hash: {pathname}: Is a directory",
-                    script_prefix(env_vars)
-                )?;
-                return Ok(EXECUTION_FAILURE);
+        // GNU builtins/hash.def:131-135: `hash -p pathname` with no name is a
+        // usage error (EX_USAGE), not a table print (rubash#1360).
+        if names.is_empty() {
+            writeln!(
+                stderr,
+                "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]"
+            )?;
+            return Ok(EX_USAGE);
+        }
+        if pathname == "/" {
+            writeln!(
+                stderr,
+                "{}hash: {pathname}: Is a directory",
+                script_prefix(env_vars)
+            )?;
+            return Ok(EXECUTION_FAILURE);
+        }
+        // GNU builtins/hash.def:190-196: with `-p`, every name is inserted
+        // via phash_insert; a name containing '/' is silently skipped
+        // (absolute_program → continue), never stored (rubash#1360 #1362).
+        // GNU hash.def `hash -p PATH NAME`: phash_insert(name, pathname)
+        // makes subsequent lookups of `name` return `pathname` without a
+        // PATH scan. Mirror that in the in-memory lookup cache so
+        // find_user_command(name) returns the same path external_inner
+        // would execute. Convert through shell_path_to_windows so the
+        // cached PathBuf matches the Windows-native form produced by
+        // find_user_command_uncached.
+        for name in &names {
+            if name.contains('/') {
+                continue;
             }
             table.insert(
-                name.to_string(),
+                (*name).to_string(),
                 (pathname.to_string(), 0, next_hash_seq(&table)),
             );
-            store_hash_table(env_vars, &table);
-            // GNU hash.def `hash -p PATH NAME`: phash_insert(name, pathname)
-            // makes subsequent lookups of `name` return `pathname` without a
-            // PATH scan. Mirror that in the in-memory lookup cache so
-            // find_user_command(name) returns the same path external_inner
-            // would execute. Convert through shell_path_to_windows so the
-            // cached PathBuf matches the Windows-native form produced by
-            // find_user_command_uncached.
             let cached_path = crate::executor::path::shell_path_to_windows(pathname, env_vars);
             crate::executor::path::set_command_lookup_cache(name, Some(cached_path));
-            return Ok(EXECUTION_SUCCESS);
         }
-        print = true;
+        store_hash_table(env_vars, &table);
+        return Ok(EXECUTION_SUCCESS);
     }
 
     if delete {
@@ -191,6 +216,9 @@ where
 
     if translate {
         let mut status = EXECUTION_SUCCESS;
+        // GNU builtins/hash.def list_hashed_filename_targets: with several
+        // names each line is prefixed with `name\t`.
+        let multiple = names.len() > 1;
         for name in names {
             // GNU phash_search -> hash_search bumps times_found on a hit
             // (hashlib.c:254).
@@ -198,10 +226,25 @@ where
                 *hits += 1;
                 let path = path.clone();
                 let _ = (hits, seq);
-                if reusable {
-                    writeln!(stdout, "builtin hash -p {path} {name}")?;
-                } else {
-                    writeln!(stdout, "{path}")?;
+                // GNU hashcmd.c phash_search: a stored relative path prints
+                // `./`-prefixed when that form is executable, and reports
+                // not-found when it resolves to `.` itself unexecutably
+                // (rubash#1361).
+                match phash_search_target(&path) {
+                    Some(target) => {
+                        if reusable {
+                            writeln!(stdout, "builtin hash -p {target} {name}")?;
+                        } else {
+                            if multiple {
+                                write!(stdout, "{name}\t")?;
+                            }
+                            writeln!(stdout, "{target}")?;
+                        }
+                    }
+                    None => {
+                        writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
+                        status = EXECUTION_FAILURE;
+                    }
                 }
             } else {
                 writeln!(stderr, "{}hash: {name}: not found", script_prefix(env_vars))?;
@@ -212,7 +255,10 @@ where
         return Ok(status);
     }
 
-    if print {
+    // GNU builtins/hash.def:138-146: the table print happens only when no
+    // names were given (`list == 0`) and the table was not just expunged;
+    // `-l` with names goes through the name loop above (rubash#1368).
+    if names.is_empty() {
         if !table.is_empty() {
             if !reusable {
                 writeln!(stdout, "hits\tcommand")?;
@@ -258,6 +304,12 @@ where
     if !names.is_empty() {
         let mut status = EXECUTION_SUCCESS;
         for name in names {
+            // GNU builtins/hash.def:192-193: absolute_program(w) → continue.
+            // A name containing '/' is never hashed and never reported
+            // (rubash#1362); general.c:864 defines it as containing a slash.
+            if name.contains('/') {
+                continue;
+            }
             // Drop any stale remembered location so the PATH scan is
             // authoritative.
             crate::executor::path::remove_command_lookup_cache(name);
@@ -320,6 +372,49 @@ pub(crate) fn hashed_entries(env_vars: &HashMap<String, String>) -> Vec<(String,
         .collect();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries
+}
+
+/// GNU hashcmd.c:123-191 phash_search, as used by `hash -t`
+/// (list_hashed_filename_targets): resolve the stored path to its display
+/// target. A stored relative path (RELPATH, general.h:267) prints
+/// `./`-prefixed when that dotted form is executable; when it is not
+/// executable and its directory is the current directory, the entry counts
+/// as not found (None). Absolute paths print as stored. (rubash#1361)
+fn phash_search_target(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        let dotted: std::borrow::Cow<str> = if path.starts_with("./") {
+            std::borrow::Cow::Borrowed(path)
+        } else {
+            std::borrow::Cow::Owned(format!("./{path}"))
+        };
+        if crate::executor::path::is_executable_file(std::path::Path::new(dotted.as_ref())) {
+            return Some(dotted.into_owned());
+        }
+        // hashcmd.c:183-196: only when the dotted form is not executable
+        // and the stored path starts with '.'.
+        if path.starts_with('.') {
+            if let Some((dir, _)) = path.rsplit_once('/') {
+                let dir = if dir.is_empty() { "." } else { dir };
+                if same_file(".", dir) {
+                    return None;
+                }
+            }
+        }
+        return Some(path.to_string());
+    }
+    Some(path.to_string())
+}
+
+/// device+inode identity (hashcmd.c same_file); canonicalized-path
+/// comparison is close enough for the directory-identity test here.
+fn same_file(first: &str, second: &str) -> bool {
+    match (
+        std::fs::canonicalize(first),
+        std::fs::canonicalize(second),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// GNU hashlib.c:208-222 hash_string — the FNV-1 variant
