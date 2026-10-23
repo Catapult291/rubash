@@ -2154,6 +2154,34 @@ fn test_lastpipe_final_assignment_updates_current_shell() {
 }
 
 #[test]
+fn test_lastpipe_final_brace_group_updates_current_shell() {
+    // rubash#1320: GNU execute_pipeline runs the lastpipe element through
+    // execute_command in the current shell, where cm_group dispatches to
+    // execute_group_command (execute_cmd.c:1104). The stage used to fall to
+    // execute_empty_words_command and drop the body entirely.
+    let _cwd_guard = CwdGuard::take();
+    let inner_path = "target/rubash-lastpipe-brace-inner-output.txt";
+    let output_path = "target/rubash-lastpipe-brace-output.txt";
+    let _ = fs::remove_file(inner_path);
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s lastpipe; printf value | {{ read result; echo in=$result; }} > {inner_path}; echo out=$result > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(inner_path).unwrap(), "in=value\n");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "out=value\n");
+    let _ = fs::remove_file(inner_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
 fn test_lastpipe_preserves_pipeline_statuses() {
     let _cwd_guard = CwdGuard::take();
     let output_path = "target/rubash-lastpipe-pipestatus-output.txt";

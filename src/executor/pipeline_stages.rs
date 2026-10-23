@@ -51,8 +51,22 @@ impl Executor {
         // Direct-stdout builtins in the stage consult the thread-local
         // capture, which belongs to an enclosing capture when this pipeline
         // runs inside one; give the stage its own capture.
-        let (thread_captured, result) =
-            crate::executor::shell_options::capture_stdout(|| self.execute_command(command));
+        let (thread_captured, result) = crate::executor::shell_options::capture_stdout(|| {
+            // GNU execute_pipeline hands the lastpipe element to
+            // execute_command in the current shell, where cm_group
+            // dispatches to execute_group_command (execute_cmd.c:1104).
+            // execute_command's compound dispatch has no brace-group arm —
+            // the AST loop peels groups into execute_brace_group_pipeline
+            // first — so a typed group node here fell to
+            // execute_empty_words_command and dropped the body
+            // (rubash#1320). Dispatch the group to that port the way
+            // execute_compound_pipeline_stage does.
+            if command.brace_group.is_some() {
+                self.execute_brace_group_pipeline(command).map(|_| ())
+            } else {
+                self.execute_command(command)
+            }
+        });
         let mut output = self.stdout_capture.take().unwrap_or_default();
         output.extend_from_slice(&thread_captured);
         let stderr = self.stderr_capture.take().unwrap_or_default();
