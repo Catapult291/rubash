@@ -93,7 +93,7 @@ impl Executor {
                 // skip-and-abandon path keeps the shell running, and an
                 // unbalanced tempenv mark would corrupt every later restore.
                 self.restore_temporary_assignments(applied);
-                if special {
+                if special || self.evalerror_pending.get() {
                     // GNU subst.c:13186-13195 (the tempenv arm):
                     // bash_variable_assignment_error(is_special_builtin)
                     // jumps FORCE_EOF for a special builtin
@@ -101,10 +101,25 @@ impl Executor {
                     // run_one_command remaps the jump to 127 under -c while
                     // script mode exits 1 (eval.c:104-109) and subshell
                     // children contain it at 1 (execute_cmd.c:1811).
+                    // A DISCARD-class expansion error (evalerror pending)
+                    // is expand_wdesc_fatal under posixly_correct
+                    // (subst.c:10881-10888): FORCE_EOF for every command
+                    // class, special or not (rubash#1226).
                     let code = self.expansion_fatal_status();
                     self.exit_code = code;
                     return Err(ExecuteError::ExitCode(code));
                 }
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            // rubash#1226: a DISCARD-class expansion error raised inside the
+            // prefix expansion (arith evalerror, subscript trap) armed the
+            // reader-level abort — GNU's jump fires inside expand_words
+            // (subst.c:13101-13105), so the command is SKIPPED in every
+            // mode and the rest of the list is abandoned. The failing
+            // bind never landed; restore the partial tempenv first.
+            if assignments_failed && self.evalerror_pending.get() {
+                self.exit_code = 1;
+                self.restore_temporary_assignments(applied);
                 return Err(ExecuteError::ExpansionFailure(1));
             }
             applied

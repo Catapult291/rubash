@@ -3503,6 +3503,26 @@ impl Executor {
             let _ = self.finish_process_substitutions(process_substitution_files);
             let _ =
                 self.finish_assignment_output_process_substitutions_for_command(&materialized_cmd);
+            // A DISCARD-class expansion error (evalerror pending) is
+            // expand_wdesc_fatal under posixly_correct — FORCE_EOF, not the
+            // skip-and-abandon (subst.c:10881-10888, rubash#1226).
+            if self.evalerror_pending.get() {
+                let code = self.expansion_fatal_status();
+                self.exit_code = code;
+                return Some(Err(ExecuteError::ExitCode(code)));
+            }
+            return Some(Err(ExecuteError::ExpansionFailure(1)));
+        }
+        // rubash#1226: a DISCARD-class expansion error raised inside the
+        // prefix expansion armed the reader-level abort — GNU's jump fires
+        // inside expand_words, so the function is SKIPPED in every mode and
+        // the rest of the list is abandoned.
+        if assignments_failed && self.evalerror_pending.get() {
+            self.exit_code = 1;
+            self.restore_temporary_assignments(temporary_assignments);
+            let _ = self.finish_process_substitutions(process_substitution_files);
+            let _ =
+                self.finish_assignment_output_process_substitutions_for_command(&materialized_cmd);
             return Some(Err(ExecuteError::ExpansionFailure(1)));
         }
         // GNU variables.c push_context: the function-call tempenv becomes the
