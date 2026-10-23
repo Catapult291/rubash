@@ -535,22 +535,24 @@ impl Executor {
         let mut format = String::new();
         for ch in chars.by_ref() {
             if ch == '}' {
-                // GNU parse.y:6390-6425 `case 'D'`: an empty timefmt becomes
-                // "%X" (locale-specific current time) before the system
-                // strftime call; the result is backslash-quoted for double
-                // quotes when the expansion pass will run (parse.y:6430-6436).
-                let effective = if format.is_empty() {
-                    "%X"
-                } else {
-                    format.as_str()
-                };
-                let rendered = self.prompt_time(effective);
-                return self.prompt_quote_for_expansion(&rendered);
+                break;
             }
             format.push(ch);
         }
-
-        format!("\\D{{{format}")
+        // GNU parse.y:6390-6425 `case 'D'`: the format run ends at `}` or
+        // at end of string alike — an unclosed brace still formats
+        // (parse.y:6398-6400 scan stops at NUL; `c` stays 0 so add_string
+        // does not re-emit `\D`). An empty timefmt becomes "%X" (locale-
+        // specific current time) before the system strftime call; the
+        // result is backslash-quoted for double quotes when the
+        // expansion pass will run (parse.y:6430-6436). rubash#1099.
+        let effective = if format.is_empty() {
+            "%X"
+        } else {
+            format.as_str()
+        };
+        let rendered = self.prompt_time(effective);
+        self.prompt_quote_for_expansion(&rendered)
     }
 
     /// parse.y:6434/6452/6533/6549/6563 — the decode outputs that carry

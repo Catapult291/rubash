@@ -75,10 +75,13 @@ pub(super) fn strftime_subset(format: &str, time: &LocalTimeParts) -> String {
             )),
             other => {
                 // GNU parse.y `case 'D'` / printf.def `%()T` delegate to the
-                // system strftime; glibc drops an unknown `%x` to the bare
-                // `x` (probe-verified on bash 5.3.20: `\D{%N}` -> `N`,
-                // `%( %N)T` -> `N`). `%%` stays `%` (arm above); a trailing
-                // lone `%` is kept verbatim (arm above).
+                // system strftime; glibc emits an unknown conversion
+                // verbatim as `%x` — the `%` is kept (probe-verified on
+                // bash 5.3.20 + glibc strftime: `\D{%N}` -> `%N`,
+                // `%( %N)T` -> `%N`, `strftime("%Q")` -> `%Q`). `%%`
+                // stays `%` (arm above); a trailing lone `%` is kept
+                // verbatim (arm above). rubash#1099.
+                output.push('%');
                 output.push(other);
             }
         }
