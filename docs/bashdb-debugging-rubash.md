@@ -3,6 +3,22 @@
 This note documents the supported workflow for running a clean external bashdb
 against scripts executed by `target/debug/rubash.exe`.
 
+## Startup Integration (--debugger, rubash#1191/#1192)
+
+Since the #1191/#1192 startup change, `rubash --debugger script.sh` mirrors
+GNU bash: after option parsing the shell sources the bashdb starter file
+(`bashdb-main.inc`) before your script runs, then clears the mode with
+GNU's diagnostic pair if no starter exists. Search order:
+`$BASHDB_START_FILE` (seam for nonstandard prefixes — Termux, custom
+`--prefix`), `/usr/local/share/bashdb/bashdb-main.inc`,
+`/usr/share/bashdb/bashdb-main.inc`. With the `target/bashdb-clean`
+fixture, set `BASHDB_START_FILE` to its `bashdb-main.inc` to drive the
+whole flow through the flag instead of the launcher script. The flag
+never sets extdebug itself — the starter's `shopt -s extdebug` does,
+exactly like GNU (shell.c:257/:1547). `--debug` is a separate niu
+extension: extdebug armed from the first command, no bashdb attempt
+(GNU's own `--debug` is a write-only variable nothing reads).
+
 ## Current Status
 
 Rubash can now run the clean bashdb command loop well enough for the core
