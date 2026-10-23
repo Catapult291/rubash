@@ -1224,26 +1224,123 @@ impl Executor {
     }
 
     fn external_rm(&mut self, cmd: &CommandNode) -> Result<bool, ExecuteError> {
-        let force = cmd
-            .words
-            .iter()
-            .skip(1)
-            .any(|arg| arg.starts_with('-') && arg.contains('f'));
-        let mut status = 0;
-        let mut stderr = Vec::new();
-        for path in cmd.words.iter().skip(1).filter(|arg| !arg.starts_with('-')) {
+        // GNU rm (coreutils rm.c): -r/-R/--recursive removes directories,
+        // -d/--dir removes empty ones, and a directory operand without
+        // either is an error — never an implicit recursion. -f ignores
+        // failures for NONEXISTENT operands only; every other failure keeps
+        // its diagnostic and status 1. Options accept the `--` terminator
+        // and may follow operands (argv permutation in getopt_long).
+        let mut force = false;
+        let mut recursive = false;
+        let mut remove_empty_dir = false;
+        let mut verbose = false;
+        let mut no_more_options = false;
+        let mut usage_error = false;
+        let mut operands: Vec<&str> = Vec::new();
+
+        for word in cmd.words.iter().skip(1) {
             // argv as-is — no second expand_word pass (issue #555, see
             // external_mkdir): a quoted '$FIX/r' must fail on the literal
             // name, never remove the expanded neighbor.
-            let expanded = path.as_str();
+            let expanded = word.as_str();
+            if no_more_options || expanded == "-" || !expanded.starts_with('-') {
+                operands.push(expanded);
+                continue;
+            }
+            if expanded == "--" {
+                no_more_options = true;
+                continue;
+            }
+            if let Some(long) = expanded.strip_prefix("--") {
+                let name = long.split('=').next().unwrap_or(long);
+                match name {
+                    // The real binary owns these two texts.
+                    "help" | "version" => return Ok(false),
+                    "force" => force = true,
+                    "recursive" => recursive = true,
+                    "dir" => remove_empty_dir = true,
+                    "verbose" => verbose = true,
+                    "interactive" | "one-file-system" | "preserve-root"
+                    | "no-preserve-root" => {}
+                    other => {
+                        eprintln!("rm: unrecognized option '--{other}'");
+                        usage_error = true;
+                    }
+                }
+                continue;
+            }
+            for flag in expanded[1..].chars() {
+                match flag {
+                    'f' => force = true,
+                    'r' | 'R' => recursive = true,
+                    'd' => remove_empty_dir = true,
+                    'v' => verbose = true,
+                    // Prompting needs the interactive input path; the option
+                    // is accepted so -i/-I never deletes a literal `-i`.
+                    'i' | 'I' => {}
+                    other => {
+                        eprintln!("rm: invalid option -- '{other}'");
+                        usage_error = true;
+                    }
+                }
+            }
+        }
+
+        if usage_error {
+            eprintln!("Try 'rm --help' for more information.");
+            self.exit_code = 1;
+            return Ok(true);
+        }
+        if operands.is_empty() {
+            eprintln!("rm: missing operand");
+            eprintln!("Try 'rm --help' for more information.");
+            self.exit_code = 1;
+            return Ok(true);
+        }
+
+        let mut status = 0;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for expanded in operands {
             let target = shell_path_to_windows(expanded, &self.shell_state.env_vars);
-            let result = if target.is_dir() {
-                fs::remove_dir_all(&target)
-            } else {
-                fs::remove_file(&target)
+            let result = match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // A symlink operand names the link itself; a directory
+                    // link is unlinked with remove_dir.
+                    if target.is_dir() {
+                        fs::remove_dir(&target)
+                    } else {
+                        fs::remove_file(&target)
+                    }
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    if recursive {
+                        fs::remove_dir_all(&target)
+                    } else if remove_empty_dir {
+                        fs::remove_dir(&target)
+                    } else {
+                        status = 1;
+                        writeln!(&mut stderr, "rm: cannot remove '{expanded}': Is a directory")?;
+                        continue;
+                    }
+                }
+                Ok(_) => fs::remove_file(&target),
+                Err(error) => Err(error),
             };
-            if let Err(error) = result {
-                if !force {
+            match result {
+                Ok(()) => {
+                    if verbose {
+                        writeln!(&mut stdout, "removed '{expanded}'")?;
+                    }
+                }
+                // GNU rm -f removes the "did not exist" diagnostic; it is
+                // not a license to hide a failed removal.
+                Err(error)
+                    if force
+                        && (error.kind() == io::ErrorKind::NotFound
+                            || (cfg!(windows)
+                                && contains_windows_forbidden_posix_filename_char(&expanded))) => {}
+                Err(error) => {
                     status = 1;
                     let message = if matches!(
                         error.kind(),
@@ -1252,16 +1349,16 @@ impl Executor {
                         && contains_windows_forbidden_posix_filename_char(&expanded))
                     {
                         "No such file or directory".to_string()
+                    } else if cfg!(windows) && error.raw_os_error() == Some(145) {
+                        "Directory not empty".to_string()
                     } else {
                         crate::posix_errors::message(&error)
                     };
-                    writeln!(&mut stderr, "rm: cannot remove '{}': {message}", expanded)?;
+                    writeln!(&mut stderr, "rm: cannot remove '{expanded}': {message}")?;
                 }
             }
         }
-        if !stderr.is_empty() {
-            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
-        }
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         self.exit_code = status;
         Ok(true)
     }
