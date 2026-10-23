@@ -19,7 +19,7 @@ const DISABLED_BUILTINS: &str = "__RUBASH_DISABLED_BUILTINS";
 const EXPORTED_VARS: &str = "__RUBASH_EXPORTED_VARS";
 const ARRAY_VARS: &str = "__RUBASH_ARRAY_VARS";
 const ASSOC_VARS: &str = "__RUBASH_ASSOC_VARS";
-const SERVICE_NAMES: &str = "__RUBASH_SERVICE_NAMES";
+
 const SHELL_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -843,7 +843,7 @@ pub(crate) fn apply_completion_actions(
             "group" => candidates.extend(group_completion_candidates(env_vars)),
             "job" | "running" => candidates.extend(job_completion_candidates(job_names)),
             "keyword" => candidates.extend(SHELL_KEYWORDS.iter().map(|s| s.to_string())),
-            "service" => candidates.extend(service_completion_candidates(env_vars, word)),
+            "service" => candidates.extend(service_completion_candidates(word)),
             "setopt" => candidates.extend(SETOPT_COMPLETIONS.iter().map(|s| s.to_string())),
             "shopt" => candidates.extend(SHOPT_COMPLETIONS.iter().map(|s| s.to_string())),
             "signal" => candidates.extend(signal_completion_candidates()),
@@ -1387,51 +1387,53 @@ fn group_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String
     candidates
 }
 
-fn service_completion_candidates(
-    env_vars: &crate::shell::var_table::VarTable,
-    word: &str,
-) -> Vec<String> {
+fn service_completion_candidates(word: &str) -> Vec<String> {
     // GNU bashline.c:2668 bash_servicename_completion_function walks
     // getservent() entries in database order: an entry contributes its
     // primary s_name when the name matches the word prefix; only when
     // the name does NOT match may the entry contribute a matching
     // alias instead — never both, and duplicates (tcp/udp pairs) are
-    // kept. On a files-backed NSS the database is /etc/services (name =
-    // first field, port/proto second, aliases after, `#` comments).
-    // rubash#1044.
-    #[cfg(unix)]
-    {
-        if let Ok(contents) = std::fs::read_to_string("/etc/services") {
-            let mut candidates = Vec::new();
-            for raw_line in contents.lines() {
-                let line = raw_line.split('#').next().unwrap_or("");
-                let mut fields = line.split_whitespace();
-                let Some(name) = fields.next() else {
-                    continue;
-                };
-                // field 2 is port/proto; the rest are aliases.
-                let _ = fields.next();
-                if name.starts_with(word) {
-                    candidates.push(name.to_string());
-                } else if let Some(alias) = fields.find(|alias| alias.starts_with(word)) {
-                    candidates.push(alias.to_string());
-                }
-            }
-            if !candidates.is_empty() {
-                return candidates;
-            }
+    // kept. The files-backed database is /etc/services on unix and
+    // %SystemRoot%\System32\drivers\etc\services on Windows (the file
+    // the OS resolver itself consults); the IANA layout is identical:
+    // name = first field, port/proto second, aliases after, `#`
+    // comments. With no readable database getservent yields nothing
+    // (rubash#1044).
+    let Ok(contents) = std::fs::read_to_string(services_db_path()) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("");
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        // field 2 is port/proto; the rest are aliases.
+        let _ = fields.next();
+        if name.starts_with(word) {
+            candidates.push(name.to_string());
+        } else if let Some(alias) = fields.find(|alias| alias.starts_with(word)) {
+            candidates.push(alias.to_string());
         }
     }
-    let mut candidates = ["SERVICE", "SERVICENAME"]
-        .iter()
-        .filter_map(|name| env_vars.get(*name))
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.extend(env_vars.marked_names(SERVICE_NAMES));
-    candidates.sort();
-    candidates.dedup();
     candidates
+}
+
+/// The system services database `getservent()` walks: /etc/services on
+/// unix; the resolver file the Windows TCP/IP stack reads on Windows.
+#[cfg(unix)]
+fn services_db_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/services")
+}
+
+#[cfg(windows)]
+fn services_db_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join(r"System32\drivers\etc\services")
 }
 
 fn variable_completion_candidates(env_vars: &HashMap<String, String>) -> Vec<String> {
