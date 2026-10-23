@@ -1,30 +1,28 @@
-//! Issue rubash#1158 regressions: interactive non-login shells perform the
-//! owner-decided "compatible reading" — source `$HOME/.bashrc` (the GNU
-//! parity migration path) and then `$HOME/.niubashrc` (niu's own config,
-//! running last so it overrides).
+//! Issue rubash#1158 regressions: interactive non-login shells use
+//! FALLBACK-ONLY rc selection (owner decision, revising the original
+//! compatible-reading stack): `~/.niubashrc` is the personal rc when it
+//! exists; otherwise `~/.bashrc` (the GNU parity migration path) is sourced.
+//! NEVER both — one config file per session, one blast radius, zero
+//! implicit stacking. A user who wants the bash layer under niu writes
+//! `source ~/.bashrc` in `~/.niubashrc` (explicit, visible, theirs — the
+//! same shape as bash's own .bash_profile → .bashrc chain).
 //!
-//! Before this change the engine sourced NO startup files on Windows:
+//! Before #1187 the engine sourced NO startup files on Windows:
 //! `run_startup_files` was `#[cfg(not(windows))]`-gated (src/main.rs),
 //! which is why `niu -i` ignored `~/.bashrc`. The login profile chain is
 //! deliberately untouched (rubash#1159 was closed NOT-A-BUG: a login shell
 //! sources profiles only, and a .bash_profile that wants .bashrc sources
 //! it itself — the user's script's job, not ours).
 //!
-//! Verified against the WSL GNU Bash 5.3.20 oracle (script-file probes,
-//! 2026-10-23):
+//! GNU oracle facts the fallback must not break (WSL GNU Bash 5.3.20,
+//! script-file probes, 2026-10-23): a bash-only home is byte-identical to
+//! GNU (the fallback IS GNU's own rc); `--norc` skips everything;
+//! `--rcfile f` replaces the whole personal-rc slot; non-interactive and
+//! login shells read no personal rc; a broken rc warns but startup
+//! continues.
 //!
-//! | case                                    | GNU 5.3.20 |
-//! | --- | --- |
-//! | `bash -i -c` + `~/.bashrc` marker       | marker, then AFTER, rc 0 |
-//! | `bash --norc -i -c`                     | AFTER only |
-//! | `bash --rcfile f -i -c` (defaults exist)| ONLY f runs |
-//! | `bash --rcfile missing -i -c`           | AFTER, silent, rc 0 |
-//! | `bash -c` (non-interactive)             | no rc at all |
-//! | syntax error in rc                      | diagnostic, AFTER, rc 0 |
-//! | `exit 7` in rc                          | shell ends, nothing after |
-//!
-//! The .niubashrc sibling is a product extension on top of that GNU list
-//! (the issue's #1158 decision), not a GNU behavior.
+//! The .niubashrc slot itself is a product extension (the #1158 decision),
+//! not a GNU behavior.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -117,10 +115,11 @@ fn run_i_c(args: &[&str], home_dir: &Path) -> Run {
 // The compatible-reading contract
 // ---------------------------------------------------------------------------
 
-/// GNU parity migration path: `~/.bashrc` alone is sourced by an
-/// interactive non-login shell, before the `-c` command.
+/// FALLBACK path: with no `~/.niubashrc`, `~/.bashrc` is sourced for an
+/// interactive non-login shell, before the `-c` command — byte-identical to
+/// GNU's own behavior for a bash-only home.
 #[test]
-fn bashrc_alone_is_sourced_for_interactive_shell() {
+fn bashrc_fallback_when_niubashrc_missing() {
     let dir = home("bashrc-only");
     write_rc(&dir, ".bashrc", "echo BASHRC-MARK\n");
     let run = run_i_c(&[], &dir);
@@ -141,10 +140,11 @@ fn niubashrc_alone_is_sourced_for_interactive_shell() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Both files: `.bashrc` runs first, `.niubashrc` second — proven by a
-/// variable the second file overwrites.
+/// Both files exist: ONLY `~/.niubashrc` runs — the fallback never stacks,
+/// so `.bashrc` is not even opened (no BASHRC-MARK, no side effects). A
+/// user who wants the stack writes `source ~/.bashrc` in `.niubashrc`.
 #[test]
-fn both_files_run_bashrc_first_niubashrc_last() {
+fn niubashrc_wins_when_both_exist() {
     let dir = home("both");
     write_rc(&dir, ".bashrc", "echo BASHRC-MARK\nMARKER=from-bashrc\n");
     write_rc(
@@ -158,7 +158,7 @@ fn both_files_run_bashrc_first_niubashrc_last() {
         b"",
     );
     assert_eq!(
-        run.stdout, "BASHRC-MARK\nNIUBASHRC-MARK\nAFTER\nMARKER=from-niubashrc\n",
+        run.stdout, "NIUBASHRC-MARK\nAFTER\nMARKER=from-niubashrc\n",
         "{run:?}"
     );
     assert_eq!(run.code, Some(0));
@@ -252,18 +252,35 @@ fn login_shell_reads_no_rc() {
 // parse_and_execute ordinary return), it does not abort startup.
 // ---------------------------------------------------------------------------
 
-/// A syntax error in `.bashrc` must not stop startup: the diagnostic
-/// prints, `.niubashrc` still runs, and the `-c` command still runs —
-/// verified `bash --rcfile bad.rc -i -c 'echo AFTER'` on WSL GNU 5.3.20
-/// (error + AFTER, rc 0). The diagnostic's exact shape is issue #1161's
-/// area, so this asserts only that a syntax error is reported.
+/// A broken `~/.bashrc` is completely inert when `~/.niubashrc` exists —
+/// fallback-only means it is never opened, so no diagnostic, no side
+/// effects, just the niu rc and the command.
 #[test]
-fn broken_bashrc_warns_but_niubashrc_and_command_still_run() {
+fn broken_bashrc_inert_when_niubashrc_exists() {
     let dir = home("broken");
     write_rc(&dir, ".bashrc", "if then\n");
     write_rc(&dir, ".niubashrc", "echo NIUBASHRC-MARK\n");
     let run = run_i_c(&[], &dir);
     assert_eq!(run.stdout, "NIUBASHRC-MARK\nAFTER\n", "{run:?}");
+    assert!(
+        !run.stderr.contains("syntax error"),
+        "bashrc must not be read at all, stderr: {:?}",
+        run.stderr
+    );
+    assert_eq!(run.code, Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With no `.niubashrc` the fallback DOES read a broken `.bashrc`: the
+/// diagnostic prints and startup continues — GNU's own rc contract
+/// (error + AFTER, rc 0; verified `bash --rcfile bad.rc -i -c` on WSL GNU
+/// 5.3.20). The diagnostic's exact shape is issue #1161's area.
+#[test]
+fn broken_bashrc_alone_warns_but_command_still_runs() {
+    let dir = home("broken-fallback");
+    write_rc(&dir, ".bashrc", "if then\n");
+    let run = run_i_c(&[], &dir);
+    assert_eq!(run.stdout, "AFTER\n", "{run:?}");
     assert!(
         run.stderr.contains("syntax error"),
         "expected a syntax diagnostic, stderr: {:?}",
@@ -297,17 +314,15 @@ fn broken_rcfile_warns_but_command_still_runs() {
 }
 
 /// The interactive reader path (`-i` with piped stdin) runs the same
-/// chain, ahead of the first command line.
+/// fallback selection, ahead of the first command line — and the ignored
+/// `.bashrc` stays untouched even here.
 #[test]
 fn interactive_stdin_reader_runs_the_chain_before_input() {
     let dir = home("stdin-reader");
     write_rc(&dir, ".bashrc", "echo BASHRC-MARK\n");
     write_rc(&dir, ".niubashrc", "echo NIUBASHRC-MARK\n");
     let run = spawn(&["-i"], Some(&dir), b"echo STDIN-LINE\nexit\n");
-    assert!(
-        run.stdout.contains("BASHRC-MARK\nNIUBASHRC-MARK\n"),
-        "{run:?}"
-    );
+    assert_eq!(run.stdout, "NIUBASHRC-MARK\nSTDIN-LINE\n", "{run:?}");
     assert!(run.stdout.contains("STDIN-LINE"), "{run:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
