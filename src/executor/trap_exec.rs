@@ -1723,8 +1723,22 @@ impl Executor {
         // so a stray Return here keeps the historical swallow.
         let return_unwind = matches!(result, Err(ExecuteError::Return(_)))
             && (self.shell_state.function_depth + self.source_nest_depth) > 0;
+        // rubash#1405: `break`/`continue` in the ERR trap action must
+        // propagate to the enclosing loop (GNU honors it). The trap runs
+        // in the loop's context, so the Break/Continue unwind must reach
+        // the loop frame instead of being swallowed.
+        let loop_unwind = matches!(
+            result,
+            Err(ExecuteError::Break(_)) | Err(ExecuteError::Continue(_))
+        );
         self.exit_code = saved_exit;
-        if exit_unwind || return_unwind {
+        if exit_unwind || return_unwind || loop_unwind {
+            // For Break/Continue from the trap, preserve the failing
+            // command's status (saved_exit) as the loop's exit status.
+            // The loop's Break handler uses break_failure_status if set.
+            if loop_unwind {
+                self.break_failure_status.set(Some(saved_exit));
+            }
             return result;
         }
         Ok(())
