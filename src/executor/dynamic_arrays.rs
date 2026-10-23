@@ -411,9 +411,16 @@ impl Executor {
         } else {
             ""
         };
+        // rubash#1366: readonly flag must also be displayed (GNU shows
+        // `declare -ar GROUPS` and `declare -r LINENO` after `readonly`).
+        let readonly = if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, name) {
+            "r"
+        } else {
+            ""
+        };
         match name {
             "RANDOM" | "SECONDS" | "SRANDOM" | "BASHPID" => {
-                Some(format!("declare -i{exported} {name}={quoted}"))
+                Some(format!("declare -i{readonly}{exported} {name}={quoted}"))
             }
             "GROUPS" => {
                 let elements = groups_words()
@@ -422,10 +429,14 @@ impl Executor {
                     .map(|(index, group)| format!("[{index}]={}", sh_double_quote_text(group)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                Some(format!("declare -a{exported} {name}=({elements})"))
+                Some(format!("declare -a{readonly}{exported} {name}=({elements})"))
             }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
-            | "BASH_COMMAND" | "HISTCMD" => Some(format!("declare --{exported} {name}={quoted}")),
+            | "BASH_COMMAND" | "HISTCMD" => {
+                let flags = format!("{readonly}{exported}");
+                let flags = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
+                Some(format!("declare {flags} {name}={quoted}"))
+            }
             _ => None,
         }
     }
