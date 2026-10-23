@@ -744,6 +744,16 @@ impl Executor {
         } else {
             element
         };
+        // rubash#1401: `declare -u a; a[0]=abc` must uppercase the element
+        // (GNU applies the case attribute on element store, not just
+        // compound init and scalar assignment).
+        let element = if attrs.uppercase {
+            element.to_uppercase()
+        } else if attrs.lowercase {
+            element.to_lowercase()
+        } else {
+            element
+        };
         // rubash#616 (plan Phase 1b): an append (index == max_index + 1) onto a
         // canonical mirror is applied in place — one structured insert plus the
         // exact segment the renderer would have appended — instead of a full
