@@ -194,6 +194,8 @@ where
         print_exported(
             env_vars,
             env_vars.get("__RUBASH_POSIX_MODE").map(String::as_str) == Some("1"),
+            array,
+            assoc,
             stdout,
         )?;
         return Ok(EXECUTION_SUCCESS);

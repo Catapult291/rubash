@@ -133,6 +133,8 @@ where
 pub(super) fn print_exported<W>(
     env_vars: &crate::shell::var_table::VarTable,
     posix_mode: bool,
+    filter_array: bool,
+    filter_assoc: bool,
     stdout: &mut W,
 ) -> io::Result<()>
 where
@@ -140,11 +142,23 @@ where
 {
     let readonly = marked_vars(env_vars, READONLY_VARS);
     let arrays = marked_vars(env_vars, ARRAY_VARS);
+    let assocs = marked_vars(env_vars, ASSOC_VARS);
     let integers = marked_vars(env_vars, INTEGER_VARS);
     let uppercase = marked_vars(env_vars, UPPERCASE_VARS);
     let lowercase = marked_vars(env_vars, LOWERCASE_VARS);
     let mut names: Vec<_> = marked_vars(env_vars, EXPORTED_VARS).into_iter().collect();
     names.sort();
+    // rubash#1395: bare `export -a`/`-A` must filter by type (GNU lists
+    // only exported indexed/assoc arrays, not all exported vars).
+    let filter_by_type = filter_array || filter_assoc;
+    names.retain(|name| {
+        if !filter_by_type {
+            return true;
+        }
+        let is_array = arrays.contains(name);
+        let is_assoc = assocs.contains(name);
+        (!filter_array || (is_array && !is_assoc)) && (!filter_assoc || is_assoc)
+    });
 
     for name in names {
         if name.starts_with("__RUBASH_") {
