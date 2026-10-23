@@ -5,14 +5,6 @@ use std::collections::HashMap;
 
 const SEP: char = crate::executor::markers::DIR_STACK_FIELD_SEP;
 
-pub(super) fn strip_double_dash<'a>(args: &'a [&str]) -> &'a [&'a str] {
-    if args.first().copied() == Some("--") {
-        &args[1..]
-    } else {
-        args
-    }
-}
-
 pub(super) fn is_stack_index(arg: &str) -> bool {
     let Some(rest) = arg.strip_prefix('+').or_else(|| arg.strip_prefix('-')) else {
         return false;

@@ -1222,7 +1222,11 @@ impl Executor {
             // variables declared local to the current function frame (sorted,
             // declare -- form) -- never the whole variable table. Rewrite
             // the args so the shared declare printer renders just those names.
-            if !had_dash_operand && local_names(&args).is_empty() {
+            // `local_operands` (not `local_names`): `local -- -p` HAS an
+            // operand (`-p`, an invalid name) and must reach declare's
+            // `not a valid identifier` diagnostic, not the list branch
+            // (rubash#1377).
+            if !had_dash_operand && local_operands(&args).is_empty() {
                 let local_names: Vec<String> = self
                     .shell_state
                     .local_var_scopes

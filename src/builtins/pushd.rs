@@ -13,7 +13,6 @@ use crate::shell::var_table::VarTable;
 use parse::{parse_popd_operand, parse_pushd_operand, PopdOperand, PushdOperand};
 use stack::{
     is_stack_index, logical_dir_exists, normalize_stack_dir, resolved_index, stack_index,
-    strip_double_dash,
 };
 use std::io::{self, Write};
 
@@ -100,8 +99,17 @@ where
 
     match builtin {
         StackBuiltin::Dirs => {
-            let args = strip_double_dash(&args);
-            if args.first().copied() == Some("-c") {
+            // GNU pushd.def dirs_builtin: ISOPTION(word, '-') on a bare `--`
+            // does `list = list->next; break;` — flag parsing ends there;
+            // flags before `--` still apply, words after it are ignored
+            // entirely (rubash#1380: `dirs -- -l`/`-- -c` must not apply).
+            let mut args: &[&str] = &args;
+            let mut parsing_options = true;
+            if args.first().copied() == Some("--") {
+                args = &args[1..];
+                parsing_options = false;
+            }
+            if parsing_options && args.first().copied() == Some("-c") {
                 save_stack(env_vars, &[]);
                 return Ok(EXECUTION_SUCCESS);
             }
@@ -118,21 +126,30 @@ where
             let mut printable = false;
             let mut numbered = false;
             let mut long_form = false;
-            while let Some(arg) = args.get(flag_end).copied() {
-                match arg {
-                    // rubash#759: -l is the LONG form, not the one-per-line
-                    // form. GNU pushd.def:493 DIRSTACK_FORMAT skips
-                    // polite_directory_format (general.c:953, $HOME -> ~)
-                    // only under LONGFORM; the separator stays a single
-                    // space, and -p alone selects one entry per line.
-                    "-l" => long_form = true,
-                    "-p" => printable = true,
-                    "-v" => numbered = true,
-                    _ => break,
+            if parsing_options {
+                while let Some(arg) = args.get(flag_end).copied() {
+                    match arg {
+                        // rubash#759: -l is the LONG form, not the one-per-line
+                        // form. GNU pushd.def:493 DIRSTACK_FORMAT skips
+                        // polite_directory_format (general.c:953, $HOME -> ~)
+                        // only under LONGFORM; the separator stays a single
+                        // space, and -p alone selects one entry per line.
+                        "-l" => long_form = true,
+                        "-p" => printable = true,
+                        "-v" => numbered = true,
+                        // A `--` mid-flags also ends option parsing (GNU
+                        // `list = list->next; break;`); the rest is ignored.
+                        "--" => {
+                            flag_end += 1;
+                            parsing_options = false;
+                            break;
+                        }
+                        _ => break,
+                    }
+                    flag_end += 1;
                 }
-                flag_end += 1;
             }
-            let rest = &args[flag_end..];
+            let rest = if parsing_options { &args[flag_end..] } else { &[] };
             if let Some(arg) = rest.first().copied() {
                 if arg.starts_with('+') || arg.starts_with('-') {
                     if !is_stack_index(arg) {
