@@ -144,11 +144,11 @@ impl Executor {
                     if is_null_device(&target) {
                         self.create_redirect_output(&target, true)
                     } else {
-                        OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
-                            .map_err(|e| crate::posix_errors::path_error(&target, e))
+                        open_redirect_append(&shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        ))
+                        .map_err(|e| crate::posix_errors::path_error(&target, e))
                     }
                 })?;
             }
@@ -181,10 +181,7 @@ impl Executor {
             }
             if redirect.fd_var.is_some() {
             } else if !is_closed_redirect_target(&target) && redirect_target_fd(&target).is_none() {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             }
         }

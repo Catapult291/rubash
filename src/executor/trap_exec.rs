@@ -177,10 +177,12 @@ impl Executor {
             return Ok(());
         }
         let path = shell_path_to_windows(target, &self.shell_state.env_vars);
-        let file = FileFd::open_readwrite(path)?;
-        self.set_fd_input_file(fd, file.clone(), dynamic);
+        // open_readwrite_pair splits `<>CON` into its CONIN$/CONOUT$
+        // halves (niubash#519: CON rejects a read+write handle).
+        let (read_file, write_file) = FileFd::open_readwrite_pair(path)?;
+        self.set_fd_input_file(fd, read_file, dynamic);
         self.fd_table
-            .open_output(fd, FdWriteEndpoint::File(file), dynamic);
+            .open_output(fd, FdWriteEndpoint::File(write_file), dynamic);
         self.shell_state.env_vars.remove(&fd_closed_key(fd));
         self.shell_state
             .env_vars
@@ -2196,10 +2198,8 @@ impl Executor {
 
         if let Some(redirect) = &cmd.append {
             let target = self.expand_redirect_target(redirect);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stdout = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
@@ -2319,10 +2319,8 @@ impl Executor {
 
         if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stderr = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
@@ -3659,10 +3657,10 @@ impl Executor {
                     self.create_redirect_output(&target, redirect.clobber)?;
                 }
                 crate::parser::RedirectKind::Append => {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))?;
                 }
                 crate::parser::RedirectKind::ReadWrite => {
                     OpenOptions::new()
@@ -3844,22 +3842,26 @@ impl Executor {
                 }
 
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-                let file = if redirect.kind == crate::parser::RedirectKind::ReadWrite {
-                    FileFd::open_readwrite(path)
-                } else {
-                    FileFd::open_read(path)
-                }
-                .map_err(|io| crate::posix_errors::path_error(&target, io))?;
+                let (read_file, write_file) =
+                    if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                        FileFd::open_readwrite_pair(path)
+                            .map_err(|io| crate::posix_errors::path_error(&target, io))?
+                    } else {
+                        let file = FileFd::open_read(path)
+                            .map_err(|io| crate::posix_errors::path_error(&target, io))?;
+                        (file.clone(), file)
+                    };
+                let file = read_file;
                 let Some(fd) = self.allocate_dynamic_fd() else {
                     return Err(ExecuteError::IoError(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         self.fd_dup_error_payload(&target),
                     )));
                 };
-                self.set_fd_input_file(fd, file.clone(), true);
+                self.set_fd_input_file(fd, file, true);
                 if redirect.kind == crate::parser::RedirectKind::ReadWrite {
                     self.fd_table
-                        .open_output(fd, FdWriteEndpoint::File(file), true);
+                        .open_output(fd, FdWriteEndpoint::File(write_file), true);
                     self.shell_state.env_vars.remove(&fd_closed_key(fd));
                     self.shell_state
                         .env_vars

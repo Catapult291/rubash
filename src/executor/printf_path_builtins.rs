@@ -568,10 +568,7 @@ fn open_cd_redirect_file(
     env_vars: &std::collections::HashMap<String, String>,
 ) -> std::io::Result<File> {
     if append {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(shell_path_to_windows(target, env_vars))
+        open_redirect_append(&shell_path_to_windows(target, env_vars))
     } else {
         File::create(shell_path_to_windows(target, env_vars))
     }

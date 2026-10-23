@@ -22,11 +22,19 @@ impl Executor {
         &self,
         target: &str,
     ) -> io::Result<File> {
+        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        // niubash#519: CON has no read+write handle (GENERIC_READ|
+        // GENERIC_WRITE -> ERROR_INVALID_PARAMETER); the real `<>` bind
+        // splits it into CONIN$/CONOUT$ (FileFd::open_readwrite_pair),
+        // so probe the console's input half.
+        if is_con_device_path(&path) {
+            return File::open("CONIN$");
+        }
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(shell_path_to_windows(target, &self.shell_state.env_vars))
+            .open(&path)
     }
 
     /// rubash#1026: GNU redir.c netopen — `/dev/tcp/host/port` and

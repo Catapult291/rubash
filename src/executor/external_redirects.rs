@@ -591,10 +591,7 @@ impl Executor {
             // other redirect diagnostic (redir.c:149-176 redirection_error,
             // issue #518): a bare OS error renders message-only and drops
             // `$FIX/b` from `$FIX/b: No such file or directory`.
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(target, &self.shell_state.env_vars))
+            open_redirect_append(&shell_path_to_windows(target, &self.shell_state.env_vars))
                 .map_err(|e| crate::posix_errors::path_error(target, e))?
         } else {
             self.create_redirect_output(target, redirect.clobber)?
@@ -626,15 +623,11 @@ impl Executor {
             let stdout_target = self.expand_redirect_target(stdout_redirect);
             let stderr_target = self.expand_redirect_target(stderr_redirect);
             if stdout_target == stderr_target {
-                let mut file =
-                    OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(shell_path_to_windows(
-                            &stdout_target,
-                            &self.shell_state.env_vars,
-                        ))?;
-                file.seek(SeekFrom::End(0))?;
+                let path = shell_path_to_windows(&stdout_target, &self.shell_state.env_vars);
+                let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+                if !is_dos_device_path(&path) {
+                    file.seek(SeekFrom::End(0))?;
+                }
                 process.stderr(Stdio::from(file.try_clone()?));
                 process.stdout(Stdio::from(file));
                 return Ok(true);
@@ -689,11 +682,11 @@ impl Executor {
                 } else if self.has_output_fd_target(&target) {
                     process.stdout(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
-                    let mut file = OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
-                    file.seek(SeekFrom::End(0))?;
+                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+                    if !is_dos_device_path(&path) {
+                        file.seek(SeekFrom::End(0))?;
+                    }
                     process.stdout(Stdio::from(file));
                 }
                 redirected = true;
@@ -811,11 +804,11 @@ impl Executor {
                 } else if self.has_output_fd_target(&target) {
                     process.stderr(Stdio::from(self.open_output_fd_append(&target)?));
                 } else if redirect_target_fd(&target).is_none() {
-                    let mut file = OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
-                    file.seek(SeekFrom::End(0))?;
+                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+                    if !is_dos_device_path(&path) {
+                        file.seek(SeekFrom::End(0))?;
+                    }
                     process.stderr(Stdio::from(file));
                 }
                 redirected = true;

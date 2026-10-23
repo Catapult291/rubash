@@ -678,7 +678,7 @@ impl Executor {
                 && !target.starts_with("<(")
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-                if let Err(error) = FileFd::open_readwrite(path) {
+                if let Err(error) = FileFd::open_readwrite_pair(path) {
                     let message = crate::posix_errors::path_error(&target, error);
                     let text = crate::posix_errors::message(&message);
                     return self
@@ -1432,10 +1432,7 @@ impl Executor {
                 // failed open's target word (`$FIX/b: No such file or
                 // directory`, issue #518); a bare OS error renders
                 // message-only and drops the word.
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))
                     .map_err(|e| crate::posix_errors::path_error(&target, e))?;
             } else {
                 self.create_redirect_output(&target, redirect.clobber)?;
@@ -1645,10 +1642,8 @@ impl Executor {
                 }
             }
             OutputTarget::Path(path) => {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(shell_path_to_windows(path, &self.shell_state.env_vars))?;
+                let mut file =
+                    open_redirect_append(&shell_path_to_windows(path, &self.shell_state.env_vars))?;
                 file.write_all(&bytes)?;
             }
             OutputTarget::SharedFile(file) => {
@@ -1833,10 +1828,10 @@ impl OutputFdState {
                 Ok(())
             }
             OutputTarget::Path(path) => {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(shell_path_to_windows(&path, &executor.shell_state.env_vars))?;
+                let mut file = open_redirect_append(&shell_path_to_windows(
+                    &path,
+                    &executor.shell_state.env_vars,
+                ))?;
                 file.write_all(output)?;
                 Ok(())
             }

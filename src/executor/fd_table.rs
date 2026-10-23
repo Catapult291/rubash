@@ -49,6 +49,36 @@ impl FileFd {
         crate::fd::open_file_readwrite(&path).map(|handle| Rc::new(Self { handle, path }))
     }
 
+    /// `[N]<>file` endpoint pair — O_RDWR|O_CREAT on ONE open file
+    /// description for regular paths, so both directions of the slot
+    /// share a single offset (GNU redir.c r_input_output). niubash#519:
+    /// the console multiplex device CON rejects GENERIC_READ|
+    /// GENERIC_WRITE (ERROR_INVALID_PARAMETER — a console is two kernel
+    /// objects, not one seekable file), so `<>/dev/tty` binds CONIN$ to
+    /// the read endpoint and CONOUT$ to the write endpoint; together
+    /// they cover GNU's read+write terminal descriptor.
+    pub(crate) fn open_readwrite_pair(path: PathBuf) -> std::io::Result<(Rc<Self>, Rc<Self>)> {
+        #[cfg(windows)]
+        if crate::fd::is_dos_device_path(&path)
+            && path.to_string_lossy().eq_ignore_ascii_case("CON")
+        {
+            let read = crate::fd::open_file_read(std::path::Path::new("CONIN$"))?;
+            let write = crate::fd::open_file_write(std::path::Path::new("CONOUT$"))?;
+            return Ok((
+                Rc::new(Self {
+                    handle: read,
+                    path: path.clone(),
+                }),
+                Rc::new(Self {
+                    handle: write,
+                    path,
+                }),
+            ));
+        }
+        let file = Self::open_readwrite(path)?;
+        Ok((file.clone(), file))
+    }
+
     /// Adopt an already-open std File (a connected socket for
     /// /dev/tcp|/dev/udp redirection, rubash#1026) as a FileFd whose
     /// `path` is the shell-level target name.

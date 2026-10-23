@@ -24,10 +24,8 @@ impl Executor {
             if let Some(result) = self.write_dev_stdio_redirect_output(&target, output) {
                 return result;
             }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             file.write_all(output)?;
         } else {
             self.write_default_stdout(output)?;
@@ -63,9 +61,7 @@ impl Executor {
         }
         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
         if append {
-            return Ok(Some(
-                OpenOptions::new().create(true).append(true).open(path)?,
-            ));
+            return Ok(Some(open_redirect_append(&path)?));
         }
         Ok(Some(self.create_redirect_output(&target, clobber)?))
     }

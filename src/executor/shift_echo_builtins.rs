@@ -207,10 +207,8 @@ impl Executor {
                 )?;
                 return Ok(());
             }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             crate::builtins::echo::write_echo_decoded(
                 echo_args.iter().map(String::as_str),
                 &mut file,

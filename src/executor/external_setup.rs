@@ -249,11 +249,19 @@ impl Executor {
                 return Ok(());
             }
             let file = if redirect.append {
-                OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?
+                let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                // niubash#519: CON has no read+write handle; a child's fd 0
+                // only needs the console input half (FileFd::
+                // open_readwrite_pair splits the fd-table binds).
+                if is_con_device_path(&path) {
+                    File::open("CONIN$")?
+                } else {
+                    OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .open(&path)?
+                }
             } else {
                 self.open_input_redirect(&target)?
             };

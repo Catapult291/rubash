@@ -946,10 +946,10 @@ impl Executor {
             }
             let opened = if write {
                 if redirect.append {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                    open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))
                 } else {
                     self.create_redirect_output(&target, redirect.clobber)
                         .map_err(|error| crate::posix_errors::path_error(&target, error))

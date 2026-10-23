@@ -1101,14 +1101,14 @@ struct CommandSubstitutionRedirect {
 }
 
 fn open_command_substitution_redirect(redirect: &CommandSubstitutionRedirect) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true);
     if redirect.append {
-        options.append(true);
-    } else {
-        options.truncate(true);
+        return open_redirect_append(&redirect.path);
     }
-    options.open(&redirect.path)
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&redirect.path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
