@@ -480,7 +480,16 @@ impl Executor {
     }
 
     pub(in crate::executor) fn prompt_job_count(&self) -> usize {
-        0
+        // GNU parse.y:6594-6596 `case 'j'` -> itos(count_all_jobs());
+        // jobs.c:5130 count_all_jobs counts `jobs[i] && DEADJOB(i) == 0`
+        // ("all non-dead jobs"). Completed is the rubash JDEAD encoding;
+        // Running and Stopped both count.
+        self.shell_state
+            .job_table
+            .jobs
+            .values()
+            .filter(|job| job.state != crate::jobs::ProcessState::Completed)
+            .count()
     }
 
     pub(in crate::executor) fn prompt_history_number(&self) -> usize {
@@ -526,11 +535,16 @@ impl Executor {
         let mut format = String::new();
         for ch in chars.by_ref() {
             if ch == '}' {
-                // parse.y:6430-6436: the strftime text is backslash-quoted
-                // for double quotes when the expansion pass will run, so a
-                // `%`-format output containing `$`/backtick/quote bytes is
-                // not read as expansion syntax by that pass.
-                let rendered = self.prompt_time(&format);
+                // GNU parse.y:6390-6425 `case 'D'`: an empty timefmt becomes
+                // "%X" (locale-specific current time) before the system
+                // strftime call; the result is backslash-quoted for double
+                // quotes when the expansion pass will run (parse.y:6430-6436).
+                let effective = if format.is_empty() {
+                    "%X"
+                } else {
+                    format.as_str()
+                };
+                let rendered = self.prompt_time(effective);
                 return self.prompt_quote_for_expansion(&rendered);
             }
             format.push(ch);
@@ -1118,18 +1132,39 @@ fn prompt_dirtrim(name: &str, env_vars: &HashMap<String, String>) -> String {
     format!("{}...{}", &name[..beg], &name[tail..])
 }
 
-fn prompt_terminal_basename(env_vars: &HashMap<String, String>) -> String {
-    env_vars
-        .get("TTY")
-        .or_else(|| env_vars.get("SSH_TTY"))
-        .map(|tty| {
-            tty.trim_end_matches(['/', '\\'])
-                .rsplit(['/', '\\'])
+fn prompt_terminal_basename(_env_vars: &HashMap<String, String>) -> String {
+    // GNU parse.y:6598-6607 `case 'l'`: ttyname(fileno(stdin)) basename,
+    // else the literal "tty". The TTY/SSH_TTY lookup was wrong (those are
+    // not consulted); the name comes from the stdin file descriptor.
+    #[cfg(unix)]
+    {
+        // SAFETY: ttyname returns a static NUL-terminated string or NULL;
+        // copied immediately into an owned String.
+        let name = unsafe {
+            let ptr = libc::ttyname(0);
+            if ptr.is_null() {
+                None
+            } else {
+                std::ffi::CStr::from_ptr(ptr)
+                    .to_str()
+                    .ok()
+                    .map(|s| s.to_string())
+            }
+        };
+        match name {
+            Some(path) => path
+                .rsplit('/')
                 .next()
-                .unwrap_or(tty)
-                .to_string()
-        })
-        .unwrap_or_default()
+                .filter(|base| !base.is_empty())
+                .unwrap_or("tty")
+                .to_string(),
+            None => "tty".to_string(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        "tty".to_string()
+    }
 }
 
 fn prompt_dollar(env_vars: &HashMap<String, String>) -> char {
