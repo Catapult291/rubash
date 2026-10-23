@@ -817,6 +817,73 @@ fn extglob_group_swallows_bracket_for_subscript_scan() {
     );
 }
 
+/// Issue #1335 (harvest nightly 10-23): the two SYNTAX-REJECT-RUBASH-ONLY
+/// assets on current master. Both are assignment-statement shapes GNU
+/// accepts; each had a distinct lexer root cause.
+///
+/// Bug A (linux_exploit_suggester.sh `EXPLOITS[((n++))]=$(cat <<EOF...`):
+/// GNU parse.y:5633-5651 read_token_word decides AT the `[` from the word
+/// assembled so far (token_is_ident over the whole prefix, parse.y:5291 —
+/// no name-length limit) and consumes the span via parse_matched_pair
+/// P_ARRAYSUB, so parens inside the subscript are word text. The
+/// word-level `looks_like_array_element_assignment` armed only when the
+/// scan position itself sat at the `[`, which holds only for
+/// single-character names — longer names broke the word at `(`.
+#[test]
+fn harvest_1335_multichar_array_subscript_with_parens_stays_one_word() {
+    for word in [
+        "ab[((n))]=x",
+        "EXPLOITS[((n++))]=x",
+        "EXPLOITS[((n++))]=$(echo hi)",
+        "ab[i + 1]+=v",
+    ] {
+        let tokens = tokenize(word);
+        assert_eq!(tokens.len(), 1, "word splits: {word}");
+        assert_eq!(tokens[0].value, word);
+    }
+    // Parity with the single-character name the old predicate already
+    // armed: same token count, same kind (the parser, not the word
+    // classifier, owns array-element assignment recognition).
+    let single = tokenize("a[((n))]=x");
+    let multi = tokenize("ab[((n))]=x");
+    assert_eq!(single.len(), multi.len());
+    assert_eq!(single[0].kind, multi[0].kind);
+    // Single-character names keep working, and genuinely unclosed
+    // subscripts still report (rubash#221 true positive).
+    let tokens = tokenize("a[((n))]=x");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(unclosed_array_subscript_line("a[b\n"), Some((1, false)));
+}
+
+/// Bug B (cylon Cylon.sh `PS3="$(printf "\033[36;1m")..."`): GNU
+/// parse.y:3877 parse_matched_pair recurses into quotes with fresh state
+/// and routes `$(...)`/`${...}`/backquote inside double quotes through
+/// parse_dollar_word (parse.y:4158-4168 parse_comsub), so an inner `"`
+/// never closes the outer `"`. The subscript pre-scan's double-quote arm
+/// flipped on the inner quote, leaving a phantom identifier word (`a`)
+/// before `[` that opened a subscript hunt and died as a `]`-EOF.
+#[test]
+fn harvest_1335_dquoted_comsub_inner_quote_hides_bracket_from_subscript_scan() {
+    for input in [
+        "x=\"$(printf \"a[\")\"\n",
+        "x=\"$(printf \"\\033[36;1m\")\"\n",
+        "x=\"$(echo \"a[b\" )\"\n",
+        "x=\"`printf \"a[\"`\"\n",
+        "x=\"${y}a[\"\necho hi\n",
+    ] {
+        assert_eq!(unclosed_array_subscript_line(input), None, "{input:?}");
+        assert_eq!(unclosed_array_subscript_eof(input), None, "{input:?}");
+    }
+    // True positives unchanged: a real command-position `[` still reports,
+    // while an unclosed outer `"` stays another diagnostic family's job
+    // (the generic quote scan owns the `"`-EOF, not the subscript hunt).
+    assert_eq!(unclosed_array_subscript_line("a[b\n"), Some((1, false)));
+    assert_eq!(
+        unclosed_array_subscript_line("x=\"$(printf \"a[\")\n"),
+        None
+    );
+}
+
 /// rubash#380: the `$(` body is a fresh command stream (subst.c:7143
 /// command_substitute -> parse_and_execute; parse.y:4451 parse_comsub), so
 /// its FIRST word sits at command position and IS a reserved word — a
