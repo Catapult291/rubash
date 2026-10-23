@@ -46,10 +46,15 @@ where
     let mut symbolic = false;
     let mut reusable = false;
     let mut mode = None;
+    // GNU builtins/umask.def:83 `internal_getopt (list, "Sp")`: option
+    // parsing stops at the first mode operand, so a trailing `-S`/`-p` is an
+    // ignored extra operand, not a flag (rubash#1381). `--`/first-wins stay
+    // owned by #1292.
+    let mut parsing_options = true;
 
     for arg in args {
         match arg.as_str() {
-            value if value.starts_with('-') && value != "-" => {
+            value if parsing_options && value.starts_with('-') && value != "-" => {
                 for option in value[1..].chars() {
                     match option {
                         'S' => symbolic = true,
@@ -66,7 +71,7 @@ where
                     }
                 }
             }
-            value if value.starts_with('-') => {
+            value if parsing_options && value.starts_with('-') => {
                 writeln!(
                     stderr,
                     "{}umask: {value}: invalid option",
@@ -75,7 +80,15 @@ where
                 writeln!(stderr, "umask: usage: umask [-p] [-S] [mode]")?;
                 return Ok(EX_USAGE);
             }
-            value => mode = Some(value),
+            value => {
+                parsing_options = false;
+                // Dash-words after the mode are ignored operands (#1381);
+                // plain extra operands keep the existing last-wins until
+                // #1292 settles first-wins.
+                if !value.starts_with('-') {
+                    mode = Some(value);
+                }
+            }
         }
     }
 
@@ -368,8 +381,10 @@ mod tests {
         )]));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // GNU: flags must precede the mode operand (rubash#1381: trailing
+        // flags after the mode are ignored, not parsed).
         let status = execute_with_io(
-            &vec![mode.to_string(), "-S".to_string()],
+            &vec!["-S".to_string(), mode.to_string()],
             &mut env,
             &mut stdout,
             &mut stderr,
