@@ -2196,10 +2196,8 @@ impl Executor {
 
         if let Some(redirect) = &cmd.append {
             let target = self.expand_redirect_target(redirect);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stdout = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
@@ -2319,10 +2317,8 @@ impl Executor {
 
         if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let mut file =
+                open_redirect_append(&shell_path_to_windows(&target, &self.shell_state.env_vars))?;
             let child_stderr = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
                 &cmd.words[1..],
@@ -3659,10 +3655,10 @@ impl Executor {
                     self.create_redirect_output(&target, redirect.clobber)?;
                 }
                 crate::parser::RedirectKind::Append => {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))?;
                 }
                 crate::parser::RedirectKind::ReadWrite => {
                     OpenOptions::new()

@@ -54,10 +54,10 @@ impl Executor {
         if let Some(redirect) = &cmd.redirect_err_append {
             let target = self.expand_redirect_target(redirect);
             if !target.starts_with('&') {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                let mut file = open_redirect_append(&shell_path_to_windows(
+                    &target,
+                    &self.shell_state.env_vars,
+                ))?;
                 return self.execute_unset_with_stderr(&cmd.words[1..], &arrayref_flags, &mut file);
             }
         }

@@ -277,7 +277,7 @@ fn forward_coproc_stderr(
                 std::io::stderr().flush()?;
             }
             CoprocStderrForwardTarget::File(path) => {
-                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+                let mut file = open_redirect_append(path)?;
                 file.write_all(&buffer[..count])?;
             }
             CoprocStderrForwardTarget::Discard => {}
@@ -1397,11 +1397,10 @@ impl Executor {
                     } else if is_null_device(&target) {
                         BackgroundStdio::Null
                     } else {
-                        match OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
-                        {
+                        match open_redirect_append(&shell_path_to_windows(
+                            &target,
+                            &self.shell_state.env_vars,
+                        )) {
                             Ok(file) => BackgroundStdio::File(file),
                             Err(_) => continue,
                         }
@@ -1429,10 +1428,10 @@ impl Executor {
                         continue;
                     } else {
                         let opened = if redirect.kind == RedirectKind::CombinedAppend {
-                            OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
+                            open_redirect_append(&shell_path_to_windows(
+                                &target,
+                                &self.shell_state.env_vars,
+                            ))
                         } else {
                             self.create_redirect_output(&target, false)
                         };
@@ -3413,12 +3412,10 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stdout(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stdout(Stdio::from(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?,
-                ));
+                child.stdout(Stdio::from(open_redirect_append(&shell_path_to_windows(
+                    &target,
+                    &self.shell_state.env_vars,
+                ))?));
             }
         }
 
@@ -3436,12 +3433,10 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 child.stderr(Stdio::null());
             } else if redirect_target_fd(&target).is_none() {
-                child.stderr(Stdio::from(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?,
-                ));
+                child.stderr(Stdio::from(open_redirect_append(&shell_path_to_windows(
+                    &target,
+                    &self.shell_state.env_vars,
+                ))?));
             }
         }
 

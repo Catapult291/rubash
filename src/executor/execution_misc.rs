@@ -158,6 +158,41 @@ pub(in crate::executor) fn is_null_device(path: &str) -> bool {
     crate::executor::path::is_shell_null_device(path)
 }
 
+/// niubash#519: whether a Windows-translated redirect path is a bare DOS
+/// device name (CON, CONIN$, CONOUT$, NUL, PRN, AUX, COMx, LPTx). Always
+/// false off Windows.
+pub(in crate::executor) fn is_dos_device_path(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::fd::is_dos_device_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// niubash#519: append-mode open of an output redirect target
+/// (`N>>target`, `&>>target`, and the deferred-write reopens of
+/// OutputTarget::Path). GNU redir.c:725 redir_open uses a single
+/// open(O_WRONLY|O_CREAT|O_APPEND), which succeeds on /dev/tty because
+/// O_APPEND is a no-op on a character device; the Windows adaptation maps
+/// /dev/tty to CON, where FILE_APPEND_DATA fails CreateFileW with
+/// ERROR_INVALID_PARAMETER. Devices open in plain write mode — an append
+/// flag on a stream is meaningless — while regular paths keep O_APPEND.
+pub(in crate::executor) fn open_redirect_append(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    if is_dos_device_path(path) {
+        return std::fs::OpenOptions::new().write(true).open(path);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 pub(in crate::executor) fn is_closed_redirect_target(path: &str) -> bool {
     path == "&-"
 }

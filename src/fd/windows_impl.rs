@@ -540,6 +540,28 @@ pub fn open_file_create_new(path: &std::path::Path) -> std::io::Result<HANDLE> {
     create_file(path, GENERIC_WRITE, CREATE_NEW)
 }
 
+/// niubash#519: whether `path` is a bare DOS device name — CON, CONIN$,
+/// CONOUT$, PRN, AUX, NUL, COM1-9, LPT1-9 (optionally under \\.\). These
+/// reject FILE_APPEND_DATA at CreateFileW (ERROR_INVALID_PARAMETER): a
+/// character device is a byte stream with no file offset, so O_APPEND
+/// does not apply to it. A directory-qualified "dir\CON" is a (reserved,
+/// differently-failing) file path, not the device.
+pub fn is_dos_device_path(path: &std::path::Path) -> bool {
+    let name = path.to_string_lossy();
+    let name = name.strip_prefix(r"\\.\").unwrap_or(&name);
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return false;
+    }
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "CONIN$" | "CONOUT$" | "PRN" | "AUX" | "NUL"
+    ) || (upper.len() == 4
+        && upper.as_bytes()[3].is_ascii_digit()
+        && upper.as_bytes()[3] != b'0'
+        && (upper.starts_with("COM") || upper.starts_with("LPT")))
+}
+
 /// `N>>file` — O_WRONLY|O_CREAT|O_APPEND. A handle must carry
 /// FILE_APPEND_DATA and NOT FILE_WRITE_DATA for Windows to force every
 /// write to end-of-file regardless of the shared offset (MSDN:
@@ -547,6 +569,13 @@ pub fn open_file_create_new(path: &std::path::Path) -> std::io::Result<HANDLE> {
 /// FILE_WRITE_DATA, so a GENERIC_WRITE handle wrote at offset 0 and
 /// `cmd >>existing` overwrote the head instead of appending.
 pub fn open_file_append(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    // niubash#519: DOS devices reject FILE_APPEND_DATA; appending to a
+    // stream device is a no-op anyway, so GENERIC_WRITE carries `exec
+    // 3>>/dev/tty` (redir.c redir_open's open() — O_APPEND on a POSIX tty
+    // succeeds, the Windows adaptation must not fail the open).
+    if is_dos_device_path(path) {
+        return create_file(path, GENERIC_WRITE, OPEN_EXISTING);
+    }
     create_file(path, FILE_APPEND_DATA | SYNCHRONIZE, OPEN_ALWAYS)
 }
 
@@ -1561,6 +1590,24 @@ mod tests {
         t.dup(3, 5).unwrap();
         t.seek(5, 8).unwrap();
         assert_eq!(t.read_n(3, 2).unwrap(), b"ij");
+    }
+
+    #[test]
+    fn dos_device_path_detection() {
+        use std::path::Path;
+        for name in [
+            "CON", "con", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9",
+        ] {
+            assert!(is_dos_device_path(Path::new(name)), "{name}");
+        }
+        assert!(is_dos_device_path(Path::new(r"\\.\COM3")));
+        assert!(is_dos_device_path(Path::new(r"\\.\con")));
+        for name in ["COM0", "COM10", "LPT0", "CONSOLE", "CONX", "", "file.txt"] {
+            assert!(!is_dos_device_path(Path::new(name)), "{name}");
+        }
+        // A directory-qualified name is a file path, not the device.
+        assert!(!is_dos_device_path(Path::new(r"C:\tmp\CON")));
+        assert!(!is_dos_device_path(Path::new("dir/CON")));
     }
 
     #[test]

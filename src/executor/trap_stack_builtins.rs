@@ -128,10 +128,10 @@ impl Executor {
                 } else if redirect_target_fd(&target) == Some(1) {
                     super::write_stdout_bytes(&stdout)?;
                 } else {
-                    let mut file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    let mut file = open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))?;
                     file.write_all(&stdout)?;
                 }
             }
@@ -177,10 +177,10 @@ impl Executor {
                         super::write_stdout_bytes(&stderr)?;
                     }
                 } else {
-                    let mut file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    let mut file = open_redirect_append(&shell_path_to_windows(
+                        &target,
+                        &self.shell_state.env_vars,
+                    ))?;
                     file.write_all(&stderr)?;
                 }
             }
