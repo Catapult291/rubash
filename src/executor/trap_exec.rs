@@ -1093,8 +1093,20 @@ impl Executor {
         // RETURN` after `false` keeps rc 1; `trap 'false' RETURN` after
         // `true` keeps rc 0). Save/restore like the ERR/signal runners;
         // unwinds (exit/return in the action) still propagate.
+        //
+        // rubash#1406: `break`/`continue` in the RETURN trap must NOT leak
+        // into the caller's loop (GNU errors "only meaningful in a loop").
+        // The trap runs in the function's return context, which has no loop,
+        // even if the caller is in a loop. Save/clear loop_depth around the
+        // action so break/continue see no loop.
         let saved_exit = self.exit_code;
+        let saved_loop_depth = self.shell_state.loop_depth;
+        let saved_inherited = self.shell_state.inherited_loop_depth;
+        self.shell_state.loop_depth = 0;
+        self.shell_state.inherited_loop_depth = 0;
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        self.shell_state.loop_depth = saved_loop_depth;
+        self.shell_state.inherited_loop_depth = saved_inherited;
         self.trap_saved_exit_value = prev_saved_exit;
         self.trap_saved_exit_context = prev_saved_context;
         self.return_trap_running = false;
