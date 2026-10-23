@@ -108,7 +108,10 @@ where
 }
 
 fn parse_exit_status(arg: &str) -> Option<i32> {
-    let value = arg.parse::<i128>().ok()?;
+    // GNU builtins/common.c get_exitstat parses as intmax_t (int64);
+    // out-of-range values are rejected with "numeric argument required"
+    // (rubash#1403), not silently wrapped.
+    let value = arg.parse::<i64>().ok()?;
     Some(normalize_status(value))
 }
 

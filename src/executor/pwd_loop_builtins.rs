@@ -206,7 +206,9 @@ impl Executor {
             _ => args,
         };
         let status = if let Some(value) = args.first() {
-            match value.parse::<i128>() {
+            // GNU get_exitstat parses as int64; out-of-range rejected
+            // (rubash#1403).
+            match value.parse::<i64>() {
                 Ok(value) => crate::builtins::exit::normalize_status(value),
                 Err(_) => {
                     writeln!(
