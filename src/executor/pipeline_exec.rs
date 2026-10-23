@@ -153,6 +153,80 @@ fn lingerer_sigpipe_status() -> std::process::ExitStatus {
     }
 }
 
+/// Terminate a hard-killed lingerer AND every descendant it left behind.
+///
+/// D10 (niubash defects 2026-10-23): winuxcmd's `powershell` is a 63 KB
+/// dispatcher that `CreateProcess`es the real `pwsh.exe`. `Child::kill`
+/// only terminates the dispatcher; the grandchild keeps the inheritable
+/// niu stdout-pump write end open, so `piped_stdout::finish` never sees
+/// EOF and `niu -c 'powershell … | head -3'` hangs after every child the
+/// parent knows about is gone. A tree walk matches the semantic that
+/// killing a pipeline member ends its whole job tree.
+#[cfg(windows)]
+fn terminate_lingerer_process_tree(pid: u32) {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                children_of
+                    .entry(entry.th32ParentProcessID)
+                    .or_default()
+                    .push(entry.th32ProcessID);
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+
+    // Deepest-first so a dispatcher cannot respawn mid-walk.
+    let mut stack = vec![pid];
+    let mut ordered = Vec::new();
+    while let Some(current) = stack.pop() {
+        ordered.push(current);
+        if let Some(kids) = children_of.get(&current) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+
+    for victim in ordered.into_iter().rev() {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, victim) };
+        if handle.is_null() {
+            continue;
+        }
+        let _ = unsafe { TerminateProcess(handle, 128 + 13) };
+        unsafe { CloseHandle(handle) };
+    }
+}
+
+/// Kill a lingerer: whole process tree first, then the `Child` itself so
+/// the reaper path still observes a terminated status.
+fn kill_lingerer(process: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        terminate_lingerer_process_tree(process.id());
+    }
+    let _ = process.kill();
+}
+
 #[cfg(any(windows, unix))]
 fn wait_for_windows_pipeline_member(
     process: &mut std::process::Child,
@@ -188,7 +262,10 @@ fn wait_for_windows_pipeline_member(
             kill_deadline = Some(std::time::Instant::now() + NATURAL_EXIT_WINDOW);
         }
         if kill_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            let _ = process.kill();
+            // D10: hard-kill the whole tree — winuxcmd `powershell` is a
+            // dispatcher whose `pwsh` grandchild would otherwise outlive
+            // this Child and hold the niu stdout-pump write end open.
+            kill_lingerer(process);
             // Reap the terminated child, then report the SIGPIPE shape GNU
             // observes for a producer whose consumer closed the pipe
             // (rubash#382; see lingerer_sigpipe_status).
@@ -2762,7 +2839,9 @@ impl Executor {
                     // the downstream already exited, so a member still alive
                     // here is the broken-pipe lingerer — report the SIGPIPE
                     // shape GNU observes (rubash#382; lingerer_sigpipe_status).
-                    let _ = process.kill();
+                    // Tree-kill first (D10): a dispatcher grandchild would
+                    // otherwise outlive this Child and pin niu's exit drain.
+                    kill_lingerer(&mut process);
                     process.wait().map_err(ExecuteError::IoError)?;
                     lingerer_sigpipe_status()
                 }
