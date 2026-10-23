@@ -53,7 +53,11 @@ impl Executor {
             &mut stdout,
             &mut stderr,
         )?;
-        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        // GNU printf.def emits conversion diagnostics through
+        // builtin_error (unbuffered) while the converted output sits in
+        // stdout's stdio buffer until the builtin returns: in a merged
+        // 2>&1 stream the diagnostics come first (rubash#1134).
+        self.write_buffered_builtin_output_stderr_first(cmd, &stdout, &stderr)?;
         // GNU builtins/printf.def printf_builtin returns
         // sh_chkwrite(format/operands success): a failed flush (a closed
         // stdout fd) folds the write failure into the builtin's status —

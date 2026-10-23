@@ -416,6 +416,11 @@ impl Executor {
                 self.write_redirect_diagnostic_routed(&cmd, &stderr)?;
                 self.exit_code = 1;
                 if self.errexit_enabled() && self.errexit_is_active() {
+                    // rubash#1171 (same class): a redirect-failed simple
+                    // command is a failed command — GNU fires the ERR
+                    // trap before the ERREXIT jump; the Ok path below
+                    // lets the ast_exec loop fire instead.
+                    self.maybe_run_error_trap(&cmd)?;
                     return Err(ExecuteError::ExitCode(1));
                 }
                 Ok(())
@@ -645,6 +650,48 @@ impl Executor {
         }
 
         if let Some(spec) = cmd.get_assignment("__RUBASH_PARSE_ERROR_NEAR__") {
+            // rubash#1093: GNU reads and executes one line at a time, so a
+            // runtime `shopt -s extglob` executed on an earlier line (via
+            // a function, eval, or an if-block — none of which the lexer's
+            // literal-shopt line scan can foresee) opens the parse gate
+            // for this line. Rubash parsed the whole script up front with
+            // the gate closed and stored a parse-error node; when the
+            // gate is open NOW and was opened by an earlier line, reparse
+            // the stored line with the live gate and execute that, which
+            // is exactly the cadence GNU had. A same-line enable keeps
+            // the error (GNU parses a full line before executing it).
+            {
+                let mut fields = spec.split(crate::executor::markers::PARSE_ERROR_FIELD_SEP);
+                let token = fields.next().unwrap_or_default();
+                let line = fields
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let enabled_line = self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_EXTGLOB_ENABLED_LINE")
+                    .and_then(|value| value.parse::<usize>().ok());
+                if token == "("
+                    && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob")
+                    && enabled_line.is_some_and(|enabled| enabled < line)
+                {
+                    if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
+                        if !source.contains("<<") {
+                            let tokens = crate::lexer::tokenize(source);
+                            let ast = crate::parser::parse(&tokens);
+                            let still_errored = ast.commands.iter().any(|command| {
+                                command.has_assignment("__RUBASH_PARSE_ERROR__")
+                                    || command.has_assignment("__RUBASH_PARSE_ERROR_NEAR__")
+                                    || command.has_assignment("__RUBASH_PARSE_ERROR_EOF__")
+                            });
+                            if !still_errored && !ast.commands.is_empty() {
+                                return self.execute_ast(&ast).map(|_| true);
+                            }
+                        }
+                    }
+                }
+            }
             // GNU parse.y yyerror: `syntax error near unexpected token 'X'`
             // reported at the line of the offending token, with that input
             // line echoed (mismatched closer inside a compound command).
@@ -729,6 +776,34 @@ impl Executor {
         }
 
         if cmd.has_assignment("__RUBASH_PARSE_ERROR__") {
+            // rubash#1093: same runtime-extglob recovery as the NEAR arm
+            // below, for producers that store the offending line.
+            if cmd
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .is_some_and(|message| message.contains("unexpected token `('"))
+                && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extglob")
+                && self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_EXTGLOB_ENABLED_LINE")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|enabled| enabled < cmd.line.unwrap_or(1))
+            {
+                if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
+                    if !source.contains("<<") {
+                        let tokens = crate::lexer::tokenize(source);
+                        let ast = crate::parser::parse(&tokens);
+                        let still_errored = ast.commands.iter().any(|command| {
+                            command.has_assignment("__RUBASH_PARSE_ERROR__")
+                                || command.has_assignment("__RUBASH_PARSE_ERROR_NEAR__")
+                                || command.has_assignment("__RUBASH_PARSE_ERROR_EOF__")
+                        });
+                        if !still_errored && !ast.commands.is_empty() {
+                            return self.execute_ast(&ast).map(|_| true);
+                        }
+                    }
+                }
+            }
             self.mark_parse_error();
             if let Some(source) = cmd.get_assignment("__RUBASH_PARSE_SOURCE__") {
                 if !source.contains("<<") {

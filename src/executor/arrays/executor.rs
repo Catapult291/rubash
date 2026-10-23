@@ -42,8 +42,8 @@ impl Executor {
                 }
                 return stack;
             }
-            "BASH_ARGC" => return self.shell_state.bash_argc_stack.clone(),
-            "BASH_ARGV" => return self.shell_state.bash_argv_stack.clone(),
+            "BASH_ARGC" => return self.bash_argc_view(),
+            "BASH_ARGV" => return self.bash_argv_view(),
             "BASH_LINENO" => return self.bash_lineno_view(),
             "BASH_SOURCE" => return self.shell_state.bash_source_stack.clone(),
             _ => {}
@@ -205,6 +205,25 @@ impl Executor {
                 );
             }
             let key = self.assoc_subscript_key(key);
+            // GNU arrayfunc.c:1610-1618 array_value_internal (assoc arm):
+            // akey = expand_subscript_string (t, 0); an EMPTY expanded key
+            // is INDEX_ERROR — err_badarraysub (name) with the bare variable
+            // name — and the expansion is empty. Unlike the length form's
+            // expand_wdesc_error (subst.c:7550), the plain value form does
+            // not fail the command: `echo ${m[$u]}` with $u unset prints the
+            // diagnostic, expands empty, and the command's status is
+            // unaffected (rubash#1148).
+            if key.is_empty() {
+                self.write_diagnostic_fd2(
+                    format!(
+                        "{}{}: bad array subscript\n",
+                        self.diagnostic_prefix(),
+                        array_name
+                    )
+                    .as_bytes(),
+                );
+                return Some(String::new());
+            }
             // Typed-cell fast path, mirroring the indexed leg below: GNU
             // assoc.c:120 assoc_reference is a single hash_search over the
             // assoc table — O(1), never a walk of the whole table. The

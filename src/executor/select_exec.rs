@@ -346,8 +346,33 @@ impl Executor {
             // BufReader that would prefetch the whole stream and break the
             // shared kernel offset for sibling reads.
             let stdin_handle = crate::fd::process_std_handle(0);
+            // GNU execute_cmd.c select_query reads through the same
+            // timeout machinery as `read`: TMOUT bounds the wait
+            // (bash's -E manual: select uses TMOUT as its timeout), and
+            // an expired query returns NULL exactly like EOF — the loop
+            // above reports EXECUTION_FAILURE and prints the newline
+            // (rubash#1141). A regular-file stdin disables the timeout
+            // (read.def:499-505 S_ISREG rule, via arm_read_deadline's
+            // parsing).
+            let deadline = self
+                .shell_state
+                .env_vars
+                .get("TMOUT")
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .filter(|_| !crate::fd::is_disk_file(stdin_handle))
+                .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
             let mut line: Vec<u8> = Vec::new();
             let at_eof = loop {
+                if let Some(deadline) = deadline {
+                    let now = std::time::Instant::now();
+                    if now >= deadline
+                        || crate::fd::wait_readable(stdin_handle, deadline - now)
+                            == crate::fd::ReadWait::Timeout
+                    {
+                        break true;
+                    }
+                }
                 match crate::fd::read_some(stdin_handle, 1) {
                     Ok(buf) if buf.is_empty() => break true,
                     Ok(buf) => {

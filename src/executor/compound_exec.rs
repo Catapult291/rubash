@@ -11,7 +11,7 @@ use super::*;
 /// per-process runtime state (FD tables, coproc pipes, command-substitution
 /// and heredoc payloads, trap table entries, line/pid bookkeeping,
 /// evaluation-context flags, test-harness sentinels) stay dropped.
-fn rubash_spawn_inherited_state(key: &str) -> bool {
+pub(in crate::executor) fn rubash_spawn_inherited_state(key: &str) -> bool {
     const KEYS: &[&str] = &[
         "__RUBASH_ARRAY_VARS",
         "__RUBASH_ASSOC_VARS",
@@ -432,7 +432,10 @@ impl Executor {
         // The gate runs BEFORE any wrapper-only setup (exe resolution, env
         // block, handle duplication): a direct spawn pays none of it.
         let direct_plan = if !self.xtrace_enabled() && !captured_pipe_writer {
-            self.background_direct_external_command(&background_command.command)
+            self.background_direct_external_command(
+                &background_command.command,
+                !consumed.is_empty() && consumed.iter().all(|entry| *entry),
+            )
         } else {
             None
         };
@@ -526,6 +529,13 @@ impl Executor {
             !(key.starts_with("__RUBASH_TRAP") && key != "__RUBASH_TRAP_ORIG_IGN")
         });
         env_map.insert("__RUBASH_SHELL_PID".to_string(), self.shell_pid.to_string());
+        // rubash#1074: the wrapper child is one subshell level deeper than
+        // this shell (execute_in_subshell's subshell_level++); carry the
+        // target depth so the child's BASH_SUBSHELL starts at parent + 1.
+        env_map.insert(
+            "__RUBASH_SUBSHELL_DEPTH".to_string(),
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
         // GNU execute_cmd.c:1761 (execute_in_subshell): a forked async
         // subshell keeps the parent's $0 and line number, so diagnostics
         // inside `xcase &` print `./script: line N:` rather than `bash:`. The
@@ -781,6 +791,7 @@ impl Executor {
     fn background_direct_external_command(
         &mut self,
         command: &CommandNode,
+        redirects_fully_consumed: bool,
     ) -> Option<(std::path::PathBuf, Vec<String>)> {
         // A restricted shell refuses command names carrying `/' before any
         // dispatch (execute_prepared_command -> restricted_command_error,
@@ -815,14 +826,19 @@ impl Executor {
         {
             return None;
         }
-        // No assignments (tempenv belongs to the child in GNU) and no
-        // redirections beyond the async fd 0-2 stdio rules this caller
-        // already resolved into handles.
-        if !command.assignments.is_empty()
-            || !command.compound_assignments.is_empty()
-            || !command.array_element_assignments.is_empty()
-            || !command.assignment_raws.is_empty()
-            || !command.redirects.is_empty()
+        // No assignments (tempenv belongs to the child in GNU).
+        // Redirections are admissible only when resolve_background_stdio
+        // consumed EVERY entry of `command.redirects` into the fd 0-2
+        // handles the direct spawn receives: the Option mirror fields
+        // (redirect_out & friends) duplicate entries of that list, so a
+        // fully-consumed list means the stdio triple carries the whole
+        // redirection set and nothing is left for a child shell to
+        // re-apply. Any unconsumed remainder (fd>2, {fd} vars, procsub
+        // targets, failed opens whose diagnostic belongs to the job)
+        // keeps the wrapper (rubash#1033: a redirected simple external
+        // used to ALWAYS take the wrapper, so $! named the wrapper and
+        // kill/wait never reached the real job's traps).
+        let redirect_fields_present = !command.redirects.is_empty()
             || command.redirect_in.is_some()
             || command.redirect_out.is_some()
             || command.append.is_some()
@@ -833,7 +849,12 @@ impl Executor {
             || command.heredoc_delimiter.is_some()
             || !command.heredoc_redirects.is_empty()
             || command.here_string.is_some()
-            || command.here_string_carrier.is_some()
+            || command.here_string_carrier.is_some();
+        if !command.assignments.is_empty()
+            || !command.compound_assignments.is_empty()
+            || !command.array_element_assignments.is_empty()
+            || !command.assignment_raws.is_empty()
+            || (redirect_fields_present && !redirects_fully_consumed)
         {
             return None;
         }
@@ -957,6 +978,14 @@ impl Executor {
         };
         // Script files need the shell fallback the wrapper's child provides.
         if crate::executor::path::should_run_with_shell(&program) {
+            return None;
+        }
+        // On unix a shebangless text file is an execve-ENOEXEC case:
+        // a native spawn would hand it to glibc execvp's /bin/sh
+        // fallback instead of this shell (rubash#1037) — the wrapper's
+        // foreground-classification path owns it, so stay out.
+        #[cfg(unix)]
+        if super::external_inner::is_enoexec_candidate(&program) {
             return None;
         }
         Some((program, expanded.words))
@@ -2067,7 +2096,14 @@ impl Executor {
         let saved_exec_replaced = self.exec_replaced;
         crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         self.shell_state.subshell_depth.set(saved_depth + 1);
+        // rubash#1115: the forked child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for the wholesale restore.
+        self.shell_state.random_state.reseed_fresh();
         self.shell_state.loop_depth = 0;
+        // execute_in_subshell resets loop_level (execute_cmd.c:1642), so
+        // fork-inherited depth does not cross a `( )` boundary either.
+        self.shell_state.inherited_loop_depth = 0;
 
         // RESTRICTED_SHELL (#804): the subshell's redirects apply inside
         // the child before the body (do_redirections precedes the list), so
@@ -2667,6 +2703,25 @@ impl Executor {
             .name
             .clone()
             .unwrap_or_else(|| "COPROC".to_string());
+        // GNU execute_cmd.c execute_coproc validates an explicit NAME
+        // before anything is spawned: valid_identifier fails ->
+        // err_invalidid (`` `<name>': not a valid identifier ``) and
+        // EXECUTION_FAILURE, and no coprocess is created (rubash#1153:
+        // `coproc "" { echo hi; }` printed the same text but exited 0
+        // after spawning). The default COPROC name never takes this
+        // branch, and a nameref name is a valid identifier itself — its
+        // target is adjudicated at bind time below.
+        if let Some(name) = &coproc_cmd.name {
+            if !is_shell_name(name) {
+                eprintln!(
+                    "{}`{}': not a valid identifier",
+                    self.diagnostic_prefix(),
+                    name
+                );
+                self.exit_code = 1;
+                return Ok(());
+            }
+        }
         use std::process::{Command, Stdio};
         let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
             .map(std::path::PathBuf::from)
@@ -2761,6 +2816,13 @@ impl Executor {
         // blocked read cannot consume the shell signal mailbox.
         child.env(INHERIT_PROCESS_STDIN, "1");
         child.env("__RUBASH_COPROC_CHILD", "1");
+        // rubash#1074: the coproc body runs in a forked subshell
+        // (execute_in_subshell: subshell_level++), so the child's
+        // BASH_SUBSHELL starts at this shell's depth + 1.
+        child.env(
+            "__RUBASH_SUBSHELL_DEPTH",
+            (self.shell_state.subshell_depth.get() + 1).to_string(),
+        );
 
         // Create pipes for bidirectional communication
         let stdin_result = std::io::pipe();
@@ -3194,6 +3256,21 @@ impl Executor {
             {
                 self.exit_code = 0;
                 return Ok(());
+            }
+        }
+        // GNU execute_cmd.c:3695: the case subject goes through
+        // expand_word_leave_quoted, so a nounset unbound variable (or
+        // another fatal expansion error) in it raises the FORCE_EOF
+        // class before any clause is tested (rubash#1130) — the
+        // simple-command pre-scan never sees the subject.
+        {
+            let scan_text = if case_command.word_metadata.raw.is_empty() {
+                case_command.word.as_str()
+            } else {
+                case_command.word_metadata.raw.as_str()
+            };
+            if let Some(error) = self.parameter_expansion_error_in_word(scan_text) {
+                return self.raise_word_expansion_error(error);
             }
         }
         // GNU execute_cmd.c:3695-3699: the case word is expanded by

@@ -4177,12 +4177,17 @@ fn command_substitution_break_uses_subshell_loop_context() {
         .expect("run rubash");
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "a:B\nC\nb:B\nC\n");
+    // GNU (subst.c command_substitute -> parse_and_execute in a fork that
+    // inherits loop_level; builtins/break.def check_loop_level): `break`
+    // inside the substitution is meaningful — it ends the substitution's
+    // own list silently, so `echo C` never runs and no diagnostic prints
+    // (rubash#1065; verified against GNU bash 5.3.20).
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a:B\nb:B\n");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr)
             .matches("break: only meaningful")
             .count(),
-        2
+        0
     );
 }
 

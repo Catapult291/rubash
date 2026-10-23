@@ -936,14 +936,43 @@ impl RandomGen {
         }
     }
 
-    /// Command/process substitution clones carry the seeds over (GNU
-    /// reseeds from genseed on pid change, which rubash cannot observe).
+    /// Command/process substitution clones carry the seeds over; the
+    /// subshell boundary itself reseeds (see `reseed_fresh`).
     pub(crate) fn clone_state(&self) -> Self {
         Self {
             rseed: Cell::new(self.rseed.get()),
             last_value: Cell::new(self.last_value.get()),
             rseed32: Cell::new(self.rseed32.get()),
         }
+    }
+
+    /// Restore a snapshot taken by `clone_state` (pipeline-stage bracket:
+    /// the stage's reseeded generator must not leak back to the parent).
+    pub(crate) fn restore_state(&self, saved: &Self) {
+        self.rseed.set(saved.rseed.get());
+        self.last_value.set(saved.last_value.get());
+        self.rseed32.set(saved.rseed32.get());
+    }
+
+    /// GNU variables.c:1418-1423 get_random_number: entering a subshell
+    /// environment under a new pid reseeds via seedrand() — lib/sh/
+    /// random.c:122-129, whose genseed (random.c:88-96) mixes time, pid,
+    /// ppid and uid — and sbrand resets last_random_value to 0
+    /// (random.c:117-121). Rubash subshells are in-process, so the entry
+    /// points call this eagerly where GNU's fork would change the pid:
+    /// the observable contract is identical (a fresh, run-varying
+    /// sequence inside the subshell; the parent's state untouched, since
+    /// every entry here sits behind a clone/save boundary). The counter
+    /// keeps sibling entries within the same microsecond distinct.
+    pub(crate) fn reseed_fresh(&self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ENTRY_COUNTER: AtomicU32 = AtomicU32::new(0);
+        let tick = ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = (current_epoch_micros() as u32)
+            ^ std::process::id().rotate_left(7)
+            ^ tick.wrapping_mul(0x9e37_79b9);
+        self.rseed.set(seed);
+        self.last_value.set(0);
     }
 }
 
@@ -962,15 +991,42 @@ fn intrand32(last: u32) -> u32 {
     }
 }
 
+/// GNU lib/sh/random.c:99-113 brand(): the 15-bit fold
+/// `(rseed >> 16) ^ (rseed & 65535)` applies only when
+/// shell_compatibility_level > 50; at lower levels the raw state is
+/// masked directly (`ret = rseed & BASH_RAND_MAX`) — the pre-5.1
+/// generator sequence `shopt -s compat32/compat44` selects
+/// (rubash#1167). The level derivation mirrors GNU's: a set compatNN
+/// flag (all ≤ 44) wins, else the BASH_COMPAT parse, else the 5.3
+/// default of 53.
+pub(in crate::executor) fn random_compat_fold(env_vars: &HashMap<String, String>) -> bool {
+    for flag in [
+        "compat31", "compat32", "compat40", "compat41", "compat42", "compat43", "compat44",
+    ] {
+        if crate::builtins::shopt::option_enabled(env_vars, flag) {
+            return false;
+        }
+    }
+    shell_compatibility_level_value(env_vars) > 50
+}
+
 /// GNU lib/sh/random.c:99-113 brand() + variables.c:1424-1431
-/// get_random_number: fold the 31-bit seed to 15 bits via
-/// `(rseed >> 16) ^ (rseed & 65535)` (the shell_compatibility_level > 50
-/// path) and resample while the draw repeats the previous value.
-pub(in crate::executor) fn next_random_from_state(state: &RandomGen) -> u32 {
+/// get_random_number: advance the Park-Miller state, fold per the
+/// compat level (see random_compat_fold), and resample while the draw
+/// repeats the previous value.
+pub(in crate::executor) fn next_random_from_state(
+    state: &RandomGen,
+    env_vars: &HashMap<String, String>,
+) -> u32 {
+    let fold = random_compat_fold(env_vars);
     loop {
         let rseed = intrand32(state.rseed.get());
         state.rseed.set(rseed);
-        let ret = ((rseed >> 16) ^ (rseed & 65_535)) & 32_767;
+        let ret = if fold {
+            ((rseed >> 16) ^ (rseed & 65_535)) & 32_767
+        } else {
+            rseed & 32_767
+        };
         if ret != state.last_value.get() {
             state.last_value.set(ret);
             return ret;

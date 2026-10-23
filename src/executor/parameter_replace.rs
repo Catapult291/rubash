@@ -98,7 +98,11 @@ pub(in crate::executor) fn replace_parameter_pattern(
     let mut output = String::new();
     let mut cursor = 0;
 
-    while cursor <= value.len() {
+    // GNU pat_subst (subst.c:9238+): the scan runs over positions
+    // [0, len) — a zero-length match at the very end does NOT earn a
+    // replacement (`${w//*(a)/Q}` on `abac` is `QQbQQc`, no trailing Q);
+    // the empty-VALUE case was handled above.
+    while cursor < value.len() {
         let Some((start, end)) =
             find_parameter_pattern_match(value, pattern, cursor, &indices, nocase, extglob)
         else {
@@ -280,11 +284,16 @@ pub(in crate::executor) fn find_parameter_pattern_match(
     let ends_at_value_end = !extglob_pattern && pattern_ends_with_lone_backslash(pattern);
 
     for (start_pos, start) in indices[start_index..].iter().enumerate() {
-        let ends = &indices[start_index + start_pos + 1..];
+        // Candidate ends include `start` itself: a pattern that can match
+        // the empty string (`*(...)`, `?(...)`, `*`) matches zero-length
+        // at this position, and GNU pat_subst replaces that empty match
+        // (subst.c:9238 match loop; rubash#1091). It is tried first so
+        // the ascending scan still ends with the LONGEST match.
+        let ends = &indices[start_index + start_pos..];
         let mut best: Option<usize> = None;
         for (end_rel, end) in ends.iter().enumerate() {
             if let Some(bound) = bound {
-                if end_rel + 1 > bound {
+                if end_rel > bound {
                     break;
                 }
             }
@@ -533,9 +542,17 @@ pub(in crate::executor) fn apply_parameter_transform(
         ParameterTransform::KeyValueQuoted => shell_reusable_quote(value),
         ParameterTransform::KeyValueSplit => shell_reusable_quote(value),
         ParameterTransform::Prompt => value.to_string(),
-        ParameterTransform::Upper => value.chars().flat_map(char::to_uppercase).collect(),
+        // ${var@U}/${var@L} run the same casemod.c simple 1:1 mapping
+        // as ${var^^}/${var,,} (rubash#1063).
+        ParameterTransform::Upper => value
+            .chars()
+            .map(crate::locale::simple_case_upper)
+            .collect(),
         ParameterTransform::UpperFirst => uppercase_first_char(value),
-        ParameterTransform::Lower => value.chars().flat_map(char::to_lowercase).collect(),
+        ParameterTransform::Lower => value
+            .chars()
+            .map(crate::locale::simple_case_lower)
+            .collect(),
     }
 }
 
@@ -544,7 +561,10 @@ fn uppercase_first_char(value: &str) -> String {
     let Some(first) = chars.next() else {
         return String::new();
     };
-    first.to_uppercase().chain(chars).collect::<String>()
+    let mut out = String::with_capacity(value.len());
+    out.push(crate::locale::simple_case_upper(first));
+    out.push_str(chars.as_str());
+    out
 }
 
 pub(in crate::executor) fn format_key_value_transform_part(

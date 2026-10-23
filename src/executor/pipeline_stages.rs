@@ -106,6 +106,12 @@ impl Executor {
     ) -> Result<(String, String, i32), ExecuteError> {
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // A compound pipeline element passes execute_in_subshell, which
+        // resets loop_level to 0 (execute_cmd.c:1642, Posix interp 842):
+        // break/continue inside `{ break; } | cat` are "only meaningful"
+        // there even when the pipeline sits in a loop — unlike a SIMPLE
+        // element, which inherits the depth (rubash#1064).
+        subshell.shell_state.inherited_loop_depth = 0;
         // A pipeline member runs in a subshell: caught signal traps reset to
         // the inherited disposition (execute_cmd.c subshell trap reset), so
         // only traps set inside the member run at its exit.
@@ -658,7 +664,13 @@ impl Executor {
                     ),
                     None => (
                         not_found_word.clone(),
-                        ": command not found".to_string(),
+                        // With PATH unset the name is never searched, so
+                        // GNU reports the execve ENOENT text (rubash#1145).
+                        if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                            ": No such file or directory".to_string()
+                        } else {
+                            ": command not found".to_string()
+                        },
                         127,
                     ),
                 };

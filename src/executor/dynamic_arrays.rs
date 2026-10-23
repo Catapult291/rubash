@@ -9,6 +9,7 @@ use super::*;
 pub(crate) struct ArithDynamicContext {
     bashpid: u32,
     subshell_depth: usize,
+    histcmd: usize,
     function_depth: usize,
     funcname_top: Option<String>,
     debug_trap_command: Option<String>,
@@ -32,6 +33,7 @@ impl ArithDynamicContext {
         match name {
             "BASHPID" => Some(self.bashpid.to_string()),
             "BASH_SUBSHELL" => Some(self.subshell_depth.to_string()),
+            "HISTCMD" => Some(self.histcmd.to_string()),
             // variables.c:1526 get_bash_argv0 returns dollar_vars[0]; the
             // script-name chain below is rubash's dollar_vars[0] model.
             "BASH_ARGV0" => Some(script_name_value_from_env(env_vars)),
@@ -39,8 +41,8 @@ impl ArithDynamicContext {
             // function depth 0 (variables.c:1812 make_funcname_visible);
             // the dynamic snapshot omitted it there — funcname_top is None.
             "FUNCNAME" => self.funcname_top.clone(),
-            // groups_words() is the current stub (vec!["0"]); keep both
-            // readers on one source so a real port changes them together.
+            // groups_words() is the single GROUPS source (general.c
+            // get_groupset port); keep both readers on it.
             "GROUPS" => Some(groups_words().get(0).cloned().unwrap_or_default()),
             "BASH_COMMAND" => Some(
                 self.debug_trap_command
@@ -106,18 +108,18 @@ pub(in crate::executor) fn env_derived_dynamic_parameter_value(
                 .get(SECONDS_OFFSET)
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
-            Some(
-                (current_epoch_seconds() - start + offset)
-                    .max(0)
-                    .to_string(),
-            )
+            // GNU variables.c get_seconds: the value is a plain
+            // time_t difference plus the assignment offset — a negative
+            // assignment (`SECONDS=-100`) reads back negative and ticks
+            // up through zero; there is no clamp at 0 (rubash#1083).
+            Some((current_epoch_seconds() - start + offset).to_string())
         }
         _ => None,
     }
 }
 
-/// GROUPS word list — stub returning a single "0" (a real port would walk
-/// the process group set, GNU variables.c:1886 get_groupset). Shared by
+/// GROUPS word list — the process group set (GNU general.c:1281
+/// initialize_group_array / variables.c:1637 get_groupset). Shared by
 /// the Executor accessors and the arithmetic dynamic context.
 /// shquote.c sh_double_quote: wrap in `"` and backslash-escape `\`, `"`,
 /// `` ` `` and `$` — the declare -p renderer for dynamic variable values.
@@ -135,7 +137,46 @@ fn sh_double_quote_text(value: &str) -> String {
 }
 
 pub(in crate::executor) fn groups_words() -> Vec<String> {
-    vec!["0".to_string()]
+    // GNU general.c:1281 initialize_group_array feeding variables.c:1637
+    // get_groupset: the process group set from getgroups(), with the
+    // primary gid guaranteed present and moved to element 0 (an empty
+    // getgroups result degrades to just the primary gid). Cached by GNU
+    // for the shell's lifetime (group_set is built once); the process
+    // group set cannot change under a running shell except through
+    // setgroups by the process itself, which rubash never calls.
+    // rubash#1046 (the old stub always returned ["0"]).
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+        GROUPS
+            .get_or_init(|| {
+                let gid = unsafe { libc::getgid() };
+                let mut groups: Vec<libc::gid_t> = vec![0; 64];
+                let count = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+                let mut gids: Vec<u32> = if count > 0 {
+                    groups.truncate(count as usize);
+                    groups
+                } else {
+                    Vec::new()
+                };
+                if gids.is_empty() {
+                    gids.push(gid);
+                } else if let Some(pos) = gids.iter().position(|&g| g == gid) {
+                    if pos != 0 {
+                        gids.swap(0, pos);
+                    }
+                } else {
+                    gids.insert(0, gid);
+                }
+                gids.iter().map(u32::to_string).collect()
+            })
+            .clone()
+    }
+    #[cfg(not(unix))]
+    {
+        vec!["0".to_string()]
+    }
 }
 
 impl Executor {
@@ -166,6 +207,7 @@ impl Executor {
                 | "SHELLOPTS"
                 | "BASHOPTS"
                 | "PIPESTATUS"
+                | "HISTCMD"
         ) {
             return None;
         }
@@ -182,6 +224,13 @@ impl Executor {
             "SRANDOM" => Some(self.next_srandom_value().to_string()),
             "BASHPID" => Some(self.bashpid_value().to_string()),
             "BASH_SUBSHELL" => Some(self.shell_state.subshell_depth.get().to_string()),
+            // GNU bashhist.c: HISTCMD is always defined — the history
+            // number of the current command, i.e. of the most recent
+            // history entry (history_base + history_length - 1); the
+            // pre-execution add makes that the current line whenever the
+            // line was recorded, and it is 0 before anything is recorded
+            // (rubash#1071: it read as entirely unset).
+            "HISTCMD" => Some(self.histcmd_value().to_string()),
             "BASH_ARGV0" => Some(self.script_name_value()),
             // GNU FUNCNAME carries att_invisible and only becomes visible
             // while a function is executing (variables.c:1812
@@ -294,6 +343,25 @@ impl Executor {
     /// non-numeric value fails valid_number and leaves the state alone.
     /// Applied on the declare/typeset/local bind path, whose assignment
     /// operands bypass apply_shell_assignment's own seed (rubash#541).
+    /// A RANDOM seed written as a canonical decimal integer (optional
+    /// sign, no leading zero) seeds directly; anything else (`010`,
+    /// `0x10`, `abc`, `42x`) goes through evalexp like GNU assign_random
+    /// (rubash#1082).
+    pub(in crate::executor) fn canonical_decimal_seed(value: &str) -> Option<i64> {
+        let trimmed = value.trim();
+        let digits = trimmed
+            .strip_prefix('-')
+            .or_else(|| trimmed.strip_prefix('+'))
+            .unwrap_or(trimmed);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        trimmed.parse::<i64>().ok()
+    }
+
     pub(in crate::executor) fn apply_declare_random_seeds(&self, args: &[String]) {
         for arg in args {
             let Some((name, value)) = arg.split_once('=') else {
@@ -302,10 +370,21 @@ impl Executor {
             if name.ends_with('+') || name != "RANDOM" {
                 continue;
             }
-            if let Ok(seed) = value.trim().parse::<i64>() {
+            if let Some(seed) = Self::canonical_decimal_seed(value) {
+                self.shell_state.random_state.rseed.set(seed as u32);
+                self.shell_state.random_state.last_value.set(0);
+            } else if let Some(seed) = crate::executor::arithmetic::eval_conditional_arith_value(
+                value,
+                &self.shell_state.env_vars,
+            ) {
+                // Same evalexp seeding as the plain assignment path
+                // (rubash#1082); a failed evaluation leaves the seed
+                // alone — declare's caller surfaces the evalerror.
                 self.shell_state.random_state.rseed.set(seed as u32);
                 self.shell_state.random_state.last_value.set(0);
             }
+            // A failed evaluation leaves the seed alone; the evalerror
+            // record stays for the declare caller's diagnostic path.
         }
     }
 
@@ -336,10 +415,45 @@ impl Executor {
             "RANDOM" | "SECONDS" | "SRANDOM" | "BASHPID" => {
                 Some(format!("declare -i{exported} {name}={quoted}"))
             }
-            "GROUPS" => Some(format!("declare -a{exported} {name}=([0]={quoted})")),
+            "GROUPS" => {
+                let elements = groups_words()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| format!("[{index}]={}", sh_double_quote_text(group)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(format!("declare -a{exported} {name}=({elements})"))
+            }
             "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "BASH_SUBSHELL" | "BASH_ARGV0"
-            | "BASH_COMMAND" => Some(format!("declare --{exported} {name}={quoted}")),
+            | "BASH_COMMAND" | "HISTCMD" => Some(format!("declare --{exported} {name}={quoted}")),
             _ => None,
+        }
+    }
+
+    /// GNU bashhist.c histcmd: the history number of the most recent
+    /// entry (history_base + history_length - 1); 0 when nothing has
+    /// been recorded or no session list is attached (rubash#1071).
+    pub(in crate::executor) fn histcmd_value(&self) -> usize {
+        // GNU variables.c histcmd stays 0 while history is disabled: the
+        // dynamic value tracks the readline-maintained list position, and
+        // with `set +o history` the list (even when `history -s` appended
+        // to it) never advances the variable (verified GNU 5.3 script:
+        // -s a / -s b / -c / -s z all leave $HISTCMD at 0).
+        if self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_SETOPT_history")
+            .map(String::as_str)
+            != Some("1")
+        {
+            return 0;
+        }
+        match self.shell_state.session_history.as_ref() {
+            Some(session) => {
+                let session = session.borrow();
+                (session.base + session.entries.len()).saturating_sub(1)
+            }
+            None => 0,
         }
     }
 
@@ -364,6 +478,7 @@ impl Executor {
                 | "SHELLOPTS"
                 | "BASHOPTS"
                 | "PIPESTATUS"
+                | "HISTCMD"
         )
     }
 
@@ -395,6 +510,7 @@ impl Executor {
         ArithDynamicContext {
             bashpid: self.bashpid_value(),
             subshell_depth: self.shell_state.subshell_depth.get(),
+            histcmd: self.histcmd_value(),
             function_depth: self.shell_state.function_depth,
             funcname_top: (self.shell_state.function_depth > 0).then(|| {
                 self.shell_state
@@ -435,6 +551,67 @@ impl Executor {
     /// frame and reports BASH_LINENO with no trailing "0" (probe
     /// 2026-09-27: "inner outer|bash bash|1 1"). The main script frame
     /// exists exactly when has_script_main_frame() is true.
+    /// Effective BASH_ARGV contents: the extdebug call frames plus the
+    /// bottom frame (the shell's own positional parameters, reversed)
+    /// that GNU's init_bash_argv installs when the arrays materialize
+    /// (variables.c get_bashargcv / execute_cmd.c:5337). The bottom
+    /// frame's content depends on how the arrays materialized:
+    /// startup / extdebug enable / a top-level read capture the
+    /// then-current positional parameters, while a compat <= 44
+    /// function entry installs an empty frame (see function entry).
+    /// A top-level read before any materialization synthesizes the
+    /// frame from the current positional window, mirroring GNU's
+    /// read-time initialization at variable_context 0
+    /// (variables.c get_bashargcv): GNU shows the bottom frame at
+    /// the top level regardless of extdebug (oracle: script and -c,
+    /// args X Y -> BASH_ARGC=(2), BASH_ARGV=(Y X)), while inside a
+    /// function the arrays stay unmaterialized until a
+    /// materializing call (rubash#1051, rubash#1110 item 4).
+    pub(in crate::executor) fn bash_argv_view(&self) -> Vec<String> {
+        let mut view = self.shell_state.bash_argv_stack.clone();
+        if let Some(bottom) = self.bash_arg_bottom_frame() {
+            view.extend(bottom.iter().cloned());
+        }
+        view
+    }
+
+    /// Effective BASH_ARGC contents — one count per BASH_ARGV frame,
+    /// the bottom frame's count last (see [`Self::bash_argv_view`]).
+    pub(in crate::executor) fn bash_argc_view(&self) -> Vec<String> {
+        let mut view = self.shell_state.bash_argc_stack.clone();
+        if let Some(bottom) = self.bash_arg_bottom_frame() {
+            view.push(bottom.len().to_string());
+        }
+        view
+    }
+
+    /// The installed BASH_ARGV bottom frame, or None while the arg
+    /// arrays have never materialized. A read at the top level
+    /// materializes the frame on the spot, exactly like variables.c
+    /// get_bashargcv (variable_context == 0 && debugging_mode == 0 ->
+    /// init_bash_argv): the frame captures the positional parameters
+    /// current at that first read and persists for the shell's
+    /// lifetime, so a later function entry (even a compat <= 44 one,
+    /// whose own init is then a no-op) observes the same frame.
+    /// Inside a function an unmaterialized array stays unmaterialized.
+    fn bash_arg_bottom_frame(&self) -> Option<Vec<String>> {
+        if let Some(bottom) = self.shell_state.bash_arg_bottom.borrow().as_ref() {
+            return Some(bottom.clone());
+        }
+        if self.shell_state.function_depth > 0 {
+            return None;
+        }
+        let frame: Vec<String> = self
+            .shell_state
+            .positional_window()
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        *self.shell_state.bash_arg_bottom.borrow_mut() = Some(frame.clone());
+        Some(frame)
+    }
+
     pub(in crate::executor) fn bash_lineno_view(&self) -> Vec<String> {
         let mut stack = self.shell_state.bash_lineno_stack.clone();
         if self.has_script_main_frame() && stack.last().map(String::as_str) != Some("0") {
@@ -491,8 +668,16 @@ impl Executor {
                     stack
                 }
             }
-            "BASH_ARGV" => self.shell_state.bash_argv_stack.clone(),
-            "BASH_ARGC" => self.shell_state.bash_argc_stack.clone(),
+            // rubash#1110 item 4 + rubash#1051: execute_cmd.c's
+            // push_args runs only in debugging_mode, so without
+            // extdebug no call frame is ever pushed; the view still
+            // shows the bottom frame once the arrays materialize
+            // (a compat <= 44 call materializes it — see function
+            // entry), which is why BASH_ARGV reads empty in an
+            // arg-less shell at compat <= 44 without extdebug while
+            // BASH_ARGC reads (0).
+            "BASH_ARGV" => self.bash_argv_view(),
+            "BASH_ARGC" => self.bash_argc_view(),
             "BASH_LINENO" => self.bash_lineno_view(),
             "BASH_SOURCE" => {
                 let mut stack = self.shell_state.bash_source_stack.clone();
@@ -577,15 +762,12 @@ impl Executor {
                 }
                 return Some(format_indexed_array_values(stack));
             }
-            "BASH_ARGC" => {
-                return Some(format_indexed_array_values(
-                    self.shell_state.bash_argc_stack.clone(),
-                ))
-            }
+            "BASH_ARGC" => return Some(format_indexed_array_values(self.bash_argc_view())),
             "BASH_ARGV" => {
-                return Some(format_indexed_array_values(
-                    self.shell_state.bash_argv_stack.clone(),
-                ))
+                // rubash#1110 item 4: same composed view as the direct
+                // arm in dynamic_stack_array_values (no call frames
+                // without extdebug; bottom frame once materialized).
+                return Some(format_indexed_array_values(self.bash_argv_view()));
             }
             "BASH_LINENO" => return Some(format_indexed_array_values(self.bash_lineno_view())),
             "BASH_SOURCE" => {
@@ -728,7 +910,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn next_random_value(&self) -> u32 {
-        next_random_from_state(&self.shell_state.random_state)
+        next_random_from_state(&self.shell_state.random_state, &self.shell_state.env_vars)
     }
 
     pub(in crate::executor) fn next_srandom_value(&self) -> u32 {

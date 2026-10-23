@@ -181,7 +181,9 @@ impl Executor {
             }
             "let" => {
                 self.apply_no_output_builtin_redirects(&builtin_cmd)?;
-                self.exit_code = self.execute_let(&builtin_cmd.words[1..]);
+                self.exit_code = self.with_compound_output_redirects(&builtin_cmd, |executor| {
+                    Ok(executor.execute_let(&builtin_cmd.words[1..]))
+                })?;
                 Ok(())
             }
             "umask" => {

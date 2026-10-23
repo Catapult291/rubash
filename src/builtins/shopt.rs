@@ -154,7 +154,14 @@ where
             ShoptMode::List | ShoptMode::Query => {
                 print_all_shopts(env_vars, print, stdout)?;
             }
-            ShoptMode::Set => {}
+            // GNU builtins/shopt.def shopt_builtin: bare `shopt -s` (no
+            // operands, no -p) lists the SET options in the plain
+            // name/on-off format, exactly like bare `shopt -u` lists the
+            // unset ones (rubash#1107 item 5: `shopt -s compat44;
+            // shopt -s | grep -c compat` is 1 in GNU, was 0).
+            ShoptMode::Set => {
+                print_shopts_by_state(env_vars, true, false, stdout)?;
+            }
         }
         return Ok(status);
     }
@@ -351,6 +358,30 @@ pub(crate) fn set_option(
     name: &str,
     enabled: bool,
 ) {
+    set_option_inner(env_vars, name, enabled, true);
+}
+
+/// GNU general.c:103-128 posix_initialize writes the posix_vars C
+/// variables directly; it does NOT go through shopt.def toggle_shopts,
+/// so a posix-mode flip never rebinds $BASHOPTS (rubash#1055: runtime
+/// `set -o posix` leaves $BASHOPTS at its startup/shopt-builtin snapshot
+/// even though `shopt` queries show the flipped values). The posix walk
+/// in builtins/set/options.rs therefore sets its options through this
+/// entry, which skips the set_bashopts rebind at the bottom.
+pub(crate) fn set_option_from_posix_walk(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    name: &str,
+    enabled: bool,
+) {
+    set_option_inner(env_vars, name, enabled, false);
+}
+
+fn set_option_inner(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    name: &str,
+    enabled: bool,
+    rebind_bashopts: bool,
+) {
     // rubash#131: keep the parse-time extglob gate in step with the runtime
     // shopt (GNU builtins/shopt.def updates extglob_flag; reset_parser
     // parse.y:3502 propagates it into the parser's extended_glob). Later
@@ -358,6 +389,20 @@ pub(crate) fn set_option(
     // value GNU's parser would.
     if name == "extglob" {
         crate::lexer::set_parse_extended_glob(enabled);
+        // rubash#1093: record the line whose execution enabled extglob so
+        // the executor can tell a runtime flip on an EARLIER line (GNU's
+        // read-execute cadence parses later lines with the gate on) from
+        // a same-line `shopt -s extglob; case ...` unit (GNU parses the
+        // whole line first and rejects the pattern).
+        if enabled {
+            let line = env_vars
+                .get("__RUBASH_CURRENT_LINE")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string());
+            env_vars.insert("__RUBASH_EXTGLOB_ENABLED_LINE".to_string(), line);
+        } else {
+            env_vars.remove("__RUBASH_EXTGLOB_ENABLED_LINE");
+        }
     }
     match name {
         "xpg_echo" => XPG_ECHO.store(enabled, Ordering::Relaxed),
@@ -410,9 +455,13 @@ pub(crate) fn set_option(
     }
     // GNU shopt.def toggle_shopts -> set_bashopts: every shopt change
     // rebinds the BASHOPTS variable, so an export of BASHOPTS carries the
-    // live state to child shells (invocation1.sub:28-31).
-    let bashopts = bashopts_value(env_vars);
-    env_vars.insert("BASHOPTS".to_string(), bashopts);
+    // live state to child shells (invocation1.sub:28-31). The posix walk
+    // (set_option_from_posix_walk) is the one caller that must not
+    // rebind: GNU posix_initialize bypasses toggle_shopts (rubash#1055).
+    if rebind_bashopts {
+        let bashopts = bashopts_value(env_vars);
+        env_vars.insert("BASHOPTS".to_string(), bashopts);
+    }
 }
 
 fn state(env_vars: &HashMap<String, String>) -> HashSet<String> {

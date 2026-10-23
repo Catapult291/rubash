@@ -73,6 +73,13 @@ pub struct ShellState {
     /// variables.c BASH_ARGC/BASH_ARGV stacks.
     pub(crate) bash_argc_stack: Vec<String>,
     pub(crate) bash_argv_stack: Vec<String>,
+    /// The BASH_ARGV bottom frame (the shell's own positional parameters,
+    /// reversed into display order) installed by init_bash_argv the first
+    /// time the arg arrays materialize (rubash#1051). A RefCell because
+    /// GNU's materialization can happen inside the variables.c getter
+    /// (get_bashargcv) during a read, where the executor is shared.
+    /// None while the arrays have never been initialized.
+    pub(crate) bash_arg_bottom: std::cell::RefCell<Option<Vec<String>>>,
     /// variables.c BASH_LINENO/BASH_SOURCE stacks.
     pub(crate) bash_lineno_stack: Vec<String>,
     pub(crate) bash_source_stack: Vec<String>,
@@ -84,6 +91,16 @@ pub struct ShellState {
     pub(crate) expanding_aliases: Vec<String>,
     /// execute_cmd.c loop_level — break/continue scope boundary.
     pub(crate) loop_depth: usize,
+    /// Loop depth inherited across a fork boundary (command substitution
+    /// body, simple pipeline/async element): GNU's fork copies loop_level
+    /// into the child, whose parse_and_execute is not wrapped by
+    /// execute_in_subshell, so break/continue there are meaningful and
+    /// silently end the child's own command list (builtins/break.def
+    /// check_loop_level sees loop_level > 0). Compound elements and `( )`
+    /// subshells DO pass execute_in_subshell, which resets loop_level to 0
+    /// (execute_cmd.c:1642, Posix interp 842), so those boundaries leave
+    /// this at 0 (rubash#1064, rubash#1065).
+    pub(crate) inherited_loop_depth: usize,
     /// rubash#817 read-unit identity for the executor-level alias same-read
     /// guard (arithmetic_aliases.rs alias_defined_on_current_line). GNU
     /// expands an alias use only when the definition was consumed by an
@@ -182,6 +199,13 @@ pub struct ShellState {
     pub(crate) arithmetic_nonfatal_error: Cell<bool>,
     pub(crate) arithmetic_fatal_error: Cell<bool>,
     pub(crate) arithmetic_nounset_error: Cell<bool>,
+    /// Latch for a nounset fatal raised while expanding a `[[ =~ ]]`
+    /// operand (rubash#1177): the diagnostic prints at detection inside
+    /// conditional evaluation (which returns only an i32 status), and
+    /// execute_conditional_command_with_redirects converts the latch to
+    /// the FORCE_EOF exit, mirroring arithmetic_nounset_error's flow
+    /// through execute_bare_arithmetic_command.
+    pub(crate) conditional_nounset_error: Cell<bool>,
     pub(crate) arithmetic_last_error_category:
         Cell<Option<crate::executor::arithmetic::ArithmeticErrorCategory>>,
     /// Bad substitution flag (subshell boundary).
@@ -263,6 +287,7 @@ pub(crate) struct InteriorSnapshot {
     arithmetic_nonfatal_error: bool,
     arithmetic_fatal_error: bool,
     arithmetic_nounset_error: bool,
+    conditional_nounset_error: bool,
     arithmetic_last_error_category: Option<crate::executor::arithmetic::ArithmeticErrorCategory>,
     parameter_bad_substitution: bool,
     redirect_failglob_error: bool,
@@ -316,6 +341,7 @@ impl ShellState {
             arithmetic_nonfatal_error: self.arithmetic_nonfatal_error.get(),
             arithmetic_fatal_error: self.arithmetic_fatal_error.get(),
             arithmetic_nounset_error: self.arithmetic_nounset_error.get(),
+            conditional_nounset_error: self.conditional_nounset_error.get(),
             arithmetic_last_error_category: self.arithmetic_last_error_category.get(),
             parameter_bad_substitution: self.parameter_bad_substitution.get(),
             redirect_failglob_error: self.redirect_failglob_error.get(),
@@ -356,6 +382,8 @@ impl ShellState {
             .set(snapshot.arithmetic_fatal_error);
         self.arithmetic_nounset_error
             .set(snapshot.arithmetic_nounset_error);
+        self.conditional_nounset_error
+            .set(snapshot.conditional_nounset_error);
         self.arithmetic_last_error_category
             .set(snapshot.arithmetic_last_error_category);
         self.parameter_bad_substitution
@@ -387,6 +415,7 @@ impl Clone for ShellState {
             function_name_stack: self.function_name_stack.clone(),
             bash_argc_stack: self.bash_argc_stack.clone(),
             bash_argv_stack: self.bash_argv_stack.clone(),
+            bash_arg_bottom: self.bash_arg_bottom.clone(),
             bash_lineno_stack: self.bash_lineno_stack.clone(),
             bash_source_stack: self.bash_source_stack.clone(),
             local_var_scopes: self.local_var_scopes.clone(),
@@ -394,6 +423,7 @@ impl Clone for ShellState {
             local_typed_scopes: self.local_typed_scopes.clone(),
             expanding_aliases: self.expanding_aliases.clone(),
             loop_depth: self.loop_depth,
+            inherited_loop_depth: self.inherited_loop_depth,
             read_generation: self.read_generation,
             read_generation_ceiling: self.read_generation_ceiling,
             command_number: self.command_number,
@@ -420,6 +450,7 @@ impl Clone for ShellState {
             arithmetic_nonfatal_error: Cell::new(self.arithmetic_nonfatal_error.get()),
             arithmetic_fatal_error: Cell::new(self.arithmetic_fatal_error.get()),
             arithmetic_nounset_error: Cell::new(self.arithmetic_nounset_error.get()),
+            conditional_nounset_error: Cell::new(self.conditional_nounset_error.get()),
             arithmetic_last_error_category: Cell::new(self.arithmetic_last_error_category.get()),
             parameter_bad_substitution: Cell::new(self.parameter_bad_substitution.get()),
             redirect_failglob_error: Cell::new(self.redirect_failglob_error.get()),

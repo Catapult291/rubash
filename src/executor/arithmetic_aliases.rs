@@ -52,30 +52,47 @@ impl Executor {
         // list abort; DISCARD is chosen only by array_expand_index /
         // make_variable_value / word-expansion callers.
         if let Some(record) = crate::executor::arithmetic::take_arith_eval_error() {
-            eprintln!("{}{}: {}", self.diagnostic_prefix(), label, record.render());
+            self.arith_diag(&format!(
+                "{}{}: {}\n",
+                self.diagnostic_prefix(),
+                label,
+                record.render()
+            ));
         } else if let Some(token) = arithmetic_division_by_zero_token(expression) {
-            eprintln!(
-                "{}{}: {expression}: division by 0 (error token is \"{token}\")",
+            self.arith_diag(&format!(
+                "{}{}: {expression}: division by 0 (error token is \"{token}\")\n",
                 self.diagnostic_prefix(),
                 label
-            );
+            ));
         } else if let Some(token) = self.undefined_var_operand_token(expression) {
             // GNU expr.c: when $var expands to empty (undefined variable),
             // the arithmetic evaluator reports "operand expected" with the
             // original $var token (e.g. `jv += $iv` -> token "$iv").
-            eprintln!(
-                "{}{}: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")",
+            self.arith_diag(&format!(
+                "{}{}: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")\n",
                 self.diagnostic_prefix(),
                 label
-            );
+            ));
         } else if let Some(message) = crate::executor::arithmetic::arithmetic_command_error_message(
             expression,
             trailing_space,
         ) {
-            eprintln!("{}{}: {message}", self.diagnostic_prefix(), label);
+            self.arith_diag(&format!(
+                "{}{}: {message}\n",
+                self.diagnostic_prefix(),
+                label
+            ));
         }
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
+    }
+
+    /// GNU error.c writes a command's diagnostics to fd 2 *as currently
+    /// bound* — the `(( ))`/`let`/`[[ ]]` command's own redirections are
+    /// installed in the fd table before it runs, so `((a+=1)) 2>&1`
+    /// reports on stdout (rubash#1127). A raw eprintln! here leaks the
+    /// diagnostic to the shell's outer stderr. Route through the fd-2
+    /// dispatch (the same mechanism expansion diagnostics use, #167).
+    pub(in crate::executor) fn arith_diag(&self, text: &str) {
+        self.write_diagnostic_fd2(text.as_bytes());
     }
 
     /// Detect a $var reference in the expression that would expand to empty
@@ -152,6 +169,16 @@ impl Executor {
     }
 
     pub(in crate::executor) fn report_arithmetic_error_raw_display(&self, raw_display: &str) {
+        // GNU expr.c:1190-1216 expr_streval: an unbound variable under
+        // `set -u` reports `name: unbound variable` at the trap site and
+        // jumps straight out — evalerror never runs, so no second
+        // diagnostic may be synthesized from the expression text. The
+        // text heuristics below misread a postfix `u++`/`u--` whose
+        // operand trapped as a trailing-operator syntax error
+        // (rubash#1150: `((u++))` printed both lines).
+        if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
         if self.report_subscript_eval_failure() {
             return;
         }
@@ -161,18 +188,14 @@ impl Executor {
         let record_opt = crate::executor::arithmetic::take_arith_eval_error();
         if let Some(record) = record_opt {
             let rendered = record.render();
-            eprintln!("{}((: {}", self.diagnostic_prefix(), rendered);
-            use std::io::Write;
-            let _ = std::io::stderr().flush();
+            self.arith_diag(&format!("{}((: {}\n", self.diagnostic_prefix(), rendered));
             return;
         }
         let display = raw_display.trim_start_matches([' ', '\t']);
         if let Some(message) =
             crate::executor::arithmetic::arithmetic_command_error_message(display, false)
         {
-            eprintln!("{}((: {message}", self.diagnostic_prefix());
-            use std::io::Write;
-            let _ = std::io::stderr().flush();
+            self.arith_diag(&format!("{}((: {message}\n", self.diagnostic_prefix()));
         }
     }
 
@@ -182,15 +205,19 @@ impl Executor {
         token: &str,
     ) {
         self.raise_evalerror_abort();
-        eprintln!(
-            "{}((: {display}: division by 0 (error token is \"{token}\")",
+        self.arith_diag(&format!(
+            "{}((: {display}: division by 0 (error token is \"{token}\")\n",
             self.diagnostic_prefix()
-        );
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
+        ));
     }
 
     pub(in crate::executor) fn report_let_arithmetic_error(&self, expression: &str) {
+        // GNU expr.c:1190-1216 expr_streval: the nounset trap already
+        // reported the unbound variable and jumped out — no evalerror
+        // follows (rubash#1150, `let u++` double-reported).
+        if self.shell_state.arithmetic_nounset_error.get() {
+            return;
+        }
         // GNU expr.c: a failed array SUBSCRIPT eval (nested evalexp inside
         // array_expand_index) names the subscript, not the let operand.
         if self.report_subscript_eval_failure() {
@@ -206,12 +233,10 @@ impl Executor {
         // text scan is the fallback for paths that never reached the parser.
         if crate::executor::arithmetic::peek_arith_eval_error().is_none() {
             if let Some(token) = dollar_var_operand_token(expression) {
-                eprintln!(
-                    "{}let: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")",
+                self.arith_diag(&format!(
+                    "{}let: {expression}: arithmetic syntax error: operand expected (error token is \"{token}\")\n",
                     self.diagnostic_prefix()
-                );
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
+                ));
                 return;
             }
         }
@@ -233,17 +258,15 @@ impl Executor {
             return false;
         };
         match label {
-            Some(label) => eprintln!(
-                "{}{label}: `{value}': not a valid identifier",
+            Some(label) => self.arith_diag(&format!(
+                "{}{label}: `{value}': not a valid identifier\n",
                 self.diagnostic_prefix()
-            ),
-            None => eprintln!(
-                "{}`{value}': not a valid identifier",
+            )),
+            None => self.arith_diag(&format!(
+                "{}`{value}': not a valid identifier\n",
                 self.diagnostic_prefix()
-            ),
+            )),
         }
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
         true
     }
 
@@ -290,10 +313,10 @@ impl Executor {
             // DISCARD at execute_cmd.c:3937's expansion step); a marker
             // would leak into the NEXT command's expansion and discard it.
             if !self.shell_state.arithmetic_expansion_error.replace(true) {
-                eprintln!(
-                    "{}{eval_input_expr}: bad substitution",
+                self.arith_diag(&format!(
+                    "{}{eval_input_expr}: bad substitution\n",
                     self.diagnostic_prefix()
-                );
+                ));
             }
             return 1;
         }

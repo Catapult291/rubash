@@ -329,6 +329,14 @@ pub(crate) fn set_shell_option(
         shell_option_key(name),
         if enabled { "1" } else { "0" }.to_string(),
     );
+    // GNU builtins/set.def set_edit_mode (the shared setter for the
+    // emacs/vi o_options): turning one editing mode ON turns the other
+    // OFF — the two are never on together (rubash#1073). Turning one off
+    // does not turn the other on.
+    if enabled && matches!(name, "emacs" | "vi") {
+        let other = if name == "emacs" { "vi" } else { "emacs" };
+        env_vars.insert(shell_option_key(other), "0".to_string());
+    }
     let shelopts = shellopts_value(env_vars);
     env_vars.insert("SHELLOPTS".to_string(), shelopts);
     if let Some(prior) = posix_prior {
@@ -418,7 +426,10 @@ fn apply_posix_mode_transition(
             "inherit_errexit",
             "shift_verbose",
         ] {
-            crate::builtins::shopt::set_option(env_vars, option, true);
+            // general.c posix_initialize writes these directly, NOT via
+            // toggle_shopts, so $BASHOPTS keeps its prior snapshot
+            // (rubash#1055).
+            crate::builtins::shopt::set_option_from_posix_walk(env_vars, option, true);
         }
     } else {
         env_vars.remove("POSIXLY_CORRECT");
@@ -426,8 +437,12 @@ fn apply_posix_mode_transition(
         // the interactive default through __RUBASH_INTERACTIVE.
         let interactive_default =
             env_vars.get("__RUBASH_INTERACTIVE").map(String::as_str) == Some("1");
-        crate::builtins::shopt::set_option(env_vars, "expand_aliases", interactive_default);
-        crate::builtins::shopt::set_option(env_vars, "shift_verbose", false);
+        crate::builtins::shopt::set_option_from_posix_walk(
+            env_vars,
+            "expand_aliases",
+            interactive_default,
+        );
+        crate::builtins::shopt::set_option_from_posix_walk(env_vars, "shift_verbose", false);
     }
 }
 

@@ -23,6 +23,15 @@ pub(super) enum ParsedAssocSubscript {
     },
 }
 
+/// GNU array_expand_index (arrayfunc.c): a subscript that — after the
+/// expand_arith_string quote removal — is exactly `@` or `*` is not an
+/// index expression at all; it is the bad-array-subscript case
+/// (`arr[@]: bad array subscript`, value 0, rubash#1136).
+fn is_at_star_subscript(subscript: &str) -> bool {
+    let stripped = crate::executor::arithmetic::strip_arith_double_quotes(subscript);
+    matches!(stripped.trim(), "@" | "*")
+}
+
 impl ConditionalArithParser<'_> {
     /// Parse an lvalue for an assignment target. GNU expr.c:1395-1401: the
     /// STR's value (and subscript) is evaluated at token time only when the
@@ -88,6 +97,11 @@ impl ConditionalArithParser<'_> {
         }
 
         let subscript = self.collect_raw_subscript(start)?;
+        if is_at_star_subscript(&subscript) {
+            return Some(ArithLValue::BadSubscriptElement {
+                display: format!("{resolved_name}[{}]", subscript.trim()),
+            });
+        }
 
         // GNU readtok's peektok: `=` (exactly EQ) defers the subscript;
         // any other assignment operator evaluated it during expr_streval.
@@ -209,6 +223,11 @@ impl ConditionalArithParser<'_> {
         // get_array_value reuses array_variable_part's work for the
         // side-effectful cases.
         let subscript = self.collect_raw_subscript(start)?;
+        if is_at_star_subscript(&subscript) {
+            return Some(ArithLValue::BadSubscriptElement {
+                display: format!("{resolved_name}[{}]", subscript.trim()),
+            });
+        }
         Some(ArithLValue::IndexedRaw {
             name: resolved_name,
             subscript,

@@ -32,6 +32,15 @@ pub(crate) const COMPATIBLE_SHELL_PATH_ENV: &str = "__RUBASH_COMPATIBLE_SHELL_PA
 struct CommandLookupCache {
     fingerprint: String,
     results: HashMap<String, Option<PathBuf>>,
+    /// Entries mirrored from the user-visible hash table (`hash -p`,
+    /// BASH_CMDS assignment — set_command_lookup_cache). GNU keeps these
+    /// in hashed_filenames (findcmd.c phash_search), a table that a PATH
+    /// change does NOT flush — only `hash -r`/`hash -d` remove entries —
+    /// so the fingerprint reset that invalidates PATH-scan results must
+    /// not discard them (rubash#1137: a `hash -p` entry inserted before
+    /// the first PATH scan vanished when the scan initialized the
+    /// fingerprint, and the registered command never executed).
+    hashed: HashMap<String, Option<PathBuf>>,
     /// File-name listing per physical PATH directory. Replaces the PATH x
     /// PATHEXT per-candidate stat grid with one read_dir per directory
     /// (rubash#159); exact-case set + ASCII-lowercase fold map since #799.
@@ -81,6 +90,7 @@ fn command_lookup_cache() -> &'static Mutex<CommandLookupCache> {
         Mutex::new(CommandLookupCache {
             fingerprint: String::new(),
             results: HashMap::new(),
+            hashed: HashMap::new(),
             listings: HashMap::new(),
             probes: HashMap::new(),
             path_dirs: None,
@@ -94,6 +104,9 @@ pub(crate) fn clear_command_lookup_cache() {
     let mut cache = command_lookup_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // `hash -r` (phash_flush) forgets hashed_filenames too — unlike a
+    // fingerprint reset, this clear drops the hash-table mirror as well.
+    cache.hashed.clear();
     cache.reset(String::new());
 }
 
@@ -109,6 +122,7 @@ pub(crate) fn remove_command_lookup_cache(name: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.results.remove(name);
+    cache.hashed.remove(name);
 }
 
 /// Insert or override one remembered command location.
@@ -125,7 +139,11 @@ pub(crate) fn set_command_lookup_cache(name: &str, path: Option<PathBuf>) {
     if cache.results.len() >= 4096 {
         cache.results.clear();
     }
-    cache.results.insert(name.to_string(), path);
+    cache.results.insert(name.to_string(), path.clone());
+    // Mirror into the hash-table map: this setter is the hash table's
+    // write path (`hash -p`, BASH_CMDS), whose entries outlive PATH-scan
+    // fingerprint resets (rubash#1137).
+    cache.hashed.insert(name.to_string(), path);
 }
 
 /// Environment values that can change a lookup result. The cache resets
@@ -262,6 +280,18 @@ pub(crate) fn path_is_user_owned(env_vars: &HashMap<String, String>) -> bool {
     }
 }
 
+/// GNU findcmd.c:279-293 (_find_user_command_internal): when PATH is
+/// unset, search_for_command never walks a path list at all — NO
+/// external command resolves, and shell_execve's ENOENT reports "No
+/// such file or directory". Every internal emulation of an external
+/// command (pipeline inline stages, file builtins, identity tools,
+/// the sleep fast path) must stand down under the same condition or
+/// the command's existence depends on the invocation shape
+/// (rubash#1126, #1145).
+pub(crate) fn path_is_unset(env_vars: &HashMap<String, String>) -> bool {
+    !env_vars.contains_key("PATH")
+}
+
 pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
@@ -303,22 +333,43 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cache.fingerprint != fingerprint {
             cache.reset(fingerprint.clone());
-        } else if let Some(result) = cache.results.get(name) {
-            // GNU findcmd.c:367-380: if check_hashed_filenames (the `checkhash`
-            // shopt) is active, stat the cached path on every hit; a file
-            // that no longer exists or is not executable is removed from the
-            // hash table and PATH search resumes.
-            if let Some(path) = result {
+        }
+        // GNU findcmd.c:367-380 search_for_command consults
+        // hashed_filenames (phash_search) before any PATH walk, and the
+        // hash table survives PATH changes — consult the mirrored
+        // hash-table entries first, even right after a fingerprint reset
+        // (rubash#1137).
+        if let Some(result) = cache.hashed.get(name).cloned() {
+            if let Some(path) = &result {
                 if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path) {
+                    cache.hashed.remove(name);
                     cache.results.remove(name);
-                    // fall through to re-search PATH below
                 } else {
                     return Some(path.clone());
                 }
+            } else {
+                return None;
             }
-            // rubash#392: a memoized miss is no longer served — fall through
-            // to the PATH walk (GNU findcmd.c:623 re-walks for every unhashed
-            // lookup, so a command that appears mid-session stays findable).
+        }
+        if cache.fingerprint == fingerprint {
+            if let Some(result) = cache.results.get(name) {
+                // GNU findcmd.c:367-380: if check_hashed_filenames (the `checkhash`
+                // shopt) is active, stat the cached path on every hit; a file
+                // that no longer exists or is not executable is removed from the
+                // hash table and PATH search resumes.
+                if let Some(path) = result {
+                    if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path)
+                    {
+                        cache.results.remove(name);
+                        // fall through to re-search PATH below
+                    } else {
+                        return Some(path.clone());
+                    }
+                }
+                // rubash#392: a memoized miss is no longer served — fall through
+                // to the PATH walk (GNU findcmd.c:623 re-walks for every unhashed
+                // lookup, so a command that appears mid-session stays findable).
+            }
         }
     }
 

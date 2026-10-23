@@ -540,7 +540,7 @@ impl Executor {
                 }
                 Ok(buf) => {
                     bytes.push(buf[0]);
-                    if buf[0] == delimiter as u8 && !exact_char_limit {
+                    if delimiter_byte_matches(buf[0], delimiter) && !exact_char_limit {
                         delimiter_found = true;
                         break;
                     }
@@ -561,7 +561,9 @@ impl Executor {
         // read.def:949 eof: the pipe drained (or errored) before the
         // delimiter arrived; a timeout break is not EOF.
         if ended && !self.read_timed_out && !bytes.is_empty() {
-            self.read_eof_no_delimiter = !bytes.contains(&(delimiter as u8));
+            self.read_eof_no_delimiter = !bytes
+                .iter()
+                .any(|byte| delimiter_byte_matches(*byte, delimiter));
         }
         if ended
             && matches!(

@@ -306,11 +306,24 @@ impl StdinCharDecoder {
 /// `$'\200'` yields byte 0x80; `char::from` keeps `delimiter as u8`
 /// byte-compare sites working unchanged.
 pub(in crate::executor) fn read_delimiter_char(word: &str) -> char {
-    substitution_metadata::shell_text_to_raw_bytes(word)
-        .first()
-        .copied()
-        .map(char::from)
-        .unwrap_or('\0')
+    let bytes = substitution_metadata::shell_text_to_raw_bytes(word);
+    // GNU builtins/read.def: the -d delimiter is the first CHARACTER of
+    // the argument (read_builtin decodes it with the locale's multibyte
+    // rules, and zread compares decoded characters via read_mbchar). In a
+    // multibyte locale `-d é` is the character é, not its first byte 0xC3:
+    // taking byte 0 made the delimiter U+00C3, which neither the literal
+    // text nor the marker-pair needle in the buffered FUNCTION_STDIN
+    // mirror ever matches — a builtin producer's `read -d é` read to EOF
+    // (rubash#1062). Single-byte locales (and words that are not valid
+    // UTF-8, e.g. -d $'\xff') keep the first-byte rule.
+    if crate::locale::is_multi_byte() {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Some(ch) = text.chars().next() {
+                return ch;
+            }
+        }
+    }
+    bytes.first().copied().map(char::from).unwrap_or('\0')
 }
 
 /// The delimiter needle inside buffered shell text: raw bytes live in text
@@ -321,17 +334,34 @@ pub(in crate::executor) fn read_delimiter_char(word: &str) -> char {
 pub(in crate::executor) fn read_delimiter_needle(delimiter: char) -> String {
     let code = delimiter as u32;
     if code >= 0x80 || crate::lexer::ansi::is_assignment_carrier_byte(code) {
-        substitution_metadata::bytes_to_shell_text(&[code as u8])
+        // The needle must be the marker form of the delimiter's bytes AS
+        // THEY APPEAR IN THE STREAM: a multibyte delimiter travels as its
+        // UTF-8 byte sequence, not as its codepoint truncated to one byte
+        // (the old `[code as u8]` form made `read -d é` over a pipe never
+        // register the delimiter, so the read reported EOF failure even
+        // though the value was split correctly — rubash#1062).
+        let mut buf = [0u8; 4];
+        substitution_metadata::bytes_to_shell_text(delimiter.encode_utf8(&mut buf).as_bytes())
     } else {
         delimiter.to_string()
     }
 }
 
-/// True when `text` holds the delimiter in either transport form: the
-/// tagged marker pair (normalized records) or the literal char (raw mirror
-/// texts such as FUNCTION_STDIN, which stores raw pipe bytes).
+/// True when `text` holds the delimiter in any transport form: the tagged
+/// marker pair (normalized records), the single-byte marker form a
+/// byte-locale delimiter takes (the delimiter char then stands for one
+/// raw byte), or the literal char (raw mirror texts such as
+/// FUNCTION_STDIN, which stores raw pipe bytes).
 pub(in crate::executor) fn record_contains_delimiter(text: &str, delimiter: char) -> bool {
-    text.contains(&read_delimiter_needle(delimiter)) || text.contains(delimiter)
+    if text.contains(delimiter) || text.contains(&read_delimiter_needle(delimiter)) {
+        return true;
+    }
+    let code = delimiter as u32;
+    if (0x80..=0xFF).contains(&code) {
+        let single = substitution_metadata::bytes_to_shell_text(&[code as u8]);
+        return text.contains(&single);
+    }
+    false
 }
 
 /// Normalize a served `read` record into the shell's storage domain: every
@@ -364,6 +394,21 @@ pub(in crate::executor) fn tag_read_carrier_text(input: &str) -> String {
     output
 }
 
+/// True when a raw stream byte can terminate a record for `delimiter`.
+/// Byte-wise readers stop at the delimiter's first byte: for a delimiter
+/// that arrived as a raw byte (read_delimiter_char's first-byte form,
+/// U+0000..=U+00FF) that is the byte itself; for a real multibyte
+/// character (rubash#1062: -d é is U+00E9) it is the first byte of its
+/// UTF-8 encoding — the byte GNU's readchar comparison keys on before
+/// the buffered readers hand the record to the character-level trim.
+pub(in crate::executor) fn delimiter_byte_matches(byte: u8, delimiter: char) -> bool {
+    if byte == delimiter as u8 {
+        return true;
+    }
+    let mut encoded = [0u8; 4];
+    byte == delimiter.encode_utf8(&mut encoded).as_bytes()[0]
+}
+
 /// True when a decoded stdin unit is the delimiter byte (GNU read.def
 /// compares `c == delim` on input bytes). Raw bytes surface as RawByte
 /// marker units; a multibyte char is compared by its first byte, matching
@@ -381,7 +426,7 @@ pub(in crate::executor) fn stdin_unit_is_delimiter(unit: &StdinUnit, delimiter: 
             }
         }
     };
-    byte == delimiter as u8
+    delimiter_byte_matches(byte, delimiter)
 }
 
 pub(in crate::executor) fn read_stdin_until(
@@ -568,7 +613,13 @@ fn trim_read_input_literal(
         // yields "a\r" and `printf 'a\r' | read x` yields "a\r" too. The '\r'
         // stripping is the Windows CRT-text-mode compensation (native tools
         // emit CRLF); on unix it would eat legal filename bytes.
-        if let Some((before, _)) = input.split_once(&read_delimiter_needle(delimiter)) {
+        // The needle covers the raw-byte transport form; a multibyte
+        // delimiter character (rubash#1062) travels as the literal char,
+        // so fall back to it when the needle form is absent.
+        if let Some((before, _)) = input
+            .split_once(&read_delimiter_needle(delimiter))
+            .or_else(|| input.split_once(delimiter))
+        {
             input = if cfg!(windows) {
                 before.trim_end_matches('\r').to_string()
             } else {

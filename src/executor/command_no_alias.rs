@@ -277,20 +277,19 @@ impl Executor {
             return self.execute_command_without_aliases(cmd);
         }
 
-        let saved_path = self.shell_state.env_vars.get("PATH").cloned();
+        // GNU builtins/command.def: -p (CDESC_STDPATH) changes only the
+        // PATH used to look up THIS command (findcmd.c search_for_
+        // command with the standard path); the $PATH variable itself is
+        // untouched, so the executed command's environment and any
+        // nested builtin (`command -p command -v ls`) keep the user's
+        // PATH. The old implementation swapped env_vars["PATH"] for the
+        // whole re-dispatch, exporting the default PATH into children
+        // (rubash#1047). Scope the standard path to the execution
+        // lookup via standard_path_scope instead.
         let standard = standard_path(&self.shell_state.env_vars);
-        self.shell_state
-            .env_vars
-            .insert("PATH".to_string(), standard);
+        let saved_scope = self.standard_path_scope.replace(standard);
         let result = self.execute_command_without_aliases(cmd);
-        match saved_path {
-            Some(path) => {
-                self.shell_state.env_vars.insert("PATH".to_string(), path);
-            }
-            None => {
-                self.shell_state.env_vars.remove("PATH");
-            }
-        }
+        self.standard_path_scope = saved_scope;
         result
     }
 }

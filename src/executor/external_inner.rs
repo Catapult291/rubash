@@ -1,6 +1,24 @@
 use super::*;
 
 impl Executor {
+    /// The simple-command execution lookup. Under a `command -p`
+    /// re-dispatch (standard_path_scope set) the lookup walks the
+    /// standard path — by substituting PATH in a throwaway copy of the
+    /// env map, never in the shell's own variables (rubash#1047).
+    pub(in crate::executor) fn find_scoped_user_command(
+        &self,
+        name: &str,
+    ) -> Option<std::path::PathBuf> {
+        match &self.standard_path_scope {
+            Some(standard) => {
+                let mut env_vars = self.shell_state.env_vars.clone();
+                env_vars.insert("PATH".to_string(), standard.clone());
+                find_user_command(name, &env_vars)
+            }
+            None => find_user_command(name, &self.shell_state.env_vars),
+        }
+    }
+
     pub(in crate::executor) fn execute_env_command(
         &mut self,
         cmd: &CommandNode,
@@ -442,7 +460,42 @@ impl Executor {
             return Ok(());
         }
 
-        let Some(program) = find_user_command(&cmd.words[0], &self.shell_state.env_vars) else {
+        let Some(program) = self.find_scoped_user_command(&cmd.words[0]) else {
+            // GNU execute_cmd.c (execute_simple_command /
+            // command_not_found_handler): when the shell function
+            // `command_not_found_handle` is defined, it is invoked with
+            // the full command line as its arguments instead of the
+            // `command not found` diagnostic, and its exit status becomes
+            // the command's status. The executing_command_not_found_handler
+            // guard keeps a missing command inside the handler itself on
+            // the plain 127 path (rubash#1080).
+            if !cmd.words[0].contains('/')
+                && self
+                    .shell_state
+                    .functions
+                    .contains_key("command_not_found_handle")
+                && !self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_CNF_HANDLER_RUNNING")
+            {
+                self.shell_state
+                    .env_vars
+                    .insert("__RUBASH_CNF_HANDLER_RUNNING".to_string(), "1".to_string());
+                // GNU passes the whole command line: $1 is the missing
+                // command name, $2.. its arguments.
+                let args: Vec<String> = cmd.words.to_vec();
+                let mut handler_cmd = cmd.clone();
+                handler_cmd.words = std::iter::once("command_not_found_handle".to_string())
+                    .chain(cmd.words.iter().cloned())
+                    .collect();
+                let result = self.execute_function("command_not_found_handle", &args, &handler_cmd);
+                self.shell_state
+                    .env_vars
+                    .remove("__RUBASH_CNF_HANDLER_RUNNING");
+                result?;
+                return Ok(());
+            }
             let mut stderr = Vec::new();
             // GNU findcmd.c:385-386 (search_for_command): a name containing
             // a slash is never PATH-searched — it goes straight to execve,
@@ -467,11 +520,22 @@ impl Executor {
                 self.finish_external_error(cmd, &stderr, status)?;
                 return Ok(());
             }
+            // GNU findcmd.c:279-293 + execute_cmd.c shell_execve: with
+            // PATH unset the name is never searched, so the failure is
+            // the execve ENOENT text, not "command not found" — bash
+            // switches diagnostic on PATH being unset (rubash#1145).
+            let not_found_message =
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    "No such file or directory"
+                } else {
+                    "command not found"
+                };
             writeln!(
                 &mut stderr,
-                "{}{}: command not found",
+                "{}{}: {}",
                 self.diagnostic_prefix(),
-                name
+                name,
+                not_found_message
             )?;
             self.finish_external_error(cmd, &stderr, 127)?;
             return Ok(());
@@ -521,6 +585,27 @@ impl Executor {
                 self.finish_external_error(cmd, &stderr, status)?;
                 return Ok(());
             }
+        }
+
+        // GNU execute_cmd.c:6139 shell_execve attempts execve directly
+        // and classifies an ENOEXEC refusal by first bytes (refuse
+        // binaries, run text as a script in THIS shell). std::process::
+        // Command spawns through glibc execvp, whose own ENOEXEC
+        // fallback silently substitutes /bin/sh — a foreign shell with
+        // different syntax — so on unix the classification must happen
+        // BEFORE the spawn: a regular file that is neither #!-headed
+        // nor a native ELF image is exactly what execve refuses
+        // (rubash#1037).
+        #[cfg(unix)]
+        if is_enoexec_candidate(&program) {
+            if let Some((diagnostic, status)) = self.exec_format_refusal(cmd, &program) {
+                let mut stderr = Vec::new();
+                let _ = writeln!(&mut stderr, "{diagnostic}");
+                self.finish_external_error(cmd, &stderr, status)?;
+                return Ok(());
+            }
+            self.execute_enoexec_shell_script(cmd, &program)?;
+            return Ok(());
         }
 
         let (dev_args, dev_ops) = self.materialize_dev_fd_operands(
@@ -748,6 +833,16 @@ impl Executor {
         }
         #[cfg(unix)]
         {
+            // GNU deferral is the correct model here (jobs.c:3064
+            // wait_for): while a real foreground child runs, a trapped
+            // signal is only RECORDED (trap.c trap_handler) and its
+            // trap dispatches at the command boundary when wait_for
+            // returns — which is immediate when the child itself dies
+            // from a group-delivered signal (rubash#1034's ^C case).
+            // Untrapped terminating signals stay SIG_DFL at the kernel
+            // and kill this process inside waitpid directly. So a
+            // blocking wait is faithful on unix; the sliced observer
+            // loop exists for platforms without kernel delivery.
             child.wait().map_err(ExecuteError::IoError)
         }
     }
@@ -1226,14 +1321,102 @@ impl Executor {
         // failure against the RESOLVED pathname (findcmd.c file_to_lose_on
         // fallback included), not the typed word — `noexec.sh` found via
         // PATH prints the full candidate path (rubash#231).
+        //
+        // The status is NOT uniformly EX_NOEXEC: shell_execve sets
+        // last_command_exit_value = (errno == ENOENT) ? EX_NOTFOUND (127)
+        // : EX_NOEXEC (126) (execute_cmd.c:6143). A command the PATH walk
+        // resolved whose image the kernel then cannot load — an ELF whose
+        // PT_INTERP loader is missing is the common case — fails execve
+        // with ENOENT and must surface as a LOOKUP failure (127), not an
+        // exec refusal (126): scripts branch on 126-vs-127 (rubash#1172).
+        // The diagnostic follows the same switch: an existing executable
+        // file with a #! line names its interpreter ("bad interpreter",
+        // EX_NOEXEC); an existing executable non-#! file is "cannot
+        // execute: required file not found" (EX_NOTFOUND); anything else
+        // keeps the plain errno text via file_error.
+        let (message, status) = spawn_error_diagnostic(program, &error);
         writeln!(
             &mut stderr,
             "{}{}: {}",
             self.diagnostic_prefix(),
             program.display(),
-            crate::posix_errors::message(&error)
+            message
         )?;
-        self.finish_external_error(cmd, &stderr, 126)
+        self.finish_external_error(cmd, &stderr, status)
+    }
+}
+
+/// GNU shell_execve (execute_cmd.c:6126-6159) classification of a failed
+/// execve/spawn against the resolved program path. Returns the diagnostic
+/// body (the caller prepends the report prolog and the resolved pathname)
+/// and the exit status. Non-ENOENT failures are EX_NOEXEC with the plain
+/// errno text, exactly the historical behavior of this call site.
+fn spawn_error_diagnostic(program: &PathBuf, error: &io::Error) -> (String, i32) {
+    const EX_NOTFOUND: i32 = 127;
+    const EX_NOEXEC: i32 = 126;
+    // ENOENT on unix and ERROR_FILE_NOT_FOUND on Windows share the value 2;
+    // no libc dependency is needed for this classification.
+    const OS_ERROR_FILE_NOT_FOUND: i32 = 2;
+    if error.raw_os_error() != Some(OS_ERROR_FILE_NOT_FOUND) {
+        return (crate::posix_errors::message(error).to_string(), EX_NOEXEC);
+    }
+    // errno == ENOENT: the status is EX_NOTFOUND unless the file itself
+    // proves the #! bad-interpreter refusal (EX_NOEXEC).
+    let metadata = std::fs::metadata(program).ok();
+    let executable = metadata
+        .as_ref()
+        .is_some_and(|meta| meta.is_file() && file_has_exec_bit(meta));
+    if executable {
+        if let Ok(sample) = std::fs::read(program) {
+            if sample.len() >= 2 && sample[0] == b'#' && sample[1] == b'!' {
+                let line_end = sample
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .unwrap_or(sample.len());
+                let line = String::from_utf8_lossy(&sample[2..line_end]);
+                // GNU getinterp (execute_cmd.c) terminates the interpreter
+                // name at a blank or tab only — a CR stays part of the
+                // name (and is displayed as ^M below), so do not split on
+                // the full whitespace class here.
+                let interp = line.split([' ', '\t']).next().unwrap_or_default();
+                if !interp.is_empty() {
+                    // GNU getinterp + sys_error (execute_cmd.c:6170-6184):
+                    // a trailing CR in the interpreter name is displayed
+                    // as ^M (`#!/bin/sh\r` -> "/bin/sh^M").
+                    let interp = match interp.strip_suffix('\r') {
+                        Some(stem) => format!("{stem}^M"),
+                        None => interp.to_string(),
+                    };
+                    return (
+                        format!("{interp}: bad interpreter: No such file or directory"),
+                        EX_NOEXEC,
+                    );
+                }
+            }
+        }
+        // An executable file the kernel cannot load at all (missing
+        // PT_INTERP loader): execute_cmd.c:6188-6192 internal_error.
+        return (
+            "cannot execute: required file not found".to_string(),
+            EX_NOTFOUND,
+        );
+    }
+    (crate::posix_errors::message(error).to_string(), EX_NOTFOUND)
+}
+
+/// GNU executable_file (execute_cmd.c / findcmd.c file_status FS_EXECABLE):
+/// any execute permission bit set. Non-unix hosts have no mode bits; an
+/// existing regular file counts as executable there.
+fn file_has_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
     }
 }
 
@@ -1421,6 +1604,26 @@ fn is_exec_format_error(error: &io::Error) -> bool {
         let _ = error;
         false
     }
+}
+
+/// Whether execve(2) would refuse `program` with ENOEXEC: a regular
+/// file whose first bytes are neither a `#!` interpreter line nor the
+/// ELF magic of a native image (the only two formats the kernel takes
+/// directly on modern Linux). Directories and unreadable files are
+/// left to the normal spawn-error classification.
+#[cfg(unix)]
+pub(in crate::executor) fn is_enoexec_candidate(program: &std::path::Path) -> bool {
+    use std::io::Read;
+    if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(program) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    let read = file.read(&mut head).unwrap_or(0);
+    let head = &head[..read];
+    !head.starts_with(b"#!") && !head.starts_with(b"\x7fELF")
 }
 
 /// GNU general.c:843 absolute_program: a name containing `/` (or `\` on a

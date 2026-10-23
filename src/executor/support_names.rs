@@ -47,6 +47,33 @@ pub(in crate::executor) fn shell_compatibility_level_value(
     level.parse::<u32>().unwrap_or(53)
 }
 
+/// The effective `shell_compatibility_level` for behavior gates: a set
+/// compatNN shopt flag wins (GNU builtins/shopt.def:654-708
+/// set_compatibility_level makes the flags mutually exclusive and
+/// rebinds BASH_COMPAT; rubash#1107's sync gap means the flag and the
+/// variable can disagree on this base, and the flag is what the user
+/// explicitly toggled last via shopt), else the BASH_COMPAT parse above.
+/// GNU's priority chain over multiple set flags is 31,32,40,...,44
+/// (shopt.def:676-689), mirrored here.
+pub(in crate::executor) fn shell_compatibility_level_flag_aware(
+    env_vars: &HashMap<String, String>,
+) -> u32 {
+    for (flag, level) in [
+        ("compat31", 31),
+        ("compat32", 32),
+        ("compat40", 40),
+        ("compat41", 41),
+        ("compat42", 42),
+        ("compat43", 43),
+        ("compat44", 44),
+    ] {
+        if crate::builtins::shopt::option_enabled(env_vars, flag) {
+            return level;
+        }
+    }
+    shell_compatibility_level_value(env_vars)
+}
+
 /// The `$BASH_VERSION` value the executor seeds (`5.3.20(1)-release` — the
 /// `-release` suffix is part of it, version.c's shell_version_string). Pub
 /// so `usage::show_shell_help`/`show_shell_version` fall back to the same
@@ -63,6 +90,32 @@ pub(in crate::executor) fn bash_path_value() -> String {
 
 pub(in crate::executor) fn shell_path_value() -> String {
     bash_path_value()
+}
+
+/// GNU variables.c set_shell_var: when SHELL is not in the environment,
+/// it is initialized from the passwd entry for the current uid
+/// (get_current_user_info, shell.c:1877-1915: getpwuid(getuid())->pw_shell)
+/// — never from the shell's own executable path (rubash#1143). Falls back
+/// to the executable path when no passwd entry/shell is available (the
+/// only source on non-unix hosts).
+pub(in crate::executor) fn login_shell_value() -> String {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        let entry = unsafe { libc::getpwuid(uid) };
+        if !entry.is_null() {
+            let shell = unsafe { (*entry).pw_shell };
+            if !shell.is_null() {
+                let value = unsafe { std::ffi::CStr::from_ptr(shell) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !value.is_empty() {
+                    return value;
+                }
+            }
+        }
+    }
+    shell_path_value()
 }
 
 pub(in crate::executor) fn bash_versinfo_values() -> Vec<String> {
@@ -82,15 +135,28 @@ pub(in crate::executor) fn hosttype_value() -> String {
 }
 
 pub(in crate::executor) fn hostname_value() -> String {
-    std::env::var("HOSTNAME")
+    let from_env = std::env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| {
             std::env::var("COMPUTERNAME")
                 .ok()
                 .filter(|value| !value.is_empty())
-        })
-        .unwrap_or_else(|| "localhost".to_string())
+        });
+    if let Some(value) = from_env {
+        return value;
+    }
+    // GNU variables.c set_machine_vars: HOSTNAME is current_host_name —
+    // the machine's real host name from gethostname/uname(2) (shell.c
+    // get_host_name), not a hardcoded constant (rubash#1139).
+    #[cfg(unix)]
+    {
+        let name = super::identity::nodename();
+        if !name.is_empty() && name != "unknown" {
+            return name;
+        }
+    }
+    "localhost".to_string()
 }
 
 pub(in crate::executor) fn ostype_value() -> String {

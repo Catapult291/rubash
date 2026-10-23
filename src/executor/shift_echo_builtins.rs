@@ -73,21 +73,18 @@ impl Executor {
         Ok(())
     }
 
-    /// The `time` keyword's report with the POSIX-mode notes item 6 stream
-    /// rule: GNU print_time_info (execute_cmd.c:1552) writes the timing to
-    /// the shell's CURRENTLY BOUND stderr — `{ time ...; } 2>file` captures
-    /// it — so a POSIX shell routes the report through the executor's fd-2
-    /// endpoint (xtrace_write) instead of the raw process stream. The
-    /// default mode keeps the historical raw write.
+    /// The `time` keyword's report: GNU print_time_info
+    /// (execute_cmd.c:1552) writes the timing to the shell's CURRENTLY
+    /// BOUND stderr in every mode — `{ time ...; } 2>file` captures it —
+    /// so the report routes through the executor's fd-2 endpoint
+    /// (xtrace_write) instead of the raw process stream (rubash#1128:
+    /// the raw eprintln! in print_time leaked past an enclosing group's
+    /// redirection).
     pub(in crate::executor) fn print_time_shell(
         &mut self,
         posix_format: bool,
         started: std::time::Instant,
     ) {
-        if !self.posix_mode_enabled() {
-            print_time(&self.shell_state.env_vars, posix_format, started);
-            return;
-        }
         let metrics = TimeCommandMetrics::from_start(started);
         if let Some(report) = format_time_report(&self.shell_state.env_vars, posix_format, metrics)
         {

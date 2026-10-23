@@ -25,6 +25,28 @@ impl Executor {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Result<(), ExecuteError> {
+        self.write_buffered_builtin_output_ordered(cmd, stdout, stderr, false)
+    }
+
+    /// printf variant (rubash#1134): GNU emits printf's diagnostics
+    /// unbuffered while its output flushes at builtin exit, so the
+    /// stderr buffer is routed before the stdout buffer.
+    pub(in crate::executor) fn write_buffered_builtin_output_stderr_first(
+        &mut self,
+        cmd: &CommandNode,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<(), ExecuteError> {
+        self.write_buffered_builtin_output_ordered(cmd, stdout, stderr, true)
+    }
+
+    fn write_buffered_builtin_output_ordered(
+        &mut self,
+        cmd: &CommandNode,
+        stdout: &[u8],
+        stderr: &[u8],
+        stderr_first: bool,
+    ) -> Result<(), ExecuteError> {
         // Silent-builtin short-circuit (perf): `shift` and friends succeed
         // with empty stdout/stderr buffers on the hot path. GNU runs such a
         // builtin's writes through its redirected descriptors, but a zero-
@@ -63,10 +85,22 @@ impl Executor {
         // marker-free and non-UTF-8 slices pass through untouched.
         let stdout = decode_raw_byte_marker_bytes(stdout);
         let stderr = decode_raw_byte_marker_bytes(stderr);
-        if self.route_builtin_buffered_output(cmd, &stdout, &stderr)? {
+        if self.route_builtin_buffered_output_ordered(cmd, &stdout, &stderr, stderr_first)? {
             return Ok(());
         }
+        if stderr_first {
+            self.write_buffered_stderr_block(cmd, &stderr)?;
+            return self.write_buffered_stdout_block(cmd, &stdout);
+        }
+        self.write_buffered_stdout_block(cmd, &stdout)?;
+        self.write_buffered_stderr_block(cmd, &stderr)
+    }
 
+    fn write_buffered_stdout_block(
+        &mut self,
+        cmd: &CommandNode,
+        stdout: &[u8],
+    ) -> Result<(), ExecuteError> {
         if let Some(redirect) = &cmd.redirect_out {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {
@@ -105,6 +139,14 @@ impl Executor {
             self.write_default_stdout(&stdout)?;
         }
 
+        Ok(())
+    }
+
+    fn write_buffered_stderr_block(
+        &mut self,
+        cmd: &CommandNode,
+        stderr: &[u8],
+    ) -> Result<(), ExecuteError> {
         if let Some(redirect) = &cmd.redirect_err {
             let target = self.expand_redirect_target(redirect);
             if is_closed_redirect_target(&target) {

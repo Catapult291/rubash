@@ -119,7 +119,13 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get() + 1);
+        // rubash#1164: a nested list (function body, compound body) samples
+        // was_error_trap per its own commands; the enclosing command's
+        // sample must be intact when its adjudication runs after the
+        // nested list returns.
+        let saved_err_trap_sample = self.err_trap_armed_sample.get();
         let result = self.execute_ast_inner_body(commands);
+        self.err_trap_armed_sample.set(saved_err_trap_sample);
         self.evalerror_exec_depth
             .set(self.evalerror_exec_depth.get().saturating_sub(1));
         // A trapped list tail with no following commands never reaches the
@@ -325,6 +331,14 @@ impl Executor {
             // error never suppresses the ERR trap this command earns by
             // failing (GNU run_error_trap is per execute_simple_command).
             self.command_expansion_failed.set(false);
+            // rubash#1164: sample was_error_trap for THIS command before it
+            // executes (execute_cmd.c:914) — adjudication below and inside
+            // dispatch consults the sample, so a trap this command installs
+            // (e.g. in a function body) cannot fire for the command itself.
+            self.err_trap_armed_sample.set(Some(matches!(
+                crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR"),
+                Some(ref action) if !action.is_empty()
+            )));
             // issue #485: the comsub $? overlay (word_expansion_comsub_exit)
             // belongs to ONE command's word expansion, exactly like GNU's
             // last_command_exit_value write in subst.c command_substitute —
@@ -684,9 +698,16 @@ impl Executor {
                 subshell_fd_table = Some(self.fd_table.clone());
                 subshell_cwd = env::current_dir().ok();
                 self.shell_state.loop_depth = 0;
+                // execute_in_subshell resets loop_level (execute_cmd.c:1642):
+                // fork-inherited depth does not cross a `( )` region either.
+                self.shell_state.inherited_loop_depth = 0;
                 crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
                 let old_depth = self.shell_state.subshell_depth.get();
                 self.shell_state.subshell_depth.set(old_depth + 1);
+                // rubash#1115: the forked child reseeds RANDOM
+                // (variables.c:1418-1423 get_random_number); the saved
+                // parent state above keeps the parent's sequence intact.
+                self.shell_state.random_state.reseed_fresh();
                 // rubash#720 form 1: a single-subshell-command region body is
                 // the body GNU's execute_in_subshell marks CMD_NO_FORK
                 // (execute_cmd.c:1799-1806) and runs in place via

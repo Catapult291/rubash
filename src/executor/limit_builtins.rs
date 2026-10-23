@@ -76,7 +76,13 @@ impl Executor {
                     "{}kill: {operand}: no such job",
                     self.diagnostic_prefix()
                 )?;
-                status = 1;
+                // Bash posix-mode quirk (rubash#1054): a jobspec that
+                // names no job still prints the diagnostic, but the kill
+                // builtin's status stays 0 in posix mode. An invalid PID
+                // operand keeps status 1 in both modes.
+                if !(operand.starts_with('%') && self.posix_mode_enabled()) {
+                    status = 1;
+                }
                 continue;
             };
 

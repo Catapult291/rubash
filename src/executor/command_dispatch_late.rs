@@ -126,7 +126,11 @@ impl Executor {
     ) -> Result<(), ExecuteError> {
         match word {
             "let" => {
-                self.exit_code = self.execute_let(&cmd.words[1..]);
+                // Same fd-2 binding contract as `(( ))` (rubash#1127):
+                // let's own redirections apply while its diagnostics run.
+                self.exit_code = self.with_compound_output_redirects(cmd, |executor| {
+                    Ok(executor.execute_let(&cmd.words[1..]))
+                })?;
                 Ok(())
             }
             "umask" => {
@@ -288,6 +292,11 @@ impl Executor {
                             return Err(error);
                         }
                         self.exit_code = self.execute_conditional_command(command);
+                        // rubash#1177: same `=~` nounset-fatal conversion
+                        // as the with-redirects path.
+                        if let Some(result) = self.take_conditional_nounset_fatal() {
+                            return result;
+                        }
                         Ok(())
                     }
                     None => self.execute_external(cmd),
@@ -303,7 +312,16 @@ impl Executor {
                     }
                     return Err(error);
                 }
-                self.exit_code = self.execute_arithmetic_command(cmd);
+                // GNU redir.c do_redirections binds the `(( ))` command's
+                // own redirections for its whole execution, and error.c
+                // writes the evalerror diagnostic to fd 2 as bound — so
+                // `((a+=1)) 2>&1` reports on stdout (rubash#1127). Bind the
+                // output redirects in the fd table around the evaluation;
+                // the diagnostic printers route through fd 2 (arith_diag).
+                let arith_status = self.with_compound_output_redirects(cmd, |executor| {
+                    Ok(executor.execute_arithmetic_command(cmd))
+                })?;
+                self.exit_code = arith_status;
                 // GNU expr.c:1190-1216: an unbound variable under `set -u`
                 // inside `(( ))` raises FORCE_EOF and terminates the
                 // noninteractive shell (probe a2: `set -u; ((b)); echo
@@ -336,20 +354,24 @@ impl Executor {
                 Ok(())
             }
             "dirname" => {
-                if let Some(status) = self.try_execute_dirname_fast_path(cmd) {
-                    self.exit_code = status;
-                    Ok(())
-                } else {
-                    self.execute_external(cmd)
+                // The fast paths emulate external commands: with PATH
+                // unset they must not resolve (rubash#1126).
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    if let Some(status) = self.try_execute_dirname_fast_path(cmd) {
+                        self.exit_code = status;
+                        return Ok(());
+                    }
                 }
+                self.execute_external(cmd)
             }
             "basename" => {
-                if let Some(status) = self.try_execute_basename_fast_path(cmd) {
-                    self.exit_code = status;
-                    Ok(())
-                } else {
-                    self.execute_external(cmd)
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    if let Some(status) = self.try_execute_basename_fast_path(cmd) {
+                        self.exit_code = status;
+                        return Ok(());
+                    }
                 }
+                self.execute_external(cmd)
             }
             // Bash posix-mode notes (item 19): in POSIX mode a function whose
             // name contains a slash is never executed — the word falls
@@ -367,14 +389,23 @@ impl Executor {
             // builtin. The `command`-builtin path (command_no_alias_late)
             // bypasses functions by definition and dispatches directly.
             "uname" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_identity_tool(cmd, "uname");
                 Ok(())
             }
             "arch" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_identity_tool(cmd, "arch");
                 Ok(())
             }
             "stty" => {
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return self.execute_external(cmd);
+                }
                 self.exit_code = self.execute_console_mode_tool(cmd);
                 Ok(())
             }

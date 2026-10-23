@@ -40,7 +40,15 @@ where
                     }
                     index += 1;
                     if args.get(index).is_none() {
-                        return Ok(EXECUTION_SUCCESS);
+                        // GNU wait.def internal_getopt "fnp:": a dangling
+                        // `-p` is a getopt error -> usage + EX_USAGE
+                        // (rubash#1156).
+                        writeln!(
+                            stderr,
+                            "{diagnostic_prefix}wait: -p: option requires an argument"
+                        )?;
+                        writeln!(stderr, "wait: usage: wait [-fn] [-p var] [id ...]")?;
+                        return Ok(EX_USAGE);
                     }
                     break;
                 }
@@ -64,11 +72,17 @@ where
     }
 
     let mut status = EXECUTION_SUCCESS;
+    // GNU wait.def set_waitlist / jobs.c get_job_spec: an operand is a pid
+    // only when it is a nonempty digit string; the empty string (like any
+    // other non-numeric text) is "`': not a pid or valid job spec" with
+    // EXECUTION_FAILURE, never the 127 "not a child" arm (rubash#1118 —
+    // `chars().all(..)` on an empty operand is vacuously true and took the
+    // digit arm).
     for operand in operands {
         if operand.starts_with('%') {
             writeln!(stderr, "{diagnostic_prefix}wait: {operand}: no such job")?;
             status = EXECUTION_NOTFOUND;
-        } else if operand.chars().all(|ch| ch.is_ascii_digit()) {
+        } else if !operand.is_empty() && operand.chars().all(|ch| ch.is_ascii_digit()) {
             writeln!(
                 stderr,
                 "{diagnostic_prefix}wait: pid {operand} is not a child of this shell"

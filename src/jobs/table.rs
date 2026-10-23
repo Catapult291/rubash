@@ -31,6 +31,10 @@ pub struct JobEntry {
     pub background: bool,
     pub foreground: bool,
     pub notified: bool,
+    /// GNU jobs.h J_NOHUP: set by `disown -h` (jobs.c:1548 nohup_job) —
+    /// the job stays in the table; the flag only suppresses the SIGHUP
+    /// the shell would otherwise send when it receives one itself.
+    pub nohup: bool,
     pub coproc_endpoints: Vec<u32>,
     /// GNU jobs.c J_JOBCONTROL: whether the job was started while job
     /// control (`set -m`) was active. fg/bg must refuse jobs without it
@@ -101,6 +105,7 @@ impl JobTable {
             background,
             foreground: !background,
             notified: false,
+            nohup: false,
             coproc_endpoints: Vec::new(),
             job_control: false,
         };

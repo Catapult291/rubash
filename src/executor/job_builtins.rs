@@ -134,6 +134,21 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<i32, ExecuteError> {
         self.refresh_background_jobs()?;
+        // GNU wait.def wait_builtin() internal_getopt "fnp:": a dangling
+        // `-p` (no joined text, no next word) is a getopt error, reported
+        // before any validation or waiting, and returns EX_USAGE
+        // (rubash#1156).
+        if wait_p_argument_missing(&cmd.words[1..]) {
+            let mut stderr = Vec::new();
+            writeln!(
+                stderr,
+                "{}wait: -p: option requires an argument",
+                self.diagnostic_prefix()
+            )?;
+            writeln!(stderr, "wait: usage: wait [-fn] [-p var] [id ...]")?;
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            return Ok(2);
+        }
         // GNU wait.def:139-152: a `-p name` option is validated and the
         // variable unbound before any waiting happens, in every wait form —
         // an invalid identifier or a readonly name fails immediately, and a
@@ -1017,16 +1032,18 @@ impl Executor {
             self.ordered_background_jobs()
         } else {
             let mut selected = Vec::new();
+            // GNU jobs.def jobs_builtin: each operand goes through
+            // get_job_spec; a bad spec is sh_badjob'd and counted in
+            // any_failed, and the builtin returns
+            // `any_failed ? EXECUTION_FAILURE : EXECUTION_SUCCESS`
+            // (jobs.def:174). The rubash#549 leniency is only about the
+            // MESSAGE/resolution (a bare operand warns about the missing
+            // `%' and is then resolved as if it had one), not the status:
+            // GNU 5.3.20 probes give rc=1 for `jobs %99`, `jobs 99`,
+            // `jobs foo` and `jobs %99 %1`, rc=0 when every operand
+            // resolves (rubash#1123).
+            let mut any_failed = false;
             for job in requested_jobs {
-                // rubash#549 (cell 1): GNU jobs.def's bad-spec path is
-                // lenient. An operand without the leading `%' draws
-                // `warning: N: job specification requires leading `%'` and
-                // is then resolved AS IF the `%' were there (probe
-                // 2026-10-12, GNU 5.3.0: `sleep 5 & jobs 1` warns and lists
-                // job 1; `jobs 5`/`jobs 1x` warn then report `N: no such
-                // job`). Every listing failure — bare or `%N` — leaves the
-                // builtin's status at 0 (`jobs %5`, `jobs 1 %2` probes all
-                // return 0); only a usage error exits 2.
                 let (spec, report) = if job.starts_with('%') {
                     (job.clone(), job.clone())
                 } else {
@@ -1048,6 +1065,7 @@ impl Executor {
                         }
                     }
                 } else {
+                    any_failed = true;
                     writeln!(
                         stderr,
                         "{}jobs: {report}: no such job",
@@ -1059,7 +1077,7 @@ impl Executor {
             // jobs.c:2231 list_one_job: explicit jobspec listing is followed
             // by cleanup_dead_jobs — a listed dead job leaves the table.
             self.shell_state.job_table.cleanup_dead_jobs();
-            return Ok((output, 0));
+            return Ok((output, i32::from(any_failed)));
         };
         let output = self.render_background_jobs(options, jobs);
         // jobs.def:137-141 JSTATE_ANY (plain `jobs`, `-l`, `-p`, `-n`): after
@@ -1201,25 +1219,38 @@ impl Executor {
         )?;
         let status = match action {
             crate::builtins::disown::DisownAction::Complete(status) => status,
-            crate::builtins::disown::DisownAction::All => {
-                let pids: Vec<u32> = self
-                    .shell_state
-                    .job_table
-                    .jobs
-                    .values()
-                    .flat_map(|job| job.pids.iter().copied())
-                    .chain(self.background_children.keys().copied())
-                    .collect();
-                self.background_children.clear();
-                for pid in pids {
-                    self.close_coproc_endpoints(pid);
-                    self.fd_table.close(pid);
+            crate::builtins::disown::DisownAction::All { nohup_only } => {
+                if nohup_only {
+                    // GNU jobs.c:5111 nohup_all_jobs: mark, never delete.
+                    for job in self.shell_state.job_table.jobs.values_mut() {
+                        job.nohup = true;
+                    }
+                    0
+                } else {
+                    let pids: Vec<u32> = self
+                        .shell_state
+                        .job_table
+                        .jobs
+                        .values()
+                        .flat_map(|job| job.pids.iter().copied())
+                        .chain(self.background_children.keys().copied())
+                        .collect();
+                    self.background_children.clear();
+                    for pid in pids {
+                        self.close_coproc_endpoints(pid);
+                        self.fd_table.close(pid);
+                    }
+                    self.shell_state.job_table.clear_jobs();
+                    0
                 }
-                self.shell_state.job_table.clear_jobs();
-                0
             }
-            crate::builtins::disown::DisownAction::Current => {
-                if self.disown_current_job() {
+            crate::builtins::disown::DisownAction::Current { nohup_only } => {
+                let acted = if nohup_only {
+                    self.nohup_current_job()
+                } else {
+                    self.disown_current_job()
+                };
+                if acted {
                     0
                 } else {
                     writeln!(
@@ -1230,14 +1261,30 @@ impl Executor {
                     1
                 }
             }
-            crate::builtins::disown::DisownAction::Jobs(jobs) => {
+            crate::builtins::disown::DisownAction::Jobs { specs, nohup_only } => {
                 let mut status = 0;
-                for job in jobs {
+                for job in specs {
                     if let Some(pid) = self.resolve_disown_job(&job) {
-                        self.background_children.remove(&pid);
-                        self.close_coproc_endpoints(pid);
-                        self.fd_table.close(pid);
-                        self.shell_state.job_table.remove_job_by_pid(pid);
+                        if nohup_only {
+                            // GNU jobs.c:1548 nohup_job: J_NOHUP mark
+                            // only — the job stays in the table, so
+                            // `jobs` still lists it and `wait %N` still
+                            // finds it (rubash#1048).
+                            if let Some(job_id) =
+                                self.shell_state.job_table.pid_to_job.get(&pid).copied()
+                            {
+                                if let Some(entry) =
+                                    self.shell_state.job_table.jobs.get_mut(&job_id)
+                                {
+                                    entry.nohup = true;
+                                }
+                            }
+                        } else {
+                            self.background_children.remove(&pid);
+                            self.close_coproc_endpoints(pid);
+                            self.fd_table.close(pid);
+                            self.shell_state.job_table.remove_job_by_pid(pid);
+                        }
                     } else {
                         // GNU jobs.def:283-289 disown_builtin: non-numeric
                         // operands go through get_job_spec, which warns when
@@ -1263,6 +1310,22 @@ impl Executor {
         };
         self.write_buffered_builtin_output(cmd, &[], &stderr)?;
         Ok(status)
+    }
+
+    /// `disown -h` with no jobspec: mark the current job J_NOHUP
+    /// (jobs.c nohup_job via get_job_spec(NULL)); the job stays live in
+    /// the table (rubash#1048).
+    fn nohup_current_job(&mut self) -> bool {
+        let Some(job_id) = self.shell_state.job_table.current_job() else {
+            return false;
+        };
+        match self.shell_state.job_table.jobs.get_mut(&job_id) {
+            Some(entry) => {
+                entry.nohup = true;
+                true
+            }
+            None => false,
+        }
     }
 
     fn disown_current_job(&mut self) -> bool {
@@ -1863,12 +1926,17 @@ impl Executor {
                 let shell = session.borrow();
                 (shell.entries.clone(), shell.base, shell.last_line_added)
             };
+            // fc.def:334: rh = remember_on_history (the `history` set -o
+            // option; on for interactive shells).
+            let remember =
+                crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "history");
             crate::builtins::fc::execute_with_history(
                 &cmd.words[1..],
                 &self.diagnostic_prefix(),
-                &entries,
+                entries,
                 base,
                 last_added,
+                remember,
                 posix_mode,
                 &mut stdout,
                 &mut stderr,
@@ -1881,8 +1949,9 @@ impl Executor {
             crate::builtins::fc::execute_with_history(
                 &cmd.words[1..],
                 &self.diagnostic_prefix(),
-                &provider_entries,
+                provider_entries,
                 1,
+                false,
                 false,
                 posix_mode,
                 &mut stdout,
@@ -1896,10 +1965,24 @@ impl Executor {
                 start,
                 end,
                 rev,
+                drop_last_entry,
             } => {
                 // fc.def edit_and_execute_command: write the selected
                 // entries to a temp file, run the editor with inherited
                 // stdio, read the result back, remember and execute it.
+                // The fc-line deletion (fc.def:403-421) happens first:
+                // EditWith indices address the post-deletion list. An
+                // empty selection still runs the editor on an empty
+                // file, exactly like GNU (#1117).
+                if drop_last_entry {
+                    if let Some(session) = session.as_ref() {
+                        let mut shell = session.borrow_mut();
+                        if !shell.entries.is_empty() {
+                            shell.entries.pop();
+                            shell.timestamps.pop();
+                        }
+                    }
+                }
                 let indices: Vec<usize> = if rev {
                     (start..=end).rev().collect()
                 } else {
@@ -1914,16 +1997,56 @@ impl Executor {
                     .filter(|i| **i < session_entries.len())
                     .map(|i| session_entries[*i].clone())
                     .collect();
-                if selected.is_empty() {
-                    return Ok(0);
-                }
                 let editor_name = editor
                     .or_else(|| self.get_env("FCEDIT").map(String::from))
                     .or_else(|| self.get_env("EDITOR").map(String::from))
                     .unwrap_or_else(|| String::from("vi"));
+                // fc.def: sh_mktmpfp ("bash-fc", MT_USERANDOM|MT_USETMPDIR)
+                // -- a six-character random suffix, created exclusively.
+                let file_text = if selected.is_empty() {
+                    String::new()
+                } else {
+                    selected.join("\n") + "\n"
+                };
                 let mut path = std::env::temp_dir();
-                path.push(format!("bash-fc.{}", std::process::id()));
-                if std::fs::write(&path, selected.join("\n") + "\n").is_err() {
+                let mut rng_state = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9e37_79b9_7f4a_7c15)
+                    ^ (std::process::id() as u64).rotate_left(17)
+                    | 1;
+                let mut created = false;
+                for _ in 0..16 {
+                    let suffix: String = (0..6)
+                        .map(|_| {
+                            // xorshift64*; take a letter/digit like mkstemp.
+                            rng_state ^= rng_state >> 12;
+                            rng_state ^= rng_state << 25;
+                            rng_state ^= rng_state >> 27;
+                            let v = (rng_state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 58) as u8;
+                            match v % 62 {
+                                0..=25 => char::from(b'a' + v % 62),
+                                26..=51 => char::from(b'A' + v % 62 - 26),
+                                _ => char::from(b'0' + v % 62 - 52),
+                            }
+                        })
+                        .collect();
+                    path.push(format!("bash-fc.{suffix}"));
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(mut file) => {
+                            created = file.write_all(file_text.as_bytes()).is_ok();
+                            break;
+                        }
+                        Err(_) => {
+                            path.pop();
+                        }
+                    }
+                }
+                if !created {
                     writeln!(
                         stderr,
                         "{pfx}fc: cannot open temp file",
@@ -1932,34 +2055,43 @@ impl Executor {
                     self.write_buffered_builtin_output(cmd, &[], &stderr)?;
                     return Ok(1);
                 }
-                let editor_path = crate::executor::path::find_user_command(
-                    &editor_name,
-                    &self.shell_state.env_vars,
-                )
-                .unwrap_or_else(|| std::path::PathBuf::from(&editor_name));
-                let mut edit_command = std::process::Command::new(&editor_path);
-                // The editor is an external child like any other: it gets
-                // the exported table vars explicitly (#916 — no process-env
-                // mirror to inherit from anymore).
-                self.apply_child_environment(&mut edit_command);
-                edit_command.arg(&path);
-                suppress_orphan_console(&mut edit_command);
-                let edit_status = edit_command.status();
-                match edit_status {
-                    Ok(st) if st.success() => {}
-                    Ok(st) => {
+                // fc.def edit_and_execute_command: the editor string is
+                // a shell COMMAND LINE run through parse_and_execute with
+                // the temp file appended (sprintf "%s %s", ename, fn) —
+                // builtins, functions and multi-word editors all work
+                // (`fc -e :`, `fc -e 'sed -i s/a/b/'`), and any failure
+                // makes fc fail with EXECUTION_FAILURE (#1117).
+                let editor_line = format!("{editor_name} {}", path.display());
+                let editor_tokens = crate::lexer::tokenize(&editor_line);
+                let mut editor_ast = crate::parser::parse_with_options(
+                    &editor_tokens,
+                    crate::parser::ParseLoopOptions {
+                        stray_close_is_error: true,
+                        diagnostic_text: None,
+                        source_text: Some(editor_line.as_str().into()),
+                        source_line_offset: 0,
+                    },
+                );
+                self.apply_command_output_redirects(cmd, &mut editor_ast)?;
+                let editor_result = self.with_compound_output_redirects(cmd, |executor| {
+                    executor.execute_ast(&editor_ast)
+                });
+                let editor_status = self.exit_code;
+                match editor_result {
+                    Ok(()) if editor_status == 0 => {}
+                    Ok(()) => {
                         let _ = std::fs::remove_file(&path);
-                        return Ok(crate::executor::wait_status::process_exit_status(&st));
+                        self.exit_code = 1;
+                        return Ok(1);
                     }
-                    Err(err) => {
-                        writeln!(
-                            stderr,
-                            "{pfx}fc: {editor_name}: {err}",
-                            pfx = self.diagnostic_prefix(),
-                        )?;
-                        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                    Err(ExecuteError::ExitCode(code)) => {
                         let _ = std::fs::remove_file(&path);
-                        return Ok(127);
+                        return Err(ExecuteError::ExitCode(code));
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&path);
+                        self.exit_code = 1;
+                        return Ok(1);
                     }
                 }
                 let edited = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1978,9 +2110,13 @@ impl Executor {
                     let ignore = self.get_env("HISTIGNORE").unwrap_or_default();
                     let histsize =
                         crate::history::SessionHistory::size_limit(self.get_env("HISTSIZE"));
-                    session
-                        .borrow_mut()
-                        .record(&edited, &control, &ignore, histsize);
+                    let mut shell = session.borrow_mut();
+                    // The fc-line entry was already deleted above
+                    // (fc.def:403-421); the executed text is remembered
+                    // in its place (fc_execute_file with
+                    // remember_on_history forced on, fc.def:530).
+                    let was_recorded = shell.record(&edited, &control, &ignore, histsize);
+                    shell.last_line_added = was_recorded;
                 }
                 let tokens = crate::lexer::tokenize(&edited);
                 let mut ast = crate::parser::parse_with_options(
@@ -2006,9 +2142,13 @@ impl Executor {
                     let histsize =
                         crate::history::SessionHistory::size_limit(self.get_env("HISTSIZE"));
                     let mut shell = session.borrow_mut();
-                    // fc.def fc_replhist: the executed command REPLACES the
-                    // fc entry (delete the last line, add the new one), so
-                    // the fc command itself never appears in the history.
+                    // fc.def fc_replhist: the executed command REPLACES
+                    // the last entry (bash_delete_last_history +
+                    // maybe_add_history), so the fc command itself never
+                    // appears in the history. Rubash pops when the last
+                    // entry is the current line's (hist_last_line_added),
+                    // which covers both the interactive fc line and the
+                    // entry an `fc -s`/`fc -e -` re-execution resolved.
                     if shell.last_line_added && !shell.entries.is_empty() {
                         shell.entries.pop();
                         shell.timestamps.pop();
@@ -2078,6 +2218,15 @@ impl Executor {
             } else {
                 None
             };
+            // GNU names the pseudo compspecs by their pcomplete.h magic
+            // names in diagnostics (`complete: _DefaultCmD_: no completion
+            // specification`), while -p prints the -D/-E flag form
+            // (rubash#1090).
+            let pseudo_diag_name = pseudo.map(|flag| match flag {
+                "-D" => "_DefaultCmD_",
+                "-E" => "_EmptycmD_",
+                _ => "_InitialWorD_",
+            });
             if parsed.pflag {
                 // -p overrides everything else (complete.def:426-441).
                 let mut status = 0;
@@ -2093,7 +2242,8 @@ impl Executor {
                         None => {
                             writeln!(
                                 stderr,
-                                "{diagnostic_prefix}complete: {pseudo}: no completion specification"
+                                "{diagnostic_prefix}complete: {}: no completion specification",
+                                pseudo_diag_name.unwrap_or(pseudo)
                             )?;
                             status = 1;
                         }
@@ -2135,7 +2285,8 @@ impl Executor {
                     if !self.shell_state.completion_specs.remove(pseudo) {
                         writeln!(
                             stderr,
-                            "{diagnostic_prefix}complete: {pseudo}: no completion specification"
+                            "{diagnostic_prefix}complete: {}: no completion specification",
+                            pseudo_diag_name.unwrap_or(pseudo)
                         )?;
                         status = 1;
                     }
@@ -2230,18 +2381,25 @@ impl Executor {
             // complete.def:893-911: `for (l = wl ? wl : list; ...)` — the
             // pseudo word replaces the operand list when present.
             let mut status = 0;
-            let operand_refs: Vec<(&str, &str)> = parsed
+            // (print name, diagnostic name, registry key): GNU compopt
+            // prints the pseudo specs by their -D/-E flag form but names
+            // the pcomplete.h magic names in diagnostics (rubash#1090).
+            let operand_refs: Vec<(&str, &str, &str)> = parsed
                 .operands
                 .iter()
-                .map(|name| (name.as_str(), name.as_str()))
+                .map(|name| (name.as_str(), name.as_str(), name.as_str()))
                 .collect();
-            for (report_name, key) in pseudo.into_iter().chain(operand_refs) {
+            let pseudo_ref: Vec<(&str, &str, &str)> = pseudo
+                .into_iter()
+                .map(|(magic, flag)| (flag, magic, flag))
+                .collect();
+            for (report_name, diag_name, key) in pseudo_ref.into_iter().chain(operand_refs) {
                 match self.shell_state.completion_specs.get_mut(key) {
                     None => {
                         // complete.def:896-898 progcomp_search miss.
                         writeln!(
                             stderr,
-                            "{diagnostic_prefix}compopt: {report_name}: no completion specification"
+                            "{diagnostic_prefix}compopt: {diag_name}: no completion specification"
                         )?;
                         status = 1;
                     }
@@ -2267,13 +2425,22 @@ impl Executor {
             return Ok(status);
         }
         let function_names: Vec<String> = self.shell_state.functions.keys().cloned().collect();
+        // GNU job completion names a job by its command name only (the
+        // first word — `%sleep`, pcomplete.c it_jobs / jobs.c job names),
+        // not the full command line (rubash#1052).
         let job_names: Vec<String> = self
             .shell_state
             .job_table
             .jobs
             .values()
             .filter(|job| job.background)
-            .map(|job| job.command.clone())
+            .map(|job| {
+                job.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         // compgen's dynamic inputs — complete.def:669 compgen_builtin drives
         // pcomplete.c:1251 gen_compspec_completions, which runs the -F
@@ -2306,12 +2473,19 @@ impl Executor {
                 Ok(parsed) => {
                     if parsed.funcname.is_some() || parsed.command.is_some() {
                         // complete.def:693-696: builtin_error warning, no
-                        // usage line.
+                        // usage line. GNU's builtin_error reaches stderr
+                        // BEFORE the -F function / -C command runs, so
+                        // flush it through the buffered-output path (which
+                        // honors this command's redirects) before the
+                        // function produces its own output (rubash#1090).
                         let which = if parsed.funcname.is_some() { 'F' } else { 'C' };
                         writeln!(
                             stderr,
                             "{diagnostic_prefix}compgen: warning: -{which} option may not work as you expect"
                         )?;
+                        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+                        stdout.clear();
+                        stderr.clear();
                     }
                     let word = parsed.word().to_string();
                     let mut resolved = crate::builtins::complete::CompgenDynamic::default();
@@ -2516,8 +2690,16 @@ impl Executor {
         self.set_env("COMP_POINT", &point.to_string());
         self.set_env("COMP_TYPE", "0");
         self.set_env("COMP_KEY", "0");
-        store_indexed_array_state(&mut self.shell_state, "COMP_WORDS", words.to_vec());
-        self.shell_state.variables.remove("COMP_WORDS");
+        // GNU compgen passes the caller's COMP_WORDS through to the -F
+        // function: outside a live completion there is no word list to
+        // bind, so a COMP_WORDS the script already set stays visible
+        // (only an unset one is bound, to the empty list) (rubash#1088).
+        if !self.shell_state.env_vars.contains_key("COMP_WORDS")
+            && self.shell_state.variables.get("COMP_WORDS").is_none()
+        {
+            store_indexed_array_state(&mut self.shell_state, "COMP_WORDS", words.to_vec());
+            self.shell_state.variables.remove("COMP_WORDS");
+        }
         self.set_env("COMP_CWORD", &cword.to_string());
     }
 
@@ -2539,6 +2721,39 @@ impl Executor {
             env::remove_var(name);
         }
     }
+}
+
+/// GNU wait.def wait_builtin(): options are scanned with
+/// internal_getopt "fnp:"; a `-p` at the end of a cluster with no joined
+/// text consumes the NEXT word as its argument. When no next word exists,
+/// getopt reports `-p: option requires an argument` and the builtin falls
+/// into its default case: usage + EX_USAGE (2). Returns true when the word
+/// list has such a dangling `-p` (rubash#1156 — the operand scanners below
+/// used to walk one word past the end and panic on the slice).
+fn wait_p_argument_missing(words: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word == "--" || !word.starts_with('-') || word == "-" {
+            break;
+        }
+        for (offset, option) in word[1..].char_indices() {
+            match option {
+                'n' | 'f' => {}
+                'p' => {
+                    let value_start = 1 + offset + option.len_utf8();
+                    if value_start < word.len() {
+                        // Joined form `-pNAME`: argument is in this word;
+                        // `-p` ends the cluster either way.
+                        break;
+                    }
+                    return words.get(index + 1).is_none();
+                }
+                _ => return false,
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 struct WaitAnyRequest {
@@ -2634,9 +2849,12 @@ fn wait_background_operands(words: &[String]) -> Option<Vec<String>> {
     }
 
     // Jobspec operands keep no W_ARRAYREF consumer — strip the in-band
-    // flag so `wait: A[]]: ...` diagnostics print clean text.
+    // flag so `wait: A[]]: ...` diagnostics print clean text. A dangling
+    // `-p` walks `index` one past the end (its argument word is counted,
+    // then the option word itself); saturate instead of slicing past the
+    // end (rubash#1156).
     Some(
-        words[index..]
+        words[index.min(words.len())..]
             .iter()
             .map(|word| {
                 crate::builtins::arrayref::take_arrayref_flag(word)
@@ -2699,7 +2917,7 @@ where
         return Ok(127);
     }
 
-    if operand.chars().all(|ch| ch.is_ascii_digit()) {
+    if !operand.is_empty() && operand.chars().all(|ch| ch.is_ascii_digit()) {
         writeln!(
             stderr,
             "{diagnostic_prefix}wait: pid {operand} is not a child of this shell"

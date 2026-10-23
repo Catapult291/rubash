@@ -274,21 +274,40 @@ fn unclosed_regex_paren_line(word: &str, base_line: usize) -> Option<usize> {
 }
 
 /// error_token_from_text (parse.y:6772-6808): the reported token extends
-/// left across characters that are not ` \n\t;|&` breaks, so adjacent
+/// across characters that are not ` \n\t;|&` breaks, so adjacent
 /// arguments merge into one reported string (`(x' for `(x').
-fn walk_back_near_token(args: &[CondArg], mut index: usize) -> String {
+fn walk_back_near_token(args: &[CondArg], index: usize) -> String {
     // Raw text (quote/escape forms intact): GNU's error_token_from_text
     // names the source form of the offending word (`syntax error near
     // `\<'', not `<').
-    let mut text = args
-        .get(index)
-        .map(|(_, raw, _, _)| raw.clone())
-        .unwrap_or_default();
-    while index > 0 && args[index].2.is_empty() {
-        index -= 1;
-        text = format!("{}{}", args[index].1, text);
+    let orig = index;
+    let mut start = index;
+    while start > 0 && args[start].2.is_empty() {
+        start -= 1;
     }
-    text
+    // GNU's scan (parse.y:6787-6793) is anchored at the end of the token
+    // the reader consumed and walks back over non-break characters
+    // (" \n\t;|&" are the breaks). The cond reader's token can span
+    // several collected fragments glued together with no whitespace, in
+    // either direction from the fragment the parser tripped on:
+    // fragments before it merge through the walk above, and fragments
+    // glued directly AFTER it merge here — `[[ a == (a ]]` trips on the
+    // `(' fragment but GNU reports `(a' (rubash#1125). A following
+    // fragment joins only when glued (empty leading whitespace) and not
+    // itself starting with a break character.
+    let mut end = orig;
+    while end + 1 < args.len()
+        && args[end + 1].2.is_empty()
+        && !args[end + 1]
+            .1
+            .starts_with([' ', '\t', '\n', ';', '|', '&'])
+    {
+        end += 1;
+    }
+    (start..=end)
+        .filter_map(|i| args.get(i))
+        .map(|(_, raw, _, _)| raw.as_str())
+        .collect()
 }
 
 /// The GNU yacc-level token for one collected argument. Shell metacharacters

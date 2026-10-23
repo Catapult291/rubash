@@ -210,6 +210,10 @@ fn run_source_groups(
         if let Some(cmd) = redirect_cmd {
             executor.apply_inherited_command_output_redirects(cmd, &mut ast)?;
         }
+        // rubash#1138: a gathered group is one GNU reader unit — a
+        // syntax error anywhere in it voids the whole group
+        // (evalstring.c parse_and_execute parses before executing).
+        crate::script_driver::apply_parse_error_unit_voiding(&mut ast);
         // The group's words are final: executor-level alias expansion would
         // expand them a second time (run_history_group precedent). Save the
         // marker so a nested `.` inside an already-streamed context restores

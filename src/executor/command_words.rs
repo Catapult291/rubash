@@ -372,6 +372,14 @@ impl Executor {
             }
         }
         if let Some(values) = self.quoted_positional_at_word_values_with_raw(word, raw, None) {
+            // The segment expander is shared with the argv path, where
+            // pathname expansion runs as a later stage; the for-list path
+            // returns final values, so a whole-word UNQUOTED ${a[@]}/${a[*]}
+            // splice must be globbed here or the loop iterates the literal
+            // pattern (rubash#1067: `for i in ${arr[@]}` yielded `*.sh`).
+            if !suppress_glob && word_is_unquoted_array_list_expansion(word) {
+                return self.glob_for_list_fields(values);
+            }
             return Ok(values);
         }
         // GNU subst.c parameter_brace_expand's `+` arm: the alternative word
@@ -385,10 +393,18 @@ impl Executor {
         }
         if let Some(values) = self.array_at_word_values(word) {
             if word_is_unquoted_array_list_expansion(word) {
-                return Ok(field_split_array_values_with_ifs(
+                let fields = field_split_array_values_with_ifs(
                     values,
                     self.shell_state.env_vars.get("IFS").map(String::as_str),
-                ));
+                );
+                if suppress_glob {
+                    return Ok(fields);
+                }
+                // GNU subst.c:13219 expand_word_list_internal: an unquoted
+                // ${a[@]}/${a[*]} splice is field-split AND then pathname-
+                // expanded field by field, exactly like a scalar expansion
+                // (rubash#1067).
+                return self.glob_for_list_fields(fields);
             }
             return Ok(values);
         }
@@ -434,6 +450,22 @@ impl Executor {
         }
 
         self.expand_for_brace_word_values(word, raw, suppress_glob)
+    }
+
+    /// Pathname-expand final for-list fields one by one (subst.c:13219
+    /// expand_word_list_internal -> glob_expand_word_list): a match
+    /// replaces the field, a non-match keeps the finalized literal, and a
+    /// failglob pattern aborts the whole list expansion (rubash#1067).
+    fn glob_for_list_fields(&self, fields: Vec<String>) -> Result<Vec<String>, String> {
+        let mut globbed = Vec::with_capacity(fields.len());
+        for field in fields {
+            match glob::pathname_expand_word(&field, &self.shell_state.env_vars) {
+                glob::PathnameExpansion::Matches(matches) => globbed.extend(matches),
+                glob::PathnameExpansion::NoMatch => globbed.push(finalize_for_list_value(field)),
+                glob::PathnameExpansion::Fail(pattern) => return Err(pattern),
+            }
+        }
+        Ok(globbed)
     }
 
     fn expand_for_brace_word_values(

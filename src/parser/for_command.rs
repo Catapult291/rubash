@@ -49,16 +49,58 @@ pub(super) fn parse_for_command(
     ) {
         return None;
     }
-    // `for` loop variable may be a reserved word used as a name
-    // (`for for in for; do ...`); reject only `in`/`do`/`done` that would
-    // be ambiguous with the loop syntax. This mirrors GNU parse.y which
-    // accepts any WORD as loop variable.
-    if tokens.get(start + 1)?.kind == TokenKind::Keyword
-        && matches!(tokens.get(start + 1)?.value.as_str(), "do" | "done" | "in")
-    {
-        return None;
-    }
+    // `for` loop variable may be any reserved word used as a name: GNU
+    // parse.y reads the slot after FOR as a plain WORD (reserved-word
+    // recognition is positional), so `for in in a b`, `for do in a` and
+    // `for done in a` are all valid loops (an invalid NAME like `{` is
+    // an execution-time `not a valid identifier`, not a parse error).
     let mut i = skip_newline_list(tokens, start + 2);
+    // GNU parse.y for grammar: after the name only `in`, a terminator
+    // (`;`/newline, already skipped) or `do` may follow — anything else
+    // is `syntax error near unexpected token` AT THAT TOKEN
+    // (rubash#1140: `for in 1 2; do ...` blames `1', not the later
+    // `do' the fall-through word path used to reach).
+    if !is_keyword(tokens, i, "in") {
+        if let Some(token) = tokens.get(i) {
+            let legal_follower = token.kind == TokenKind::Semicolon
+                || is_keyword(tokens, i, "do")
+                || for_brace_body_start(tokens, i)
+                || matches!(
+                    token.kind,
+                    TokenKind::Eof
+                        | TokenKind::RedirectIn
+                        | TokenKind::RedirectOut
+                        | TokenKind::Append
+                        | TokenKind::RedirectErr
+                        | TokenKind::RedirectErrAppend
+                        | TokenKind::HereDoc
+                        | TokenKind::HereString
+                );
+            if !legal_follower {
+                let mut command = CommandNode::new();
+                command.line = tokens.get(start).map(|token| token.position);
+                command.insert_assignment(
+                    "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                    format!(
+                        "{}{}{}",
+                        token.value,
+                        crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                        token.position
+                    ),
+                );
+                command.insert_assignment(
+                    "__RUBASH_PARSE_SOURCE__".to_string(),
+                    super::parse_loop::offending_line_text(
+                        tokens,
+                        i,
+                        source.map(|rc| &**rc),
+                        source_line_offset,
+                    ),
+                );
+                return Some(finish_compound_command(command, tokens, tokens.len()));
+            }
+        }
+    }
     let mut words = Vec::new();
     let mut word_metadata = Vec::new();
     let mut in_keyword = None;

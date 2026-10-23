@@ -317,7 +317,15 @@ where
 
     if matches!(first, "-l" | "-L") {
         if args.len() == 1 || args.get(1).is_some_and(|value| value == "-1") {
-            write_signal_list(stdout)?;
+            // POSIX mode (bash posix-mode notes / kill.def list_signals
+            // under POSIX_MODE): the bare list is ONE line of bare signal
+            // names, space-separated, no numbers and no SIG prefix
+            // (rubash#1054).
+            if posix {
+                write_signal_list_posix(stdout)?;
+            } else {
+                write_signal_list(stdout)?;
+            }
             return Ok(0);
         }
         let mut status = 0;
@@ -677,6 +685,24 @@ pub fn register_signal_mailbox(_pid: u32) -> io::Result<()> {
     kernel_signals::install()
 }
 
+/// Signal numbers (1..=64) whose disposition was SIG_IGN when this
+/// process started — GNU trap.c's original_signals snapshot, feeding
+/// the trap table's hard-ignore seed (trap.rs seed_startup_traps,
+/// rubash#1124). Probed once per process; empty on non-unix, where the
+/// trap table is transported through the environment instead.
+#[cfg(unix)]
+pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
+    let mask = kernel_signals::entry_ignored_mask_all();
+    (1..=64)
+        .filter(|sig| mask & (1u64 << (sig - 1)) != 0)
+        .collect()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn entry_ignored_signal_numbers() -> Vec<i32> {
+    Vec::new()
+}
+
 #[cfg(not(unix))]
 pub fn register_signal_mailbox(pid: u32) -> io::Result<()> {
     let dir = signal_mailbox_dir();
@@ -812,7 +838,10 @@ pub fn register_signal_mailbox_async(_pid: u32) {
     // Unix keeps kernel dispositions (see register_signal_mailbox): there
     // is no marker file, so the async Windows path has no work — a no-op
     // keeps the init.rs call site platform-uniform.
-    let _ = kernel_signals::install();
+    // rubash#1027: startup does only the fd-free capture/policy step;
+    // the signal_hook backend (self-pipe socketpair) installs lazily on
+    // the first trapped signal (kernel_signals::reconcile).
+    kernel_signals::capture_entry_and_policy();
 }
 
 #[cfg(not(unix))]
@@ -1283,6 +1312,17 @@ where
     Ok(())
 }
 
+/// POSIX-mode `kill -l` with no operand (rubash#1054): one line, bare
+/// names in signal-number order, single-space separated.
+fn write_signal_list_posix<W>(stdout: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    let names: Vec<&str> = SIGNALS.iter().map(|(_, _, name)| *name).collect();
+    writeln!(stdout, "{}", names.join(" "))?;
+    Ok(())
+}
+
 fn diagnostic_prefix() -> String {
     if let (Ok(script), Ok(line)) = (
         std::env::var("__RUBASH_SCRIPT_NAME"),
@@ -1653,6 +1693,41 @@ mod kernel_signals {
     /// ignored (GNU sig.c:273-277 marks them hard-ignored).
     static ENTRY_IGNORED: AtomicU64 = AtomicU64::new(0);
 
+    /// Process-wide probe of EVERY signal's entry disposition (bit
+    /// sig-1), captured once on first use. GNU trap.c initialize_traps
+    /// snapshots original_signals[] for all NSIG signals at startup;
+    /// trap -p lists the SIG_IGN ones as `trap -- '' SIG` and the trap
+    /// builtin refuses to trap or reset them (SIG_HARD_IGNORE,
+    /// trap.c:850). The MANAGED-only ENTRY_IGNORED above cannot serve
+    /// that display: entry-ignored SIGPIPE/SIGXFSZ/realtime signals are
+    /// outside the managed set (rubash#1124). The probe runs before any
+    /// rubash code changes a disposition (seed_startup_traps in
+    /// Executor::new precedes install()'s SIGQUIT policy ignore), and
+    /// the OnceLock keeps later executors (subshell clones) from
+    /// re-probing a live, already-mutated disposition table.
+    static ENTRY_IGNORED_ALL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    pub(super) fn entry_ignored_mask_all() -> u64 {
+        *ENTRY_IGNORED_ALL.get_or_init(|| {
+            let mut mask = 0u64;
+            for sig in 1..=64 {
+                if current_disposition_is_ignored(sig) {
+                    mask |= 1u64 << (sig - 1);
+                }
+            }
+            // SIGPIPE is excluded: the Rust runtime sets it to SIG_IGN
+            // before main() runs, so its observed disposition is the
+            // runtime's, never the invoking environment's — attributing
+            // it to the parent would list `trap -- '' SIGPIPE` in shells
+            // whose parent left it at SIG_DFL (GNU lists nothing there).
+            // The shell also depends on the ignore for its EPIPE write
+            // error model (rubash#440), so the entry state is
+            // deliberately not reconstructed.
+            mask &= !(1u64 << (libc::SIGPIPE as u64 - 1));
+            mask
+        })
+    }
+
     fn bit(sig: i32) -> u64 {
         1 << MANAGED
             .iter()
@@ -1726,12 +1801,12 @@ mod kernel_signals {
     }
 
     pub(super) fn reconcile(dispositions: &[(i32, Disposition)]) {
-        let Some(mutex) = KERNEL_SIGNALS.get() else {
-            return;
-        };
-        let Ok(signals) = mutex.lock() else {
-            return;
-        };
+        // rubash#1027: the signal_hook backend is installed lazily, on
+        // the first Handler wish — before that, Ignore/Default wishes
+        // are plain sigaction calls that need no backend (and no
+        // self-pipe socketpair on fds 3/4). Startup ran only
+        // capture_entry_and_policy (fd-free).
+        let mut signals_guard = None;
         for &(sig, ref want) in dispositions {
             let target = match want {
                 Disposition::Handler => 2u8,
@@ -1743,7 +1818,20 @@ mod kernel_signals {
             }
             match want {
                 Disposition::Handler => {
-                    if ensure_handler(&signals, sig).is_err() {
+                    if signals_guard.is_none() {
+                        if install().is_err() {
+                            continue;
+                        }
+                        let Some(mutex) = KERNEL_SIGNALS.get() else {
+                            continue;
+                        };
+                        let Ok(guard) = mutex.lock() else {
+                            continue;
+                        };
+                        signals_guard = Some(guard);
+                    }
+                    let signals = signals_guard.as_ref().expect("installed above");
+                    if ensure_handler(signals, sig).is_err() {
                         continue;
                     }
                 }
@@ -1780,26 +1868,46 @@ mod kernel_signals {
         MANAGED.contains(&sig) && HANDLER_SET.load(Ordering::Relaxed) & bit(sig) != 0
     }
 
+    static ENTRY_CAPTURED: std::sync::Once = std::sync::Once::new();
+
+    /// The fd-free part of startup (rubash#1027): capture entry
+    /// dispositions and apply the SIGQUIT policy ignore. Neither needs
+    /// the signal_hook self-pipe, so this runs at shell startup without
+    /// allocating the socketpair that used to sit on fds 3/4 of every
+    /// shell (and of every process listing /proc/$$/fd) for its whole
+    /// life. GNU has no self-pipe at all (sig.c handlers set flags), so
+    /// the pair must not exist before a trap actually needs the backend.
+    pub(super) fn capture_entry_and_policy() {
+        ENTRY_CAPTURED.call_once(|| {
+            // Capture entry dispositions BEFORE changing anything:
+            // signals ignored on entry must stay ignored (POSIX 2.11,
+            // GNU sig.c:273).
+            for sig in MANAGED {
+                if current_disposition_is_ignored(sig) {
+                    ENTRY_IGNORED.fetch_or(bit(sig), Ordering::SeqCst);
+                }
+            }
+            // sig.c:102 initialize_signals -> sig.c:333: every shell
+            // ignores SIGQUIT (script shells do not die on ^\).
+            if ENTRY_IGNORED.load(Ordering::Relaxed) & bit(libc::SIGQUIT as i32) == 0
+                && !current_disposition_is_ignored(libc::SIGQUIT as i32)
+            {
+                set_kernel_handler(libc::SIGQUIT as i32, libc::SIG_IGN);
+            }
+            store_state(libc::SIGQUIT as i32, 1);
+        });
+    }
+
     pub(super) fn install() -> io::Result<()> {
+        capture_entry_and_policy();
         if KERNEL_SIGNALS.get().is_some() {
             return Ok(());
-        }
-        // Capture entry dispositions BEFORE changing anything: signals
-        // ignored on entry must stay ignored (POSIX 2.11, GNU sig.c:273).
-        for sig in MANAGED {
-            if current_disposition_is_ignored(sig) {
-                ENTRY_IGNORED.fetch_or(bit(sig), Ordering::SeqCst);
-            }
         }
         // Empty initial set: no kernel handler exists until a trap names a
         // signal (GNU leaves non-interactive terminating signals SIG_DFL,
         // sig.c:315-316).
         let signals = Signals::new([] as [i32; 0])?;
         let _ = KERNEL_SIGNALS.set(Mutex::new(signals));
-        // sig.c:102 initialize_signals -> sig.c:333: every shell ignores
-        // SIGQUIT (script shells do not die on ^\).
-        set_kernel_handler(libc::SIGQUIT as i32, libc::SIG_IGN);
-        store_state(libc::SIGQUIT as i32, 1);
         // Entry-ignored signals stay ignored (captured above); record their
         // state so the first reconcile does not "restore" them to SIG_DFL.
         for sig in MANAGED {

@@ -228,7 +228,7 @@ impl Executor {
             }
             if is_closed_redirect_target(&target) {
                 if redirect.fd.unwrap_or(0) == 0 {
-                    process.stdin(Stdio::null());
+                    process.stdin(closed_stdin());
                 }
                 return Ok(());
             }
@@ -260,10 +260,14 @@ impl Executor {
             if redirect.fd.unwrap_or(0) == 0 {
                 process.stdin(Stdio::from(file));
             }
-        } else if self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
-            || self.virtual_fd_stdin_remaining(0).is_some()
+        } else if self.fd_table.is_closed(0)
+            || (self.fd_table.has_entry(0) && !self.fd_table.is_open_for_read(0))
         {
-            process.stdin(Stdio::piped());
+            // rubash#1102: an exec-installed closed/write-only fd 0 shadows
+            // the ambient stage buffer — the forked stage simply has no
+            // readable fd 0 (GNU: `exec <&-` in a group makes its readers
+            // fail with EBADF, not see the pipe bytes).
+            process.stdin(closed_stdin());
         } else if let Some(
             FdReadEndpoint::File(file_fd) | FdReadEndpoint::CoprocStdout { fd: file_fd, .. },
         ) = self.fd_table.read_endpoint(0)
@@ -271,13 +275,16 @@ impl Executor {
             // GNU: fd 0 is a real descriptor and the child inherits the open
             // file description, file offset included (`exec 0<f; tr ...`
             // reads f from the current position). DuplicateHandle shares the
-            // file pointer just like dup2.
+            // file pointer just like dup2. rubash#1102/#1103: this arm must
+            // win over the FUNCTION_STDIN buffer below — inside a pipeline
+            // stage an `exec <file` rebinds fd 0 to the file, and only the
+            // readers that ran BEFORE the exec keep the pipe bytes.
             let dup = crate::fd::duplicate_handle(file_fd.handle)?;
             process.stdin(Stdio::from(crate::fd::handle_to_file(dup)));
-        } else if self.fd_table.is_closed(0)
-            || (self.fd_table.has_entry(0) && !self.fd_table.is_open_for_read(0))
+        } else if self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
+            || self.virtual_fd_stdin_remaining(0).is_some()
         {
-            process.stdin(Stdio::null());
+            process.stdin(Stdio::piped());
         }
 
         Ok(())
@@ -1254,6 +1261,22 @@ impl Executor {
         }
         Some(self.expand_heredoc_body_mut(body))
     }
+}
+
+/// stdin for a child whose fd 0 is closed (rubash#1102): GNU leaves the
+/// descriptor closed in the forked child, so its reads fail EBADF instead
+/// of reporting EOF (coreutils: `cat: -: Bad file descriptor`, exit 1).
+/// A write-only /dev/null reproduces that observable contract on Unix —
+/// read(2) on a write-only descriptor fails EBADF. Elsewhere fall back to
+/// the plain null device (EOF).
+fn closed_stdin() -> Stdio {
+    #[cfg(unix)]
+    {
+        if let Ok(file) = OpenOptions::new().write(true).open("/dev/null") {
+            return Stdio::from(file);
+        }
+    }
+    Stdio::null()
 }
 
 fn sync_ordered_redirect_targets(command: &mut CommandNode) {

@@ -288,6 +288,10 @@ impl Executor {
             return Err(ExecuteError::ExitCode(code));
         }
         if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+            // rubash#1171 (same class): a failing bare arithmetic command
+            // earns its ERR fire before the ERREXIT conversion, exactly
+            // like the assignment-only tail below.
+            self.maybe_run_error_trap(cmd)?;
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())
@@ -331,6 +335,29 @@ impl Executor {
         let procsub_fd_base = self.command_scoped_procsub_input_fds.len();
         self.bind_conditional_stdio_redirects(cmd)?;
         self.exit_code = self.execute_conditional_command(conditional_command);
+        // rubash#1130: a [[ ]] operand hit a FATAL word-expansion error
+        // (nounset unbound) — the diagnostic and exit_code are already
+        // in place from expand_conditional_word; unwind with the
+        // FORCE_EOF class (or the interactive DISCARD class).
+        let conditional_fatal = self.conditional_expansion_fatal.replace(false);
+        if conditional_fatal {
+            self.finish_conditional_output_procsubs()?;
+            self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
+            for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {
+                match saved {
+                    Some(entry) => {
+                        self.fd_table.entries.insert(fd, entry);
+                    }
+                    None => {
+                        self.fd_table.entries.remove(&fd);
+                    }
+                }
+            }
+            if self.expansion_error_is_interactive_discard() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            return Err(ExecuteError::ExitCode(self.exit_code));
+        }
         self.finish_conditional_output_procsubs()?;
         self.close_command_scoped_procsub_input_fds_from(procsub_fd_base);
         for (fd, saved) in [(1u32, saved_stdout), (2, saved_stderr)] {
@@ -342,6 +369,12 @@ impl Executor {
                     self.fd_table.entries.remove(&fd);
                 }
             }
+        }
+        // rubash#1177: a nounset fatal latched while expanding a `=~`
+        // operand inside the conditional converts to the FORCE_EOF exit
+        // here, after the command's redirects are restored.
+        if let Some(result) = self.take_conditional_nounset_fatal() {
+            return result;
         }
         Ok(())
     }
@@ -718,6 +751,16 @@ impl Executor {
         }
         self.exit_code = status;
         if self.errexit_enabled() && self.errexit_is_active() && self.exit_code != 0 {
+            // rubash#1171: GNU fires the ERR trap inside
+            // execute_simple_command (run_error_trap, execute_cmd.c:1000)
+            // BEFORE the ERREXIT jump in execute_command_internal — an
+            // assignment-only command whose substitution failed
+            // (`set -e; trap 'echo T' ERR; x=$(false)`) prints T and then
+            // exits. Converting straight to ExitCode here bypassed the
+            // ast_exec loop's adjudication entirely. The non-errexit path
+            // still returns Ok and lets the loop fire, so fire only on
+            // this converting branch.
+            self.maybe_run_error_trap(cmd)?;
             return Err(ExecuteError::ExitCode(self.exit_code));
         }
         Ok(())

@@ -929,8 +929,33 @@ impl Executor {
                         } else {
                             output.push_str(&value);
                         }
-                    } else if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
-                        && self.posix_mode_enabled()
+                    } else if self.posix_mode_enabled()
+                        // rubash#1109 item 2: the Interp 221 literal-quote
+                        // rule applies only above compat 42 — at <= 42 a
+                        // single quote inside ${...} quotes again, even in
+                        // POSIX mode (GNU parse.y compat gate).
+                        && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+                        && (matches!(
+                            context,
+                            SubstitutionQuoteContext::DoubleQuoted
+                                | SubstitutionQuoteContext::HereDocument
+                        ) || in_double
+                            // The lexer already applied the rule when it
+                            // tokenized the word: it early-closed the span
+                            // and marked the tail's quote as DATA_SQUOTE,
+                            // but stripped the quote context, so the word
+                            // arrives Unquoted. That marker immediately
+                            // after the in-context close is the lexer's own
+                            // boundary decision surfacing in the token —
+                            // honor it instead of re-pairing the quotes.
+                            || {
+                                let remainder: String = chars.clone().collect();
+                                matching_parameter_brace_in_context(&remainder, true, true)
+                                    .is_some_and(|close| {
+                                        remainder.chars().nth(close + 1)
+                                            == Some(crate::executor::markers::DATA_SQUOTE)
+                                    })
+                            })
                     {
                         let remainder: String = chars.clone().collect();
                         if let Some(close) =
@@ -2030,6 +2055,10 @@ impl Executor {
         self.shell_state
             .subshell_depth
             .set(saved_state.subshell_depth.get() + 1);
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for the restore.
+        self.shell_state.random_state.reseed_fresh();
         self.shell_state.in_command_substitution.set(true);
 
         let saved_capture = self.stdout_capture.take();
@@ -2063,7 +2092,9 @@ impl Executor {
         // trap, so a parent trap cannot fire inside the substitution. The
         // in-place body below runs on this executor, but the wholesale
         // state restore at the end rolls the parent's trap table back.
-        crate::builtins::trap::reset_for_subshell(&mut self.shell_state.env_vars);
+        // The ERR trap is the errtrace exception (rubash#1133): under
+        // `set -E` it stays live in the child, like the `( )` path.
+        crate::builtins::trap::reset_for_subshell_child(&mut self.shell_state.env_vars);
         // Bash runs command substitution in a subshell where the -e option
         // is turned off at child entry: `$(false; echo ok)` prints ok
         // because the inner `false` does not abort the substitution
@@ -2211,6 +2242,10 @@ impl Executor {
         // forked child in GNU — so variable/scope/job mutations of the call
         // die with the substitution. Whole-state clone, not a field list.
         let saved_state = self.shell_state.clone_for_child_save();
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number); saved_state keeps
+        // the parent's sequence for restore_flat_subshell.
+        self.shell_state.random_state.reseed_fresh();
         let saved_dir = env::current_dir().ok();
         let saved_capture = self.stdout_capture.take();
         self.stdout_capture = Some(Vec::new());

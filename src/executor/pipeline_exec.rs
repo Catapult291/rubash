@@ -949,7 +949,15 @@ impl Executor {
         // kills only the element (stage status 127), never the enclosing
         // script (issue #67).
         let saved = self.snapshot_arithmetic_error_flags();
+        // rubash#1115: the speculative producer expansion must not draw
+        // from the parent's RANDOM sequence — a pipeline element is a
+        // forked child (variables.c:1418-1423 reseeds), and when this
+        // fast path declines, the sequential stage loop re-expands the
+        // words itself. Snapshot, reseed for the attempt, restore.
+        let saved_random = self.shell_state.random_state.clone_state();
+        self.shell_state.random_state.reseed_fresh();
         let result = self.execute_timed_read_pipeline_inner(commands);
+        self.shell_state.random_state.restore_state(&saved_random);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match (result, nounset_hit) {
             (Ok(Some(())), true) => {
@@ -1035,6 +1043,11 @@ impl Executor {
         match name.as_str() {
             "true" | ":" => Some(()),
             "sleep" => {
+                // With PATH unset, sleep does not resolve (rubash#1126):
+                // decline the timing model so the real pipeline reports it.
+                if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
+                    return None;
+                }
                 let duration = command
                     .words
                     .get(1)
@@ -2879,6 +2892,18 @@ impl Executor {
         // this idempotent pass covers the recursion entry points that bypass
         // the gather (the `time` prefix arm and the timed-read followup).
         let command = &normalize_pipeerr_stage(command);
+        // rubash#1115: GNU forks every pipeline element
+        // (execute_cmd.c:2620 execute_pipeline -> execute_simple_command
+        // in the child), so the element's word expansion and body draw
+        // from a RESEEDED generator (variables.c:1418-1423
+        // get_random_number) and never advance the parent's sequence.
+        // The stage runs in place on the shared executor here, so
+        // bracket it: snapshot the parent's generator, reseed for the
+        // stage's duration, restore on exit. (lastpipe's last element
+        // runs through execute_lastpipe_stage instead — it IS the
+        // current shell and keeps the parent sequence.)
+        let saved_random = self.shell_state.random_state.clone_state();
+        self.shell_state.random_state.reseed_fresh();
         // A pipeline element runs in its own subshell: an expansion error
         // raised while expanding the element's words on the shared executor
         // (notably `set -u` unbound in `$(( ))`) terminates only that
@@ -2988,6 +3013,7 @@ impl Executor {
             FUNCTION_STDIN_OFFSET,
             old_stdin_offset,
         );
+        self.shell_state.random_state.restore_state(&saved_random);
         let nounset_hit = self.restore_arithmetic_error_flags(&saved);
         match result {
             Ok(Some((output, stderr, _status))) if nounset_hit => {
@@ -3015,11 +3041,7 @@ impl Executor {
             else {
                 return Ok(None);
             };
-            print_time(
-                &self.shell_state.env_vars,
-                time_command.posix_format,
-                started,
-            );
+            self.print_time_shell(time_command.posix_format, started);
             let status = if time_command.inverted {
                 invert_exit_status(status)
             } else {
@@ -3275,6 +3297,16 @@ impl Executor {
         // and a pure inline fast-path arm (`echo`/`printf`/`tr`/...) is
         // confirmed as a builtin when the stage returns.
         let _profiler_stage = super::profiler::enter_prepared_command(name);
+        // GNU findcmd.c: with PATH unset no external command resolves —
+        // the inline arms below that emulate external programs (head,
+        // cat, sed, grep, wc, tr) must stand down and let the external
+        // stage report the failure (rubash#1126). Builtin arms are
+        // unaffected.
+        if crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+            && matches!(name, "head" | "cat" | "sed" | "grep" | "wc" | "tr" | "tput")
+        {
+            return self.execute_external_pipeline_stage(command, input, stdin_inherit);
+        }
         match name {
             "true" | ":" => Ok(Some((String::new(), String::new(), 0))),
             "false" => Ok(Some((String::new(), String::new(), 1))),

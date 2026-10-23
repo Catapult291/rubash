@@ -10,9 +10,19 @@ const EX_USAGE: i32 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisownAction {
     Complete(i32),
-    Current,
-    All,
-    Jobs(Vec<String>),
+    /// No jobspec: the current job. `nohup_only` is `disown -h` —
+    /// GNU builtins/jobs.def disown_builtin: with -h the job is marked
+    /// (jobs.c nohup_job, J_NOHUP) instead of deleted (rubash#1048).
+    Current {
+        nohup_only: bool,
+    },
+    All {
+        nohup_only: bool,
+    },
+    Jobs {
+        specs: Vec<String>,
+        nohup_only: bool,
+    },
 }
 
 pub fn execute_with_io<E>(
@@ -24,6 +34,7 @@ where
     E: Write,
 {
     let mut all_jobs = false;
+    let mut nohup_only = false;
     let mut index = 0;
     while let Some(arg) = args.get(index) {
         if arg == "--" {
@@ -37,7 +48,7 @@ where
         for option in arg[1..].chars() {
             match option {
                 'a' | 'r' => all_jobs = true,
-                'h' => {}
+                'h' => nohup_only = true,
                 other => {
                     writeln!(
                         stderr,
@@ -52,13 +63,16 @@ where
     }
 
     if all_jobs && args.get(index).is_none() {
-        return Ok(DisownAction::All);
+        return Ok(DisownAction::All { nohup_only });
     }
 
     if index < args.len() {
-        Ok(DisownAction::Jobs(args[index..].to_vec()))
+        Ok(DisownAction::Jobs {
+            specs: args[index..].to_vec(),
+            nohup_only,
+        })
     } else {
-        Ok(DisownAction::Current)
+        Ok(DisownAction::Current { nohup_only })
     }
 }
 

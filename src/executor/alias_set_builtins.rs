@@ -120,6 +120,20 @@ impl Executor {
             &mut stdout,
             &mut stderr,
         )?;
+        if cmd.words.len() == 1 {
+            // GNU set.def set_builtin with no arguments calls
+            // print_var_list over ALL variables — shell functions are
+            // variables in GNU's table and print after the scalars, in
+            // name order, through print_function_def (rubash#1056).
+            let mut names: Vec<&String> = self.shell_state.functions.keys().collect();
+            names.sort();
+            for name in names {
+                if let Some(body) = self.shell_state.functions.get(name) {
+                    let commands = body.commands.clone();
+                    self.write_function_definition(name, &commands, false, &mut stdout)?;
+                }
+            }
+        }
         self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
         self.load_history_file_if_needed();
         // GNU set.def returns EX_USAGE (258 > EX_SHERRBASE) for invalid
@@ -163,6 +177,17 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // rubash#1020: the fast paths below apply flags/positionals and
+        // return success without ever looking at cmd's redirections, so
+        // `set -- -a -b > o1.txt` silently dropped the redirect (no file,
+        // no error) and `set -- -b 2>/bad/path` masked the open failure.
+        // GNU do_redirections runs before the builtin (redir.c), and the
+        // full path (execute_set -> write_buffered_builtin_output) honors
+        // them — route any redirected `set` there.
+        if compound_command_has_redirects(cmd) {
+            self.exit_code = self.execute_set(cmd)?;
+            return Ok(());
+        }
         if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted")
             && cmd.words[1..]
                 .iter()

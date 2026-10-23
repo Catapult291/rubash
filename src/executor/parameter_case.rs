@@ -143,20 +143,32 @@ pub(in crate::executor) fn apply_parameter_case_mod(
             return out;
         }
         match operation {
-            CaseMod::UpperAll => return value.chars().flat_map(char::to_uppercase).collect(),
-            CaseMod::LowerAll => return value.chars().flat_map(char::to_lowercase).collect(),
+            // GNU casemod.c uses the SIMPLE 1:1 locale mapping, not the
+            // full Unicode mapping (rubash#1063: ß/ﬁ stay, İ -> i).
+            CaseMod::UpperAll => {
+                return value
+                    .chars()
+                    .map(crate::locale::simple_case_upper)
+                    .collect()
+            }
+            CaseMod::LowerAll => {
+                return value
+                    .chars()
+                    .map(crate::locale::simple_case_lower)
+                    .collect()
+            }
             // An empty pattern behaves as `?`, matching every character, so
             // toggle-all needs no matcher either (rubash#608).
             CaseMod::ToggleAll => {
                 return value
                     .chars()
-                    .flat_map(|ch| {
+                    .map(|ch| {
                         if ch.is_lowercase() {
-                            ch.to_uppercase().collect::<Vec<_>>()
+                            crate::locale::simple_case_upper(ch)
                         } else if ch.is_uppercase() {
-                            ch.to_lowercase().collect::<Vec<_>>()
+                            crate::locale::simple_case_lower(ch)
                         } else {
-                            vec![ch]
+                            ch
                         }
                     })
                     .collect()
@@ -190,13 +202,13 @@ pub(in crate::executor) fn apply_parameter_case_mod(
         }
         let mut out = String::with_capacity(value.len());
         match operation {
-            CaseMod::UpperFirst => out.extend(first.to_uppercase()),
-            CaseMod::LowerFirst => out.extend(first.to_lowercase()),
+            CaseMod::UpperFirst => out.push(crate::locale::simple_case_upper(first)),
+            CaseMod::LowerFirst => out.push(crate::locale::simple_case_lower(first)),
             _ => {
                 if first.is_lowercase() {
-                    out.extend(first.to_uppercase())
+                    out.push(crate::locale::simple_case_upper(first))
                 } else if first.is_uppercase() {
-                    out.extend(first.to_lowercase())
+                    out.push(crate::locale::simple_case_lower(first))
                 } else {
                     out.push(first)
                 }
@@ -216,13 +228,17 @@ pub(in crate::executor) fn apply_parameter_case_mod(
             continue;
         }
         match operation {
-            CaseMod::UpperAll | CaseMod::UpperFirst => out.extend(ch.to_uppercase()),
-            CaseMod::LowerAll | CaseMod::LowerFirst => out.extend(ch.to_lowercase()),
+            CaseMod::UpperAll | CaseMod::UpperFirst => {
+                out.push(crate::locale::simple_case_upper(ch))
+            }
+            CaseMod::LowerAll | CaseMod::LowerFirst => {
+                out.push(crate::locale::simple_case_lower(ch))
+            }
             CaseMod::ToggleAll | CaseMod::ToggleFirst if ch.is_lowercase() => {
-                out.extend(ch.to_uppercase())
+                out.push(crate::locale::simple_case_upper(ch))
             }
             CaseMod::ToggleAll | CaseMod::ToggleFirst if ch.is_uppercase() => {
-                out.extend(ch.to_lowercase())
+                out.push(crate::locale::simple_case_lower(ch))
             }
             CaseMod::ToggleAll | CaseMod::ToggleFirst => out.push(ch),
         }

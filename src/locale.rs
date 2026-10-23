@@ -166,6 +166,51 @@ pub fn char_count(s: &str) -> usize {
     s.chars().count()
 }
 
+/// GNU lib/sh/casemod.c maps each character through the locale's
+/// towupper/towlower — the SIMPLE (1:1) Unicode case mapping, never the
+/// full mapping: `ß` has no simple uppercase and stays `ß`, the `ﬁ`
+/// ligature stays, and U+0130 `İ` lowercases to plain `i` (its simple
+/// mapping; the full mapping is `i` + combining dot above). Rust's
+/// char::to_uppercase/to_lowercase produce FULL mappings, so keep the
+/// result only when it is exactly one character (rubash#1063). In a
+/// single-byte locale only ASCII letters map at all (glibc towupper in
+/// the C locale), matching is_utf8()'s byte model.
+pub fn simple_case_upper(ch: char) -> char {
+    if !is_utf8() {
+        return if ch.is_ascii_lowercase() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+    }
+    let mut mapped = ch.to_uppercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(upper), None) => upper,
+        _ => ch,
+    }
+}
+
+/// Lowercase counterpart of [`simple_case_upper`].
+pub fn simple_case_lower(ch: char) -> char {
+    if !is_utf8() {
+        return if ch.is_ascii_uppercase() {
+            ch.to_ascii_lowercase()
+        } else {
+            ch
+        };
+    }
+    // U+0130: glibc towlower gives plain `i` (the simple mapping); the
+    // Rust full mapping is `i` + U+0307 (rubash#1063).
+    if ch == '\u{130}' {
+        return 'i';
+    }
+    let mut mapped = ch.to_lowercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(lower), None) => lower,
+        _ => ch,
+    }
+}
+
 /// Byte offsets of the GNU multibyte character boundaries in `bytes`.
 ///
 /// This is the ADVANCE_CHAR walk of `include/shmbutil.h:114-147`: a valid

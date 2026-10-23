@@ -443,6 +443,10 @@ impl Executor {
                 self.restore_function_call_fd0(binding);
             }
         }
+        // Set inside the entry block when this call actually pushes
+        // BASH_ARGC/BASH_ARGV frames (extdebug only — see below), so the
+        // exit path pops exactly what this call pushed (rubash#1051).
+        let mut pushed_bash_args = false;
         let (old_function, old_function_stdin, old_function_stdin_offset, old_positional_params) = {
             let old_function = self
                 .shell_state
@@ -493,11 +497,55 @@ impl Executor {
                     source
                 },
             );
-            self.shell_state
-                .bash_argc_stack
-                .insert(0, args.len().to_string());
-            for arg in args {
-                self.shell_state.bash_argv_stack.insert(0, arg.clone());
+            // GNU execute_cmd.c:5342-5347 execute_function: push_args
+            // runs ONLY in debugging_mode (extdebug). Without it the
+            // BASH_ARGV/BASH_ARGC cells stay empty — populating them
+            // unconditionally leaked call-stack data to introspection
+            // and left ${#BASH_ARGC[@]} disagreeing with declare -p
+            // (rubash#1051).
+            if crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug") {
+                pushed_bash_args = true;
+                // execute_cmd.c:5337: init_bash_argv() runs before the
+                // push when debugging — the first materialization
+                // installs the bottom frame from the CURRENT positional
+                // parameters (the caller's context), which then persists
+                // for the shell's lifetime (rubash#1051).
+                if self.shell_state.bash_arg_bottom.borrow().is_none() {
+                    *self.shell_state.bash_arg_bottom.borrow_mut() = Some(
+                        self.shell_state
+                            .positional_window()
+                            .iter()
+                            .rev()
+                            .cloned()
+                            .collect(),
+                    );
+                }
+                self.shell_state
+                    .bash_argc_stack
+                    .insert(0, args.len().to_string());
+                for arg in args {
+                    self.shell_state.bash_argv_stack.insert(0, arg.clone());
+                }
+            } else if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) <= 44
+                && self.shell_state.bash_arg_bottom.borrow().is_none()
+            {
+                // rubash#1110 item 4 / rubash#1051 integration: GNU
+                // execute_cmd.c:5337-5339 runs init_bash_argv at
+                // function entry when debugging_mode OR
+                // shell_compatibility_level <= 44, so a compat <= 44
+                // call materializes the BASH_ARGV/BASH_ARGC arrays
+                // even without extdebug — but push_args still runs
+                // only in debugging_mode, so no call frame is added.
+                // The frame the entry-time init pushes is EMPTY
+                // (observed against the GNU 5.3.20 oracle in every
+                // entry order: script args X Y, `set -- P Q R` first,
+                // nested entry — in-function reads always show
+                // BASH_ARGC=(0), BASH_ARGV=()); the positional content
+                // frame appears only when materialization happened
+                // earlier (startup, extdebug enable, or a top-level
+                // read via variables.c get_bashargcv). Once installed,
+                // the frame persists for later reads at any level.
+                *self.shell_state.bash_arg_bottom.borrow_mut() = Some(Vec::new());
             }
             self.set_positional_params(args.to_vec());
             (
@@ -532,7 +580,7 @@ impl Executor {
         // body may still set a new DEBUG trap, which then fires for the
         // remaining body commands (trap.tests: "func[29] funcdebug").
         let saved_debug_action =
-            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG");
+            crate::builtins::trap::get_trap_action_fast(&self.shell_state.env_vars, "DEBUG");
         if saved_debug_action.is_some() && !function_traced {
             crate::builtins::trap::clear_debug_trap(&mut self.shell_state.env_vars);
         }
@@ -544,7 +592,7 @@ impl Executor {
         let errtrace =
             crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "errtrace");
         let saved_err_action =
-            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR");
+            crate::builtins::trap::get_trap_action_fast(&self.shell_state.env_vars, "ERR");
         if saved_err_action.is_some() && !errtrace {
             crate::builtins::trap::clear_error_trap(&mut self.shell_state.env_vars);
         }
@@ -572,6 +620,7 @@ impl Executor {
         // non-zero trap status under debugging_mode skips the body entirely
         // (no RETURN trap either, probe m2: `FN=0` with the body's echo
         // absent); the function call's status is EXECUTION_SUCCESS.
+        let mut debug_entry_return: Option<i32> = None;
         let debug_entry_skip = if function_traced {
             if let Some(line) = body_open_line {
                 self.set_current_line_value(line);
@@ -592,7 +641,21 @@ impl Executor {
                 .unwrap_or_else(|| {
                     crate::executor::command_text::bash_command_source_text(call_cmd)
                 });
-            self.run_debug_trap(&command_text)?.is_some()
+            match self.run_debug_trap(&command_text) {
+                Ok(skip) => skip.is_some(),
+                // rubash#1162: a `return` inside the DEBUG action at the
+                // entry fire (funcnest is already incremented, so the
+                // action runs in this function's frame) returns from THIS
+                // function — GNU bashdb semantics. Feed it into the normal
+                // result path below instead of letting it escape
+                // execute_function, where nothing consumes Return and it
+                // aborted the whole script at the top-level driver.
+                Err(ExecuteError::Return(status)) => {
+                    debug_entry_return = Some(status);
+                    false
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             false
         };
@@ -611,8 +674,18 @@ impl Executor {
         // return success without unwinding (modernish QRK_BCDANGER: bash
         // 5.x is quirk-ABSENT). Restore the caller's depth after the body
         // like the unwind-protect does.
+        // rubash#1110 item 1: at compat level <= 43 the reset does NOT
+        // happen — the caller's loop_level carries into the body, so a
+        // `break` inside the function breaks the caller's loop.
         let saved_loop_depth = self.shell_state.loop_depth;
-        self.shell_state.loop_depth = 0;
+        if shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 43 {
+            self.shell_state.loop_depth = 0;
+        }
+        // The fresh loop scope covers fork-inherited depth too: a function
+        // called from a comsub body inside a loop still hits
+        // check_loop_level's empty case (rubash#1064/#1065 boundary rule).
+        let saved_inherited_loop_depth = self.shell_state.inherited_loop_depth;
+        self.shell_state.inherited_loop_depth = 0;
         // GNU execute_cmd.c:5205 (execute_function) runs a copy of the
         // stored body command, and execute_command_internal:854 applies
         // the DEFINITION's redirect list when that body command runs —
@@ -679,7 +752,9 @@ impl Executor {
         // `debugging_mode == 0 || result == EXECUTION_SUCCESS` branch). The
         // unwind restores below run for the skip path too, like
         // run_unwind_frame does in GNU.
-        let result = if debug_entry_skip {
+        let result = if let Some(status) = debug_entry_return {
+            Err(ExecuteError::Return(status))
+        } else if debug_entry_skip {
             Ok(())
         } else {
             self.with_compound_output_redirects(call_cmd, |executor| {
@@ -698,6 +773,7 @@ impl Executor {
             self.resume_alias_streamed(saved_alias_streamed);
         }
         self.shell_state.loop_depth = saved_loop_depth;
+        self.shell_state.inherited_loop_depth = saved_inherited_loop_depth;
         // GNU execute_cmd.c:5269+ — the call's input redirections are
         // undone when the function returns.
         while let Some(binding) = fd0_bindings.pop() {
@@ -751,12 +827,14 @@ impl Executor {
             if !self.shell_state.bash_source_stack.is_empty() {
                 self.shell_state.bash_source_stack.remove(0);
             }
-            if !self.shell_state.bash_argc_stack.is_empty() {
-                self.shell_state.bash_argc_stack.remove(0);
-            }
-            for _ in args {
-                if !self.shell_state.bash_argv_stack.is_empty() {
-                    self.shell_state.bash_argv_stack.remove(0);
+            if pushed_bash_args {
+                if !self.shell_state.bash_argc_stack.is_empty() {
+                    self.shell_state.bash_argc_stack.remove(0);
+                }
+                for _ in args {
+                    if !self.shell_state.bash_argv_stack.is_empty() {
+                        self.shell_state.bash_argv_stack.remove(0);
+                    }
                 }
             }
             // Fold any deferred comsub write-back into the child's cursor
@@ -865,7 +943,7 @@ impl Executor {
             {
                 let target = self.expand_redirect_target(redirect);
                 if redirect_target_fd(&target).is_none() {
-                    self.create_redirect_output(&target, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&target, redirect.clobber)?;
                 }
                 let mut append_redirect = redirect.clone();
                 append_redirect.target = target;
@@ -894,7 +972,7 @@ impl Executor {
         {
             let target = self.expand_redirect_target(redirect);
             if redirect_target_fd(&target).is_none() && !is_null_device(&target) {
-                self.create_redirect_output(&target, redirect.clobber)?;
+                self.create_redirect_output_prepared(&target, redirect.clobber)?;
             }
             let mut append_redirect = redirect.clone();
             append_redirect.target = target;

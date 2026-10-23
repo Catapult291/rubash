@@ -42,6 +42,9 @@ pub(in crate::executor) fn is_shell_keyword(word: &str) -> bool {
             | "{"
             | "}"
             | "!"
+            | "[["
+            | "]]"
+            | "coproc"
     )
 }
 

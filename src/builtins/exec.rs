@@ -129,6 +129,18 @@ where
         return Ok(EXECUTION_SUCCESS);
     }
 
+    // GNU builtins/exec.def exec_builtin: -a NAME sets the child's
+    // argv[0] (shell_execve passes it through), and -l prefixes it with
+    // '-' (a login shell's argv[0]); without either, argv[0] is the
+    // command name as invoked. rubash parsed argv0 but dropped it, so
+    // the child saw the resolved program path instead (rubash#1132).
+    let effective_argv0 = match (&argv0, login) {
+        (Some(name), true) => Some(format!("-{name}")),
+        (Some(name), false) => Some(name.clone()),
+        (None, true) => command.map(|name| format!("-{name}")),
+        (None, false) => None,
+    };
+
     if command == Some("printenv") {
         return run_printenv_fallback(operands, env_vars, clean_env, stdout);
     }
@@ -206,6 +218,7 @@ where
                 operands,
                 env_vars,
                 clean_env,
+                effective_argv0.as_deref(),
                 child_stdout,
                 child_stderr,
                 child_stdin,
@@ -216,6 +229,7 @@ where
                 operands,
                 env_vars,
                 clean_env,
+                effective_argv0.as_deref(),
                 child_stdin,
                 stdout,
                 stderr,
@@ -304,6 +318,7 @@ fn run_external_exec<W, E>(
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
+    argv0: Option<&str>,
     child_stdin: Stdio,
     stdout: &mut W,
     stderr: &mut E,
@@ -312,7 +327,7 @@ where
     W: Write,
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env);
+    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     // std's Command::output() defaults stdin to Stdio::null() when .stdin()
     // is never called — a capture-path `$(exec cat)` then reads EOF on a
@@ -352,6 +367,7 @@ fn run_external_exec_with_stdio<E>(
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
+    argv0: Option<&str>,
     child_stdout: Stdio,
     child_stderr: Stdio,
     child_stdin: Stdio,
@@ -360,7 +376,7 @@ fn run_external_exec_with_stdio<E>(
 where
     E: Write,
 {
-    let mut process = external_exec_process(program, operands, env_vars, clean_env);
+    let mut process = external_exec_process(program, operands, env_vars, clean_env, argv0);
     process.stdout(child_stdout).stderr(child_stderr);
     // Explicit for symmetry with run_external_exec: `.status()` would
     // inherit by default, but every spawn site of the exec builtin must
@@ -392,6 +408,7 @@ fn external_exec_process(
     operands: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
+    argv0: Option<&str>,
 ) -> Command {
     // GNU builtins/exec.def (exec_builtin): `com2 = full_pathname (command)`
     // rebinds the exec target to its absolute path before shell_execve, so
@@ -415,6 +432,13 @@ fn external_exec_process(
         command
     };
 
+    // GNU shell_execve hands argv0 to execve verbatim (rubash#1132).
+    #[cfg(unix)]
+    if let Some(argv0) = argv0 {
+        use std::os::unix::process::CommandExt;
+        process.arg0(argv0);
+    }
+    let _ = argv0;
     process.env_clear();
     if !clean_env {
         apply_exported_environment(&mut process, env_vars);

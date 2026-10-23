@@ -277,4 +277,11 @@ pub(super) enum ArithLValue {
     InvalidElement {
         display: String,
     },
+    /// `name[@]` / `name[*]` on an indexed array in arithmetic context —
+    /// GNU array_expand_index (arrayfunc.c) rejects the `@`/`*` subscript
+    /// with `name[@]: bad array subscript` and the reference reads as 0;
+    /// a bind diagnoses once more and stores nothing (rubash#1136).
+    BadSubscriptElement {
+        display: String,
+    },
 }

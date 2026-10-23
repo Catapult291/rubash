@@ -129,6 +129,12 @@ fn errno_message(code: i32) -> &'static str {
         36 => "File name too long",                // ENAMETOOLONG
         39 => "Directory not empty",               // ENOTEMPTY
         40 => "Too many levels of symbolic links", // ELOOP
+        98 => "Address already in use",            // EADDRINUSE
+        101 => "Network is unreachable",           // ENETUNREACH
+        104 => "Connection reset by peer",         // ECONNRESET
+        110 => "Connection timed out",             // ETIMEDOUT
+        111 => "Connection refused",               // ECONNREFUSED
+        113 => "No route to host",                 // EHOSTUNREACH
         _ => "Unknown error",
     }
 }

@@ -76,7 +76,34 @@ impl Executor {
             return Some(self.apply_parameter_transform_value(&value, transform));
         }
         let ref_name = ref_name?;
-        let target_name = self.shell_state.env_vars.get(ref_name)?;
+        let raw_value = self.shell_state.env_vars.get(ref_name)?;
+        // GNU subst.c:7883-7945 parameter_brace_expand_indir: t is the
+        // dollar_at join of the source's ELEMENT VALUES (a scalar base
+        // contributes its value as the sole element), and the transform
+        // applies to the parameter t names. This arm previously used the
+        // source's raw storage text AS the target name, so any real
+        // array transformed the value of a variable named by storage
+        // bytes — usually nothing (`${!a[@]@Q}` gave `''` for a=(x),
+        // x="hi there"; GNU gives 'hi there') — rubash#1147. A source
+        // with no elements yields no t: the indirect parameter is unset
+        // and a value transform of it is empty (not `''`).
+        let element_values = if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, ref_name) {
+            self.parameter_array_storage(ref_name).map(|storage| {
+                assoc_hash_ordered_values(
+                    &storage,
+                    assoc_nbuckets(&self.shell_state.env_vars, ref_name),
+                )
+            })
+        } else if is_array_storage(raw_value) {
+            Some(array_values(raw_value))
+        } else {
+            None
+        };
+        let target_name = match element_values {
+            Some(values) if !values.is_empty() => values.join(" "),
+            Some(_) => return Some(String::new()),
+            None => raw_value.clone(),
+        };
         let value = if let Some(array_expr) = target_name
             .strip_suffix("[@]")
             .or_else(|| target_name.strip_suffix("[*]"))
@@ -89,10 +116,10 @@ impl Executor {
         } else {
             self.shell_state
                 .env_vars
-                .get(target_name)
+                .get(&target_name)
                 .and_then(|value| {
                     // Cell type, not value text (rubash#755).
-                    if self.parameter_is_array_variable(target_name) {
+                    if self.parameter_is_array_variable(&target_name) {
                         array_value_at(value, 0)
                     } else {
                         Some(value.clone())
@@ -231,18 +258,22 @@ impl Executor {
         // "0" (assoc_cell), indexed arrays read element [0] (array_cell). Expanding
         // the raw storage marker here leaks ([FOO]=BAR) where GNU prints the
         // element value or empty when key "0" is absent.
+        // A missing element is NOT an empty element: GNU get_string_value
+        // yields no value for an array whose [0] (assoc: key "0") does not
+        // exist, so the expansion behaves like an unset parameter —
+        // `${a@Q}` with a=() produces zero words, while a=("") produces
+        // the quoted empty string `''` (rubash#1112). Returning None here
+        // preserves that distinction; every caller maps None to "" for
+        // the value-only operations (pattern removal, case mods), where
+        // absent and empty are indistinguishable in GNU too.
         if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, &resolved) {
-            return Some(dequote_storage_marks(
-                &assoc_value_at(value, "0").unwrap_or_default(),
-            ));
+            return assoc_value_at(value, "0").map(|value| dequote_storage_marks(&value));
         }
 
         if is_marked_var(&self.shell_state.env_vars, ARRAY_VARS, &resolved) {
-            return Some(dequote_storage_marks(
-                &array_value_at(value, 0)
-                    .or_else(|| assoc_value_at(value, "0"))
-                    .unwrap_or_default(),
-            ));
+            return array_value_at(value, 0)
+                .or_else(|| assoc_value_at(value, "0"))
+                .map(|value| dequote_storage_marks(&value));
         }
 
         Some(dequote_storage_marks(value))

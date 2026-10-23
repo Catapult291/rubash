@@ -269,7 +269,14 @@ fn parse_options<W>(
 where
     W: Write,
 {
-    let mut mode = Mode::Logical;
+    // GNU builtins/cd.def cd_builtin: with no -L/-P flag the mode comes
+    // from the `physical` shell option (set -P); rubash#1039 accepted
+    // the flag in `set -o` but never consulted it here.
+    let mut mode = if crate::builtins::set::shell_option_enabled(env_vars, "physical") {
+        Mode::Physical
+    } else {
+        Mode::Logical
+    };
     let mut index = 0;
 
     while let Some(arg) = args.get(index) {
@@ -293,7 +300,7 @@ where
                         diagnostic_prefix(env_vars),
                         other
                     )?;
-                    writeln!(stderr, "cd: usage: cd [-L|[-P [-e]]] [dir]")?;
+                    writeln!(stderr, "cd: usage: cd [-L|[-P [-e]]] [-@] [dir]")?;
                     return Ok(Err(EX_USAGE));
                 }
             }

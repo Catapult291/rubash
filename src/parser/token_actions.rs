@@ -616,6 +616,20 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                         token.position
                     ),
                 );
+                // GNU report_syntax_error echoes the offending line in
+                // every non-interactive near-token report (parse.y:6814);
+                // without the source assignment the executor's NEAR arm
+                // cannot echo it (rubash#1140: `echo hi | | echo there`
+                // lost the line echo the `|;' shape already had).
+                error.insert_assignment(
+                    "__RUBASH_PARSE_SOURCE__".to_string(),
+                    super::parse_loop::offending_line_text(
+                        tokens,
+                        *i,
+                        state.diagnostic_text.as_deref(),
+                        state.source_line_offset,
+                    ),
+                );
                 abort_parse_at_syntax_error(state, error, tokens[*i].position);
                 return TokenAction::Break;
             } else {
@@ -880,10 +894,10 @@ pub(super) fn handle_token(tokens: &[Token], i: &mut usize, state: &mut ParseSta
                 ));
                 if fd.is_none() {
                     // GNU stores `here_doc_eof` dequoted (make_cmd.c
-                    // string_quote_removal); CTLESC pairs must not leak
+                    // string_quote_removal); no carrier bytes may leak
                     // into the `wanted `%s'` warning text.
                     state.current_cmd.heredoc_delimiter =
-                        Some(delimiter.replace(crate::executor::markers::CTLESC, ""));
+                        Some(super::redirections::heredoc_delimiter_text(&delimiter));
                 }
                 *i += 1;
             } else if let Some(error) = missing_redirect_target_node(

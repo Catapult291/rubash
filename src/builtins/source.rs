@@ -224,12 +224,28 @@ where
     // "No such file or directory".
     let source = match crate::script_driver::read_script_bytes(&source_path) {
         Ok(source) => source,
-        Err(_) => {
-            writeln!(
-                stderr,
-                "{}{filename}: No such file or directory",
-                executor.diagnostic_prefix()
-            )?;
+        Err(error) => {
+            // GNU builtins/evalfile.c:126-140 (evalfile_internal): a
+            // directory is reported through the builtin error channel
+            // (`<name>: is a directory`); every other open/read failure
+            // goes through file_error with the REAL strerror — an
+            // unreadable file is `Permission denied`, not the blanket
+            // `No such file or directory` this arm used to print for any
+            // error (rubash#1160).
+            if source_path.is_dir() {
+                writeln!(
+                    stderr,
+                    "{}{command_name}: {filename}: is a directory",
+                    executor.diagnostic_prefix()
+                )?;
+            } else {
+                writeln!(
+                    stderr,
+                    "{}{filename}: {}",
+                    executor.diagnostic_prefix(),
+                    crate::posix_errors::message(&error)
+                )?;
+            }
             executor.set_exit_code(1);
             if executor.get_env("__RUBASH_POSIX_MODE") == Some("1") {
                 return Err(ExecuteError::ExitCode(1));

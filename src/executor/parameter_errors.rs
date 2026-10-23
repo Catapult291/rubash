@@ -397,6 +397,20 @@ impl Executor {
         Some(body)
     }
 
+    /// GNU subst.c:7839-7885 parameter_brace_find_indir resolves the
+    /// indirect SOURCE in scalar form: t is the source variable's value
+    /// with an array name yielding element 0 (assoc: key "0") and an
+    /// array with no such element yielding NULL. Every validity and
+    /// value decision for `${!...}` uses THIS text, never the raw
+    /// storage encoding of the variable (whose element separators are
+    /// in-band markers) — rubash#1147 validated/joined the storage text
+    /// instead, inverting `${!assoc[@]:-d}` outcomes and leaking marker
+    /// bytes into the `invalid variable name` diagnostic.
+    pub(in crate::executor) fn indirect_source_scalar_value(&self, name: &str) -> Option<String> {
+        let value = self.shell_state.env_vars.get(name)?;
+        self.scalar_parameter_value(name, value)
+    }
+
     fn indirect_parameter_operator_value(&self, name: &str) -> Option<Option<String>> {
         let indirect_name = self.indirect_parameter_body(name)?;
         if let Some(target_name) = self.nameref_target_name(indirect_name) {
@@ -421,16 +435,42 @@ impl Executor {
                 None => Some(None),
             };
         }
-        let target_expr = self.shell_state.env_vars.get(indirect_name)?;
-        if target_expr.ends_with("[@]") || target_expr.ends_with("[*]") {
-            let values = self.indirect_target_values(target_expr);
+        // GNU subst.c:7924-7945 parameter_brace_expand_indir: a
+        // subscripted source (`${!name[sub]<op>...}`) resolves t through
+        // the subscripted reference itself — the element value, or the
+        // all-elements value for `[@]`/`[*]` — then the operator applies
+        // to the parameter t names (rubash#1147).
+        if parse_array_subscript(indirect_name).is_some() {
+            return match self.parameter_operator_value(indirect_name) {
+                Some(t) => Some(self.indirect_target_values(&t).into_iter().next()),
+                None => Some(None),
+            };
+        }
+        let Some(raw_value) = self.shell_state.env_vars.get(indirect_name) else {
+            // No value entry: a declared-unset source still yields an
+            // (unset) t, so the operator adjudicates an unset parameter;
+            // a wholly absent source is not this form.
+            if is_marked_var(
+                &self.shell_state.env_vars,
+                DECLARED_UNSET_VARS,
+                indirect_name,
+            ) {
+                return Some(None);
+            }
+            return None;
+        };
+        if raw_value.ends_with("[@]") || raw_value.ends_with("[*]") {
+            let values = self.indirect_target_values(raw_value);
             if values.is_empty() {
                 return Some(None);
             }
-            return Some(Some(self.join_expanded_array_values(values, target_expr)));
+            return Some(Some(self.join_expanded_array_values(values, raw_value)));
         }
 
-        Some(self.indirect_target_values(target_expr).into_iter().next())
+        match self.indirect_source_scalar_value(indirect_name) {
+            Some(t) => Some(self.indirect_target_values(&t).into_iter().next()),
+            None => Some(None),
+        }
     }
 
     fn is_valid_length_parameter_name(name: &str) -> bool {
@@ -773,11 +813,8 @@ impl Executor {
                     for body in &prefix_comsubs {
                         self.expand_command_substitution(body);
                     }
-                    return Some((
-                        name,
-                        "unbound variable".to_string(),
-                        Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                    ));
+                    let (name, message) = self.nounset_unbound_diagnostic(name);
+                    return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
                 }
             }
             for value in cmd.assignment_values() {
@@ -785,11 +822,8 @@ impl Executor {
                     for body in &prefix_comsubs {
                         self.expand_command_substitution(body);
                     }
-                    return Some((
-                        name,
-                        "unbound variable".to_string(),
-                        Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                    ));
+                    let (name, message) = self.nounset_unbound_diagnostic(name);
+                    return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
                 }
             }
         }
@@ -826,6 +860,39 @@ impl Executor {
         word: &str,
     ) -> Option<(String, String, i32)> {
         self.parameter_expansion_error_in_word_context(word, true)
+    }
+
+    /// Report a word-expansion error found outside the simple-command
+    /// pre-scan (for-list words, the case subject, [[ ]] operands —
+    /// rubash#1130) and raise its GNU consequence, mirroring the
+    /// simple-command handling in command_prepare: the diagnostic goes
+    /// to fd 2 as currently bound; the FATAL class (nounset unbound,
+    /// `${x?}`, bad @xform) is FORCE_EOF — ExitCode(expansion_fatal_status)
+    /// noninteractively, a status-1 DISCARD in an interactive reader;
+    /// lesser classes abandon the current command list with their status.
+    pub(in crate::executor) fn raise_word_expansion_error(
+        &mut self,
+        (name, message, status): (String, String, i32),
+    ) -> Result<(), ExecuteError> {
+        let line = format!("{}{}: {}\n", self.diagnostic_prefix(), name, message);
+        self.write_diagnostic_fd2(line.as_bytes());
+        if status == Self::FATAL_PARAMETER_EXPANSION_STATUS {
+            if self.expansion_error_is_interactive_discard() {
+                self.exit_code = 1;
+                // rubash#439: expansion error, not a failed command.
+                self.command_expansion_failed.set(true);
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            let code = self.expansion_fatal_status();
+            self.exit_code = code;
+            return Err(ExecuteError::ExitCode(code));
+        }
+        self.exit_code = status;
+        self.command_expansion_failed.set(true);
+        if status == 1 {
+            return Err(ExecuteError::ExpansionFailure(status));
+        }
+        Err(ExecuteError::ExitCode(status))
     }
 
     /// The single owner of the fatal-expansion exit status (FORCE_EOF
@@ -959,11 +1026,8 @@ impl Executor {
             if let Some(name) = self.nounset_unbound_parameter(word) {
                 // expr.c expr_streval raises FORCE_EOF for unbound vars
                 // under set -u — fatal like `${x?}` (see command_execute).
-                return Some((
-                    name,
-                    "unbound variable".to_string(),
-                    Self::FATAL_PARAMETER_EXPANSION_STATUS,
-                ));
+                let (name, message) = self.nounset_unbound_diagnostic(name);
+                return Some((name, message, Self::FATAL_PARAMETER_EXPANSION_STATUS));
             }
         }
         let mut rest = word;
@@ -1109,13 +1173,16 @@ impl Executor {
                             // Declared-unset entry: the expansion is empty,
                             // never a diagnostic (rubash#529).
                         }
-                        Some(value) => {
-                            if !Self::is_valid_indirect_target(value) {
-                                return Some((
-                                    value.clone(),
-                                    "invalid variable name".to_string(),
-                                    1,
-                                ));
+                        Some(_) => {
+                            // GNU validates t — the scalar-form value from
+                            // parameter_brace_find_indir (array element 0
+                            // / assoc key "0") — not the raw storage text
+                            // (rubash#1147: `${!a}` with a=(p q) validated
+                            // the marker-joined storage and leaked it).
+                            if let Some(t) = self.indirect_source_scalar_value(indirect) {
+                                if !Self::is_valid_indirect_target(&t) {
+                                    return Some((t, "invalid variable name".to_string(), 1));
+                                }
                             }
                         }
                     }
@@ -1164,32 +1231,85 @@ impl Executor {
                     // `name[sub]: invalid indirect expansion` while a set
                     // scalar/array base expands silently even when the
                     // element itself is unset.
+                    if head_end > 0 && is_shell_name(head) && tail.starts_with('[') {
+                        // The subscript group may close mid-tail when an
+                        // operator follows (`${!m[@]:-x}`): GNU reports
+                        // the reference through the closing `]` (subst.c
+                        // parameter_brace_expand_indir), so the diagnostic
+                        // names `head + tail[..close]`, not the whole body
+                        // (rubash#1147: unset m with `[@]:-` was silent).
+                        if let Some(close) = Self::skip_indirect_array_subscript(tail) {
+                            let base_exists = match self.nameref_resolution(head) {
+                                NamerefResolution::Target(target) => {
+                                    let base = target.split('[').next().unwrap_or(target.as_str());
+                                    self.shell_state.env_vars.contains_key(base)
+                                        || self.shell_state.variables.get(base).is_some()
+                                }
+                                NamerefResolution::NotNameref => {
+                                    self.shell_state.env_vars.contains_key(head)
+                                        || self.shell_state.variables.get(head).is_some()
+                                }
+                                // Unresolved (empty/unresolvable cell), Circular,
+                                // and MaxDepth all mean find_variable returned
+                                // NULL for the base.
+                                _ => false,
+                            };
+                            if !base_exists {
+                                return Some((
+                                    format!("{}{}", head, &tail[..close]),
+                                    "invalid indirect expansion".to_string(),
+                                    1,
+                                ));
+                            }
+                            // The PLAIN subscripted form (the group closes
+                            // the body) validates t too — here t is the
+                            // ELEMENT value (subst.c:7955-7961): `${!v[0]}`
+                            // with v="1bad" errors, while an unset element
+                            // yields no t and proceeds silently. The
+                            // trailing [@]/[*] KEYS form never validates
+                            // (subst.c:7887 keys shortcut) — rubash#1147.
+                            if close == tail.len() {
+                                let subscript = &tail[1..close - 1];
+                                if subscript != "@" && subscript != "*" {
+                                    let reference = format!("{head}{}", &tail[..close]);
+                                    if let Some(element) =
+                                        self.array_element_parameter_value(&reference)
+                                    {
+                                        if !Self::is_valid_indirect_target(&element) {
+                                            return Some((
+                                                element,
+                                                "invalid variable name".to_string(),
+                                                1,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // GNU subst.c:7955-7961 parameter_brace_expand_indir:
+                    // with an operator tail the form is indirection
+                    // through t, the head's scalar-form value, and an
+                    // invalid t reports `<t>: invalid variable name`
+                    // BEFORE the operator applies — for scalar sources
+                    // too (`${!v:-d}` with v="" or v="1bad"), not only
+                    // for the `[@]` form (rubash#1147). A source with no
+                    // scalar-form value proceeds silently; a nameref head
+                    // names its target's value, adjudicated by the
+                    // nameref arms.
                     if head_end > 0
                         && is_shell_name(head)
-                        && tail.starts_with('[')
-                        && tail.ends_with(']')
+                        && !tail.starts_with('[')
+                        && matches!(
+                            tail.chars().next(),
+                            Some(':' | '-' | '+' | '=' | '?' | '#' | '%' | '/' | '^' | ',' | '@')
+                        )
+                        && self.nameref_target_name(head).is_none()
                     {
-                        let base_exists = match self.nameref_resolution(head) {
-                            NamerefResolution::Target(target) => {
-                                let base = target.split('[').next().unwrap_or(target.as_str());
-                                self.shell_state.env_vars.contains_key(base)
-                                    || self.shell_state.variables.get(base).is_some()
+                        if let Some(t) = self.indirect_source_scalar_value(head) {
+                            if !Self::is_valid_indirect_target(&t) {
+                                return Some((t, "invalid variable name".to_string(), 1));
                             }
-                            NamerefResolution::NotNameref => {
-                                self.shell_state.env_vars.contains_key(head)
-                                    || self.shell_state.variables.get(head).is_some()
-                            }
-                            // Unresolved (empty/unresolvable cell), Circular,
-                            // and MaxDepth all mean find_variable returned
-                            // NULL for the base.
-                            _ => false,
-                        };
-                        if !base_exists {
-                            return Some((
-                                indirect.to_string(),
-                                "invalid indirect expansion".to_string(),
-                                1,
-                            ));
                         }
                     }
                 }
@@ -1206,29 +1326,41 @@ impl Executor {
                     let base = &indirect[..open];
                     if !base.is_empty() && is_shell_name(base) {
                         if let Some(value) = self.shell_state.env_vars.get(base) {
-                            if !Self::is_valid_indirect_target(value) {
-                                // GNU reports the dollar_at join of the
-                                // variable's values (array_value with
-                                // AV_ALLOWALL, arrayfunc.c:1563), not the
-                                // raw storage text.
-                                let display = if let Some(storage) =
-                                    self.parameter_array_storage(base)
-                                {
-                                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                            // GNU's t here is the dollar_at join of the
+                            // variable's ELEMENT VALUES (array_value with
+                            // AV_ALLOWALL, arrayfunc.c:1563), and validity
+                            // is judged on that join — not on the raw
+                            // storage text, whose in-band separators made
+                            // every multi-element array "invalid" and
+                            // every empty assoc "invalid" too (rubash#1147:
+                            // `${!assoc[@]:-d}` errored on an empty assoc
+                            // whose t is NULL and proceeds silently, and on
+                            // a one-element assoc whose value IS valid).
+                            // An array with no elements yields no t at all;
+                            // a scalar base yields its value as the sole
+                            // element.
+                            let element_values =
+                                if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                                    self.parameter_array_storage(base).map(|storage| {
                                         assoc_hash_ordered_values(
                                             &storage,
                                             assoc_nbuckets(&self.shell_state.env_vars, base),
                                         )
-                                        .join(" ")
-                                    } else {
-                                        array_values(&storage).join(" ")
-                                    }
+                                    })
                                 } else if is_array_storage(value) {
-                                    array_values(value).join(" ")
+                                    Some(array_values(value))
                                 } else {
-                                    value.clone()
+                                    None
                                 };
-                                return Some((display, "invalid variable name".to_string(), 1));
+                            let t = match element_values {
+                                Some(values) if !values.is_empty() => Some(values.join(" ")),
+                                Some(_) => None,
+                                None => Some(value.clone()),
+                            };
+                            if let Some(t) = t {
+                                if !Self::is_valid_indirect_target(&t) {
+                                    return Some((t, "invalid variable name".to_string(), 1));
+                                }
                             }
                         }
                     }
@@ -1422,7 +1554,10 @@ impl Executor {
     /// GNU's expand_word_internal (subst.c:11229) forks each comsub as the
     /// walk reaches it, so a child's stderr output precedes a later
     /// `unbound variable` diagnostic.
-    fn nounset_unbound_parameter_with_comsubs(&self, word: &str) -> (Option<String>, Vec<String>) {
+    pub(in crate::executor) fn nounset_unbound_parameter_with_comsubs(
+        &self,
+        word: &str,
+    ) -> (Option<String>, Vec<String>) {
         let chars: Vec<char> = word.chars().collect();
         let mut comsubs = Vec::new();
         let mut index = 0usize;
@@ -1701,10 +1836,134 @@ impl Executor {
     /// its subscript arithmetically before the element check, so an unset
     /// name inside the subscript reports that name even when the array
     /// itself is unset (nameref25.sub ok 4 reports `k`, not `r` or `a[k]`).
+    /// rubash#1168: for a `${subject<op>word}` fragment whose operator is
+    /// `-`/`=`/`+` (either `:`-prefixed or bare), decide whether GNU
+    /// would expand `word` at all, and if so scan it for unbound
+    /// references with the ordinary word scanner. Branch conditions follow
+    /// subst.c parameter_brace_expand check_nullness: the `:` forms test
+    /// unset-or-null, the bare forms test unset only; `-`/`=` expand the
+    /// word when the test FAILS the subject, `+` when it passes.
+    fn nounset_operator_word_unbound(
+        &self,
+        brace_core: &str,
+        operator_tail: &str,
+    ) -> Option<String> {
+        let (colon, op, word) = if let Some(rest) = operator_tail.strip_prefix(':') {
+            (true, rest.as_bytes().first().copied()?, &rest[1..])
+        } else {
+            (
+                false,
+                operator_tail.as_bytes().first().copied()?,
+                &operator_tail[1..],
+            )
+        };
+        if !matches!(op, b'-' | b'=' | b'+') || word.is_empty() {
+            return None;
+        }
+        let subject = &brace_core[..parameter_reference_len(brace_core)];
+        let value = self.parameter_operator_value(subject);
+        let word_expanded = match op {
+            b'-' | b'=' => {
+                if colon {
+                    value.as_deref().map_or(true, |v| v.is_empty())
+                } else {
+                    value.is_none()
+                }
+            }
+            _ => {
+                if colon {
+                    value.as_deref().map_or(false, |v| !v.is_empty())
+                } else {
+                    value.is_some()
+                }
+            }
+        };
+        if !word_expanded {
+            return None;
+        }
+        self.nounset_unbound_parameter(word)
+    }
+
     pub(in crate::executor) fn nounset_braced_parameter_is_unbound(
         &self,
         name: &str,
     ) -> Option<String> {
+        if let Some(reported) = self.nounset_braced_head_is_unbound(name) {
+            return Some(reported);
+        }
+        self.nounset_braced_operator_word_unbound(name)
+    }
+
+    /// GNU subst.c parameter_brace_expand: once the head reference's own
+    /// unbound check (subst.c:10170-10180) passes, the words the expansion
+    /// ALWAYS evaluates are expanded under the same nounset rule — the
+    /// substring offset/length (subst.c:8395 verify_substring_values via
+    /// expand_arith_string + param_expand), the patsub pattern and
+    /// replacement (subst.c:9387 parameter_brace_patsub), the
+    /// prefix/suffix removal patterns, and the casemod pattern. An unset
+    /// `$name` inside one reports `name: unbound variable` exactly like a
+    /// top-level reference (rubash#1149). The lazy default / assign /
+    /// alternate / error words are NOT scanned here: GNU expands them
+    /// only when the operator fires on the head's state, which the head
+    /// check already adjudicated.
+    fn nounset_braced_operator_word_unbound(&self, name: &str) -> Option<String> {
+        // The `#` length form owns its tail elsewhere (its remainders are
+        // the `$#` parameter's own operators or bad substitutions), and
+        // the `!` indirect form's tails are adjudicated by the indir arms
+        // of parameter_expansion_error_in_word_context.
+        if name.starts_with(['#', '!']) {
+            return None;
+        }
+        if let Some((_, pattern, replacement, _)) = parse_parameter_replacement(name) {
+            if let Some(unbound) = self.nounset_unbound_parameter(pattern) {
+                return Some(unbound);
+            }
+            if let Some(unbound) = self.nounset_unbound_parameter(replacement) {
+                return Some(unbound);
+            }
+            return None;
+        }
+        if let Some((_, _, pattern)) = parse_parameter_case_mod(name) {
+            return self.nounset_unbound_parameter(pattern);
+        }
+        // Single-char special parameters (`@`, `*`) are in OPERATOR_SET,
+        // so parameter_reference_len stops at 0 for them; they are their
+        // own one-char reference.
+        let ref_len = parameter_reference_len(name);
+        let ref_len = if ref_len == 0 {
+            name.chars().next().map_or(0, |c| c.len_utf8())
+        } else {
+            ref_len
+        };
+        let tail = &name[ref_len..];
+        if let Some(rest) = tail.strip_prefix(':') {
+            if matches!(rest.chars().next(), Some('-' | '=' | '+' | '?')) {
+                return None;
+            }
+            let (offset, length, has_length) =
+                crate::executor::parameter_core::split_top_level_colon(rest);
+            if let Some(unbound) = self.nounset_unbound_parameter(offset) {
+                return Some(unbound);
+            }
+            if has_length {
+                if let Some(unbound) = self.nounset_unbound_parameter(length) {
+                    return Some(unbound);
+                }
+            }
+            return None;
+        }
+        if let Some(pattern) = tail
+            .strip_prefix("##")
+            .or_else(|| tail.strip_prefix('#'))
+            .or_else(|| tail.strip_prefix("%%"))
+            .or_else(|| tail.strip_prefix('%'))
+        {
+            return self.nounset_unbound_parameter(pattern);
+        }
+        None
+    }
+
+    fn nounset_braced_head_is_unbound(&self, name: &str) -> Option<String> {
         if name == "!" {
             // GNU subst.c: the last-background-pid parameter is unset until a
             // background job runs; under nounset it reports an unbound
@@ -1831,11 +2090,23 @@ impl Executor {
                     Some(b'-') | Some(b'=') | Some(b'+') | Some(b'?')
                 ));
 
+        // GNU subst.c parameter_brace_expand: the default/assign/
+        // alternate operators shield the SUBJECT from the unbound check,
+        // but the operator's WORD is a fresh expansion context: when the
+        // branch that expands the word is taken, an unbound reference
+        // inside it (a bare `$u2` in `${u1:-$u2}`) reports exactly like a
+        // top-level one (rubash#1168). A nested `${u2:-deep}` stays
+        // shielded by its own operator — the recursive scan applies the
+        // same rule per fragment. `:?` is excluded: its word is only
+        // expanded on the error path itself.
+        if default_value_operator {
+            return self.nounset_operator_word_unbound(brace_core, operator_tail);
+        }
+
         if name.is_empty()
             || matches!(name, "#" | "@" | "*" | "?" | "$" | "-" | "0")
             || name.starts_with('!')
             || parse_parameter_error_operator(name, self.posix_mode_enabled()).is_some()
-            || default_value_operator
         {
             return None;
         }
@@ -2145,6 +2416,43 @@ impl Executor {
         unbound.then(|| reported.to_string())
     }
 
+    /// Build the printed (name, message) pair for a nounset fatal.
+    /// GNU parameter_brace_expand evaluates the subscript before
+    /// check_unbound_variable, so an indexed reference whose negative
+    /// subscript lands before the array start first draws
+    /// `base: bad array subscript` and only then the fatal
+    /// `base[sub]: unbound variable` (rubash#1170). The nounset scan is
+    /// side-effect-free (it can run speculatively), so the earlier line
+    /// rides inside the message of the single diagnostic the caller
+    /// prints: every print site formats `{prefix}{name}: {message}`,
+    /// which reproduces the two GNU lines byte-for-byte. Positive-index
+    /// and associative references are valid references and keep the
+    /// plain single-line form.
+    fn nounset_unbound_diagnostic(&self, reported: String) -> (String, String) {
+        if let Some((base, sub)) = parse_array_subscript(&reported) {
+            if !self.is_assoc_parameter_array(base) {
+                let index = self.eval_integer_assignment_value(sub);
+                // A scalar/unset base has only element 0, so every
+                // negative subscript is an invalid reference; an array
+                // base is invalid only when the element is absent (the
+                // subscript lands before the array start).
+                let invalid = index < 0
+                    && (!self.parameter_is_array_variable(base)
+                        || self.nounset_indexed_element_absent(base, sub));
+                if invalid {
+                    return (
+                        base.to_string(),
+                        format!(
+                            "bad array subscript\n{}{reported}: unbound variable",
+                            self.diagnostic_prefix()
+                        ),
+                    );
+                }
+            }
+        }
+        (reported, "unbound variable".to_string())
+    }
+
     fn nounset_array_element_unbound(
         &self,
         base: &str,
@@ -2224,6 +2532,19 @@ impl Executor {
     }
 
     pub(in crate::executor) fn parameter_error_value(&self, name: &str) -> Option<String> {
+        // GNU subst.c:7786 (parameter_brace_expand_word, PF_ALLINDS) +
+        // subst.c:10142 (var_is_set/var_is_null): for `${arr[@]}` /
+        // `${arr[*]}` the value an operator tests is the whole-array join
+        // — NULL only when the array has NO elements, never merely
+        // because an all-element subscript is not an element reference.
+        // parameter_operator_value implements exactly that rule for
+        // `:-`/`:=`; route the error-operator scan through it too, or
+        // `${a[@]:?}` on a non-empty array misreads as unset
+        // (array_element_parameter_value returns None for `[@]`/`[*]`)
+        // and aborts the script (rubash#1174).
+        if name.ends_with("[@]") || name.ends_with("[*]") {
+            return self.parameter_operator_value(name);
+        }
         match name {
             "#" => Some(self.shell_state.positional_window().len().to_string()),
             // GNU chk_atstar (subst.c): `$@`/`$*` are UNSET with zero

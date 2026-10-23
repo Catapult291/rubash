@@ -577,6 +577,17 @@ impl Executor {
         self.expand_command_substitution_with_context(source, SubstitutionQuoteContext::Unquoted)
     }
 
+    /// True when an ERR trap is set and `set -E` makes the substitution
+    /// child inherit it (bash's errtrace contract names command
+    /// substitutions explicitly, rubash#1133): a failing body command
+    /// must then run the trap in the child, with the trap's output
+    /// captured — behavior only the real executor path provides.
+    pub(in crate::executor) fn err_trap_inherited_into_comsub(&self) -> bool {
+        crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "errtrace")
+            && crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR")
+                .is_some_and(|action| !action.is_empty())
+    }
+
     pub(in crate::executor) fn expand_command_substitution_with_context(
         &self,
         source: &str,
@@ -755,7 +766,7 @@ impl Executor {
         // be provably equivalent, and it is not when tracing or when the
         // inherited DEBUG trap fires) and the body falls to the real
         // parser/executor below (rubash#254, rubash#825).
-        if source == "false" && !self.xtrace_enabled() {
+        if source == "false" && !self.xtrace_enabled() && !self.err_trap_inherited_into_comsub() {
             self.last_command_substitution_status.set(Some(1));
             return String::new();
         }
@@ -798,7 +809,15 @@ impl Executor {
         // execute_cmd.c:4649 (`++ echo hi` for `v=$(echo hi)`), and the
         // shortcut cannot express it. Routing to the real executor costs
         // speed only (rubash#254).
-        if !command_substitution_body_is_trivial(&word_source) || self.xtrace_enabled() {
+        // rubash#1133: an ERR trap inherited under `set -E` fires inside
+        // the substitution child for a failing body command, and its
+        // output belongs to the capture — the word-level shortcuts
+        // below cannot express that either, so they are disqualified
+        // the same way (the real executor owns the trap machinery).
+        if !command_substitution_body_is_trivial(&word_source)
+            || self.xtrace_enabled()
+            || self.err_trap_inherited_into_comsub()
+        {
             if let Some(output) = self.command_list_substitution_output(source, context) {
                 return output;
             }
@@ -880,6 +899,7 @@ impl Executor {
         // `-` operands): those read fd 0, which lives in FUNCTION_STDIN and
         // shares the caller's cursor — external_cat owns that semantics.
         if words.first().map(String::as_str) == Some("cat")
+            && !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
             && words[1..].iter().all(|word| !word.starts_with('-'))
             && words.len() > 1
             // A `/dev/fd/N` operand needs real execution when it names an
@@ -908,7 +928,9 @@ impl Executor {
                     .and_then(|rest| rest.strip_suffix(')'))
                 {
                     let mut executor = self.command_substitution_executor();
-                    crate::builtins::trap::reset_for_subshell(&mut executor.shell_state.env_vars);
+                    crate::builtins::trap::reset_for_subshell_child(
+                        &mut executor.shell_state.env_vars,
+                    );
                     output.push_str(&executor.expand_command_substitution(source));
                     continue;
                 }
@@ -1295,7 +1317,13 @@ impl Executor {
         // word-level gate ran the reset and the exit trap only when the
         // body text contained a literal `trap` word, so an EXIT trap set
         // by a sourced file never fired and the substitution read empty.
-        crate::builtins::trap::reset_for_subshell(&mut subshell.shell_state.env_vars);
+        // rubash#1133: the reset follows the `( )` child's errtrace rule
+        // — bash's `-E` contract names command substitutions explicitly
+        // ("an ERR trap is inherited by shell functions, command
+        // substitutions, and commands executed in a subshell"), so
+        // under `set -E` the child keeps the ERR action live and its
+        // output (the trap's included) lands in the capture.
+        crate::builtins::trap::reset_for_subshell_child(&mut subshell.shell_state.env_vars);
         // Keep the command source visible to BASH_COMMAND while the parsed
         // substitution body runs, including DEBUG trap actions.
         *subshell.shell_state.debug_trap_command.borrow_mut() = Some(source.trim().to_string());
@@ -1447,14 +1475,29 @@ impl Executor {
         // subst.c:7143 command_substitute), so new semantic fields are
         // isolated automatically — no per-field list to maintain.
         let mut shell_state = self.shell_state.clone();
-        // GNU forks carry the parent's loop_level, but a `break` in a real
-        // child can only end the child. In-process the loop-break flag
-        // would reach the parent's live loop, so the boundary resets it —
-        // the same rule the flat `( )` region applies at entry.
+        // GNU forks carry the parent's loop_level into the child, and the
+        // substitution body / a simple pipeline element runs through
+        // parse_and_execute there — NOT execute_in_subshell — so a
+        // break/continue in the child is meaningful (no "only meaningful"
+        // diagnostic) and ends only the child's own command list
+        // (builtins/break.def check_loop_level; subst.c:7143
+        // command_substitute). The clone cannot unwind the parent's live
+        // loop frames, so the depth crosses as `inherited_loop_depth`:
+        // execute_loop_control validates against it and ends the child's
+        // list instead of raising Break into the parent (rubash#1064,
+        // rubash#1065). Compound boundaries that DO pass
+        // execute_in_subshell (execute_cmd.c:1642 resets loop_level) clear
+        // it again at their own entry.
+        shell_state.inherited_loop_depth =
+            self.shell_state.loop_depth + self.shell_state.inherited_loop_depth;
         shell_state.loop_depth = 0;
         shell_state
             .subshell_depth
             .set(self.shell_state.subshell_depth.get() + 1);
+        // rubash#1115: the substitution child reseeds RANDOM
+        // (variables.c:1418-1423 get_random_number) — on the CLONE, so
+        // the parent's sequence is untouched.
+        shell_state.random_state.reseed_fresh();
         shell_state.in_command_substitution.set(true);
         // Mid-expansion error latches belong to the parent's in-flight word
         // expansion; the forked child starts with a clean slate (same as a
@@ -1515,12 +1558,14 @@ impl Executor {
             function_tempenv_names: Vec::new(),
             evalerror_pending: Cell::new(false),
             nounset_force_eof: Cell::new(false),
+            conditional_expansion_fatal: Cell::new(false),
             evalerror_subscript_pending: Cell::new(false),
             evalerror_failglob_pending: Cell::new(false),
             evalerror_exit_toomany_pending: Cell::new(false),
             eval_list_depth: Cell::new(None),
             evalerror_line: Cell::new(None),
             command_expansion_failed: Cell::new(false),
+            err_trap_armed_sample: Cell::new(None),
             evalerror_exec_depth: Cell::new(0),
             reader_command_line: Cell::new(None),
             break_failure_status: Cell::new(None),
@@ -1544,6 +1589,7 @@ impl Executor {
             pending_scalar_assignment: false,
             suppress_errexit: self.suppress_errexit,
             command_builtin_depth: self.command_builtin_depth,
+            standard_path_scope: self.standard_path_scope.clone(),
             debug_trap_running: false,
             debug_trap_action_cache: std::cell::RefCell::new(None),
             line_env_os_value: std::cell::RefCell::new(None),
@@ -1588,6 +1634,7 @@ impl Executor {
             // starts clean and anything it sets stays inside (separate
             // Executor); the parent never observes it.
             compound_redirect_failed: Cell::new(false),
+            noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
             exit_jump_pending: Cell::new(false),
             special_builtin_failed: Cell::new(false),
             last_builtin_write_failed: Cell::new(false),

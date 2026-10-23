@@ -140,7 +140,9 @@ impl Executor {
                 }
             }
             "sleep" => {
-                if crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..]) {
+                if !crate::executor::path::path_is_unset(&self.shell_state.env_vars)
+                    && crate::builtins::sleep::can_execute_fast_path(&cmd.words[1..])
+                {
                     // GNU sleep is an external child process, so the waiting
                     // shell is interruptible: a caught signal is recorded
                     // (trap.c:545 trap_handler -> trap.c:537 set_trap_state)
@@ -149,8 +151,15 @@ impl Executor {
                     // sleep_interruptibly slices the wait so the Windows
                     // mailbox is observed with the same deferral semantics.
                     if let Some(seconds) = crate::builtins::sleep::total_duration(&cmd.words[1..]) {
-                        self.sleep_interruptibly(seconds)?;
-                        self.exit_code = 0;
+                        // rubash#1034: Some(sig) means the virtual child
+                        // was killed by a trapped terminating signal and
+                        // its trap already dispatched — the command's
+                        // status is the signal death 128+sig, like GNU
+                        // reaping a real sleep killed the same way.
+                        match self.sleep_interruptibly(seconds)? {
+                            Some(signal) => self.exit_code = 128 + signal,
+                            None => self.exit_code = 0,
+                        }
                     } else {
                         let (status, stderr) = crate::builtins::sleep::execute(&cmd.words[1..]);
                         if let Some(stderr) = stderr {

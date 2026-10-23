@@ -428,6 +428,19 @@ impl Executor {
             return self.expand_braced_parameter_word(word, &resolved);
         }
 
+        // rubash#1169: a pure fragment that precedes a `:=`/`=` assignment
+        // to a variable it reads was frozen by the assignment pre-scan at
+        // its pre-assignment value (GNU evaluates a word's fragments
+        // strictly left-to-right); the live env already carries the
+        // assignment, so re-deriving here would leak it backwards.
+        if let Some(key) = crate::executor::expand_braced_indices::sub_site_key(name) {
+            if let Some(frozen) =
+                crate::executor::expand_braced_indices::frozen_fragment_lookup(&key)
+            {
+                return frozen;
+            }
+        }
+
         // The bad-substitution diagnostic reports the word GNU was expanding
         // (subst.c:10278), which for a walked fragment is the ENCLOSING word
         // the walker recorded. Consume the one-shot record here so a nested

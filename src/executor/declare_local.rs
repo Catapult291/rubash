@@ -220,7 +220,28 @@ impl Executor {
                 continue;
             }
             if function_names_only {
-                self.write_function_name(name, stdout)?;
+                if print {
+                    // GNU declare.def: `-F' with `-p' goes through
+                    // show_var_attributes (nodefs=1) exactly like the
+                    // no-operand listing above: `declare -<flags> name'
+                    // with the function's own r/t/x bits in f,r,t,x order
+                    // (setattr.def var_attribute_string). Only a bare
+                    // `-F' (no `-p') prints the plain name (rubash#1157).
+                    let is_traced = traced_functions.iter().any(|tn| tn == name);
+                    let mut flags = String::from("-f");
+                    if is_readonly {
+                        flags.push('r');
+                    }
+                    if is_traced {
+                        flags.push('t');
+                    }
+                    if is_exported {
+                        flags.push('x');
+                    }
+                    writeln!(stdout, "declare {flags} {name}")?;
+                } else {
+                    self.write_function_name(name, stdout)?;
+                }
             } else {
                 self.write_function_definition(
                     name,

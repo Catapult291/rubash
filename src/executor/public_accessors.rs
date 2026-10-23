@@ -443,13 +443,21 @@ impl Executor {
     /// wordlist completion.
     pub fn complete_line(&self, line: &str, cursor: usize) -> Vec<String> {
         let function_names: Vec<String> = self.shell_state.functions.keys().cloned().collect();
+        // Job completion names are the command's first word only
+        // (rubash#1052; same rule as the compgen path in job_builtins).
         let job_names: Vec<String> = self
             .shell_state
             .job_table
             .jobs
             .values()
             .filter(|job| job.background)
-            .map(|job| job.command.clone())
+            .map(|job| {
+                job.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         crate::builtins::complete::complete_line_candidates(
             line,
@@ -884,6 +892,18 @@ impl Executor {
 
     pub fn set_shell_option(&mut self, name: &str, enabled: bool) {
         crate::builtins::set::set_shell_option(&mut self.shell_state.env_vars, name, enabled);
+        // Startup-facing entry (CLI --posix/-o, invocation apply, sh
+        // argv0): GNU initialize_bashopts (shopt.def) snapshots $BASHOPTS
+        // AFTER startup option processing, so a startup posix flip lands
+        // in the snapshot. The runtime `set` builtin uses the free
+        // function directly and must NOT re-snapshot (rubash#1055:
+        // posix_initialize bypasses set_bashopts at runtime).
+        if name == "posix" {
+            let bashopts = crate::builtins::shopt::bashopts_value(&self.shell_state.env_vars);
+            self.shell_state
+                .env_vars
+                .insert("BASHOPTS".to_string(), bashopts);
+        }
     }
 
     /// GNU shell.c:1587-1601 (open_shell_script): a script filename that is
@@ -1413,6 +1433,21 @@ impl Executor {
     /// get_name_for_error(). For `bash -c` the stream name is "-c", producing
     /// "bash: -c: line N:". For script files the stream name equals the script
     /// name, so no extra segment appears.
+    /// rubash#1161: whether the input currently being parsed/executed is
+    /// a sourced FILE (the `.` builtin's dynamic extent) rather than the
+    /// invocation's own stream. `__RUBASH_IN_SOURCE` is the engine's
+    /// sourcelevel marker (set by execute_source_with_args);
+    /// source_nest_depth is its counter twin.
+    pub(in crate::executor) fn in_source_context(&self) -> bool {
+        self.source_nest_depth > 0
+            || self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_IN_SOURCE")
+                .map(String::as_str)
+                == Some("1")
+    }
+
     pub(crate) fn parser_diagnostic_prefix(&self) -> String {
         let is_c = self.shell_state.env_vars.contains_key("__RUBASH_IS_C");
         if let (Some(script), Some(line)) = (
@@ -1426,8 +1461,28 @@ impl Executor {
             {
                 return format!("{script}: eval: line {line}: ");
             }
-            if is_c {
+            // rubash#1161: while a FILE is being sourced, GNU's
+            // yy_input_name() is that file (error.c:300-316) — the `-c`
+            // stream name belongs only to the command string itself.
+            // A sourced file under a `-c` invocation (every startup
+            // rc/profile under `niu -i -c`, or `. file` inside `-c`)
+            // therefore reports `{file}: line N:`, never
+            // `{file}: -c: line N:`.
+            if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                // Interactive + sourced file: shell name prolog plus the
+                // file as input name (see parser_diagnostic_prefix_for_line).
+                return format!(
+                    "{}: {script}: line {line}: ",
+                    Self::interactive_shell_basename(&self.shell_state.env_vars)
+                );
             }
             return format!("{script}: line {line}: ");
         }
@@ -1519,8 +1574,25 @@ impl Executor {
             return format!("bash: eval: line {line}: ");
         }
         if let Some(script) = self.shell_state.env_vars.get("__RUBASH_SCRIPT_NAME") {
-            if is_c {
+            // rubash#1161: sourced file input suppresses the `-c`
+            // segment, exactly as in parser_diagnostic_prefix.
+            if is_c && !self.in_source_context() {
                 return format!("{script}: -c: line {line}: ");
+            }
+            if self.in_source_context()
+                && self
+                    .shell_state
+                    .env_vars
+                    .contains_key("__RUBASH_INTERACTIVE")
+            {
+                // GNU error.c parser_error in an interactive shell: the
+                // prolog name is the shell name (get_name_for_error) and
+                // the sourced file rides as yy_input_name —
+                // `bash: FILE: line N:` for startup rc/profile errors.
+                return format!(
+                    "{}: {script}: line {line}: ",
+                    Self::interactive_shell_basename(&self.shell_state.env_vars)
+                );
             }
             return format!("{script}: line {line}: ");
         }

@@ -1,6 +1,92 @@
 use super::*;
 use crate::executor::markers::STORAGE_WORD_PREFIX;
 
+/// rubash#1166: rebase a trap action's parsed line numbers onto the line
+/// the trap fired at. GNU parses the action string with line_number
+/// starting at the triggering command's line (trap.c _run_trap_internal
+/// via parse_and_execute), so EVERY node in the action — nested bodies
+/// included — reports trigger_line + (its action-relative line − 1). The
+/// old per-runner stamping rewrote only the top-level nodes' `line`,
+/// leaving nested commands (a `return` inside an `if` in the action) at
+/// their action-relative lines, so diagnostics cited the trap's own
+/// definition line instead of the triggering line. `delta` is signed
+/// because the DEBUG action cache reuses one parse across firings at
+/// different lines.
+pub(crate) fn shift_trap_action_lines(commands: &mut [CommandNode], delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    fn shift_slot(slot: &mut Option<usize>, delta: i64) {
+        if let Some(value) = slot {
+            *value = (*value as i64 + delta).max(1) as usize;
+        }
+    }
+    fn shift_node(node: &mut CommandNode, delta: i64) {
+        shift_slot(&mut node.line, delta);
+        shift_slot(&mut node.logical_line, delta);
+        shift_slot(&mut node.end_line, delta);
+        shift_slot(&mut node.heredoc_gather_line, delta);
+        if let Some(pipeline) = &mut node.pipeline_command {
+            shift_trap_action_lines(&mut pipeline.stages, delta);
+        }
+        if let Some(list) = &mut node.and_or_list {
+            shift_trap_action_lines(&mut list.commands, delta);
+        }
+        if let Some(wrapper) = &mut node.time_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(wrapper) = &mut node.background_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(wrapper) = &mut node.inverted_command {
+            shift_node(&mut wrapper.command, delta);
+        }
+        if let Some(for_command) = &mut node.for_command {
+            shift_trap_action_lines(&mut for_command.body, delta);
+        }
+        if let Some(if_command) = &mut node.if_command {
+            shift_trap_action_lines(&mut if_command.condition, delta);
+            shift_trap_action_lines(&mut if_command.then_body, delta);
+            for branch in &mut if_command.elif_branches {
+                shift_trap_action_lines(&mut branch.condition, delta);
+                shift_trap_action_lines(&mut branch.body, delta);
+            }
+            if let Some(else_body) = &mut if_command.else_body {
+                shift_trap_action_lines(else_body, delta);
+            }
+        }
+        if let Some(loop_command) = &mut node.loop_command {
+            shift_trap_action_lines(&mut loop_command.condition, delta);
+            shift_trap_action_lines(&mut loop_command.body, delta);
+        }
+        if let Some(subshell) = &mut node.subshell_command {
+            shift_trap_action_lines(&mut subshell.body, delta);
+        }
+        if let Some(case_command) = &mut node.case_command {
+            for clause in &mut case_command.clauses {
+                shift_trap_action_lines(&mut clause.body, delta);
+            }
+        }
+        if let Some(select_command) = &mut node.select_command {
+            shift_trap_action_lines(&mut select_command.body, delta);
+        }
+        if let Some(function) = &mut node.function_command {
+            shift_trap_action_lines(&mut function.body, delta);
+        }
+        if let Some(group) = &mut node.brace_group {
+            shift_trap_action_lines(&mut group.body, delta);
+        }
+        if let Some(coproc) = &mut node.coproc_command {
+            if let Some(body) = &mut coproc.body {
+                shift_trap_action_lines(body, delta);
+            }
+        }
+    }
+    for command in commands {
+        shift_node(command, delta);
+    }
+}
+
 impl Executor {
     pub(in crate::executor) fn set_fd_input_text(&mut self, fd: u32, input: String, dynamic: bool) {
         // input is shell text: decode marker pairs back to the raw bytes
@@ -71,6 +157,25 @@ impl Executor {
         target: &str,
         dynamic: bool,
     ) -> std::io::Result<()> {
+        // rubash#1026: `N<>/dev/tcp/host/port` binds the connected
+        // socket (one descriptor, both directions — redir.c netopen).
+        if self.is_net_redirect_target(target) {
+            // Raw error: every caller of this function applies
+            // posix_errors::path_error itself.
+            let file = self.open_net_redirect_raw(target)?;
+            let file_fd = FileFd::from_file(file, target.into());
+            self.set_fd_input_file(fd, file_fd.clone(), dynamic);
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(fd), target.to_string());
+            return Ok(());
+        }
         let path = shell_path_to_windows(target, &self.shell_state.env_vars);
         let file = FileFd::open_readwrite(path)?;
         self.set_fd_input_file(fd, file.clone(), dynamic);
@@ -96,6 +201,20 @@ impl Executor {
         dynamic: bool,
         append: bool,
     ) -> std::io::Result<()> {
+        // rubash#1026: `N>/dev/tcp/host/port` binds the connected
+        // socket, not a filesystem path (redir.c netopen).
+        if self.is_net_redirect_target(&target) {
+            let file = self.open_net_redirect(&target)?;
+            let file_fd = FileFd::from_file(file, target.clone().into());
+            self.fd_table
+                .open_output(fd, FdWriteEndpoint::File(file_fd), dynamic);
+            self.shell_state.env_vars.remove(&fd_closed_key(fd));
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(fd));
+            self.shell_state.env_vars.insert(fd_output_key(fd), target);
+            return Ok(());
+        }
         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
         let file = FileFd::open_write(path, append, false)
             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
@@ -510,6 +629,23 @@ impl Executor {
         caller_line: usize,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
+        // GNU evalstring.c parse_and_execute parses the string with the
+        // CURRENT extglob_flag (builtins/shopt.def:640 propagates the
+        // option to the parser when the builtin RUNS). The lexer global
+        // is a lex-time simulation for the script stream: the feeder
+        // flips it when it LEXES a `shopt -s/-u extglob` line, which can
+        // be lines ahead of execution — an eval running before that
+        // shopt line executes would see the gate flipped early and
+        // accept extglob patterns GNU rejects (rubash#1114). Pin the
+        // gate to the live runtime shopt state for this reparse
+        // (tokenize + parse; the case parser consults the global at
+        // parse time) and restore the stream value afterwards — a shopt
+        // executed BY the eval'd code re-pins it through set_option.
+        let saved_extglob = crate::lexer::parse_extended_glob();
+        crate::lexer::set_parse_extended_glob(crate::builtins::shopt::option_enabled(
+            &self.shell_state.env_vars,
+            "extglob",
+        ));
         let mut tokens = crate::lexer::tokenize(source);
         // GNU eval reports errors with the caller line numbering:
         // the string lines continue the script line counter
@@ -528,7 +664,12 @@ impl Executor {
                 source_line_offset: caller_line.saturating_sub(1),
             },
         );
+        crate::lexer::set_parse_extended_glob(saved_extglob);
         self.apply_command_output_redirects(cmd, &mut ast)?;
+        // rubash#1138: parse_and_execute parses a whole reader unit
+        // before executing any of it — a syntax error in the eval
+        // string voids the valid commands sharing its line.
+        crate::script_driver::apply_parse_error_unit_voiding(&mut ast);
         // A syntax error inside the eval string makes eval return 2;
         // it does not abort the calling script the way a top-level
         // parse error does. An inner exit still exits the shell, so
@@ -537,6 +678,12 @@ impl Executor {
             .commands
             .iter()
             .any(|command| command.has_assignment("__RUBASH_PARSE_ERROR__"));
+        // rubash#1013: an eval string that parses to no commands at all
+        // (empty, blanks, or comments only) succeeds — GNU evalstring.c
+        // parse_and_execute on an empty string leaves eval_builtin
+        // returning EXECUTION_SUCCESS, so the caller's $? must not
+        // survive it (`false; eval ""; echo $?` -> 0).
+        let no_commands = ast.commands.is_empty();
         let saved_eval_context = self
             .shell_state
             .env_vars
@@ -589,7 +736,7 @@ impl Executor {
         // parse_and_execute's containment could see it. Such an error is a
         // real shell exit, not eval's rc=2.
         let parser_error_errexited = self.parser_error_errexited.take();
-        match result {
+        let eval_result = match result {
             Err(ExecuteError::ExitCode(code))
                 if code == 2
                     && !parser_error_errexited
@@ -682,7 +829,13 @@ impl Executor {
                 }
                 other
             }
+        };
+        // rubash#1013: see `no_commands` above — an empty eval string
+        // that ran without error reports success, not the stale status.
+        if eval_result.is_ok() && no_commands {
+            self.exit_code = 0;
         }
+        eval_result
     }
 
     pub fn run_exit_trap(&mut self) -> Result<i32, ExecuteError> {
@@ -844,27 +997,32 @@ impl Executor {
         // out of the cache cell, re-stamped and executed, then put back —
         // no clone on the per-firing path.
         let action = self.comsub_body_alias_splice(action);
-        let mut ast = {
+        let (mut ast, ast_base) = {
             let taken = self.debug_trap_action_cache.borrow_mut().take();
             match taken {
-                Some((key, cached_ast)) if key == action => cached_ast,
+                Some((key, cached_ast, base)) if key == action => (cached_ast, base),
                 _ => {
                     let tokens = crate::lexer::tokenize(&action);
-                    crate::parser::parse(&tokens)
+                    (crate::parser::parse(&tokens), 1)
                 }
             }
         };
-        if let Some(call_line) = call_line {
-            for command in &mut ast.commands {
-                command.line = Some(call_line);
+        // rubash#1166: rebase the whole action onto this firing's line —
+        // nested nodes keep their action-relative offsets from it (see
+        // shift_trap_action_lines). The cache tracks the base the stored
+        // lines currently reflect, so reuse shifts by the delta only.
+        let ast_base = match call_line {
+            Some(line) => {
+                shift_trap_action_lines(&mut ast.commands, line as i64 - ast_base);
+                line as i64
             }
-        }
+            None => ast_base,
+        };
         let saved_alias_streamed = self.mark_alias_streamed();
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
-        // Cache the (re-stamped) AST under its spliced text for the next
-        // firing; the stamps are unconditionally overwritten by every
-        // firing's `command.line` walk above, so reuse is exact.
-        *self.debug_trap_action_cache.borrow_mut() = Some((action, ast));
+        // Cache the (re-based) AST under its spliced text for the next
+        // firing; the recorded base makes the next rebase exact.
+        *self.debug_trap_action_cache.borrow_mut() = Some((action, ast, ast_base));
         self.resume_alias_streamed(saved_alias_streamed);
         // rubash#546 (cell 2): when the firing happened inside a trap
         // action the frozen BASH_COMMAND belongs to the enclosing action —
@@ -917,14 +1075,26 @@ impl Executor {
             .get("__RUBASH_CURRENT_LINE")
             .and_then(|line| line.parse::<usize>().ok());
         if let Some(call_line) = call_line {
-            for command in &mut ast.commands {
-                command.line = Some(call_line);
-            }
+            // rubash#1166: rebase, don't just stamp the top level (see
+            // shift_trap_action_lines).
+            shift_trap_action_lines(&mut ast.commands, call_line as i64 - 1);
         }
+        // rubash#1165: the function's return status is fixed BEFORE the
+        // RETURN trap runs (execute_cmd.c's return_catch value becomes
+        // last_command_exit_value; trap.c _run_trap_internal saves and
+        // restores it around the action) — the action's own last-command
+        // status must not replace it in either direction (`trap 'echo X'
+        // RETURN` after `false` keeps rc 1; `trap 'false' RETURN` after
+        // `true` keeps rc 0). Save/restore like the ERR/signal runners;
+        // unwinds (exit/return in the action) still propagate.
+        let saved_exit = self.exit_code;
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
         self.trap_saved_exit_value = prev_saved_exit;
         self.trap_saved_exit_context = prev_saved_context;
         self.return_trap_running = false;
+        if result.is_ok() {
+            self.exit_code = saved_exit;
+        }
         result
     }
 
@@ -1275,16 +1445,64 @@ impl Executor {
     /// completes, an untrapped one kills the shell via SIG_DFL). The
     /// in-process fast path emulates that by slicing the sleep and running
     /// observe_signals_while_blocked between slices.
-    pub(crate) fn sleep_interruptibly(&mut self, seconds: f64) -> Result<(), ExecuteError> {
+    ///
+    /// rubash#1034: the emulation has one gap a real child does not —
+    /// a group-delivered terminating signal (^C, `kill` of the job)
+    /// kills GNU's real sleep instantly, wait_for returns, and the
+    /// shell's trap dispatches at once; the virtual child cannot die,
+    /// so the trap used to sit queued for the sleep's whole remainder.
+    /// When a pending delivery is a trapped signal from the kernel-
+    /// managed terminating set (HUP/INT/QUIT/TERM/USR1/USR2 — the set
+    /// a default-disposition child dies from), model the child as
+    /// killed by it: dispatch the pending traps now and end the sleep,
+    /// reporting the killing signal so the caller records 128+sig as
+    /// the command's status, exactly like a reaped signal death.
+    /// Non-terminating trapped signals (WINCH, CHLD...) keep GNU's
+    /// defer-to-completion semantics untouched.
+    pub(crate) fn sleep_interruptibly(
+        &mut self,
+        seconds: f64,
+    ) -> Result<Option<i32>, ExecuteError> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Ok(());
+                return Ok(None);
             }
             std::thread::sleep((deadline - now).min(SLICE));
             self.observe_signals_while_blocked()?;
+            // observe_signals_while_blocked re-queued any trapped
+            // deliveries; take them back for the virtual-child check
+            // and put back whatever does not abort the sleep.
+            let pending = crate::builtins::kill::take_pending_signals_now(std::process::id())
+                .unwrap_or_default();
+            if pending.is_empty() {
+                continue;
+            }
+            let abort = pending.iter().copied().find(|&signal| {
+                #[cfg(unix)]
+                {
+                    crate::builtins::kill::kernel_handler_installed(signal)
+                        && signal_trap_name(signal).is_some_and(|name| {
+                            crate::builtins::trap::get_trap_action(
+                                &self.shell_state.env_vars,
+                                &name,
+                            )
+                            .is_some_and(|action| !action.is_empty())
+                        })
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = signal;
+                    false
+                }
+            });
+            crate::builtins::kill::requeue_pending_signals(pending);
+            if let Some(signal) = abort {
+                self.run_pending_signal_traps()?;
+                return Ok(Some(signal));
+            }
         }
     }
 
@@ -1350,12 +1568,25 @@ impl Executor {
             // inner command ran and the assignment carries its status, so
             // the ERR trap still fires there.
             || self.command_expansion_failed.get()
-            || (self.shell_state.function_depth > 0
-                && !crate::builtins::set::shell_option_enabled(
-                    &self.shell_state.env_vars,
-                    "errtrace",
-                ))
         {
+            return Ok(());
+        }
+        // No function-depth gate here (rubash#1163): GNU execute_cmd.c
+        // execute_function (5284-5290) saves and CLEARS an inherited ERR
+        // trap at function entry when errtrace is off and restores it at
+        // exit — function_calls.rs mirrors that — so any ERR action
+        // visible while function_depth > 0 was set inside a function and
+        // must fire for that function's failing commands. The former
+        // `function_depth > 0 && !errtrace` early return here suppressed
+        // exactly those function-local traps, checking (in effect) only
+        // the function's final status at depth 0.
+        // rubash#1164: GNU adjudicates against was_error_trap sampled
+        // before the failing command started (execute_cmd.c:914) — a trap
+        // installed BY that command does not fire for it. The action string
+        // itself is read live here, as GNU reads trap_list at fire time (a
+        // trap replaced mid-command fires its NEW action at the enclosing
+        // frame whose sample was armed).
+        if self.err_trap_armed_sample.get() == Some(false) {
             return Ok(());
         }
         let Some(action) =
@@ -1415,9 +1646,10 @@ impl Executor {
         let tokens = crate::lexer::tokenize(&action);
         let mut ast = crate::parser::parse(&tokens);
         if let Some(line) = failed_line {
-            for action_command in &mut ast.commands {
-                action_command.line = Some(line);
-            }
+            // rubash#1166: rebase the whole action onto the failed
+            // command's line, nested nodes included (see
+            // shift_trap_action_lines).
+            shift_trap_action_lines(&mut ast.commands, line as i64 - 1);
         }
         let saved_alias_streamed = self.mark_alias_streamed();
         let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
@@ -1441,8 +1673,19 @@ impl Executor {
         // propagates — other action-level states keep the historical
         // swallow here.
         let exit_unwind = matches!(result, Err(ExecuteError::ExitCode(_)));
+        // rubash#1164: a `return` inside the ERR action targets the frame
+        // the trap fired in (GNU runs the action in the interrupted
+        // function's context, so return_catch is live): when the trap
+        // fired while a function or sourced script was on the stack
+        // (trap_return_context > 0), the Return unwind must reach that
+        // frame instead of being swallowed — the function's remaining
+        // body is skipped and it returns the action's status. At the top
+        // level the return builtin itself errors and produces no unwind,
+        // so a stray Return here keeps the historical swallow.
+        let return_unwind = matches!(result, Err(ExecuteError::Return(_)))
+            && (self.shell_state.function_depth + self.source_nest_depth) > 0;
         self.exit_code = saved_exit;
-        if exit_unwind {
+        if exit_unwind || return_unwind {
             return result;
         }
         Ok(())
@@ -1681,7 +1924,7 @@ impl Executor {
                     && !is_closed_redirect_target(&expanded)
                     && redirect_target_fd(&expanded).is_none()
                 {
-                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&expanded, redirect.clobber)?;
                 }
                 let target = self.anchor_compound_redirect_target(&expanded);
                 let append_redirect = Redirect {
@@ -1769,7 +2012,7 @@ impl Executor {
                     && redirect_target_fd(&expanded).is_none()
                     && !is_null_device(&expanded)
                 {
-                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                    self.create_redirect_output_prepared(&expanded, redirect.clobber)?;
                 }
                 let target = self.anchor_compound_redirect_target(&expanded);
                 let append_redirect = Redirect {
@@ -2019,6 +2262,57 @@ impl Executor {
 
         if let Some(redirect) = &cmd.redirect_err {
             let target = self.expand_redirect_target(redirect);
+            // GNU redir.c r_duplicating_output: a `2>&N` / `2>&-` target is
+            // a descriptor dup, never a file name — opening it literally
+            // wrote the exec-failure diagnostic into a file named "&1"
+            // and the message vanished (rubash#1144).
+            if let Some(dup) = target.strip_prefix('&') {
+                // The close form `2>&-` is exactly "-"; the move form
+                // `2>&1-` strips one trailing '-'.
+                let dup_fd = if dup == "-" {
+                    dup
+                } else {
+                    dup.strip_suffix('-').unwrap_or(dup)
+                };
+                let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                    &cmd.words[1..],
+                    crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                    crate::executor::dev_fd_operands::DevOperandStdout::FdTable,
+                );
+                let status = match dup_fd {
+                    "-" => crate::builtins::exec::execute_with_child_stdio(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut std::io::sink(),
+                        Stdio::inherit(),
+                        Stdio::null(),
+                        self.exec_inherited_stdin()?,
+                    )?,
+                    "1" => crate::builtins::exec::execute_with_io(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut crate::executor::GlobalStdout,
+                        self.exec_inherited_stdin()?,
+                    )?,
+                    _ => crate::builtins::exec::execute_with_child_stdio(
+                        &exec_args,
+                        &self.shell_state.env_vars,
+                        &mut crate::executor::GlobalStdout,
+                        &mut std::io::stderr().lock(),
+                        self.exec_inherited_stdio(1)?,
+                        dup_fd
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(|fd| self.exec_inherited_stdio(fd).ok())
+                            .unwrap_or_else(Stdio::inherit),
+                        self.exec_inherited_stdin()?,
+                    )?,
+                };
+                self.finish_dev_fd_operands(dev_ops);
+                return Ok(status);
+            }
             let mut file = self.create_redirect_output(&target, redirect.clobber)?;
             let child_stderr = Stdio::from(file.try_clone()?);
             let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
@@ -2267,6 +2561,67 @@ impl Executor {
         }
     }
 
+    /// rubash#1021 helper: spawn a `<(source)` body as a child shell
+    /// writing to a pipe and bind the read end on `fd`, the way GNU
+    /// process_substitute forks instead of collecting output first.
+    /// The child gets the coproc spawn's environment treatment (shell
+    /// vars plus the full function table as BASH_FUNC entries), is
+    /// registered for reaping, and becomes `$!`. Returns false when the
+    /// spawn could not be set up; the caller then falls back to
+    /// synchronous collection.
+    fn bind_input_process_substitution_child(&mut self, fd: u32, source: &str) -> bool {
+        use std::process::{Command, Stdio};
+        let exe = std::env::var_os("CARGO_BIN_EXE_rubash")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| "rubash".into());
+        let Ok((reader, writer)) = std::io::pipe() else {
+            return false;
+        };
+        let mut child = Command::new(&exe);
+        child.arg("-c").arg(source);
+        for (key, value) in &self.shell_state.env_vars {
+            if !key.starts_with("__RUBASH_")
+                || super::compound_exec::rubash_spawn_inherited_state(key)
+            {
+                child.env(key, value);
+            }
+        }
+        for (name, body) in &self.shell_state.functions {
+            if !is_exportable_function_name(name) {
+                continue;
+            }
+            let def_redirects = self
+                .shell_state
+                .function_def_infos
+                .get(name)
+                .map(|info| info.def_redirects.as_slice())
+                .unwrap_or(&[]);
+            child.env(
+                exported_function_env_name(name),
+                exported_function_env_value(&body.commands, def_redirects),
+            );
+        }
+        child.stdin(Stdio::inherit());
+        child.stdout(writer);
+        child.stderr(Stdio::inherit());
+        match child.spawn() {
+            Ok(child_proc) => {
+                let pid = child_proc.id();
+                self.background_children
+                    .insert(pid, crate::fd::SpawnedChild::from(child_proc));
+                // GNU process_substitute records the child in $!
+                // (subst.c assigns last_made_pid).
+                self.shell_state.last_background_pid = Some(pid);
+                let file = crate::fd::handle_to_file(crate::fd::into_handle(reader));
+                let file_fd = FileFd::from_file(file, format!("<({source})").into());
+                self.set_fd_input_file(fd, file_fd, fd != 0);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn execute_stdio_only_exec_redirect(
         &mut self,
         cmd: &CommandNode,
@@ -2471,6 +2826,16 @@ impl Executor {
                         .strip_prefix("<(")
                         .and_then(|target| target.strip_suffix(')'))
                     {
+                        // rubash#1021: GNU process_substitute (subst.c)
+                        // forks the body and binds the pipe read end
+                        // immediately; collecting its output first (the
+                        // fallback below) blocks `exec` until the
+                        // producer exits — forever for `tail -f`. Spawn
+                        // the body as a child shell on a real pipe
+                        // instead (same shape as the coproc spawn).
+                        if self.bind_input_process_substitution_child(fd, source) {
+                            continue;
+                        }
                         if let Some(input) = self.process_substitution_output(source) {
                             self.fd_table.open_input(
                                 fd,
@@ -2503,6 +2868,13 @@ impl Executor {
                     if redirect.operator.ends_with("<>") {
                         self.set_fd_readwrite_file(fd, &target, fd != 0)
                             .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                    } else if self.is_net_redirect_target(&target) {
+                        // rubash#1026: `N</dev/tcp/host/port` also
+                        // connects (redir.c netopen serves both
+                        // directions); the socket binds as the read end.
+                        let file = self.open_net_redirect(&target)?;
+                        let file_fd = FileFd::from_file(file, target.clone().into());
+                        self.set_fd_input_file(fd, file_fd, fd != 0);
                     } else {
                         let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
                         let file = FileFd::open_read(path)

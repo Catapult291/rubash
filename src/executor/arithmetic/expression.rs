@@ -39,6 +39,22 @@ impl ConditionalArithParser<'_> {
             if let Some(op) = self.consume_assignment_operator() {
                 self.note_op(op_start);
                 self.skip_ws();
+                // GNU expr.c:511-626 expassign: the LHS operand was
+                // evaluated by expcond BEFORE the recursive expassign call
+                // parses the RHS, so for OP_ASSIGN the saved lvalue value
+                // predates any RHS side effect on the same variable —
+                // `j=5; $((j+=j-=2))` is 5+3=8, not 3+3=6 (rubash#1113).
+                // Capture that read here, while the variable still holds
+                // its pre-RHS value (for non-`=` operators
+                // parse_lvalue_for_assignment has already evaluated the
+                // subscript, exactly like the STR token read). Plain `=`
+                // never reads the lvalue, and its deferred-subscript law
+                // (expr.c:1395-1401) stays untouched.
+                let precaptured = if op != "=" {
+                    Some(self.lvalue_value(&lvalue)?)
+                } else {
+                    None
+                };
                 let rhs_start = self.pos;
                 let rhs = self.parse_assignment()?;
                 // GNU expr.c:549-555: `a /= 0` / `a %= 0` evalerrors
@@ -48,7 +64,7 @@ impl ConditionalArithParser<'_> {
                 if matches!(op, "/=" | "%=") && rhs == 0 && self.noeval == 0 {
                     return self.fail("division by 0", rhs_start);
                 }
-                return self.assign_lvalue(&lvalue, op, rhs);
+                return self.assign_lvalue_precaptured(&lvalue, op, rhs, precaptured);
             }
         }
         self.pos = start;
@@ -386,13 +402,18 @@ impl ConditionalArithParser<'_> {
                 self.note_op(self.pos);
                 self.pos += 2;
                 let rhs = self.parse_expr()?;
-                let shift = u32::try_from(rhs).ok()?;
+                // GNU expr.c:856-859 expshift: plain C `val1 << val2` on
+                // intmax_t — the hardware masks the count to 6 bits, so a
+                // negative or oversized count wraps instead of erroring
+                // (`8>>-1` == 8>>63 == 0; rubash#1135). wrapping_shl/shr
+                // apply the same mask to the u32 count.
+                let shift = rhs as u32;
                 value = bash_arith((value as i64).wrapping_shl(shift) as i128);
             } else if self.starts_with(">>") {
                 self.note_op(self.pos);
                 self.pos += 2;
                 let rhs = self.parse_expr()?;
-                let shift = u32::try_from(rhs).ok()?;
+                let shift = rhs as u32;
                 value = bash_arith((value as i64).wrapping_shr(shift) as i128);
             } else {
                 return Some(value);

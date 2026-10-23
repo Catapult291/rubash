@@ -12,6 +12,41 @@ pub(super) fn parse_function_command(
     parse_function_command_with_diagnostic(tokens, start, None, 0)
 }
 
+/// A `syntax error near unexpected token' node in the established
+/// `__RUBASH_PARSE_ERROR__' encoding (message + physical source line),
+/// rendered by the executor's parse-error arm with EX_BADUSAGE=2.
+fn unexpected_token_error_node(
+    token_text: &str,
+    line: usize,
+    diagnostic_text: Option<&std::rc::Rc<str>>,
+    source_line_offset: usize,
+) -> CommandNode {
+    let mut command = CommandNode::new();
+    command.line = Some(line);
+    command.insert_assignment(
+        "__RUBASH_PARSE_ERROR__".to_string(),
+        format!("unexpected token `{token_text}'"),
+    );
+    if let Some(text) = diagnostic_text {
+        if let Some(source) = line
+            .checked_sub(source_line_offset)
+            .and_then(|line_in_text| super::parse_loop::source_line_by_number(text, line_in_text))
+        {
+            command.insert_assignment("__RUBASH_PARSE_SOURCE__".to_string(), source);
+        }
+    }
+    command
+}
+
+/// A `syntax error: unexpected end of file' node: the executor's EOF arm
+/// renders node.line + 1, so the anchor line is the last input line.
+fn unexpected_eof_error_node(tokens: &[Token], start: usize) -> CommandNode {
+    let mut command = CommandNode::new();
+    command.line = tokens.get(start).map(|token| token.position);
+    command.insert_assignment("__RUBASH_PARSE_ERROR_EOF__".to_string(), "1".to_string());
+    command
+}
+
 /// GNU parse.y function_def: the body is a `compound_command' parsed by the
 /// SAME yyparse run — a stray `)' / `;;' inside it is the yacc
 /// `syntax error near unexpected token' production (parse.y:6724 yyerror →
@@ -33,6 +68,55 @@ pub(super) fn parse_function_command_with_diagnostic(
     // `name() { ...; }` and `function name { ...; }` forms onto a function
     // command node.
     let keyword_form = is_keyword(tokens, start, "function");
+    // GNU parse.y function_def: `function' must be followed by a WORD
+    // name. A bare `function' — at end of input, before a newline, or
+    // before a hard `;' — is a syntax error at that token, never a
+    // command named `function' (rubash#1142: it fell through to the
+    // word path and reported `function: command not found', rc 127,
+    // and the script kept running).
+    if keyword_form {
+        let near_error = |name: &str, blame: usize, source_index: usize| {
+            let mut command = CommandNode::new();
+            command.line = Some(tokens[start].position);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    "{name}{}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    blame
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                super::parse_loop::offending_line_text(
+                    tokens,
+                    source_index,
+                    diagnostic_text.map(|rc| &**rc),
+                    source_line_offset,
+                ),
+            );
+            Some((command, tokens.len()))
+        };
+        match tokens.get(start + 1) {
+            None => {
+                return near_error("newline", tokens[start].position, start);
+            }
+            Some(token) if token.kind == TokenKind::Eof => {
+                return near_error("newline", tokens[start].position, start);
+            }
+            Some(token) if token.kind == TokenKind::Semicolon => {
+                let name = if token.line_break { "newline" } else { ";" };
+                return near_error(name, token.position, start + 1);
+            }
+            // `function ( ...' — a paren cannot start the name (GNU
+            // reports the `(' itself); the word path would misblame the
+            // token inside the group.
+            Some(token) if token.kind == TokenKind::Keyword && token.value == "(" => {
+                return near_error("(", token.position, start + 1);
+            }
+            _ => {}
+        }
+    }
     // GNU parse.y: function_def: WORD '(' ')' ... -- the name can be any
     // word, and a `<(...)' process-substitution-like token is read as one
     // WORD (so `<(:) () { ...; }' is a function definition whose name is
@@ -61,6 +145,33 @@ pub(super) fn parse_function_command_with_diagnostic(
         } else {
             (start, start + 1)
         };
+        if keyword_form {
+            // GNU parse.y function_def demands WORD after `function':
+            // end of input there is the yyerror EOF path, and a separator
+            // in the name slot is itself the offending token — a line
+            // break reports as `newline', a real `;' as `;' (rubash#1154:
+            // bare `function' used to fall back to a simple command and
+            // report `function: command not found', rc 127, and the
+            // script kept running).
+            match tokens.get(name_index) {
+                None => {
+                    return Some((unexpected_eof_error_node(tokens, start), tokens.len()));
+                }
+                Some(token) if token.kind == TokenKind::Semicolon => {
+                    let display = if token.line_break { "newline" } else { ";" };
+                    return Some((
+                        unexpected_token_error_node(
+                            display,
+                            token.position,
+                            diagnostic_text,
+                            source_line_offset,
+                        ),
+                        tokens.len(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         let name_token = tokens.get(name_index)?;
         (name_token.value.clone(), name_token.raw.clone(), i)
     };
@@ -95,11 +206,65 @@ pub(super) fn parse_function_command_with_diagnostic(
         return None;
     }
 
+    // GNU parse.y function_def admits only newline_list between the
+    // name/`()' and the body — a hard `;' there is a syntax error at
+    // the `;' (`function f; ...', `f() ; { ... }'; rubash#1142), and
+    // end of input is the plain unexpected-EOF report (`function f').
     while tokens
         .get(i)
-        .is_some_and(|token| token.kind == TokenKind::Semicolon)
+        .is_some_and(|token| token.kind == TokenKind::Semicolon && token.line_break)
     {
         i += 1;
+    }
+    if let Some(token) = tokens.get(i) {
+        if token.kind == TokenKind::Semicolon {
+            let mut command = CommandNode::new();
+            command.line = Some(tokens[start].position);
+            command.insert_assignment(
+                "__RUBASH_PARSE_ERROR_NEAR__".to_string(),
+                format!(
+                    ";{}{}",
+                    crate::executor::markers::PARSE_ERROR_FIELD_SEP,
+                    token.position
+                ),
+            );
+            command.insert_assignment(
+                "__RUBASH_PARSE_SOURCE__".to_string(),
+                super::parse_loop::offending_line_text(
+                    tokens,
+                    i,
+                    diagnostic_text.map(|rc| &**rc),
+                    source_line_offset,
+                ),
+            );
+            return Some((command, tokens.len()));
+        }
+    } else {
+        let mut command = CommandNode::new();
+        command.line = Some(
+            tokens
+                .iter()
+                .map(|token| token.position)
+                .max()
+                .unwrap_or(tokens[start].position),
+        );
+        command.insert_assignment("__RUBASH_PARSE_ERROR_EOF__".to_string(), "1".to_string());
+        return Some((command, tokens.len()));
+    }
+    if tokens
+        .get(i)
+        .is_some_and(|token| token.kind == TokenKind::Eof)
+    {
+        let mut command = CommandNode::new();
+        command.line = Some(
+            tokens
+                .iter()
+                .map(|token| token.position)
+                .max()
+                .unwrap_or(tokens[start].position),
+        );
+        command.insert_assignment("__RUBASH_PARSE_ERROR_EOF__".to_string(), "1".to_string());
+        return Some((command, tokens.len()));
     }
     if let Some(group) = tokens
         .get(i)

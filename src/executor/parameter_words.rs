@@ -38,6 +38,96 @@ pub(in crate::executor) fn recycle_synthetic_fragment_word(word: String) {
     SYNTHETIC_FRAGMENT_WORD.with(|pool| pool.borrow_mut().push(word));
 }
 
+/// The variable a `${...}` body assigns through a top-level `:=` or `=`
+/// operator (base name, subscript stripped), when it is a plain shell
+/// name — the target whose later assignment can leak into earlier
+/// fragments of the same word (rubash#1169).
+fn parameter_assignment_target(inner: &str) -> Option<String> {
+    let (name, _word) = super::expand_braced_ops::split_once_outside_subscript_str(inner, ":=")
+        .or_else(|| super::expand_braced_ops::split_once_outside_subscript(inner, '='))?;
+    let base = name.split('[').next().unwrap_or(name);
+    if is_shell_name(base) {
+        Some(base.to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether a `${...}` body is side-effect-free to evaluate during the
+/// assignment pre-scan: no command substitution and no backticks, and
+/// not a bad-substitution shape whose diagnostic must stay with the
+/// real pass (rubash#1169 freeze admission). `$((...))` arithmetic is
+/// admitted only when it plainly carries no side effect: no `++`/`--`
+/// and no `=` anywhere (which also excludes assignment expressions;
+/// comparison `==` is excluded too, conservatively).
+fn fragment_is_pure(inner: &str) -> bool {
+    if inner.contains('`') {
+        return false;
+    }
+    if inner.contains("$(") {
+        let comsubs = inner.matches("$(").count();
+        let ariths = inner.matches("$((").count();
+        if comsubs != ariths || inner.contains("++") || inner.contains("--") || inner.contains('=')
+        {
+            return false;
+        }
+        // An assignment operator in the body itself (`${v:=...}` as the
+        // frozen candidate) is handled by the `:=` memo, not the freeze.
+        if super::expand_braced_ops::split_once_outside_subscript_str(inner, ":=").is_some()
+            || super::expand_braced_ops::split_once_outside_subscript(inner, '=').is_some()
+        {
+            return false;
+        }
+    }
+    !super::expand_word::braced_name_is_bad_substitution(inner)
+        && !super::expand_word::braced_name_ends_on_quote(inner)
+}
+
+/// Whether a `${...}` body reads variable `var`: as its subject
+/// (`${var}`, `${var:-...}`, `${var[...]}`, `${!var...}`, `${#var}`), or
+/// as a nested `$var` / `${var...}` expansion in its word part
+/// (rubash#1169 freeze admission).
+fn fragment_references_var(inner: &str, var: &str) -> bool {
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut subject = inner;
+    if let Some(rest) = subject.strip_prefix('!') {
+        subject = rest;
+    } else if let Some(rest) = subject.strip_prefix('#') {
+        // `${#var}` length form; `${#}`/`${#@}` are special parameters.
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            subject = rest;
+        }
+    }
+    if let Some(rest) = subject.strip_prefix(var) {
+        if rest.is_empty() || !rest.chars().next().is_some_and(is_name_char) {
+            return true;
+        }
+    }
+    // Nested reads anywhere in the body (`${x:-$var}`, `${x:-${var}}`).
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            if bytes.get(j) == Some(&b'{') {
+                j += 1;
+            }
+            if inner[j..].starts_with(var) {
+                let after = inner[j + var.len()..].chars().next();
+                if after.is_none() || !after.is_some_and(is_name_char) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 impl Executor {
     pub(in crate::executor) fn expand_parameter_word(&self, word: &str) -> String {
         // TODO(subst.c/parse.y): The `word` half of ${parameter:-word},
@@ -667,7 +757,12 @@ impl Executor {
         // In POSIX mode, a double-quoted `${...}` may close at a `}` inside
         // the apparent word when a single quote is literal (Interp 221).
         // Expand that braced head separately, then continue with the suffix.
-        if matches!(context, SubstitutionQuoteContext::DoubleQuoted) && self.posix_mode_enabled() {
+        // rubash#1109 item 2: above compat 42 only — at <= 42 the quote
+        // quotes again and the whole-word span below governs.
+        if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
+            && self.posix_mode_enabled()
+            && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
+        {
             if let Some(rest) = word.strip_prefix("${") {
                 if let Some(close) = matching_parameter_brace_in_context(rest, true, true) {
                     if close + 1 < rest.len() {
@@ -699,6 +794,7 @@ impl Executor {
         // embedded walker (posixexp2 case 28).
         let spans_whole_word = if matches!(context, SubstitutionQuoteContext::DoubleQuoted)
             && self.posix_mode_enabled()
+            && shell_compatibility_level_flag_aware(&self.shell_state.env_vars) > 42
         {
             braced_parameter_spans_whole_word_in_context(word, true, true)
         } else {
@@ -775,6 +871,19 @@ impl Executor {
         // means the enclosing fragment already named it — keep it.
         let _site_guard = (!crate::executor::expand_braced_indices::sub_site_active())
             .then(|| crate::executor::expand_braced_indices::SubSiteGuard::new(0));
+
+        // rubash#1169: the assignment pre-scan may have frozen this
+        // fragment at its pre-assignment value (it precedes a `:=`/`=`
+        // fragment, in the same word, that assigns a variable it reads).
+        // The live env already carries that assignment, so the dispatch
+        // below must not re-derive the fragment from it.
+        if let Some(key) = crate::executor::expand_braced_indices::sub_site_key(name) {
+            if let Some(frozen) =
+                crate::executor::expand_braced_indices::frozen_fragment_lookup(&key)
+            {
+                return frozen;
+            }
+        }
 
         // One-pass operator-boundary index for the dispatch chain below:
         // GNU parameter_brace_expand (subst.c:9777) extracts the name up to
@@ -1161,6 +1270,9 @@ impl Executor {
         // the expansion walker's `${` arms see them (command-substitution
         // bodies do not reach either scan's arm).
         let mut frag_index = 0usize;
+        // Earlier top-level fragments (body text, ordinal), for the
+        // rubash#1169 freeze below.
+        let mut earlier_fragments: Vec<(String, usize)> = Vec::new();
         while let Some(rel) = word[consumed..].find("${") {
             let start = consumed + rel;
             let (in_double, inside_cs) = scan_word_prefix_quote_state(&word[..start], quoted_word);
@@ -1174,12 +1286,51 @@ impl Executor {
                 continue;
             }
             let inner = &word[body_start..body_start + end];
+            let this_frag = frag_index;
+            if !inherit_site {
+                // rubash#1169: GNU evaluates a word's fragments strictly
+                // left-to-right, but this pre-scan applies a `:=`/`=`
+                // fragment's assignment before the real pass evaluates
+                // ANY fragment — so an earlier fragment reading the
+                // assigned variable would see the new value. Freeze each
+                // earlier pure fragment that reads the target at its
+                // current (pre-assignment) value, keyed by its site; the
+                // real pass consults the frozen map first.
+                if let Some(target) = parameter_assignment_target(inner) {
+                    for (prev_inner, prev_index) in &earlier_fragments {
+                        if !fragment_is_pure(prev_inner)
+                            || !fragment_references_var(prev_inner, &target)
+                        {
+                            continue;
+                        }
+                        let _freeze_guard =
+                            crate::executor::expand_braced_indices::SubSiteGuard::new(*prev_index);
+                        if let Some(key) =
+                            crate::executor::expand_braced_indices::sub_site_key(prev_inner)
+                        {
+                            if crate::executor::expand_braced_indices::frozen_fragment_lookup(&key)
+                                .is_none()
+                            {
+                                let synthetic = format!("${{{prev_inner}}}");
+                                let value =
+                                    self.expand_braced_parameter_word(&synthetic, prev_inner);
+                                crate::executor::expand_braced_indices::frozen_fragment_store(
+                                    key, value,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let _site_guard = (!inherit_site).then(|| {
                 let guard = crate::executor::expand_braced_indices::SubSiteGuard::new(frag_index);
                 frag_index += 1;
                 guard
             });
             self.apply_parameter_assignment_expansion_with_context(inner, in_double);
+            if !inherit_site {
+                earlier_fragments.push((inner.to_string(), this_frag));
+            }
             consumed = body_start + end + 1;
         }
     }

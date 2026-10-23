@@ -213,9 +213,6 @@ impl Executor {
     where
         W: Write,
     {
-        if exported {
-            writeln!(stdout, "declare -fx {name}")?;
-        }
         // declare -f prints the stored command tree through the GNU
         // print_cmd.c port so it matches `type NAME` and upstream bash,
         // including the body kind and definition-level redirects.
@@ -227,7 +224,14 @@ impl Executor {
             info.map(|info| info.def_redirects.as_slice())
                 .unwrap_or(&[]),
         );
-        writeln!(stdout, "{text}")
+        writeln!(stdout, "{text}")?;
+        // GNU setattr.def show_var_attributes: the definition prints
+        // first, the `declare -fx NAME' attribute line follows it
+        // (`export -pf`, `declare -pfx NAME`; rubash#1083).
+        if exported {
+            writeln!(stdout, "declare -fx {name}")?;
+        }
+        Ok(())
     }
 
     pub(in crate::executor) fn apply_exported_functions_to_child(&self, process: &mut Command) {

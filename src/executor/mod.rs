@@ -550,6 +550,13 @@ pub struct Executor {
     /// the posix ERREXIT for `command eval '...broken...'` — errors8.sub
     /// `command eval '( '` must not exit the shell.
     command_builtin_depth: usize,
+    /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
+    /// standard path for the re-dispatched command's OWN lookup only.
+    /// Set for the duration of the re-dispatch and consulted by the
+    /// simple-command execution lookup; the shell's $PATH variable —
+    /// and therefore child environments and nested builtins' PATH
+    /// reads — is never mutated (rubash#1047).
+    standard_path_scope: Option<String>,
     debug_trap_running: bool,
     /// rubash#375: parse-once cache for the DEBUG trap action. GNU parses a
     /// trap action once at `trap` invocation (trap.c read_trap_action) and
@@ -562,7 +569,7 @@ pub struct Executor {
     /// action text pays zero clones and zero parses per firing. Any change
     /// to the spliced text (trap re-set, alias-table change feeding the
     /// splice) misses and re-parses.
-    debug_trap_action_cache: std::cell::RefCell<Option<(String, crate::parser::Ast)>>,
+    debug_trap_action_cache: std::cell::RefCell<Option<(String, crate::parser::Ast, i64)>>,
     return_trap_running: bool,
     signal_trap_running: bool,
     /// The last value written to the OS environment's
@@ -742,6 +749,13 @@ pub struct Executor {
     /// that clears `evalerror_pending` clears this alongside, so a caught
     /// abort never poisons a later unrelated abandon with 127.
     pub(crate) nounset_force_eof: Cell<bool>,
+    /// rubash#1130: a [[ ]] operand word hit a FATAL expansion error
+    /// (nounset unbound) during cond_expand_word; the diagnostic and
+    /// exit_code are already in place and
+    /// execute_conditional_command_with_redirects converts the flag
+    /// into the FORCE_EOF/DISCARD unwind, since the conditional
+    /// evaluator itself only returns an i32 status.
+    pub(crate) conditional_expansion_fatal: Cell<bool>,
     /// rubash#637: marks a pending evalerror abort as bad-subscript class.
     /// The eval boundary absorbs exactly this class (eval returns failure,
     /// the caller continues — GNU evalstring.c:365,422-442 swallowing
@@ -800,6 +814,17 @@ pub struct Executor {
     /// assignment expansion error sites, reset at each execute_ast loop
     /// iteration, consulted by maybe_run_error_trap.
     pub(crate) command_expansion_failed: Cell<bool>,
+    /// rubash#1164: GNU samples `was_error_trap` (execute_cmd.c:914/851 —
+    /// signal_is_trapped(ERROR_TRAP) && !signal_is_ignored) BEFORE a
+    /// command executes and adjudicates that command's failure against the
+    /// sample, reading the action string at fire time. A trap INSTALLED by
+    /// the command itself (a function that sets an ERR trap in its body,
+    /// then fails via its action's `return`) therefore does not re-fire
+    /// for the enclosing call. The ast_exec list loop refreshes this per
+    /// command; execute_ast_inner saves/restores it across nested lists.
+    /// None means no enclosing command is being adjudicated (direct
+    /// dispatch paths) — the runner then falls back to live presence.
+    pub(crate) err_trap_armed_sample: Cell<Option<bool>>,
     /// Nesting depth of `execute_ast_inner`: a nested list (function body,
     /// loop body, sourced text, ...) unwinds silently while an evalerror
     /// abort is pending; only the reader-level loop skips to the next
@@ -971,6 +996,19 @@ pub struct Executor {
     /// (command_substitute has no :1831-equivalent); the flat-command loop
     /// clears it between top-level commands as a backstop. rubash#846.
     pub(crate) compound_redirect_failed: Cell<bool>,
+    /// rubash#1025: expanded targets a compound command's prepare phase
+    /// (apply_compound_*_arm / apply_brace_group_redirects) already
+    /// created through the noclobber O_EXCL open in
+    /// create_redirect_output_prepared. The bind phase
+    /// (open_compound_output_redirects) opens the SAME redirect again to
+    /// bind the fd table; without this record its O_EXCL open fails on
+    /// the file the prepare phase just created, so
+    /// `set -C; { :; } > fresh` wrongly reports "cannot overwrite
+    /// existing file" for a file that did not exist before the command.
+    /// The bind phase consumes (removes) the record, a genuinely
+    /// pre-existing file still fails in the prepare phase itself, and
+    /// simple commands never consult the set.
+    pub(crate) noclobber_prepared_targets: std::cell::RefCell<std::collections::HashSet<String>>,
     /// The group's execute_ast ended by unwinding (`exit`, errexit, POSIX
     /// special-builtin failure, fatal expansion — GNU's
     /// jump_to_top_level(EXITPROG/ERREXIT/FORCE_EOF)). run_source converts

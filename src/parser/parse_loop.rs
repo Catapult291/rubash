@@ -365,7 +365,26 @@ pub(super) fn run_command_loop(tokens: &[Token], state: &mut ParseState, start: 
                         state.ast.commands.pop();
                     }
                 }
+                // rubash#1093: an extglob-gate `(' error is not a settled
+                // parse failure — a runtime `shopt -s extglob` on an
+                // earlier line can make the command valid by the time it
+                // executes, and the executor reparses it then. Keep
+                // reading the remaining commands so they exist in the
+                // AST; if the flip never comes, the executor's diagnostic
+                // still aborts with status 2 before any of them runs,
+                // which is GNU's net outcome for a real syntax error.
+                let gate_error = error
+                    .get_assignment("__RUBASH_PARSE_ERROR_NEAR__")
+                    .is_some_and(|spec| {
+                        spec.split(PARSE_ERROR_FIELD_SEP)
+                            .next()
+                            .is_some_and(|token| token == "(")
+                    });
                 state.ast.commands.push(error);
+                if gate_error {
+                    i = next_i;
+                    continue;
+                }
                 break;
             }
             // A successfully parsed compound's keyword frames are net

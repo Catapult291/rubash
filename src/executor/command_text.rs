@@ -360,7 +360,7 @@ fn err_append_source_text(cmd: &CommandNode, redirect: &Redirect) -> String {
     format_redirect("2>>", redirect)
 }
 
-fn command_words_source_text_for_command(cmd: &CommandNode) -> String {
+pub(in crate::executor) fn command_words_source_text_for_command(cmd: &CommandNode) -> String {
     let mut rendered = cmd
         .words
         .iter()

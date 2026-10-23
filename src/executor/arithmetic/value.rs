@@ -53,6 +53,14 @@ impl ConditionalArithParser<'_> {
                     .push(ArithEvalDiag::BadSubscript(display.clone()));
                 Some(0)
             }
+            ArithLValue::BadSubscriptElement { display } => {
+                // `a[@]`/`a[*]` read: GNU array_expand_index diagnoses
+                // `a[@]: bad array subscript` ONCE and the element reads
+                // as 0 (arrayfunc.c; verified GNU 5.3.20, rubash#1136).
+                self.diags
+                    .push(ArithEvalDiag::BadSubscript(display.clone()));
+                Some(0)
+            }
             ArithLValue::AssocEmptyKey { name, .. } => {
                 // `C['']` read: the akey failed `*akey == 0` inside
                 // array_value_internal — GNU INDEX_ERROR diagnoses the bare
@@ -304,7 +312,7 @@ impl ConditionalArithParser<'_> {
             if name == "RANDOM" {
                 return self
                     .random_state
-                    .map(|state| i128::from(next_random_from_state(state)));
+                    .map(|state| i128::from(next_random_from_state(state, self.env_vars)));
             }
             if name == "SRANDOM" {
                 return self
@@ -393,8 +401,17 @@ impl ConditionalArithParser<'_> {
         if let Some(number) = strlong_leading_zero_octal(value) {
             return Some(bash_arith(number));
         }
-        if let Ok(number) = value.parse::<i128>() {
-            return Some(bash_arith(number));
+        // rubash#1101: a leading-zero digit string containing 8/9 (`08`,
+        // `-08`, `+09`) is NOT decimal — GNU strlong takes the octal arm
+        // for every `0nnn` value and evalerrors "value too great for
+        // base" (expr.c:1539-1557). The plain-decimal shortcut must not
+        // swallow it; let it fall through to the nested expression parser,
+        // whose literal reader raises exactly that error (the same path
+        // that already handles `08x` / `0x1g` values correctly).
+        if !leading_zero_digit_string(value) {
+            if let Ok(number) = value.parse::<i128>() {
+                return Some(bash_arith(number));
+            }
         }
 
         let mut resolving = self.resolving.clone();
@@ -469,6 +486,21 @@ impl ConditionalArithParser<'_> {
         op: &str,
         rhs: i128,
     ) -> Option<i128> {
+        self.assign_lvalue_precaptured(lvalue, op, rhs, None)
+    }
+
+    /// `precaptured` is the lvalue's value read BEFORE the RHS was parsed
+    /// (GNU expassign's expcond read, expr.c:511-626); compound assignment
+    /// must combine THAT value with the RHS, not a post-RHS re-read
+    /// (rubash#1113). Callers that evaluate the RHS before ever seeing the
+    /// lvalue pass None and keep the re-read.
+    pub(super) fn assign_lvalue_precaptured(
+        &mut self,
+        lvalue: &ArithLValue,
+        op: &str,
+        rhs: i128,
+        precaptured: Option<i128>,
+    ) -> Option<i128> {
         // GNU expr.c:607-615 expassign: the bind is skipped under noeval —
         // no readonly check, no current-value read, no write. The computed
         // value is still returned to the caller.
@@ -486,13 +518,18 @@ impl ConditionalArithParser<'_> {
             self.set_lvalue(&lvalue, rhs);
             return Some(rhs);
         }
-        let current = self.lvalue_value(&lvalue)?;
+        let current = match precaptured {
+            Some(value) => value,
+            None => self.lvalue_value(&lvalue)?,
+        };
         let value = match op {
             "+=" => bash_arith(current + rhs),
             "-=" => bash_arith(current - rhs),
             "*=" => bash_arith(current * rhs),
-            "<<=" => bash_arith((current as i64).wrapping_shl(u32::try_from(rhs).ok()?) as i128),
-            ">>=" => bash_arith((current as i64).wrapping_shr(u32::try_from(rhs).ok()?) as i128),
+            // GNU expr.c expshift C-shift semantics (rubash#1135): the
+            // count wraps modulo the word size; it never evalerrors.
+            "<<=" => bash_arith((current as i64).wrapping_shl(rhs as u32) as i128),
+            ">>=" => bash_arith((current as i64).wrapping_shr(rhs as u32) as i128),
             "&=" => bash_arith(current & rhs),
             "^=" => bash_arith(current ^ rhs),
             "|=" => bash_arith(current | rhs),
@@ -536,6 +573,9 @@ impl ConditionalArithParser<'_> {
             // `a[]` has no writable name — GNU's bind fails later with
             // `not a valid identifier`; there is no readonly check.
             ArithLValue::InvalidElement { .. } => return true,
+            // `a[@]` bind likewise fails as a bad subscript, never as a
+            // readonly error (rubash#1136).
+            ArithLValue::BadSubscriptElement { .. } => return true,
             // GNU rejects the empty akey at arrayfunc.c:402-407 BEFORE the
             // readonly check inside bind_assoc_variable, so the empty-key
             // bind is never a readonly failure.
@@ -563,6 +603,12 @@ impl ConditionalArithParser<'_> {
                 // expression value is unaffected).
                 self.diags
                     .push(ArithEvalDiag::InvalidIdentifier(display.clone()));
+            }
+            ArithLValue::BadSubscriptElement { display } => {
+                // `a[@] = v` bind: GNU diagnoses `a[@]: bad array
+                // subscript` once and stores nothing (rubash#1136).
+                self.diags
+                    .push(ArithEvalDiag::BadSubscript(display.clone()));
             }
             ArithLValue::AssocEmptyKey { bind_display, .. } => {
                 // `C['']` on the bind side: GNU assign_array_element_internal
@@ -762,6 +808,17 @@ impl ConditionalArithParser<'_> {
         // (same discipline as the indexed element store above).
         self.env_vars.mark_array_cells_dirty();
     }
+}
+
+/// Whether a variable value is a pure digit string (optional sign) with
+/// a leading zero and more than one digit (`08`, `010`, `-09`): GNU
+/// strlong reads every such value in the octal arm, never as decimal.
+fn leading_zero_digit_string(value: &str) -> bool {
+    let digits = match value.as_bytes().first() {
+        Some(b'-' | b'+') => &value[1..],
+        _ => value,
+    };
+    digits.len() > 1 && digits.starts_with('0') && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// GNU expr.c:1539/1557 strlong's `0nnn -> base 8` arm for variable

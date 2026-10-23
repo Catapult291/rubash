@@ -250,7 +250,17 @@ pub(super) fn parse_case_command(
                             "__RUBASH_PARSE_SOURCE__".to_string(),
                             pattern_error_line_text(tokens, i),
                         );
-                        return Some(finish_compound_command(command, tokens, tokens.len()));
+                        // Consume only through this case's `esac`, not
+                        // the rest of the input: commands after the case
+                        // are separate units (GNU's reader reaches them
+                        // independently), and the executor may recover
+                        // this node by reparsing it after a runtime
+                        // extglob flip (rubash#1093).
+                        return Some(finish_compound_command(
+                            command,
+                            tokens,
+                            case_command_end_index(tokens, start),
+                        ));
                     }
                     current_pattern.push('(');
                     current_raw_pattern.push_str(&tokens[i].raw);
@@ -403,6 +413,27 @@ fn raw_token_span(tokens: &[Token], start: usize, end: usize) -> String {
         parts.push(token.raw.clone());
     }
     parts.concat()
+}
+
+/// Index just past the `esac` that closes the case command starting at
+/// `start`, counting nested `case`/`esac` keyword pairs. Falls back to
+/// the end of input when no closing `esac` exists (genuinely unterminated
+/// case), preserving the historical consume-everything behavior there.
+fn case_command_end_index(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < tokens.len() {
+        if is_keyword(tokens, index, "case") {
+            depth += 1;
+        } else if is_keyword(tokens, index, "esac") {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return index + 1;
+            }
+        }
+        index += 1;
+    }
+    tokens.len()
 }
 
 pub(super) fn case_parse_error_message(_tokens: &[Token], _start: usize) -> &'static str {

@@ -29,7 +29,65 @@ impl Executor {
             .open(shell_path_to_windows(target, &self.shell_state.env_vars))
     }
 
+    /// rubash#1026: GNU redir.c netopen — `/dev/tcp/host/port` and
+    /// `/dev/udp/host/port` are not filesystem paths: opening one
+    /// connects a socket (TCP connect(2); UDP bind+connect, which
+    /// succeeds even with no listener). Host may be a name (resolved by
+    /// the OS) or an address; the port must be numeric (GNU also accepts
+    /// service names via getservbyname — not ported).
+    pub(in crate::executor) fn is_net_redirect_target(&self, target: &str) -> bool {
+        target.starts_with("/dev/tcp/") || target.starts_with("/dev/udp/")
+    }
+
+    /// Formatted variant: the returned error already carries the
+    /// `<target>: <strerror>` shape (posix_errors::path_error), matching
+    /// the other open paths in this module.
+    pub(in crate::executor) fn open_net_redirect(&self, target: &str) -> io::Result<File> {
+        self.open_net_redirect_raw(target)
+            .map_err(|e| crate::posix_errors::path_error(target, e))
+    }
+
+    /// Raw variant for callers that apply posix_errors::path_error
+    /// themselves (e.g. set_fd_readwrite_file's `<>` path).
+    pub(in crate::executor) fn open_net_redirect_raw(&self, target: &str) -> io::Result<File> {
+        let (udp, rest) = if let Some(rest) = target.strip_prefix("/dev/tcp/") {
+            (false, rest)
+        } else if let Some(rest) = target.strip_prefix("/dev/udp/") {
+            (true, rest)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No such file or directory",
+            ));
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "Invalid argument");
+        let (host, port_text) = rest.rsplit_once('/').ok_or_else(invalid)?;
+        let port: u16 = port_text.parse().map_err(|_| invalid())?;
+        if host.is_empty() {
+            return Err(invalid());
+        }
+        let file = if udp {
+            let bind_addr = if host.contains(':') {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            let socket = std::net::UdpSocket::bind(bind_addr)?;
+            socket.connect((host, port))?;
+            udp_socket_file(socket)
+        } else {
+            let stream = std::net::TcpStream::connect((host, port))?;
+            tcp_stream_file(stream)
+        };
+        Ok(file)
+    }
+
     fn open_input_redirect_impl(&self, target: &str, consume: bool) -> io::Result<File> {
+        // rubash#1026: /dev/tcp|udp targets connect a socket, never a
+        // filesystem open (see open_net_redirect).
+        if self.is_net_redirect_target(target) {
+            return self.open_net_redirect(target);
+        }
         if is_null_device(target) {
             return File::open(shell_path_to_windows(
                 "/dev/null",
@@ -263,6 +321,11 @@ impl Executor {
         target: &str,
         clobber: bool,
     ) -> io::Result<File> {
+        // rubash#1026: /dev/tcp|udp targets connect a socket (see
+        // open_net_redirect); noclobber has no meaning for them.
+        if self.is_net_redirect_target(target) {
+            return self.open_net_redirect(target);
+        }
         if is_null_device(target) {
             return OpenOptions::new().write(true).open(shell_path_to_windows(
                 "/dev/null",
@@ -293,6 +356,37 @@ impl Executor {
                 });
         }
         File::create(path).map_err(|e| crate::posix_errors::path_error(&target, e))
+    }
+
+    /// rubash#1025: prepare-phase variant of [`Self::create_redirect_output`]
+    /// for compound commands. GNU do_redirection_internal opens a
+    /// compound's redirect ONCE; rubash's prepare phase (create/truncate
+    /// here, splice appends into the body) and bind phase
+    /// (open_compound_output_redirects) open it twice, so a successful
+    /// noclobber O_EXCL create is recorded here and the bind phase
+    /// consumes the record instead of failing on the file this same
+    /// command just created.
+    pub(in crate::executor) fn create_redirect_output_prepared(
+        &self,
+        target: &str,
+        clobber: bool,
+    ) -> io::Result<File> {
+        let file = self.create_redirect_output(target, clobber)?;
+        if !clobber
+            && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "noclobber")
+        {
+            self.noclobber_prepared_targets
+                .borrow_mut()
+                .insert(target.to_string());
+        }
+        Ok(file)
+    }
+
+    /// Consume a prepare-phase noclobber record (rubash#1025): true when
+    /// `target` was already created by the current compound's prepare
+    /// phase, so the bind phase must not run the O_EXCL open again.
+    pub(in crate::executor) fn take_noclobber_prepared_target(&self, target: &str) -> bool {
+        self.noclobber_prepared_targets.borrow_mut().remove(target)
     }
 
     pub(in crate::executor) fn redirect_output_path_target(&self, target: &str) -> String {
@@ -990,6 +1084,10 @@ impl Executor {
     pub(in crate::executor) fn function_stdin_is_command_source(&self, cmd: &CommandNode) -> bool {
         cmd.redirect_in.is_none()
             && self.virtual_fd_stdin_remaining(0).is_none()
+            // rubash#1102/#1103: an exec-rebound fd 0 (file endpoint or
+            // closed entry) is the command's source, not FUNCTION_STDIN.
+            && !self.fd_table.is_closed(0)
+            && !matches!(self.fd_table.read_endpoint(0), Some(FdReadEndpoint::File(_)))
             && self.function_stdin_remaining().is_some()
     }
 
@@ -1164,6 +1262,14 @@ impl Executor {
                     &bytes,
                 ));
             }
+            // rubash#1103: the null device is an immediate EOF, not a live
+            // character device — declining here made `cat </dev/null`
+            // inside a pipeline-stage group fall through to the ambient
+            // stage buffer and print the pipe bytes. GNU reads /dev/null
+            // as empty, always.
+            if is_null_device(&target) {
+                return Some(String::new());
+            }
             // GNU redir.c dup2's the descriptor — a character device has
             // no EOF, so slurping blocks forever on the console
             // (test.tests `t -t 0 < /dev/tty` hung via
@@ -1197,6 +1303,31 @@ impl Executor {
 
         if let Some(input) = self.virtual_fd_stdin_remaining(0) {
             return Some(input);
+        }
+
+        // rubash#1102/#1103: an exec-installed fd 0 in the fd table shadows
+        // the ambient FUNCTION_STDIN buffer. Inside a pipeline stage,
+        // `exec <file` / `exec <&-` rebinds fd 0 for the rest of the stage
+        // (GNU redir.c: the redirection is permanent in the forked stage
+        // shell), so string-stdin consumers must read the rebound endpoint,
+        // not the pipe bytes that were current before the exec. A closed
+        // fd 0 is EOF; a file endpoint streams its remaining bytes
+        // through the shared-offset dup in open_fd_read_endpoint.
+        if self.fd_table.is_closed(0) {
+            return Some(String::new());
+        }
+        if matches!(
+            self.fd_table.read_endpoint(0),
+            Some(FdReadEndpoint::File(_))
+        ) {
+            if let Ok(mut file) = self.open_fd_read_endpoint(0, "fd 0") {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let _ = file.read_to_end(&mut buf);
+                return Some(crate::executor::substitution_metadata::bytes_to_shell_text(
+                    &buf,
+                ));
+            }
         }
 
         // Check for FUNCTION_STDIN (set by pipeline execution for builtins)
@@ -1792,4 +1923,34 @@ mod windows_raw_stdio {
 
         Ok(())
     }
+}
+
+/// Connected TCP stream as a std File (rubash#1026).
+#[cfg(unix)]
+fn tcp_stream_file(stream: std::net::TcpStream) -> File {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(stream.into_raw_fd()) }
+}
+
+/// Connected TCP stream as a std File (rubash#1026).
+#[cfg(windows)]
+fn tcp_stream_file(stream: std::net::TcpStream) -> File {
+    // A SOCKET is a kernel handle: File adopts it through FromRawHandle
+    // (FromRawSocket is only implemented for the std socket types, not File).
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    unsafe { File::from_raw_handle(stream.into_raw_socket() as _) }
+}
+
+/// Connected UDP socket as a std File (rubash#1026).
+#[cfg(unix)]
+fn udp_socket_file(socket: std::net::UdpSocket) -> File {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(socket.into_raw_fd()) }
+}
+
+/// Connected UDP socket as a std File (rubash#1026).
+#[cfg(windows)]
+fn udp_socket_file(socket: std::net::UdpSocket) -> File {
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    unsafe { File::from_raw_handle(socket.into_raw_socket() as _) }
 }
