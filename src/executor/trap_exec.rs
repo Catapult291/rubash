@@ -1471,12 +1471,45 @@ impl Executor {
     ) -> Result<Option<i32>, ExecuteError> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+        // rubash#1250: the issue's `sleep 30` repro lands here (sleep is a
+        // builtin), not in wait_external_child. An interactive shell with
+        // untrapped SIGINT must survive Ctrl-C with rc=130 like GNU, which
+        // reaps its signal-killed external sleep; SIG_DFL would kill this
+        // process inside the slice sleep. The guard BLOCKS (not ignores)
+        // so the arrival stays observable: poll_abort ends the sleep with
+        // 128+SIGINT instead of running it to completion (rc=0).
+        #[cfg(unix)]
+        let _builtin_guard =
+            super::external_inner::ForegroundBuiltinSigintGuard::hold_if_interactive_untrapped(
+                self,
+            );
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
             std::thread::sleep((deadline - now).min(SLICE));
+            // rubash#1250: the hold above routed untrapped SIGINT to the
+            // mailbox for this wait. Consume it HERE (before observe drains
+            // it as an exit-jump error): abort the virtual child with
+            // 128+SIGINT like a reaped signal death, and keep the reader
+            // going. take_sigint_abort is armed-gated so a TRAPPED SIGINT
+            // still flows through observe and runs its action.
+            #[cfg(unix)]
+            if _builtin_guard.take_sigint_abort() {
+                return Ok(Some(libc::SIGINT));
+            }
+            // The µs race (delivery lands between the take above and
+            // observe's own take) surfaces as the untrapped error; fold it
+            // into the same abort instead of an exit jump.
+            #[cfg(unix)]
+            match self.observe_signals_while_blocked() {
+                Err(ExecuteError::ExitCode(code)) if code == 128 + libc::SIGINT => {
+                    return Ok(Some(libc::SIGINT));
+                }
+                other => other?,
+            }
+            #[cfg(not(unix))]
             self.observe_signals_while_blocked()?;
             // observe_signals_while_blocked re-queued any trapped
             // deliveries; take them back for the virtual-child check
