@@ -584,6 +584,21 @@ fn virtual_device_test(op: &str, operand: &str) -> Option<bool> {
         });
     }
 
+    // niubash#519 family: /dev/tty is the controlling-terminal device.
+    // GNU's node always exists and is a readable+writable character
+    // device — stat(2)/access(2) succeed even without a controlling
+    // terminal (only open() would fail ENXIO), so the truth table is
+    // /dev/null's plus no existence probing. Windows metadata("CON")
+    // fails on device names, so this must answer before the filesystem.
+    if operand == "/dev/tty" {
+        return Some(match op {
+            "-a" | "-e" | "-r" | "-w" | "-c" => true,
+            "-d" | "-f" | "-x" | "-s" | "-b" | "-p" | "-S" | "-u" | "-g" | "-k" | "-h" | "-L"
+            | "-O" | "-G" | "-N" => false,
+            _ => return None,
+        });
+    }
+
     if matches!(operand, "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0") {
         return Some(match op {
             "-a" | "-e" | "-r" | "-c" => true,
