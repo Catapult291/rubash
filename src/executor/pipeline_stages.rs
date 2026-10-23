@@ -295,6 +295,10 @@ impl Executor {
 
         let saved_dir = env::current_dir().ok();
         let mut subshell = self.command_substitution_executor();
+        // A pipeline member runs in a subshell: caught signal traps reset to
+        // the inherited disposition (execute_cmd.c subshell trap reset), so
+        // only traps the function body itself installs run at its exit.
+        crate::builtins::trap::reset_for_subshell(&mut subshell.shell_state.env_vars);
         // Function pipeline stages are compound command bodies for errexit
         // (execute_cmd.c execute_function: the body inherits the element's
         // CMD_IGNORE_RETURN), so the subshell keeps the parent's
@@ -317,8 +321,23 @@ impl Executor {
             self.pipeline_stdout_stream,
             || subshell.execute_function(&function_name, &args, &call),
         );
+        // GNU execute_cmd.c:1761-1763 (execute_in_subshell): a pipeline
+        // element is a forked subshell whose exit — implicit after the body
+        // as much as via `exit` — runs the subshell's EXIT trap. The trap
+        // table was reset at entry above, so only traps the body installed
+        // can fire (rubash#1104: `f | cat` with `trap ... EXIT` inside f
+        // carries the trap output down the pipe). Run before harvesting the
+        // captures so both the field buffer and the thread-local capture
+        // (still open) receive the trap output.
+        let body_status = subshell.last_exit_code();
+        let (trap_thread_captured, trap_result) =
+            crate::executor::shell_options::capture_stdout_streamed(
+                self.pipeline_stdout_stream,
+                || subshell.run_exit_trap_for_status(body_status),
+            );
         let mut output = subshell.stdout_capture.take().unwrap_or_default();
         output.extend_from_slice(&thread_captured);
+        output.extend_from_slice(&trap_thread_captured);
         // The call's ORDERED redirect list (call.redirects) still carries
         // the stage's output redirects, and execute_function's redirect
         // walk applied them onto the subshell's fd table before the body
@@ -335,18 +354,18 @@ impl Executor {
             self.pipeline_stage_fds_pre_wired.set(true);
         }
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
-        let status = subshell.last_exit_code();
 
         if let Some(saved_dir) = saved_dir {
             let _ = env::set_current_dir(saved_dir);
         }
-        let status = match result {
-            Ok(()) => status,
-            Err(ExecuteError::ExitCode(code)) | Err(ExecuteError::ExpansionFailure(code)) => code,
+        let status = match (result, trap_result) {
+            (Ok(()), Ok(trap_status)) => trap_status,
+            (Err(ExecuteError::ExitCode(code)), Ok(_))
+            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
             // niubash#345: a function pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
-            Err(ExecuteError::BrokenPipe) => 141,
-            Err(error) => return Err(error),
+            (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
+            (_, Err(error)) | (Err(error), _) => return Err(error),
         };
         let consumed = subshell
             .shell_state
@@ -435,6 +454,9 @@ impl Executor {
         }
 
         let mut subshell = self.command_substitution_executor();
+        // A pipeline member runs in a subshell: caught signal traps reset to
+        // the inherited disposition (execute_cmd.c subshell trap reset), so
+        // only traps the member itself installs run at its exit.
         // rubash#761: a streaming tail's reader pulls fd 0 (the real OS pipe
         // bound by `execute_external_prefix_streaming_tail`); leave
         // FUNCTION_STDIN ABSENT so `read` does not short-circuit to the
@@ -458,18 +480,25 @@ impl Executor {
         // not recorded twice.
         super::profiler::cancel_pending_dispatch();
         let result = subshell.execute_command(&call);
+        // GNU execute_cmd.c:1761-1763 (execute_in_subshell): the element's
+        // exit runs the subshell's EXIT trap (rubash#1104 family: `trap
+        // 'echo X' EXIT | cat` carries X down the pipe). The table was reset
+        // at entry, so only traps the member installed can fire. Run before
+        // harvesting the captures so the trap output joins the pipe.
+        let body_status = subshell.last_exit_code();
+        let trap_result = subshell.run_exit_trap_for_status(body_status);
         let output = crate::executor::shell_options::take_stdout_capture();
         let stderr = subshell.stderr_capture.take().unwrap_or_default();
-        let status = subshell.last_exit_code();
 
         crate::executor::shell_options::restore_stdout_capture(saved_capture);
-        let status = match result {
-            Ok(()) => status,
-            Err(ExecuteError::ExitCode(code)) | Err(ExecuteError::ExpansionFailure(code)) => code,
+        let status = match (result, trap_result) {
+            (Ok(()), Ok(trap_status)) => trap_status,
+            (Err(ExecuteError::ExitCode(code)), Ok(_))
+            | (Err(ExecuteError::ExpansionFailure(code)), Ok(_)) => code,
             // niubash#345: a builtin pipeline element writing past the
             // consumer's exit is SIGPIPE-killed (status 141).
-            Err(ExecuteError::BrokenPipe) => 141,
-            Err(error) => return Err(error),
+            (Err(ExecuteError::BrokenPipe), Ok(_)) => 141,
+            (_, Err(error)) | (Err(error), _) => return Err(error),
         };
         let consumed = subshell
             .shell_state

@@ -3341,6 +3341,20 @@ impl Executor {
                 )))
             }
             "trap" => {
+                // A `trap ACTION EXIT` install as a pipeline element runs in
+                // the forked subshell in GNU and fires at the element's exit
+                // (execute_cmd.c:1761-1763; rubash#1104: `trap 'echo X' EXIT
+                // | cat` carries X down the pipe). The inline path below runs
+                // the builtin against a throwaway env clone, so an install
+                // would be silently discarded. Decline EXIT installs to the
+                // subshell stage (which resets and runs the EXIT trap);
+                // queries (`trap -p`), resets (`trap - EXIT`), and non-EXIT
+                // installs keep the inline path — a stage is a single
+                // command, so DEBUG/RETURN/ERR installs have nothing left to
+                // fire at, and resets are no-ops on the reset table.
+                if trap_stage_installs_exit(command) {
+                    return self.execute_builtin_pipeline_stage(command, input, streaming_stdin);
+                }
                 let args = command.words[1..]
                     .iter()
                     .map(|word| self.expand_word(word))
@@ -3994,6 +4008,45 @@ fn inline_wc_word_count(input: &str) -> usize {
         .split(|byte| ASCII_WHITESPACE.contains(byte))
         .filter(|word| !word.is_empty())
         .count()
+}
+
+/// Whether a `trap` pipeline element installs an EXIT trap. Mirrors the
+/// option parsing of builtins/trap.rs execute_with_io (`--` separator,
+/// `-l`/`-p`/`-P` clusters): queries decline nothing. A single operand is a
+/// reset-or-usage, and `-`/`0` actions clear — all in-stage no-ops on the
+/// subshell-reset table — so only a real install naming EXIT (or 0) declines
+/// the inline arm to the subshell stage (rubash#1104).
+fn trap_stage_installs_exit(command: &CommandNode) -> bool {
+    let words: Vec<&str> = command.words.iter().skip(1).map(String::as_str).collect();
+    let mut index = 0;
+    if words.first() == Some(&"--") {
+        index = 1;
+    }
+    while let Some(arg) = words.get(index) {
+        if *arg == "--" {
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || *arg == "-" {
+            break;
+        }
+        // A query flag (`-l` list, `-p`/`-P` print) or an invalid flag (the
+        // builtin errors inline): never an install.
+        if arg[1..].chars().any(|c| matches!(c, 'l' | 'p' | 'P')) {
+            return false;
+        }
+        index += 1;
+    }
+    let Some((action, signals)) = words.get(index..).and_then(|rest| rest.split_first()) else {
+        return false;
+    };
+    if signals.is_empty() || *action == "-" || *action == "0" {
+        return false;
+    }
+    signals.iter().any(|signal| {
+        let signal = crate::executor::parameter_decode::strip_matching_quotes(signal);
+        signal.eq_ignore_ascii_case("EXIT") || signal == "0"
+    })
 }
 
 pub(in crate::executor) fn head_line_count(args: &[String]) -> Option<usize> {
