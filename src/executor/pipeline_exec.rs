@@ -1017,6 +1017,14 @@ impl Executor {
             }
             return Some(TimedPipelineInput { chunks, eof_at: at });
         }
+        // `(sleep N; echo x)` producers model timing exactly like the
+        // brace-group form: the subshell body is one sequential list.
+        if let Some(subshell) = &command.subshell_command {
+            for command in &subshell.body {
+                self.timed_pipeline_step(command, &mut at, &mut chunks)?;
+            }
+            return Some(TimedPipelineInput { chunks, eof_at: at });
+        }
         self.timed_pipeline_step(command, &mut at, &mut chunks)?;
         Some(TimedPipelineInput { chunks, eof_at: at })
     }
