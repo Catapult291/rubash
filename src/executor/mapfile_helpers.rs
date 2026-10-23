@@ -168,7 +168,12 @@ impl Executor {
         cmd: &CommandNode,
         read_fd: Option<u32>,
     ) -> Option<String> {
-        let Some(fd) = read_fd else {
+        // GNU mapfile.def: `-u fd` selects the descriptor zgetline reads;
+        // `-u 0` names fd 0 itself, so it is the ordinary fd-0 read below
+        // — the FUNCTION_STDIN mirror a pipeline stage parks its input on
+        // — not a numbered-fd serve (read.def's `-u` has the same rule;
+        // rubash#1207: `mapfile -u 0` from a pipe returned an empty array).
+        let Some(fd) = read_fd.filter(|fd| *fd != 0) else {
             // mapfile preserves carriage returns from CRLF input files. The generic
             // stdin helper is text-oriented, so use the raw-byte reader for a plain
             // fd-0 file redirect before falling back to heredoc/process-substitution
