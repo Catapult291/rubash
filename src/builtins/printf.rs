@@ -135,93 +135,81 @@ where
     let mut output_var = None;
     let mut index = 0;
 
-    let mut end_options = false;
-    if args.get(index) == Some(&"--") {
-        index += 1;
-        end_options = true;
-    }
-
-    if !end_options
-        && matches!(args.get(index), Some(option) if option.starts_with('-') && !option.starts_with("-v"))
-    {
-        writeln!(
-            stderr,
-            "{}printf: {}: invalid option",
-            diagnostic_prefix(env_vars),
-            args[index]
-        )?;
-        writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
-        return Ok(EX_USAGE);
-    }
-
-    if !end_options {
-        let name = match args.get(index) {
-            Some(&"-v") => {
-                let Some(name) = args.get(index + 1) else {
-                    writeln!(
-                        stderr,
-                        "{}printf: -v: option requires an argument",
-                        diagnostic_prefix(env_vars)
-                    )?;
-                    // GNU internal_getopt errors are followed by
-                    // builtin_usage (builtins/common.c): every sibling
-                    // option-error arm here prints the usage line; the
-                    // missing-argument arm dropped it (rubash#1125).
-                    writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
-                    return Ok(EX_USAGE);
-                };
-                index += 2;
-                Some(*name)
-            }
-            Some(option) => option
-                .strip_prefix("-v")
-                .filter(|name| !name.is_empty())
-                .map(|name| {
-                    index += 1;
-                    name
-                }),
-            None => None,
-        };
-
-        if let Some(name) = name {
-            if !valid_identifier(name) && !valid_printf_array_target(name, env_vars) {
-                // GNU prints the expanded operand text; decode the
-                // marker-encoded assoc key the executor delivered so the
-                // diagnostic names `a[80's]`, not its carrier bytes.
-                let display = parse_printf_array_target(name)
-                    .map(|(base, subscript)| {
-                        let key =
-                            crate::executor::arithmetic::decode_arithmetic_assoc_key(subscript)
-                                .unwrap_or_else(|| subscript.to_string());
-                        format!("{base}[{key}]")
-                    })
-                    .unwrap_or_else(|| name.to_string());
+    // GNU builtins/bashgetopt.c internal_getopt(list, "v:") +
+    // builtins/printf.def:296-337: option words are scanned
+    // character-wise. `--` ends options; a bare `-` or a non-dash word
+    // stops the scan and becomes the format. `v` requires an argument —
+    // the rest of its own word or the next word unconditionally — and
+    // the identifier is validated the moment -v is read
+    // (printf.def:306-322), before getopt resumes scanning. The first
+    // unrecognized char is reported as `-<c>`, so `---` reports `--`
+    // and `-%s` reports `-%` (rubash#1100).
+    while let Some(&word) = args.get(index) {
+        if word == "--help" {
+            // ISHELP (builtins/common.h:27) -> CASE_HELPOPT: print this
+            // builtin's own help, return EX_USAGE.
+            crate::builtins::help::print_builtin_help("printf", stdout)?;
+            return Ok(EX_USAGE);
+        }
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        let rest = &word[1..];
+        let option = rest.chars().next().expect("len > 1 dash-word");
+        if option != 'v' {
+            writeln!(
+                stderr,
+                "{}printf: -{option}: invalid option",
+                diagnostic_prefix(env_vars)
+            )?;
+            writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
+            return Ok(EX_USAGE);
+        }
+        let inline = &rest['v'.len_utf8()..];
+        let name = if !inline.is_empty() {
+            index += 1;
+            inline
+        } else {
+            let Some(name) = args.get(index + 1) else {
                 writeln!(
                     stderr,
-                    "{}printf: `{}': not a valid identifier",
-                    diagnostic_prefix(env_vars),
-                    display
+                    "{}printf: -v: option requires an argument",
+                    diagnostic_prefix(env_vars)
                 )?;
+                // GNU internal_getopt errors are followed by
+                // builtin_usage (builtins/common.c): every sibling
+                // option-error arm here prints the usage line; the
+                // missing-argument arm dropped it (rubash#1125).
+                writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
                 return Ok(EX_USAGE);
-            }
-
-            output_var = Some(name);
-            if args.get(index) == Some(&"--") {
-                index += 1;
-                end_options = true;
-            }
+            };
+            index += 2;
+            name
+        };
+        if !valid_identifier(name) && !valid_printf_array_target(name, env_vars) {
+            // GNU prints the expanded operand text; decode the
+            // marker-encoded assoc key the executor delivered so the
+            // diagnostic names `a[80's]`, not its carrier bytes.
+            let display = parse_printf_array_target(name)
+                .map(|(base, subscript)| {
+                    let key = crate::executor::arithmetic::decode_arithmetic_assoc_key(subscript)
+                        .unwrap_or_else(|| subscript.to_string());
+                    format!("{base}[{key}]")
+                })
+                .unwrap_or_else(|| name.to_string());
+            writeln!(
+                stderr,
+                "{}printf: `{}': not a valid identifier",
+                diagnostic_prefix(env_vars),
+                display
+            )?;
+            return Ok(EX_USAGE);
         }
-    }
-
-    if !end_options && matches!(args.get(index), Some(option) if option.starts_with('-')) {
-        writeln!(
-            stderr,
-            "{}printf: {}: invalid option",
-            diagnostic_prefix(env_vars),
-            args[index]
-        )?;
-        writeln!(stderr, "printf: usage: printf [-v var] format [arguments]")?;
-        return Ok(EX_USAGE);
+        output_var = Some(name);
     }
 
     let Some(format) = args.get(index) else {
