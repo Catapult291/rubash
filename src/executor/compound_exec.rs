@@ -1408,12 +1408,19 @@ impl Executor {
                 }
                 RedirectKind::ReadWrite => {
                     let target = self.expand_redirect_target(redirect);
-                    match OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))
-                    {
+                    let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                    // niubash#519: CON rejects a read+write handle; the
+                    // stdin side needs only its CONIN$ half.
+                    let opened = if is_con_device_path(&path) {
+                        File::open("CONIN$")
+                    } else {
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .open(&path)
+                    };
+                    match opened {
                         Ok(file) => BackgroundStdio::File(file),
                         Err(_) => continue,
                     }

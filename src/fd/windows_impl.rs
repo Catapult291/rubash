@@ -574,9 +574,17 @@ pub fn open_file_append(path: &std::path::Path) -> std::io::Result<HANDLE> {
     // 3>>/dev/tty` (redir.c redir_open's open() — O_APPEND on a POSIX tty
     // succeeds, the Windows adaptation must not fail the open).
     if is_dos_device_path(path) {
-        return create_file(path, GENERIC_WRITE, OPEN_EXISTING);
+        return open_file_write(path);
     }
     create_file(path, FILE_APPEND_DATA | SYNCHRONIZE, OPEN_ALWAYS)
+}
+
+/// GENERIC_WRITE on an existing path — the device-open shape: DOS
+/// devices reject FILE_APPEND_DATA and have no file offset for O_TRUNC
+/// to act on, so this is what both the append and the readwrite
+/// adaptations fall back to (niubash#519).
+pub fn open_file_write(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    create_file(path, GENERIC_WRITE, OPEN_EXISTING)
 }
 
 /// `N<>file` — O_RDWR|O_CREAT.

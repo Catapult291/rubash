@@ -77,6 +77,27 @@ fn dev_tty_exec_bind_write_and_append_succeed() {
     assert!(stderr.is_empty(), "stderr={stderr:?}");
 }
 
+/// `<>` needs a read+write descriptor: CON rejects GENERIC_READ|
+/// GENERIC_WRITE outright, so the bind splits it into CONIN$ (read) +
+/// CONOUT$ (write) via FileFd::open_readwrite_pair. `exec N<>`,
+/// `{var}<>`, and the command-scoped form all used to fail the open.
+#[test]
+fn dev_tty_readwrite_redirect_succeeds() {
+    if !console_available() {
+        return;
+    }
+    let (stdout, stderr, code) = rubash(
+        "exec 5<>/dev/tty; echo \"a=$?\"; exec 5>&- 5<&-; \
+         {v}<>/dev/tty; echo \"b=$?\"; \
+         echo x <>/dev/tty; echo \"c=$?\"",
+    );
+    assert_eq!(
+        stdout, "a=0\nb=0\nx\nc=0\n",
+        "stderr={stderr:?} code={code:?}"
+    );
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+}
+
 /// `2>`, `&>`, `&>>` route through the same append-reopen machinery.
 #[test]
 fn dev_tty_stderr_and_combined_redirects_succeed() {

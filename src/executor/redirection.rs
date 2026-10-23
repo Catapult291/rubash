@@ -678,7 +678,7 @@ impl Executor {
                 && !target.starts_with("<(")
             {
                 let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
-                if let Err(error) = FileFd::open_readwrite(path) {
+                if let Err(error) = FileFd::open_readwrite_pair(path) {
                     let message = crate::posix_errors::path_error(&target, error);
                     let text = crate::posix_errors::message(&message);
                     return self

@@ -173,6 +173,22 @@ pub(in crate::executor) fn is_dos_device_path(path: &std::path::Path) -> bool {
     }
 }
 
+/// niubash#519: whether the Windows-translated path is exactly the
+/// console multiplex device CON — the one DOS device with no single
+/// read+write handle (GENERIC_READ|GENERIC_WRITE fails CreateFileW;
+/// CONIN$/CONOUT$ each open read-write fine).
+pub(in crate::executor) fn is_con_device_path(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::fd::is_dos_device_path(path) && path.to_string_lossy().eq_ignore_ascii_case("CON")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// niubash#519: append-mode open of an output redirect target
 /// (`N>>target`, `&>>target`, and the deferred-write reopens of
 /// OutputTarget::Path). GNU redir.c:725 redir_open uses a single
