@@ -177,17 +177,17 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<(), ExecuteError> {
-        // rubash#1020: the fast paths below apply flags/positionals and
-        // return success without ever looking at cmd's redirections, so
-        // `set -- -a -b > o1.txt` silently dropped the redirect (no file,
-        // no error) and `set -- -b 2>/bad/path` masked the open failure.
-        // GNU do_redirections runs before the builtin (redir.c), and the
-        // full path (execute_set -> write_buffered_builtin_output) honors
-        // them — route any redirected `set` there.
-        if compound_command_has_redirects(cmd) {
-            self.exit_code = self.execute_set(cmd)?;
-            return Ok(());
-        }
+        // GNU execute_cmd.c:5584 execute_builtin_or_function runs
+        // do_redirections BEFORE the builtin (a failed redirect reports
+        // EX_REDIRFAIL without running it); the buffered builtin applies
+        // those redirect side effects in write_buffered_builtin_output.
+        // The fast paths below used to return without it, silently
+        // dropping `set ... > f` (no file, no error -- rubash#1020).
+        // Routing every redirected `set` to the full path instead is
+        // wrong: the full set_with_io never assigns positional params,
+        // so `set -- -a -b > f` would lose $@. Route every fast path
+        // through the same redirect application the slow path uses;
+        // with no redirects it is a proven no-op skip.
         if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "restricted")
             && cmd.words[1..]
                 .iter()
@@ -197,10 +197,12 @@ impl Executor {
             return Ok(());
         }
         if self.apply_simple_set_flags(&cmd.words[1..]) {
+            self.write_buffered_builtin_output(cmd, &[], &[])?;
             self.exit_code = 0;
             return Ok(());
         }
         if self.apply_set_positional_operands(&cmd.words[1..]) {
+            self.write_buffered_builtin_output(cmd, &[], &[])?;
             self.exit_code = 0;
             return Ok(());
         }
@@ -210,6 +212,7 @@ impl Executor {
             // builtins::set; this branch covers upstream source tests that
             // inspect `$@`.
             self.set_positional_params(cmd.words[2..].to_vec());
+            self.write_buffered_builtin_output(cmd, &[], &[])?;
             self.exit_code = 0;
             return Ok(());
         }
