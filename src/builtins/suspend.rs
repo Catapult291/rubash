@@ -1,7 +1,8 @@
 //! suspend module.
 //!
 //! GNU Bash source ownership:
-// - builtins/suspend.def
+// - builtins/suspend.def suspend_builtin (`killpg (shell_pgrp, SIGSTOP)`
+//   on -f; `sh_nojobs` failure without job control otherwise)
 
 use std::io::{self, Write};
 
@@ -41,6 +42,24 @@ where
     }
 
     if force {
+        // GNU builtins/suspend.def suspend_builtin: with -f the login-shell
+        // and no-job-control guards are skipped and the shell stops its own
+        // process group — `killpg (shell_pgrp, SIGSTOP)` — returning SUCCESS
+        // once continued (rubash#1097). shell_pgrp is this process's group
+        // (jobs.c:4737 `shell_pgrp = getpgid (0)`); SIGSTOP/SIGCONT ride the
+        // kernel defaults (never in kill.rs's managed set), so no trap
+        // bookkeeping is needed. Non-unix has no SIGSTOP: keep the
+        // historical success no-op there.
+        #[cfg(unix)]
+        {
+            // SAFETY: getpgid/killpg with our own pgrp are pure queries.
+            let pgrp = unsafe { libc::getpgid(0) };
+            if pgrp > 0 {
+                unsafe {
+                    libc::killpg(pgrp, libc::SIGSTOP);
+                }
+            }
+        }
         return Ok(EXECUTION_SUCCESS);
     }
 

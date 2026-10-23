@@ -57,6 +57,64 @@ pub(in crate::executor) fn rubash_spawn_inherited_state(key: &str) -> bool {
     key.starts_with("__RUBASH_SETOPT_") || KEYS.contains(&key)
 }
 
+/// GNU jobs.c:2455/2460 pipeline_pgrp at fork time, recorded as j->pgrp
+/// (jobs.c:649) and substituted by `jobs -x` (builtins/jobs.def
+/// execute_list_with_replacements `itos (j->pgrp)`, rubash#1096): with job
+/// control the first pipeline pid becomes the group; without job control
+/// every job shares the shell's own pgrp. Rubash never calls setpgid, but
+/// the RECORDED value is what `jobs -x` prints, and without job control
+/// GNU's value is exactly the live shell pgrp — so read getpgid(0) here.
+/// Non-unix has no pgrp concept; the job pid keeps today's observable.
+fn async_job_pgrp(first_pid: u32, job_control: bool) -> u32 {
+    if !job_control {
+        #[cfg(unix)]
+        {
+            // SAFETY: getpgid(0) only queries our own process group.
+            let pgid = unsafe { libc::getpgid(0) };
+            if pgid > 0 {
+                return pgid as u32;
+            }
+        }
+    }
+    first_pid
+}
+
+/// rubash#1095: whether the wrapper spawn may absorb the body's outermost
+/// `( list )` — serialize the inner list because the spawn itself is GNU's
+/// single async/subshell fork (execute_cmd.c:701). The parens must carry
+/// nothing the inner list cannot: no assignments (they apply inside the
+/// child) and no surviving outer redirects or heredoc payloads (consumed
+/// stdio rides the spawn handles; anything left behind would be dropped
+/// with the parens). `! (...)` and heredoc-carrying parens keep the old
+/// shape (rare corners, behavior unchanged).
+fn background_paren_absorbable(command: &CommandNode, consumed: &[bool]) -> bool {
+    if command.subshell_command.is_none() || !command.assignments.is_empty() {
+        return false;
+    }
+    // Heredoc payloads live beside `redirects` (legacy mirrors plus
+    // heredoc_redirects); never drop the parens under those.
+    if command.heredoc.is_some()
+        || command.heredoc_body.is_some()
+        || command.here_string.is_some()
+        || command.here_string_carrier.is_some()
+        || !command.heredoc_redirects.is_empty()
+    {
+        return false;
+    }
+    for (index, redirect) in command.redirects.iter().enumerate() {
+        if matches!(
+            redirect.kind,
+            crate::parser::RedirectKind::HereDoc | crate::parser::RedirectKind::HereString
+        ) {
+            return false;
+        }
+        if !consumed.get(index).copied().unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
 /// niubash#362: true when a respawned async `&` child's `-c`
 /// payload is too large to ride the OS command line / a single argv entry.
 ///
@@ -478,16 +536,17 @@ impl Executor {
                     adopt_orphan_console(pid);
                     self.background_children
                         .insert(pid, crate::fd::SpawnedChild::from(child));
-                    self.shell_state
-                        .job_table
-                        .register_process(pid, display_source.clone(), true);
-                    self.shell_state.job_table.set_job_control(
-                        pid,
-                        crate::builtins::set::shell_option_enabled(
-                            &self.shell_state.env_vars,
-                            "monitor",
-                        ),
+                    let job_control = crate::builtins::set::shell_option_enabled(
+                        &self.shell_state.env_vars,
+                        "monitor",
                     );
+                    self.shell_state.job_table.register_process(
+                        pid,
+                        display_source.clone(),
+                        true,
+                        async_job_pgrp(pid, job_control),
+                    );
+                    self.shell_state.job_table.set_job_control(pid, job_control);
                     self.shell_state.last_background_pid = Some(pid);
                     // GNU expands the async simple command's words in the
                     // exec'd child; no substitution status may leak into the
@@ -581,9 +640,49 @@ impl Executor {
             wrapper_nonce.clone(),
         );
 
+        // rubash#1095: GNU execute_cmd.c:701 runs an async `( list )`
+        // through a SINGLE make_child fork — the fork IS the subshell, so
+        // the child's BASHPID (variables.c:1511 get_bashpid = getpid())
+        // equals the parent's $!. The wrapper spawn is that fork, but the
+        // child would re-enter the parens in-process (subshell_depth + 1)
+        // and report pid + 1. Coalesce the two exactly like GNU: serialize
+        // the INNER list (the spawn already realized the subshell level)
+        // and seed the child's depth so both $BASH_SUBSHELL and $BASHPID
+        // land where the single fork puts them. Non-paren bodies
+        // (`{ }`, simple commands) equally run one level down in GNU
+        // (probed 5.3.20: `{ echo $BASH_SUBSHELL; } &` and
+        // `echo $BASH_SUBSHELL &` both report 1), so the child always
+        // starts one level below the parent — only an unstripped paren
+        // node still bumps in-process.
+        let parent_depth = self.shell_state.subshell_depth.get();
+        let bashpid_base = parent_depth + 1;
+        let strip_parens = background_paren_absorbable(&background_command.command, &consumed);
         let mut child_command = background_command.command.clone();
         strip_consumed_redirects(&mut child_command, &consumed);
-        let source = self.background_command_source(&child_command);
+        let source = if strip_parens {
+            // SAFETY: strip gate guarantees subshell_command.is_some().
+            let inner = child_command
+                .subshell_command
+                .as_ref()
+                .map(|subshell| subshell.body.clone())
+                .unwrap_or_default();
+            self.background_command_source_for_body(&inner)
+        } else {
+            self.background_command_source(&child_command)
+        };
+        env_map.insert(
+            "__RUBASH_BG_DEPTH".to_string(),
+            (if strip_parens {
+                bashpid_base
+            } else {
+                parent_depth
+            })
+            .to_string(),
+        );
+        env_map.insert(
+            "__RUBASH_BG_BASHPID_BASE".to_string(),
+            bashpid_base.to_string(),
+        );
 
         // niubash#362: the serialized source (every function the
         // parent carries + the command) rides the child's `-c` argument. When
@@ -773,13 +872,15 @@ impl Executor {
             crate::executor::shell_options::register_background_capture_writer(pid);
         }
         self.background_children.insert(pid, child);
-        self.shell_state
-            .job_table
-            .register_process(pid, display_source.clone(), true);
-        self.shell_state.job_table.set_job_control(
+        let job_control =
+            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor");
+        self.shell_state.job_table.register_process(
             pid,
-            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor"),
+            display_source.clone(),
+            true,
+            async_job_pgrp(pid, job_control),
         );
+        self.shell_state.job_table.set_job_control(pid, job_control);
         self.shell_state.last_background_pid = Some(pid);
         self.exit_code = 0;
         Ok(())
@@ -1367,6 +1468,23 @@ impl Executor {
     }
 
     fn background_command_source(&self, command: &CommandNode) -> String {
+        let mut source = self.background_function_prelude();
+        source.push_str(&bash_command_source_text(command));
+        source
+    }
+
+    /// rubash#1095: `background_command_source` for an absorbed `( list )`
+    /// body — the inner sequence rides the child's `-c` source because the
+    /// spawn itself realized the subshell level (GNU execute_cmd.c:701).
+    fn background_command_source_for_body(&self, body: &[CommandNode]) -> String {
+        let mut source = self.background_function_prelude();
+        source.push_str(&bash_command_sequence_text(body));
+        source
+    }
+
+    /// Exportable-function prelude shared by both background source forms
+    /// (print_cmd-style `name() { ...; }; ` definitions ahead of the body).
+    fn background_function_prelude(&self) -> String {
         let mut source = String::new();
         for (name, body) in &self.shell_state.functions {
             if is_exportable_function_name(name) {
@@ -1386,7 +1504,6 @@ impl Executor {
                 }
             }
         }
-        source.push_str(&bash_command_source_text(command));
         source
     }
 
@@ -2872,18 +2989,17 @@ impl Executor {
                     }
                     self.background_children
                         .insert(pid, crate::fd::SpawnedChild::from(child_proc));
+                    let job_control = crate::builtins::set::shell_option_enabled(
+                        &self.shell_state.env_vars,
+                        "monitor",
+                    );
                     let job_id = self.shell_state.job_table.register_process(
                         pid,
                         bash_command_source_text(cmd),
                         true,
+                        async_job_pgrp(pid, job_control),
                     );
-                    self.shell_state.job_table.set_job_control(
-                        pid,
-                        crate::builtins::set::shell_option_enabled(
-                            &self.shell_state.env_vars,
-                            "monitor",
-                        ),
-                    );
+                    self.shell_state.job_table.set_job_control(pid, job_control);
                     // GNU coproc.c: the coproc is an async child, so $!
                     // (last_made_pid) tracks it like any `&` spawn.
                     self.shell_state.last_background_pid = Some(pid);

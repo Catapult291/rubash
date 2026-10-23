@@ -230,6 +230,24 @@ impl Executor {
             .unwrap_or_else(std::process::id);
         env_vars.remove("__RUBASH_SHELL_PID");
 
+        // rubash#1095: an async-wrapper spawn (compound_exec.rs) already is
+        // GNU's single async/subshell fork (execute_cmd.c:701), so the
+        // child seeds its subshell depth from the parent and records which
+        // level its own pid answers for $BASHPID (variables.c:1511
+        // get_bashpid = getpid). Ordinary shells see neither key and keep
+        // depth 0 / origin 0. Stripped like __RUBASH_SHELL_PID so they
+        // never surface as shell variables.
+        let bg_depth = env_vars
+            .get("__RUBASH_BG_DEPTH")
+            .and_then(|value| value.parse::<usize>().ok());
+        env_vars.remove("__RUBASH_BG_DEPTH");
+        std::env::remove_var("__RUBASH_BG_DEPTH");
+        let bg_bashpid_base = env_vars
+            .get("__RUBASH_BG_BASHPID_BASE")
+            .and_then(|value| value.parse::<usize>().ok());
+        env_vars.remove("__RUBASH_BG_BASHPID_BASE");
+        std::env::remove_var("__RUBASH_BG_BASHPID_BASE");
+
         // Forked-child fd table restore: a `rubash -c` background/subshell
         // child inherits the parent's fd>=3 File endpoints through the
         // PROC_THREAD_ATTRIBUTE_HANDLE_LIST whitelist; the inherited handle
@@ -320,7 +338,13 @@ impl Executor {
                 function_depth: 0,
                 dollar_vars_changed_by_set: false,
                 random_state: RandomGen::seeded(),
-                subshell_depth: Cell::new(respawned_subshell_depth),
+                // rubash#1095's __RUBASH_BG_DEPTH is the authoritative seed
+                // for async `&` children (it deliberately under-seeds the
+                // level when the serialized command still carries a paren
+                // node that bumps in-process); __RUBASH_SUBSHELL_DEPTH
+                // (rubash#1074) covers coproc/other respawns where BG_DEPTH
+                // is absent.
+                subshell_depth: Cell::new(bg_depth.unwrap_or(respawned_subshell_depth)),
                 in_command_substitution: Cell::new(false),
                 stdin_redir: Cell::new(false),
                 xtrace_indirection_level: Cell::new(0),
@@ -353,6 +377,7 @@ impl Executor {
             parse_error_occurred: false,
             bash_logout_sourced: false,
             shell_pid,
+            bashpid_origin_depth: bg_bashpid_base.unwrap_or(0),
             owns_signal_mailbox,
             is_process_exit_executor: process_exit,
             background_children: HashMap::new(),

@@ -1574,6 +1574,9 @@ impl Executor {
             // subshell logout cannot double-source it either.
             bash_logout_sourced: true,
             shell_pid: self.shell_pid,
+            // rubash#1095: a fork copy shares this process's pid, so the
+            // spawn-realized BASHPID level carries over unchanged.
+            bashpid_origin_depth: self.bashpid_origin_depth,
             owns_signal_mailbox: false,
             is_process_exit_executor: false,
             arithmetic_last_error_expression: std::cell::RefCell::new(String::new()),
