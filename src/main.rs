@@ -442,7 +442,11 @@ fn run_args(executor: &mut Executor, args: &[String], argv0: Option<&str>) -> i3
                 }
             }
             "--debugger" => {
-                // Bash accepts this when starting a debugger-enabled shell.
+                // Consumed by parse_long_options above (this arm exists for
+                // the respawn/pre-scan shapes that skip it). GNU
+                // shell.c:257: debugging_mode only; the starter runs via
+                // start_debugger at the driver sites.
+                executor.set_env("__RUBASH_DEBUGGER_MODE", "1");
                 index += 1;
             }
             "--posix" => {
@@ -853,8 +857,17 @@ fn parse_long_options(
                 // reads plain lines.
                 executor.set_env("__RUBASH_NO_EDITING", "1");
             }
-            // "debug" | "debugger" | "dump-po-strings" | "dump-strings":
-            // accepted, no Windows counterpart today.
+            // "debug" | "dump-po-strings" | "dump-strings":
+            // accepted, no Windows counterpart today. --debug sets GNU's
+            // vestigial `debugging` variable (shell.c:255) with no
+            // user-visible effect — the name is NOT ours to repurpose; the
+            // native debugger (rubash#497) will own it when it lands.
+            "debug" => {}
+            // GNU shell.c:257: --debugger sets debugging_mode; the bashdb
+            // starter runs at startup (start_debugger, shell.c:764/:795).
+            "debugger" => {
+                executor.set_env("__RUBASH_DEBUGGER_MODE", "1");
+            }
             "noprofile" => {
                 executor.set_env("__RUBASH_NO_PROFILE", "1");
             }
@@ -1086,6 +1099,11 @@ fn run_command_string_with_init(
     // shell.c:722 run_startup_files runs before the rcfile/-c string
     // (rubash#487): `bash -lc` reads the profile chain, `bash -ic` the rc
     // chain; `exit` in a startup file terminates before the command runs.
+    // shell.c:764: start_debugger precedes run_one_command, so the starter
+    // file lands before both the rc chain and the -c string.
+    if executor.get_env("__RUBASH_DEBUGGER_MODE").as_deref() == Some("1") {
+        start_debugger(executor);
+    }
     let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
     if let Some(status) = run_startup_files(executor, init_file) {
         return finish_shell(executor, status, interactive);
@@ -1244,6 +1262,11 @@ fn run_script_file_with_init(
     executor.set_positional_params(args.to_vec());
     // shell.c:722 run_startup_files precedes the rcfile/script body
     // (rubash#487): `bash -l script` reads the profile chain first.
+    // shell.c:795: start_debugger gates scripts too, before any body
+    // command runs.
+    if executor.get_env("__RUBASH_DEBUGGER_MODE").as_deref() == Some("1") {
+        start_debugger(executor);
+    }
     let interactive = executor.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1");
     if let Some(status) = run_startup_files(executor, init_file) {
         return finish_shell(executor, status, interactive);
@@ -1353,6 +1376,14 @@ fn run_no_script_with_init(
     // shell.c:722 run_startup_files before the rcfile/reader (rubash#487):
     // a bare login shell reads the profile chain, a non-login interactive
     // shell reads the rc chain.
+    // shell.c:795: start_debugger fires here too, but only when this shell
+    // is NOT interactive (`reading_shell_script || interactive_shell == 0`)
+    // — a piped-stdin bare invocation is exactly GNU's plain-script case.
+    if executor.get_env("__RUBASH_DEBUGGER_MODE").as_deref() == Some("1")
+        && executor.get_env("__RUBASH_INTERACTIVE").as_deref() != Some("1")
+    {
+        start_debugger(executor);
+    }
     if let Some(status) = run_startup_files(executor, init_file) {
         return finish_shell(executor, status, true);
     }
@@ -1414,6 +1445,10 @@ fn run_stdin_script_with_init(
     }
     // shell.c:722 run_startup_files before the rcfile/stdin reader
     // (rubash#487), same branch structure as the no-script driver.
+    // shell.c:795's gate covers the stdin script reader as well.
+    if executor.get_env("__RUBASH_DEBUGGER_MODE").as_deref() == Some("1") {
+        start_debugger(executor);
+    }
     if let Some(status) = run_startup_files(executor, init_file) {
         return finish_shell(executor, status, true);
     }
@@ -1449,6 +1484,48 @@ fn run_stdin_script_with_init(
 /// startup skips (empty HOME, non-interactive extension, login).
 fn init_file_needs_direct_run(executor: &Executor, init_file: &str) -> bool {
     executor.get_env("__RUBASH_SOURCED_RC").as_deref() != Some(init_file)
+}
+
+/// GNU shell.c:1547 start_debugger: run the bashdb starter file once before
+/// any user command (-c string, script, or stdin script — never a bare
+/// interactive shell, shell.c:795's `reading_shell_script ||
+/// interactive_shell == 0` gate). GNU bakes one configure-time starter path
+/// (DEBUGGER_START_FILE); we cannot know the host bash's prefix, so the
+/// search is `BASHDB_START_FILE` (documented seam for hosts whose prefix
+/// differs — Termux, custom --prefix builds) then the two conventional
+/// install locations. On a total miss GNU warns internally and clears
+/// debugging_mode (shell.c:1559-1561); the flag itself never sets extdebug —
+/// bashdb's own init does, which the sourced file performs here through the
+/// normal shopt path.
+fn start_debugger(executor: &mut Executor) {
+    if executor.get_env("__RUBASH_DEBUGGER_ATTEMPTED").is_some() {
+        return;
+    }
+    executor.set_env("__RUBASH_DEBUGGER_ATTEMPTED", "1");
+    let mut candidates: Vec<String> = vec![
+        "/usr/local/share/bashdb/bashdb-main.inc".to_string(),
+        "/usr/share/bashdb/bashdb-main.inc".to_string(),
+    ];
+    if let Some(over) = executor.get_env("BASHDB_START_FILE") {
+        candidates.insert(0, over.to_string());
+    }
+    let starter = candidates
+        .iter()
+        .find(|path| std::fs::metadata(executor.resolve_shell_path(path)).is_ok())
+        .cloned();
+    match starter {
+        Some(path) => {
+            let _ = run_init_file(executor, &path);
+        }
+        None => {
+            // GNU force_execute_file reports the open failure with the
+            // baked path, then start_debugger warns internally
+            // (shell.c:1556-1561) and drops the mode; errexit stays
+            // suppressed for the attempt (shell.c:1551-1553).
+            eprintln!("rubash: {}: No such file or directory", candidates[0]);
+            eprintln!("rubash: warning: cannot start debugger; debugging mode disabled");
+        }
+    }
 }
 
 fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
