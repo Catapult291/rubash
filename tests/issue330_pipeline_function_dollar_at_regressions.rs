@@ -125,6 +125,7 @@ fn glob_args_expand_in_pipeline_function_call() {
          : > \"$d/zz.330t\"; : > \"$d/aa.330t\"\n\
          cd \"$d\"\n\
          m *.330t | cat\n\
+         cd /\n\
          rm -rf \"$d\"",
     );
     assert_clean(&stderr);
