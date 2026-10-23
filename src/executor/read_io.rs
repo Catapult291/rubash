@@ -216,6 +216,20 @@ impl Executor {
         // bare `read`; the descriptor serve only consults the fd table
         // and reports EOF where the pipeline stage's FUNCTION_STDIN
         // mirror holds the pipe data (rubash#938).
+        // GNU redir.c: last fd-0 redirect wins (rubash#1391). If the last
+        // stdin redirect is a herestring, the file-redirect path below must
+        // be skipped even when cmd.redirect_in is set.
+        let last_stdin_is_herestring = cmd.redirects.iter().rev().find(|r| {
+            r.fd.unwrap_or(0) == 0
+                && matches!(
+                    r.kind,
+                    crate::parser::RedirectKind::Input
+                        | crate::parser::RedirectKind::HereDoc
+                        | crate::parser::RedirectKind::HereString
+                        | crate::parser::RedirectKind::DuplicateInput
+                        | crate::parser::RedirectKind::CloseInput
+                )
+        }).is_some_and(|r| matches!(r.kind, crate::parser::RedirectKind::HereString));
         let fd0_self_dup = cmd.redirect_in.as_ref().is_some_and(|redirect| {
             redirect.fd_var.is_none()
                 && redirect.fd.unwrap_or(0) == 0
@@ -224,7 +238,7 @@ impl Executor {
                     Some((0, _))
                 )
         });
-        if let Some(redirect) = cmd.redirect_in.as_ref().filter(|_| !fd0_self_dup) {
+        if let Some(redirect) = cmd.redirect_in.as_ref().filter(|_| !fd0_self_dup && !last_stdin_is_herestring) {
             if redirect.fd.unwrap_or(0) != 0 {
                 return None;
             }
