@@ -31,6 +31,22 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
     "rubash: ".to_string()
 }
 
+/// GNU error.c:453 err_readonly (report_error family): the bare
+/// `VAR: readonly variable` bind diagnostic honors gnu_errfmt
+/// (rubash#1038), unlike the builtin_error lines sharing this file.
+fn readonly_error_prefix(env_vars: &HashMap<String, String>) -> String {
+    if let (Some(script), Some(line)) = (
+        env_vars.get("__RUBASH_SCRIPT_NAME"),
+        env_vars.get("__RUBASH_CURRENT_LINE"),
+    ) {
+        if crate::builtins::shopt::option_enabled(env_vars, "gnu_errfmt") {
+            return format!("{script}:{line}: ");
+        }
+        return format!("{script}: line {line}: ");
+    }
+    "rubash: ".to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Logical,
@@ -126,7 +142,7 @@ where
             writeln!(
                 stderr,
                 "{}OLDPWD: readonly variable",
-                diagnostic_prefix(env_vars)
+                readonly_error_prefix(env_vars)
             )?;
             failed = true;
         } else {
@@ -136,7 +152,7 @@ where
             writeln!(
                 stderr,
                 "{}PWD: readonly variable",
-                diagnostic_prefix(env_vars)
+                readonly_error_prefix(env_vars)
             )?;
             failed = true;
         } else {
@@ -215,7 +231,7 @@ where
         writeln!(
             stderr,
             "{}OLDPWD: readonly variable",
-            diagnostic_prefix(env_vars)
+            readonly_error_prefix(env_vars)
         )?;
         failed = true;
     } else {
@@ -225,7 +241,7 @@ where
         writeln!(
             stderr,
             "{}PWD: readonly variable",
-            diagnostic_prefix(env_vars)
+            readonly_error_prefix(env_vars)
         )?;
         failed = true;
     } else {

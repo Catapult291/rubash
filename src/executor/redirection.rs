@@ -190,7 +190,7 @@ impl Executor {
                 writeln!(
                     &mut stderr,
                     "{}{}: ambiguous redirect",
-                    self.diagnostic_prefix(),
+                    self.error_prefix(),
                     if redirect.fd_var.is_some() {
                         var_name
                     } else {
@@ -205,7 +205,7 @@ impl Executor {
             write!(
                 &mut stderr,
                 "{}: restricted: cannot redirect output",
-                self.diagnostic_prefix()
+                self.error_prefix()
             )?;
             return Ok(stderr);
         }
@@ -213,7 +213,7 @@ impl Executor {
             writeln!(
                 &mut stderr,
                 "{}{}: ambiguous redirect",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 if redirect.fd_var.is_some() {
                     var_name
                 } else {
@@ -230,7 +230,7 @@ impl Executor {
             writeln!(
                 &mut stderr,
                 "{}{var_name}: restricted: cannot redirect output",
-                self.diagnostic_prefix()
+                self.error_prefix()
             )?;
         } else {
             let message_word: String =
@@ -242,7 +242,7 @@ impl Executor {
             writeln!(
                 &mut stderr,
                 "{}{message_word}: restricted: cannot redirect output",
-                self.diagnostic_prefix()
+                self.error_prefix()
             )?;
         }
         Ok(stderr)
@@ -342,7 +342,7 @@ impl Executor {
                     writeln!(
                         &mut stderr,
                         "{}{name}: unbound variable",
-                        self.diagnostic_prefix()
+                        self.error_prefix()
                     )?;
                     self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
                     self.exit_code = 1;
@@ -763,7 +763,7 @@ impl Executor {
         writeln!(
             &mut stderr,
             "{}{name}: Bad file descriptor",
-            self.diagnostic_prefix()
+            self.error_prefix()
         )?;
         self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
         self.exit_code = 1;
@@ -777,7 +777,7 @@ impl Executor {
         text: &str,
     ) -> Result<(), ExecuteError> {
         let mut stderr = Vec::new();
-        writeln!(&mut stderr, "{}{text}", self.diagnostic_prefix())?;
+        writeln!(&mut stderr, "{}{text}", self.error_prefix())?;
         self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
         self.exit_code = 1;
         Ok(())
@@ -876,7 +876,7 @@ impl Executor {
                 return false;
             }
             let head = format!("{}: ", target.strip_prefix('&').unwrap_or(&target));
-            let prefix = self.diagnostic_prefix();
+            let prefix = self.error_prefix();
             std::str::from_utf8(message).is_ok_and(|text| {
                 text.strip_prefix(prefix.as_str())
                     .is_some_and(|rest| rest.starts_with(&head))
@@ -1466,7 +1466,7 @@ impl Executor {
         writeln!(
             &mut stderr,
             "{}{display_target}: {reason}",
-            self.diagnostic_prefix()
+            self.error_prefix()
         )?;
         state.write_to_fd(self, 2, &stderr)
     }
@@ -1481,7 +1481,7 @@ impl Executor {
         writeln!(
             &mut stderr,
             "{}{target}: ambiguous redirect",
-            self.diagnostic_prefix()
+            self.error_prefix()
         )?;
         state.write_to_fd(self, 2, &stderr)
     }

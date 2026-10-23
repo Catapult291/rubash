@@ -337,7 +337,7 @@ impl Executor {
             return true;
         }
         if attrs.readonly {
-            eprintln!("{}{}: readonly variable", self.diagnostic_prefix(), name);
+            eprintln!("{}{}: readonly variable", self.error_prefix(), name);
             self.exit_code = 1;
             return true;
         }
@@ -371,7 +371,7 @@ impl Executor {
                 } else {
                     lhs_as_written()
                 };
-                eprintln!("{}{lhs}: bad array subscript", self.diagnostic_prefix());
+                eprintln!("{}{lhs}: bad array subscript", self.error_prefix());
                 self.exit_code = 1;
                 return true;
             }
@@ -661,7 +661,7 @@ impl Executor {
         {
             eprintln!(
                 "{}{}: bad array subscript",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 lhs_as_written()
             );
             // Bad-subscript class for the eval boundary (rubash#637).
@@ -680,7 +680,7 @@ impl Executor {
             let Some(index) = resolve_indexed_array_subscript(&current, computed_index) else {
                 eprintln!(
                     "{}{}: bad array subscript",
-                    self.diagnostic_prefix(),
+                    self.error_prefix(),
                     lhs_as_written()
                 );
                 // Bad-subscript class for the eval boundary (rubash#637).

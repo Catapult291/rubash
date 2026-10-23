@@ -703,7 +703,10 @@ impl Executor {
                         127,
                     ),
                 };
-            let diagnostic = format!("{}{}{}\n", self.diagnostic_prefix(), word, message);
+            // slash-classified execve error or PATH-miss "command not
+            // found" (execute_cmd.c internal_error via error_prolog) honors
+            // gnu_errfmt (rubash#1038).
+            let diagnostic = format!("{}{}{}\n", self.error_prefix(), word, message);
             // Bash applies a pipeline element's redirections before the
             // command lookup fails (redir.c do_redirection_internal runs for
             // every command): `2>/dev/null` discards the diagnostic,

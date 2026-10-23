@@ -487,6 +487,11 @@ impl Executor {
                             return Err(());
                         }
                     } else if nested_readonly {
+                        // GNU declare.def make_local_variable path surfaces
+                        // through sh_readonly (builtin_error family): the
+                        // line segment never gates, so this keeps the
+                        // ungated prefix (verified: `local l=(...)` in a
+                        // function reports `line N:` under gnu_errfmt).
                         eprintln!(
                             "{}{lhs}: readonly variable",
                             self.diagnostic_prefix()
@@ -921,11 +926,7 @@ impl Executor {
             // so the reader loop drops the rest of this command's line.
             if let Some(message) = &arith_eval_failure {
                 if !message.is_empty() {
-                    writeln!(
-                        stderr,
-                        "{}{command_name}: {message}",
-                        self.diagnostic_prefix()
-                    )?;
+                    writeln!(stderr, "{}{command_name}: {message}", self.error_prefix())?;
                 }
                 self.raise_evalerror_abort();
             }
@@ -1021,7 +1022,7 @@ impl Executor {
                     writeln!(
                         stderr,
                         "{}{}: bad array subscript",
-                        self.diagnostic_prefix(),
+                        self.error_prefix(),
                         word
                     )?;
                     self.exit_code = 1;
@@ -1186,7 +1187,7 @@ impl Executor {
             }
             if let Some(message) = &arith_eval_failure {
                 if !message.is_empty() {
-                    writeln!(stderr, "{}local: {message}", self.diagnostic_prefix())?;
+                    writeln!(stderr, "{}local: {message}", self.error_prefix())?;
                 }
                 self.raise_evalerror_abort();
             }
@@ -1434,7 +1435,7 @@ impl Executor {
                     writeln!(
                         stderr,
                         "{}{}: bad array subscript",
-                        self.diagnostic_prefix(),
+                        self.error_prefix(),
                         word
                     )?;
                     self.exit_code = 1;

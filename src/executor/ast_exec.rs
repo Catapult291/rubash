@@ -175,10 +175,12 @@ impl Executor {
         error: &std::io::Error,
     ) -> Result<(), ExecuteError> {
         let mut stderr = Vec::new();
+        // GNU redir.c:135 redirection_error (internal_error family) honors
+        // gnu_errfmt (rubash#1038).
         writeln!(
             &mut stderr,
             "{}{}",
-            self.diagnostic_prefix(),
+            self.error_prefix(),
             crate::posix_errors::message(error)
         )?;
         let mut owner = command;

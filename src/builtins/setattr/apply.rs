@@ -5,8 +5,8 @@ use super::marks::{
     unmark_exported,
 };
 use super::value::{
-    array_attribute_assignment_value, diagnostic_prefix, readonly_error_subject, split_assignment,
-    valid_identifier,
+    array_attribute_assignment_value, diagnostic_prefix, readonly_error_prefix,
+    readonly_error_subject, split_assignment, valid_identifier,
 };
 use super::{ExportMode, EXECUTION_FAILURE, EXECUTION_SUCCESS, READONLY_VARS};
 use crate::executor::local_helpers::sync_shell_assignment_process_env;
@@ -55,7 +55,12 @@ where
     match mode {
         ExportMode::Set => {
             if value.is_some() && env_vars.is_marked(READONLY_VARS, name) {
-                writeln!(stderr, "{}{}: readonly variable", diagnostic_prefix(), name)?;
+                writeln!(
+                    stderr,
+                    "{}{}: readonly variable",
+                    readonly_error_prefix(env_vars),
+                    name
+                )?;
                 return Ok(EXECUTION_FAILURE);
             }
 
@@ -191,7 +196,12 @@ where
                 name
             )?;
         } else {
-            writeln!(stderr, "{}{}: readonly variable", diagnostic_prefix(), name)?;
+            writeln!(
+                stderr,
+                "{}{}: readonly variable",
+                readonly_error_prefix(env_vars),
+                name
+            )?;
         }
         return Ok(EXECUTION_FAILURE);
     }

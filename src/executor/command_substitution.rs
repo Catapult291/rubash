@@ -1272,7 +1272,7 @@ impl Executor {
             }
             eprintln!(
                 "{}maximum here-document count exceeded",
-                self.diagnostic_prefix_for_line(line)
+                self.parser_error_prefix_for_line(line)
             );
             self.last_command_substitution_parse_error.set(true);
             self.last_command_substitution_status.set(Some(2));
@@ -1760,7 +1760,7 @@ impl Executor {
         if let Some(line) = crate::lexer::heredoc_overflow_line() {
             eprintln!(
                 "{}maximum here-document count exceeded",
-                self.diagnostic_prefix_for_line(line)
+                self.parser_error_prefix_for_line(line)
             );
             self.last_command_substitution_parse_error.set(true);
             self.last_command_substitution_status.set(Some(2));
@@ -1905,7 +1905,7 @@ impl Executor {
     /// output with EXECUTION_FAILURE (subst.c:7169-7173).
     fn comsub_cat_file_substitute(&self, target: &str, raw_word: &str) -> String {
         let ambiguity = |word: &str| -> String {
-            let diagnostic = format!("{}{}: ambiguous redirect\n", self.diagnostic_prefix(), word);
+            let diagnostic = format!("{}{}: ambiguous redirect\n", self.error_prefix(), word);
             self.write_diagnostic_fd2(diagnostic.as_bytes());
             self.last_command_substitution_status.set(Some(1));
             String::new()

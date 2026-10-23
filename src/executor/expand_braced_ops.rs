@@ -142,11 +142,7 @@ impl Executor {
                     );
                 }
                 if index < 0 {
-                    eprintln!(
-                        "{}{}: bad array subscript",
-                        self.diagnostic_prefix(),
-                        array_name
-                    );
+                    eprintln!("{}{}: bad array subscript", self.error_prefix(), array_name);
                 }
                 return Some(String::new());
             }

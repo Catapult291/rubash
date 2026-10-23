@@ -38,7 +38,7 @@ impl Executor {
         let (args, arith_eval_failure) = self.evaluate_integer_attribute_assignment_args(&args);
         if let Some(message) = &arith_eval_failure {
             if !message.is_empty() {
-                writeln!(stderr, "{}readonly: {message}", self.diagnostic_prefix())?;
+                writeln!(stderr, "{}readonly: {message}", self.error_prefix())?;
             }
             self.raise_evalerror_abort();
         }

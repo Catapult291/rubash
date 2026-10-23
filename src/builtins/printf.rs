@@ -269,6 +269,22 @@ fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
     "rubash: ".to_string()
 }
 
+/// GNU variables.c assign_readonly via bind_variable (printf.def -v):
+/// the bare `name: readonly variable` is report_error family and honors
+/// gnu_errfmt (rubash#1038).
+fn readonly_error_prefix(env_vars: &HashMap<String, String>) -> String {
+    if let (Some(script), Some(line)) = (
+        env_vars.get("__RUBASH_SCRIPT_NAME"),
+        env_vars.get("__RUBASH_CURRENT_LINE"),
+    ) {
+        if crate::builtins::shopt::option_enabled(env_vars, "gnu_errfmt") {
+            return format!("{script}:{line}: ");
+        }
+        return format!("{script}: line {line}: ");
+    }
+    "rubash: ".to_string()
+}
+
 fn valid_printf_array_target(name: &str, env_vars: &crate::shell::var_table::VarTable) -> bool {
     // GNU printf.def:305: valid_array_reference(vname, arrayflags) with the
     // VA_NOEXPAND flags SET_VFLAGS derives from array_expand_once
@@ -361,7 +377,7 @@ fn assign_printf_output(
         writeln!(
             stderr,
             "{}{}: readonly variable",
-            diagnostic_prefix(env_vars),
+            readonly_error_prefix(env_vars),
             name
         )?;
         return Ok(Some(1));

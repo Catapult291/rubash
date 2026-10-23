@@ -511,25 +511,23 @@ impl Executor {
             // ("Is a directory", EX_NOEXEC), and an unexecutable file
             // reports "Permission denied" (EX_NOEXEC). Only a slash-free
             // name that PATH could not resolve is "command not found"
-            // (rubash#173).
+            // (rubash#173). All of these are internal_error via
+            // error_prolog, so the prefix honors gnu_errfmt (rubash#1038).
+            let error_prefix = self.error_prefix();
             let name = super::execution_misc::printable_filename(&cmd.words[0]);
             if let Some((message, status)) =
                 slash_command_execve_error_message(&cmd.words[0], &self.shell_state.env_vars)
             {
-                writeln!(
-                    &mut stderr,
-                    "{}{}: {}",
-                    self.diagnostic_prefix(),
-                    name,
-                    message
-                )?;
+                writeln!(&mut stderr, "{error_prefix}{name}: {message}",)?;
                 self.finish_external_error(cmd, &stderr, status)?;
                 return Ok(());
             }
             // GNU findcmd.c:279-293 + execute_cmd.c shell_execve: with
             // PATH unset the name is never searched, so the failure is
             // the execve ENOENT text, not "command not found" — bash
-            // switches diagnostic on PATH being unset (rubash#1145).
+            // switches diagnostic on PATH being unset (rubash#1145). The
+            // report is internal_error (error_prolog family), so the
+            // prefix honors gnu_errfmt (rubash#1038).
             let not_found_message =
                 if crate::executor::path::path_is_unset(&self.shell_state.env_vars) {
                     "No such file or directory"
@@ -539,7 +537,7 @@ impl Executor {
             writeln!(
                 &mut stderr,
                 "{}{}: {}",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 name,
                 not_found_message
             )?;
@@ -735,11 +733,9 @@ impl Executor {
             crate::builtins::hash::remove_hashed_path(&mut self.shell_state.env_vars, "cat");
             return Ok(false);
         }
-        eprintln!(
-            "{}{}: No such file or directory",
-            self.diagnostic_prefix(),
-            path
-        );
+        // GNU execute_cmd.c:6126 shell_execve refusal of a hashed pathname
+        // (internal_error via error_prolog) honors gnu_errfmt.
+        eprintln!("{}{}: No such file or directory", self.error_prefix(), path);
         self.exit_code = 127;
         Ok(true)
     }
@@ -1322,7 +1318,8 @@ impl Executor {
         // GNU report_prolog (errors.c:75-120): a script-context exec failure
         // prints `$0: line N: word: message` — the same prolog every other
         // diagnostic uses (rubash#231: the bare `rubash:` prefix dropped the
-        // script/line attribution GNU prints).
+        // script/line attribution GNU prints). shell_execve reports via
+        // internal_error, so the prefix honors gnu_errfmt (rubash#1038).
         // GNU shell_execve (execute_cmd.c:6126-6159) reports the execve
         // failure against the RESOLVED pathname (findcmd.c file_to_lose_on
         // fallback included), not the typed word — `noexec.sh` found via
@@ -1344,7 +1341,7 @@ impl Executor {
         writeln!(
             &mut stderr,
             "{}{}: {}",
-            self.diagnostic_prefix(),
+            self.error_prefix(),
             program.display(),
             message
         )?;

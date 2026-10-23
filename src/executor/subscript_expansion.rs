@@ -701,7 +701,7 @@ impl Executor {
                 // ('aa[$undef]', 'aa[$(true)]') reports
                 // `aa: bad array subscript` (sh_badsubscript) instead of
                 // silently testing a literal name.
-                eprintln!("{}{name}: bad array subscript", self.diagnostic_prefix());
+                eprintln!("{}{name}: bad array subscript", self.error_prefix());
             }
             return Ok(format!(
                 "{name}[{}]",
@@ -712,7 +712,7 @@ impl Executor {
             IndexedSubscript::Index(index) => Ok(format!("{name}[{index}]")),
             IndexedSubscript::Empty => {
                 if !arrayref {
-                    eprintln!("{}{name}: bad array subscript", self.diagnostic_prefix());
+                    eprintln!("{}{name}: bad array subscript", self.error_prefix());
                 }
                 Ok(operand.to_string())
             }
@@ -885,7 +885,7 @@ impl Executor {
     /// `<lhs>: bad array subscript`, emitted by the assignment paths for an
     /// empty resolved subscript.
     pub(in crate::executor) fn report_bad_array_subscript(&self, lhs: &str) {
-        eprintln!("{}{}: bad array subscript", self.diagnostic_prefix(), lhs);
+        eprintln!("{}{}: bad array subscript", self.error_prefix(), lhs);
         use std::io::Write;
         let _ = std::io::stderr().flush();
     }

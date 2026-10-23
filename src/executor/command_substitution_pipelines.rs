@@ -263,7 +263,7 @@ impl Executor {
                 .unwrap_or(1);
             eprintln!(
                 "{}warning: command substitution: 1 unterminated here-document",
-                self.diagnostic_prefix_for_line(start_line)
+                self.error_prefix_for_line(start_line)
             );
         }
         // The cat/heredoc-optimized comsub paths re-derive the here-document

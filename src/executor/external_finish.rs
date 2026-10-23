@@ -236,10 +236,15 @@ impl Executor {
             // script_driver::run_source_with_line_offset.
             if let Some(line) = crate::lexer::heredoc_overflow_line() {
                 let mut stderr = Vec::new();
-                let _ = writeln!(
-                    &mut stderr,
-                    "{script}: line {line}: maximum here-document count exceeded"
-                );
+                // GNU parse.y push_heredoc report_syntax_error gates its
+                // ` line N` segment on gnu_errfmt like every other
+                // parser_error site.
+                let diagnostic = if self.gnu_error_format_enabled() {
+                    format!("{script}:{line}: maximum here-document count exceeded")
+                } else {
+                    format!("{script}: line {line}: maximum here-document count exceeded")
+                };
+                let _ = writeln!(&mut stderr, "{diagnostic}");
                 self.finish_external_error(cmd, &stderr, 2)?;
                 return Ok(());
             }

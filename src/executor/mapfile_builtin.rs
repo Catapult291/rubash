@@ -478,11 +478,8 @@ impl Executor {
                 };
                 if target_exists {
                     if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, base) {
-                        let _ = writeln!(
-                            stderr,
-                            "{}{name}: readonly variable",
-                            self.diagnostic_prefix()
-                        );
+                        let _ =
+                            writeln!(stderr, "{}{name}: readonly variable", self.error_prefix());
                         return self.finish_mapfile_error(cmd, &stderr, 1);
                     }
                     base.to_string()
@@ -501,26 +498,18 @@ impl Executor {
                 let _ = writeln!(
                     stderr,
                     "{}warning: {name}: removing nameref attribute",
-                    self.diagnostic_prefix()
+                    self.error_prefix()
                 );
                 unmark_env_name(&mut self.shell_state.env_vars, NAMEREF_VARS, &name);
                 if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name) {
-                    let _ = writeln!(
-                        stderr,
-                        "{}{name}: readonly variable",
-                        self.diagnostic_prefix()
-                    );
+                    let _ = writeln!(stderr, "{}{name}: readonly variable", self.error_prefix());
                     return self.finish_mapfile_error(cmd, &stderr, 1);
                 }
                 name
             }
             _ => {
                 if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &name) {
-                    let _ = writeln!(
-                        stderr,
-                        "{}{name}: readonly variable",
-                        self.diagnostic_prefix()
-                    );
+                    let _ = writeln!(stderr, "{}{name}: readonly variable", self.error_prefix());
                     return self.finish_mapfile_error(cmd, &stderr, 1);
                 }
                 name

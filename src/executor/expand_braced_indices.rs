@@ -458,11 +458,7 @@ impl Executor {
                 && crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset")
             {
                 self.write_diagnostic_fd2(
-                    format!(
-                        "{}{array_name}: unbound variable\n",
-                        self.diagnostic_prefix()
-                    )
-                    .as_bytes(),
+                    format!("{}{array_name}: unbound variable\n", self.error_prefix()).as_bytes(),
                 );
                 self.shell_state.arithmetic_nonfatal_error.set(true);
                 return Some(String::new());
@@ -552,12 +548,8 @@ impl Executor {
                     }
                 } else if index < 0 {
                     self.write_diagnostic_fd2(
-                        format!(
-                            "{}[{}]: bad array subscript\n",
-                            self.diagnostic_prefix(),
-                            index
-                        )
-                        .as_bytes(),
+                        format!("{}[{}]: bad array subscript\n", self.error_prefix(), index)
+                            .as_bytes(),
                     );
                     self.shell_state.arithmetic_nonfatal_error.set(true);
                     return String::new();
@@ -586,7 +578,7 @@ impl Executor {
                     self.write_diagnostic_fd2(
                         format!(
                             "{}[{}]: bad array subscript\n",
-                            self.diagnostic_prefix(),
+                            self.error_prefix(),
                             raw_key
                         )
                         .as_bytes(),

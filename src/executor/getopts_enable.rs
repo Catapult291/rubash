@@ -226,7 +226,7 @@ impl Executor {
             let _ = writeln!(
                 stderr,
                 "{}{}: readonly variable",
-                self.diagnostic_prefix(),
+                self.error_prefix(),
                 variable
             );
             return 2;
@@ -270,11 +270,7 @@ impl Executor {
         W: Write,
     {
         if is_marked_var(&self.shell_state.env_vars, READONLY_VARS, "OPTARG") {
-            let _ = writeln!(
-                stderr,
-                "{}OPTARG: readonly variable",
-                self.diagnostic_prefix()
-            );
+            let _ = writeln!(stderr, "{}OPTARG: readonly variable", self.error_prefix());
             return;
         }
         self.getopts_apply_bind("getopts", "OPTARG", value, stderr);
