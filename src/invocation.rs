@@ -20,8 +20,14 @@ pub struct ShellInvocation {
     pub dump_po: bool,
     /// --pretty-print: parse input and print it back in normalized form.
     pub pretty_print: bool,
-    /// --debug / --debugger: accepted; --debugger enables extdebug so a
-    /// debugger can install its hooks.
+    /// --debug: GNU shell.c:255 sets the vestigial `debugging` variable —
+    /// accepted, recorded, no behavioral effect (the native debugger,
+    /// rubash#497, will own this name when it lands).
+    pub debug: bool,
+    /// --debugger: GNU parity (shell.c:257 sets debugging_mode). The flag
+    /// itself never touches extdebug — startup runs the bashdb starter file
+    /// (main.rs start_debugger) and clears the mode when it is missing
+    /// (shell.c:1547-1566).
     pub debugger: bool,
     pub command: Option<String>,
     pub command_name: Option<String>,
@@ -135,6 +141,7 @@ impl ShellInvocation {
             dump_strings: false,
             dump_po: false,
             pretty_print: false,
+            debug: false,
             debugger: false,
             command: None,
             command_name: None,
@@ -219,7 +226,11 @@ impl ShellInvocation {
                     out.pretty_print = true;
                     i += 1;
                 }
-                "--debug" | "--debugger" => {
+                "--debug" => {
+                    out.debug = true;
+                    i += 1;
+                }
+                "--debugger" => {
                     out.debugger = true;
                     i += 1;
                 }
@@ -380,10 +391,14 @@ impl ShellInvocation {
             // (`shopt -s|-u name`).
             let _ = self.write_shopt_options_listing(executor, &mut std::io::stdout());
         }
+        // self.debug (GNU shell.c:255) is vestigial by design: recorded at
+        // parse, no behavioral effect. --debugger is the behavioral one.
         if self.debugger {
-            // GNU bash --debugger enables extdebug so a debugger can install
-            // its hooks; the host shell decides the rest.
-            executor.set_shopt_option("extdebug", true);
+            // GNU shell.c:257: --debugger sets debugging_mode only; the
+            // bashdb starter file runs at startup (main.rs start_debugger)
+            // and a missing starter clears the mode (shell.c:1547-1566).
+            // The flag itself never touches extdebug.
+            executor.set_env("__RUBASH_DEBUGGER_MODE", "1");
         }
         if self.posix {
             executor.set_shell_option("posix", true);
@@ -554,7 +569,11 @@ fn parse_post_c_option(
             out.no_editing = true;
             Ok(Some(index + 1))
         }
-        "--debug" | "--debugger" => {
+        "--debug" => {
+            out.debug = true;
+            Ok(Some(index + 1))
+        }
+        "--debugger" => {
             out.debugger = true;
             Ok(Some(index + 1))
         }
@@ -902,9 +921,23 @@ mod tests {
         assert!(parsed.dump_po);
         assert!(parsed.pretty_print);
         assert!(parsed.debugger);
+        assert!(!parsed.debug);
         assert!(parsed.restricted);
         assert!(parsed.shell_flags.contains(&("verbose".into(), true)));
         assert_eq!(parsed.rc_file.as_deref(), Some("alt.rc"));
+    }
+
+    #[test]
+    fn parses_debug_and_debugger_as_distinct_flags() {
+        // GNU shell.c:255-257: --debug and --debugger set different internal
+        // variables; ours split the same way (debug = extdebug extension,
+        // debugger = bashdb starter mode).
+        let parsed = ShellInvocation::parse(&["--debug".to_string()]).unwrap();
+        assert!(parsed.debug);
+        assert!(!parsed.debugger);
+        let both =
+            ShellInvocation::parse(&["--debug".to_string(), "--debugger".to_string()]).unwrap();
+        assert!(both.debug && both.debugger);
     }
 
     #[test]
