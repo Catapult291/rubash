@@ -88,17 +88,70 @@ fn internal_pipeline_program(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("<rubash-internal-{name}>"))
 }
 
+/// Where a drain thread sends the last member's stdout bytes.
+#[derive(Clone, Copy)]
+#[cfg(any(windows, unix))]
+enum PipelineDrainTarget {
+    /// Collect the bytes and hand them back to the caller — command
+    /// substitution, a stage-redirect walk, or a prefix that feeds a
+    /// sequential tail all need the whole payload up front.
+    Collect,
+    /// Forward each chunk to the host process stdout as it arrives and
+    /// return an empty buffer: the GNU shape where execute_cmd.c:2620
+    /// leaves the rightmost element's fd 1 on the shell's own stdout, so
+    /// `A | B` never withholds its payload until every member exits
+    /// (niubash D4). The caller's deferred write then sees no bytes.
+    StreamHostStdout,
+}
+
 /// Drain one end of a child's pipe on a reader thread so the child can keep
 /// writing while the parent waits on other pipeline members (niubash#158).
 #[cfg(any(windows, unix))]
-fn spawn_pipe_drain<R>(mut reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+fn spawn_pipe_drain<R>(
+    mut reader: R,
+    target: PipelineDrainTarget,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: std::io::Read + Send + 'static,
 {
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
+    std::thread::spawn(move || match target {
+        PipelineDrainTarget::Collect => {
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output)?;
+            Ok(output)
+        }
+        PipelineDrainTarget::StreamHostStdout => {
+            // Forward live (niubash D4). After the first host-write failure
+            // keep reading and drop the bytes: abandoning the reader would
+            // back up the pipe and re-create the niubash#158 deadlock this
+            // drain exists to prevent. The first error is reported at join,
+            // where the collecting path would have surfaced it from the
+            // deferred write anyway.
+            let mut buffer = [0u8; 16 * 1024];
+            let mut first_error = None;
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if first_error.is_none() {
+                            if let Err(error) =
+                                crate::executor::shell_options::write_real_stdout_uncaptured(
+                                    &buffer[..read],
+                                )
+                            {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(Vec::new()),
+            }
+        }
     })
 }
 
@@ -1362,7 +1415,7 @@ impl Executor {
         // would break the profiler's stack discipline — the members' wall
         // time overlaps, which a sequential frame stack cannot represent.
         let _profiler_external_pipeline = super::profiler::enter_external("pipeline");
-        let results = self.spawn_wait_concurrent_external_stages(commands, specs)?;
+        let results = self.spawn_wait_concurrent_external_stages(commands, specs, true)?;
         let (_, stderr, _) = results.last().unwrap();
         self.write_pipeline_output(
             commands[commands.len() - 1],
@@ -1721,8 +1774,26 @@ impl Executor {
         // window only arms after that downstream exited.
         let mut results: Vec<(String, String, i32)> = vec![Default::default(); consumer_count];
         let last_index = consumer_count - 1;
-        let last_stdout = processes[last_index].stdout.take().map(spawn_pipe_drain);
-        let last_stderr = processes[last_index].stderr.take().map(spawn_pipe_drain);
+        // When the producer exited cleanly the last consumer's payload goes
+        // only to write_pipeline_output below, so it may stream live — unless
+        // a producer error makes that write (and the payload) get discarded.
+        let stream_stdout = producer_error.is_none()
+            && self.final_member_stdout_streams_to_host(
+                consumers.last().expect("pipeline has at least two stages"),
+            );
+        let stdout_target = if stream_stdout {
+            PipelineDrainTarget::StreamHostStdout
+        } else {
+            PipelineDrainTarget::Collect
+        };
+        let last_stdout = processes[last_index]
+            .stdout
+            .take()
+            .map(|reader| spawn_pipe_drain(reader, stdout_target));
+        let last_stderr = processes[last_index]
+            .stderr
+            .take()
+            .map(|reader| spawn_pipe_drain(reader, PipelineDrainTarget::Collect));
         for index in 0..last_index {
             let (head, tail) = processes.split_at_mut(index + 1);
             let member = head.last_mut().expect("member index inside pipeline");
@@ -1931,6 +2002,60 @@ impl Executor {
         Some((program, expanded_name, args))
     }
 
+    /// True when the final member's fd-1 payload lands on the host process
+    /// stdout through `write_pipeline_output` — the GNU shape where
+    /// execute_cmd.c:2620 leaves the rightmost element's fd 1 on the
+    /// shell's own stdout. Only then may a drain forward bytes to the host
+    /// as they arrive (niubash D4); every capture, dup snapshot, or stage
+    /// redirect keeps the collecting path so the deferred walk still places
+    /// the payload (niubash#158's drain stays the transport either way).
+    /// Evaluated on the same thread that later performs the deferred write,
+    /// before any member is reaped — nothing in the wait mutates these
+    /// bindings.
+    #[cfg(any(windows, unix))]
+    fn final_member_stdout_streams_to_host(&self, command: &CommandNode) -> bool {
+        // write_pipeline_output runs route_pipeline_stage_streams first
+        // whenever the member carries an output-side redirect; that walk
+        // opens `>f`, resolves `1>&2`/`>&-`, and reports write failures, so
+        // it needs the whole payload up front.
+        if command.redirect_out.is_some()
+            || command.append.is_some()
+            || command.redirect_err.is_some()
+            || command.redirect_err_append.is_some()
+            || command
+                .redirects
+                .iter()
+                .any(|redirect| redirect.is_output_side())
+        {
+            return false;
+        }
+        if self.fd_table.is_closed(1) {
+            return false;
+        }
+        if !matches!(
+            self.fd_table.output_endpoint(1),
+            Some(FdWriteEndpoint::Stdout)
+        ) {
+            return false;
+        }
+        // While an enclosing shell-side producer frame owns fd 1, the
+        // payload belongs to the upstream pipe, not the host stdout.
+        if crate::executor::shell_options::active_capture_stream().is_some() {
+            return false;
+        }
+        // Mirror write_fd_endpoint's fd-1 resolution exactly: a dup record
+        // names its snapshot target, and the live arm honours the
+        // thread-local capture first, then the executor's capture field.
+        match self.fd_table.stdout_alias_generation.get(&1) {
+            Some(Some(_)) => false,
+            Some(None) => true,
+            None => {
+                !crate::executor::shell_options::stdout_capture_active()
+                    && self.stdout_capture.is_none()
+            }
+        }
+    }
+
     /// Spawn the already-admitted external pipeline members on real OS
     /// pipes (GNU execute_cmd.c:2620 execute_pipeline forks every left
     /// element connected by pipe(2) as it walks the connection list —
@@ -1939,11 +2064,19 @@ impl Executor {
     /// the shell's memory). The last member's stdout is captured and
     /// returned in the last results entry; the caller owns writing the
     /// final output and the exit/pipestatus bookkeeping.
+    ///
+    /// `allow_stream_stdout` marks callers whose last entry is only ever
+    /// handed to `write_pipeline_output` (the all-external path). When
+    /// `final_member_stdout_streams_to_host` agrees, the drain forwards the
+    /// bytes live and the returned payload stays empty; callers that feed
+    /// the bytes elsewhere — the sequential prefix path passes them on as
+    /// stage input — pass `false` and always get the collected stream.
     #[cfg(windows)]
     fn spawn_wait_concurrent_external_stages(
         &mut self,
         commands: &[&CommandNode],
         specs: Vec<(std::path::PathBuf, String, Vec<String>)>,
+        allow_stream_stdout: bool,
     ) -> Result<Vec<(String, String, i32)>, ExecuteError> {
         let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> =
             Vec::with_capacity(commands.len() - 1);
@@ -2145,8 +2278,21 @@ impl Executor {
         // parent drains that capture concurrently with the members —
         // subst.c:7428 close(fildes[1]) then subst.c:7437 read_comsub(fildes[0])
         // BEFORE subst.c:7441 wait_for(pid).
-        let last_stdout = processes[last_index].stdout.take().map(spawn_pipe_drain);
-        let last_stderr = processes[last_index].stderr.take().map(spawn_pipe_drain);
+        let stream_stdout = allow_stream_stdout
+            && self.final_member_stdout_streams_to_host(commands[last_index]);
+        let stdout_target = if stream_stdout {
+            PipelineDrainTarget::StreamHostStdout
+        } else {
+            PipelineDrainTarget::Collect
+        };
+        let last_stdout = processes[last_index]
+            .stdout
+            .take()
+            .map(|reader| spawn_pipe_drain(reader, stdout_target));
+        let last_stderr = processes[last_index]
+            .stderr
+            .take()
+            .map(|reader| spawn_pipe_drain(reader, PipelineDrainTarget::Collect));
         // Reap non-final stages in forward order: a `/dev/stdout`-family
         // operand on stage N flushes into a dup'd writer of pipe N, and that
         // dup must close before stage N+1 can see EOF — reaping downstream
@@ -2492,7 +2638,9 @@ impl Executor {
             return Ok(None);
         }
         let commands = &commands[..prefix_len];
-        let results = self.spawn_wait_concurrent_external_stages(commands, specs)?;
+        // The last prefix member's payload becomes the sequential tail's
+        // stage input — it must be collected, never streamed away.
+        let results = self.spawn_wait_concurrent_external_stages(commands, specs, false)?;
         let Some((output, stderr, _)) = results.last().cloned() else {
             return Ok(None);
         };
