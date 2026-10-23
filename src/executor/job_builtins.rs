@@ -683,10 +683,6 @@ impl Executor {
         }
     }
 
-    pub(in crate::executor) fn refresh_background_jobs(&mut self) -> Result<(), ExecuteError> {
-        self.refresh_background_jobs_with_protected_coprocs(&[])
-    }
-
     /// Reap one forked procsub placeholder (rubash#1022). Returns true when
     /// the pid is no longer a live placeholder (reaped now, or already gone
     /// — ECHILD). Non-placeholder pids are never touched.
@@ -872,10 +868,15 @@ impl Executor {
         Ok(())
     }
 
-    pub(in crate::executor) fn refresh_background_jobs_with_protected_coprocs(
-        &mut self,
-        protected_coprocs: &[u32],
-    ) -> Result<(), ExecuteError> {
+    /// Per-command boundary reap of background children (GNU's
+    /// notify_and_cleanup -> cleanup_dead_jobs cadence, jobs.c:3642 ->
+    /// :1303): every finished child is marked completed, and a finished
+    /// coproc is disposed the way coproc_reap disposes it — vars unbound,
+    /// endpoints closed (execute_cmd.c:2166 coproc_dispose, :2450
+    /// coproc_unsetvars). rubash#1023: GNU consults nothing about the next
+    /// command's redirects, so a dead coproc's `name`/`name_PID` are gone
+    /// before that command expands.
+    pub(in crate::executor) fn refresh_background_jobs(&mut self) -> Result<(), ExecuteError> {
         let mut finished = Vec::new();
         for (pid, child) in &mut self.background_children {
             if let Some(status) = child.try_wait()? {
@@ -917,9 +918,7 @@ impl Executor {
             self.join_coproc_stderr_forwarder(pid)?;
             self.shell_state.job_table.mark_completed(pid, status);
             self.run_sigchld_trap_for_reaped_child()?;
-            if !protected_coprocs.contains(&pid) {
-                self.retire_completed_coproc(pid);
-            }
+            self.retire_completed_coproc(pid);
         }
         Ok(())
     }

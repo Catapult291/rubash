@@ -1,62 +1,6 @@
 use super::*;
 
 impl Executor {
-    fn coprocs_referenced_by_command(&self, command: &CommandNode) -> Vec<u32> {
-        // rubash#186: the filter at the bottom can only admit a pid when the
-        // command is a coproc itself or some considered source string both
-        // contains the coproc name and contains '[' — i.e. at least one
-        // source must contain '['. For the overwhelmingly common case (no
-        // coproc command, no bracket-bearing redirect/word) skip building
-        // redirect_sources and scanning the entire environment per command.
-        if command.coproc_command.is_none() {
-            let mut sources = command
-                .redirect_in
-                .iter()
-                .chain(command.redirect_out.iter())
-                .chain(command.append.iter())
-                .chain(command.redirect_err.iter())
-                .chain(command.redirect_err_append.iter())
-                .chain(command.redirects.iter())
-                .map(|redirect| redirect.target.as_str());
-            if !sources.any(|source| source.contains('['))
-                && !(command.words.first().map(String::as_str) == Some("wait")
-                    && command.words.iter().any(|word| word.contains('[')))
-            {
-                return Vec::new();
-            }
-        }
-        let mut redirect_sources = command
-            .redirect_in
-            .iter()
-            .chain(command.redirect_out.iter())
-            .chain(command.append.iter())
-            .chain(command.redirect_err.iter())
-            .chain(command.redirect_err_append.iter())
-            .chain(command.redirects.iter())
-            .map(|redirect| redirect.target.as_str())
-            .collect::<Vec<_>>();
-        if command.words.first().map(String::as_str) == Some("wait") {
-            redirect_sources.extend(command.words.iter().map(String::as_str));
-        }
-        self.shell_state
-            .env_vars
-            .iter()
-            .filter_map(|(key, value)| {
-                let name = key.strip_suffix("_PID")?;
-                let pid = value.parse::<u32>().ok()?;
-                if command.coproc_command.is_some()
-                    || redirect_sources
-                        .iter()
-                        .any(|source| source.contains(name) && source.contains('['))
-                {
-                    Some(pid)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     pub fn execute_ast(&mut self, ast: &Ast) -> Result<(), ExecuteError> {
         if EXECUTION_LOCK_DEPTH.with(|depth| depth.get() > 0) {
             return self.execute_ast_inner(&ast.commands);
@@ -614,8 +558,14 @@ impl Executor {
             }
             {
                 let _t = super::exec_profile::PhaseTimer::new(&super::exec_profile::P_JOBS);
-                let protected_coprocs = self.coprocs_referenced_by_command(command);
-                self.refresh_background_jobs_with_protected_coprocs(&protected_coprocs)?;
+                // GNU has no "referenced by the next command" protection for
+                // dead coprocs: cleanup_dead_jobs -> coproc_reap (jobs.c:
+                // 1342) disposes every COPROC_DEAD entry through
+                // coproc_dispose -> coproc_unsetvars (execute_cmd.c:2166,
+                // :2450) — <name> and <name>_PID unbind unconditionally, so
+                // `cat <&${A[0]}` for a reaped coproc reports `ambiguous
+                // redirect` (rubash#1023).
+                self.refresh_background_jobs()?;
                 self.run_pending_signal_traps()?;
                 // GNU eval.c:355 runs notify_and_cleanup after each top-level
                 // command: children killed by a signal get their stderr
