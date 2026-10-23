@@ -37,11 +37,13 @@ use std::io::{self, Write};
 /// * The Linux RT block pins the glibc contract 34..64 as literals:
 ///   `libc::SIGRTMIN` is a FUNCTION on glibc (linux_like libc, forwarding
 ///   to `__libc_current_sigrtmin()`), not a const, so it cannot populate a
-///   const table. The block stays out of android: bionic's RT base is its
-///   own `__libc_current_sigrtmin()` (32, not glibc's 34), so the literal
-///   numbering would lie there.
-///   `signal_table_tests::linux_realtime_block_matches_libc`
-///   guards the equality at runtime on every Linux CI run.
+///   const table. Android carries its own literal block for bionic's RT
+///   base: `__libc_current_sigrtmin()` is 41 and `__libc_current_sigrtmax()`
+///   is 64 on the Termux oracle (GNU bash 5.3.20 aarch64-linux-android
+///   maps `kill -l 41` to RTMIN), so 41..64 carry the signames.c:92-139
+///   arithmetic names and 32..40 stay holes.
+///   `signal_table_tests::linux_realtime_block_matches_libc` and its
+///   android sibling guard the equality at runtime on every CI run.
 #[cfg(not(unix))]
 const SIGNALS: &[(i32, &str, &str)] = &[
     (1, "1", "HUP"),
@@ -246,6 +248,57 @@ const SIGNALS: &[(i32, &str, &str)] = &[
     #[cfg(target_os = "linux")]
     (63, "63", "RTMAX-1"),
     #[cfg(target_os = "linux")]
+    (64, "64", "RTMAX"),
+    // Android-only POSIX realtime block, numbered 41..64 per the bionic
+    // contract (see the table doc above; 32..40 are holes, exactly like
+    // GNU's `#if defined (SIGRTMIN)` at signames.c:97-139 generates).
+    #[cfg(target_os = "android")]
+    (41, "41", "RTMIN"),
+    #[cfg(target_os = "android")]
+    (42, "42", "RTMIN+1"),
+    #[cfg(target_os = "android")]
+    (43, "43", "RTMIN+2"),
+    #[cfg(target_os = "android")]
+    (44, "44", "RTMIN+3"),
+    #[cfg(target_os = "android")]
+    (45, "45", "RTMIN+4"),
+    #[cfg(target_os = "android")]
+    (46, "46", "RTMIN+5"),
+    #[cfg(target_os = "android")]
+    (47, "47", "RTMIN+6"),
+    #[cfg(target_os = "android")]
+    (48, "48", "RTMIN+7"),
+    #[cfg(target_os = "android")]
+    (49, "49", "RTMIN+8"),
+    #[cfg(target_os = "android")]
+    (50, "50", "RTMIN+9"),
+    #[cfg(target_os = "android")]
+    (51, "51", "RTMIN+10"),
+    #[cfg(target_os = "android")]
+    (52, "52", "RTMIN+11"),
+    #[cfg(target_os = "android")]
+    (53, "53", "RTMAX-11"),
+    #[cfg(target_os = "android")]
+    (54, "54", "RTMAX-10"),
+    #[cfg(target_os = "android")]
+    (55, "55", "RTMAX-9"),
+    #[cfg(target_os = "android")]
+    (56, "56", "RTMAX-8"),
+    #[cfg(target_os = "android")]
+    (57, "57", "RTMAX-7"),
+    #[cfg(target_os = "android")]
+    (58, "58", "RTMAX-6"),
+    #[cfg(target_os = "android")]
+    (59, "59", "RTMAX-5"),
+    #[cfg(target_os = "android")]
+    (60, "60", "RTMAX-4"),
+    #[cfg(target_os = "android")]
+    (61, "61", "RTMAX-3"),
+    #[cfg(target_os = "android")]
+    (62, "62", "RTMAX-2"),
+    #[cfg(target_os = "android")]
+    (63, "63", "RTMAX-1"),
+    #[cfg(target_os = "android")]
     (64, "64", "RTMAX"),
 ];
 
@@ -2225,6 +2278,49 @@ pub fn background_wrapper_role_armed() -> bool {
     BACKGROUND_WRAPPER_ROLE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// rubash#1035: environment key marking a `rubash -c` respawn as an
+/// asynchronous (`&`) job child while job_control is off (the `monitor`
+/// option is unset). GNU execute_cmd.c setup_async_signals forces
+/// SIGINT/SIGQUIT to SIG_IGN in every such forked child; a respawned
+/// process cannot inherit that disposition through spawn (the parent holds
+/// no ignore itself), so the background spawn site stamps this key into
+/// the child's environment block and startup consumes it (see
+/// [`apply_async_child_entry_ignores`]) before the trap table seeds and
+/// the kernel backend captures entry dispositions.
+///
+/// Forgery note: a user `export` of this key only buys the spawner kernel
+/// ignore for that process subtree — the same disposition `trap '' INT`
+/// achieves deliberately — and never arms traps or PDEATHSIG (those read
+/// the trap table / the nonce handshake, rubash#866). The spawn site
+/// overwrites a forged ambient value on every background respawn and
+/// removes it otherwise, so `set -m` (job control on) children never see
+/// it.
+#[cfg(unix)]
+pub const ASYNC_CHILD_ENV_KEY: &str = "__RUBASH_ASYNC_CHILD";
+
+/// Consume [`ASYNC_CHILD_ENV_KEY`] at process startup (rubash#1035): a
+/// background-job respawn starts life with SIGINT/SIGQUIT ignored, exactly
+/// as if forked by GNU's setup_async_signals path. Must run before the
+/// executor seeds the trap table and before the kernel backend captures
+/// entry dispositions, so the ignore surfaces both as `trap -- '' SIGINT`
+/// (via the ORIG_IGN transport the spawn site adds for exec-like bodies)
+/// and as the kernel entry disposition (ENTRY_IGNORED) for the rest.
+/// Scrubs the key unconditionally afterwards so it never reaches
+/// `export -p` or grandchildren environments (kernel inheritance carries
+/// the disposition there, as fork does in GNU).
+#[cfg(unix)]
+pub fn apply_async_child_entry_ignores() {
+    if std::env::var(ASYNC_CHILD_ENV_KEY).as_deref() != Ok("1") {
+        std::env::remove_var(ASYNC_CHILD_ENV_KEY);
+        return;
+    }
+    std::env::remove_var(ASYNC_CHILD_ENV_KEY);
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
+}
+
 /// PR_SET_PDEATHSIG + race check against the EXPECTED parent pid. Runs
 /// between fork and exec: syscalls and atomic loads only, no allocation.
 #[cfg(target_os = "linux")]
@@ -2285,6 +2381,28 @@ pub fn child_pre_exec_reset() -> std::io::Result<()> {
         let expected =
             BACKGROUND_WRAPPER_EXPECTED_PARENT.load(std::sync::atomic::Ordering::Acquire);
         arm_pdeathsig(expected)?;
+    }
+    Ok(())
+}
+
+/// pre_exec hook for asynchronous (`&`) child spawns (unix arm of
+/// rubash#1035): GNU execute_cmd.c setup_async_signals runs in every
+/// forked async child while job_control == 0 and forces SIGINT/SIGQUIT to
+/// SIG_IGN before exec — a background `sleep` survives `kill -INT $!`,
+/// and an exec'd script inherits the ignore as SIG_HARD_IGNORE (trap.c
+/// set_signal refuses to trap it, `trap -p` shows `trap -- '' SIGINT`).
+/// Runs after the plain entry-disposition restore on purpose: a parent
+/// `trap '...' INT` must not leak a catchable disposition into the async
+/// child (GNU ignores unconditionally). The background spawn site selects
+/// this hook instead of [`child_pre_exec_reset`]; the hook itself takes no
+/// decision input beyond the call — pre_exec runs post-fork and must not
+/// consult user-forgeable ambient state (rubash#866).
+#[cfg(unix)]
+pub fn child_pre_exec_reset_async() -> std::io::Result<()> {
+    child_pre_exec_reset()?;
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
     Ok(())
 }
@@ -2631,6 +2749,36 @@ mod signal_table_tests {
         assert_eq!(super::signal_number_for_spec("RTMIN+1"), Some(35));
         assert_eq!(super::signal_number_for_spec("RTMAX"), Some(64));
         assert_eq!(super::signal_number_for_spec("SIGRTMIN+3"), Some(37));
+        assert_eq!(super::signal_name(libc::SIGSTKFLT as i32), Some("STKFLT"));
+        assert_eq!(super::signal_name(libc::SIGPWR as i32), Some("PWR"));
+        assert_eq!(super::signal_name(libc::SIGIO as i32), Some("IO"));
+    }
+
+    /// Android keeps its own POSIX realtime block at 41..64 with GNU's
+    /// arithmetic names (signames.c:92-139). bionic's RT base comes from
+    /// `__libc_current_sigrtmin/max()` (functions, like glibc), so the
+    /// table pins the literals and asserts the equality here so a
+    /// bionic ABI drift fails CI instead of shipping silently
+    /// (rubash#1036).
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_realtime_block_matches_bionic() {
+        assert_eq!(unsafe { libc::__libc_current_sigrtmin() }, 41);
+        assert_eq!(unsafe { libc::__libc_current_sigrtmax() }, 64);
+        assert_eq!(super::signal_name(41), Some("RTMIN"));
+        assert_eq!(super::signal_name(64), Some("RTMAX"));
+        assert_eq!(super::signal_name(42), Some("RTMIN+1"));
+        assert_eq!(super::signal_name(52), Some("RTMIN+11"));
+        assert_eq!(super::signal_name(53), Some("RTMAX-11"));
+        assert_eq!(super::signal_name(48), Some("RTMIN+7"));
+        assert_eq!(super::signal_name(32), None);
+        assert_eq!(super::signal_name(40), None);
+        assert_eq!(super::signal_number_for_spec("RTMIN"), Some(41));
+        assert_eq!(super::signal_number_for_spec("RTMIN+7"), Some(48));
+        assert_eq!(super::signal_number_for_spec("RTMAX"), Some(64));
+        assert_eq!(super::signal_number_for_spec("SIGRTMIN+3"), Some(44));
+        assert_eq!(super::translate_signal("41"), Some("RTMIN"));
+        assert_eq!(super::translate_signal("RTMIN"), Some("41"));
         assert_eq!(super::signal_name(libc::SIGSTKFLT as i32), Some("STKFLT"));
         assert_eq!(super::signal_name(libc::SIGPWR as i32), Some("PWR"));
         assert_eq!(super::signal_name(libc::SIGIO as i32), Some("IO"));

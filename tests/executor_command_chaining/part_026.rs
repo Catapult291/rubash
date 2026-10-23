@@ -98,12 +98,19 @@ fn test_kill_translates_realtime_signals() {
 
     assert!(result.is_ok());
     assert_eq!(executor.last_exit_code(), 0);
+    // Signal table contract, per platform (GNU 5.3.0, byte-verified):
+    // Linux: RTMIN=34, 32/33 unassigned so `kill -l 32` / `kill -l 160`
+    // (= 32 after the >128 fold) produce no stdout lines; 49 = RTMIN+15.
+    // Android (bionic): RTMIN=41, 32..40 unassigned; 49 = RTMIN+8.
+    #[cfg(target_os = "linux")]
     assert_eq!(
         fs::read_to_string(output_path).unwrap(),
-        // Linux signal table (GNU 5.3.0 contract, byte-verified):
-        // RTMIN=34, 32/33 unassigned so `kill -l 32` / `kill -l 160`
-        // produce no stdout lines; 49 = RTMIN+15.
         "34\n35\n35\nRTMIN+15\n63\n64\nRTMAX\n"
+    );
+    #[cfg(target_os = "android")]
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "41\n42\n42\nRTMIN+8\n63\n64\nRTMAX\n"
     );
     let _ = fs::remove_file(output_path);
 }
@@ -128,7 +135,10 @@ fn test_kill_lists_common_signals() {
     assert!(output.contains("9) SIGKILL"));
     assert!(output.contains("15) SIGTERM"));
     assert!(output.contains("31) SIGSYS"));
+    #[cfg(target_os = "linux")]
     assert!(output.contains("34) SIGRTMIN"));
+    #[cfg(target_os = "android")]
+    assert!(output.contains("41) SIGRTMIN"));
     assert!(output.contains("64) SIGRTMAX"));
     let _ = fs::remove_file(output_path);
 }

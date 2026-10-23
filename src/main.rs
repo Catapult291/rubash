@@ -67,6 +67,14 @@ fn run_main() -> i32 {
     // site to attach the argv flag to respawns; host CLIs that never call
     // this get env-only respawns and never see the niu-specific flag.
     rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
+    // rubash#1035: an asynchronous-job respawn starts with SIGINT/SIGQUIT
+    // ignored (GNU execute_cmd.c setup_async_signals, job_control == 0).
+    // Consume the spawn-site marker here — before the executor seeds the
+    // trap table and captures kernel entry dispositions — so the ignore is
+    // in place for both. Runs for plain invocations too, where it is just
+    // the scrub.
+    #[cfg(unix)]
+    rubash::builtins::kill::apply_async_child_entry_ignores();
     let invocation_name = invoked_as.clone().or_else(|| args.first().cloned());
     if let Some(name) = args
         .get(1)

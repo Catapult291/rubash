@@ -52,11 +52,16 @@ const EX_USAGE_INTERNAL: i32 = 258;
 /// * `target_os = "android"`: bionic resolves the Linux kernel numbering
 ///   for 1..31 (libc's android module pins SIGBUS=7, SIGUSR1=10,
 ///   SIGSTKFLT=16, SIGPWR=30, SIGSYS=31, ...), so those slots match the
-///   Linux table. The RT slots stay EMPTY: glibc's 34..64 literal contract
-///   does not hold there (bionic's `__libc_current_sigrtmin()` is 32, and
-///   libc exports no const), so — like GNU's `#if defined (SIGRTMIN)` arm —
-///   the arithmetic names compile out and in-range numeric specifiers are
-///   silently accepted with no name, exactly like the Linux 32/33 holes.
+///   Linux table. The realtime block follows bionic's own RT base:
+///   `__libc_current_sigrtmin()` is 41 and `__libc_current_sigrtmax()`
+///   is 64 on the Termux oracle (GNU bash 5.3.20 aarch64-linux-android
+///   lists `41) SIGRTMIN` through `64) SIGRTMAX`), so signals 32..40 are
+///   holes — GNU's `trap -l` skips them and accepts the numeric
+///   specifiers silently, exactly like the Linux 32/33 holes — and
+///   41..64 carry the signames.c:92-139 arithmetic names
+///   (SIGRTMIN..SIGRTMIN+11, SIGRTMAX-11..SIGRTMAX). The unix tests pin
+///   these slots against `__libc_current_sigrtmin/max` so a bionic ABI
+///   drift fails loudly instead of shipping a lying table.
 /// * other unix (macos/freebsd): the BSD-family numbering where
 ///   7=EMT, 10=BUS, 12=SYS, 16=URG, 17=STOP, 18=TSTP, 19=CONT, 20=CHLD,
 ///   23=IO, 29=INFO, 30=USR1, 31=USR2 (libc resolves these per target; the
@@ -200,13 +205,12 @@ pub(crate) const SIGNALS: [&str; 64] = [
 ];
 
 /// Android (bionic) table: Linux kernel numbering for 1..31 (see the table
-/// doc above for the libc-crate anchors). RT slots stay empty — bionic's
-/// `__libc_current_sigrtmin()` is 32, so glibc's 34..64 arithmetic names
-/// would be lies there; empty slots keep `trap -l` and numeric specifiers
-/// GNU-shaped (silent accept, no name), and the 64-slot length keeps the
-/// `kill -l` NSIG range check identical to Linux. The unix tests
-/// (`positional_slots_match_libc`, `trap_table_agrees_with_kill_table`)
-/// pin these slots whenever an android test runner exists.
+/// doc above for the libc-crate anchors), holes for 32..40, and the
+/// signames.c:92-139 arithmetic names for bionic's 41..64 realtime block.
+/// The 64-slot length keeps the `kill -l` NSIG range check identical to
+/// Linux. The unix tests (`positional_slots_match_libc`,
+/// `android_realtime_and_holes`, `trap_table_agrees_with_kill_table`) pin
+/// these slots whenever an android test runner exists.
 #[cfg(all(unix, target_os = "android"))]
 pub(crate) const SIGNALS: [&str; 64] = [
     "SIGHUP",
@@ -249,30 +253,30 @@ pub(crate) const SIGNALS: [&str; 64] = [
     "",
     "",
     "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
+    "SIGRTMIN",
+    "SIGRTMIN+1",
+    "SIGRTMIN+2",
+    "SIGRTMIN+3",
+    "SIGRTMIN+4",
+    "SIGRTMIN+5",
+    "SIGRTMIN+6",
+    "SIGRTMIN+7",
+    "SIGRTMIN+8",
+    "SIGRTMIN+9",
+    "SIGRTMIN+10",
+    "SIGRTMIN+11",
+    "SIGRTMAX-11",
+    "SIGRTMAX-10",
+    "SIGRTMAX-9",
+    "SIGRTMAX-8",
+    "SIGRTMAX-7",
+    "SIGRTMAX-6",
+    "SIGRTMAX-5",
+    "SIGRTMAX-4",
+    "SIGRTMAX-3",
+    "SIGRTMAX-2",
+    "SIGRTMAX-1",
+    "SIGRTMAX",
 ];
 
 /// BSD-family table (macos/freebsd): positional names for signals 1..31 in
@@ -1288,6 +1292,27 @@ mod tests {
         assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
         assert_eq!(super::normalize_signal("32"), Some(""));
         assert_eq!(super::normalize_signal("33"), Some(""));
+        assert_eq!(super::normalize_signal("65"), None);
+    }
+
+    /// Android (bionic): the realtime block sits at 41..64
+    /// (`__libc_current_sigrtmin/max`), with 32..40 holes GNU's trap -l
+    /// skips (rubash#1036).
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_realtime_and_holes() {
+        assert_eq!(super::normalize_signal("RTMIN"), Some("SIGRTMIN"));
+        assert_eq!(super::normalize_signal("RTMIN+7"), Some("SIGRTMIN+7"));
+        assert_eq!(super::normalize_signal("RTMAX"), Some("SIGRTMAX"));
+        assert_eq!(super::normalize_signal("RTMAX-1"), Some("SIGRTMAX-1"));
+        assert_eq!(super::normalize_signal("41"), Some("SIGRTMIN"));
+        assert_eq!(super::normalize_signal("52"), Some("SIGRTMIN+11"));
+        assert_eq!(super::normalize_signal("53"), Some("SIGRTMAX-11"));
+        assert_eq!(super::normalize_signal("64"), Some("SIGRTMAX"));
+        assert_eq!(super::normalize_signal("STKFLT"), Some("SIGSTKFLT"));
+        assert_eq!(super::normalize_signal("17"), Some("SIGCHLD"));
+        assert_eq!(super::normalize_signal("32"), Some(""));
+        assert_eq!(super::normalize_signal("40"), Some(""));
         assert_eq!(super::normalize_signal("65"), None);
     }
 

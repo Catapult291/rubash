@@ -980,6 +980,33 @@ pub fn should_run_with_shell(path: &Path) -> bool {
     false
 }
 
+/// Whether `path` is directly exec-able by the kernel (rubash#1035): a file
+/// carrying a `#!` interpreter line or an ELF image. GNU shell_execve
+/// (execute_cmd.c:6126-6233) only reaches the in-process shell-script
+/// fallback when execve refuses (ENOEXEC) — a script WITHOUT a hashbang.
+/// A direct spawn of such a file does not fail cleanly everywhere: libc's
+/// script fallback (glibc/bionic posix_spawn running `/bin/sh`) executes
+/// it under the WRONG shell (a no-shebang `./script &` ran under
+/// /system/bin/sh, which lacks even `trap -p`). The background direct gate
+/// consults this after PATH resolution; anything else keeps the wrapper,
+/// whose child provides the ENOEXEC shell-script fallback exactly like the
+/// foreground path (execute_enoexec_shell_script, including the "cannot
+/// execute binary file" refusal). Unreadable files answer true — the spawn
+/// error path below reports those, as today.
+pub fn program_execs_directly(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut prefix = [0u8; 4];
+    let Ok(()) = file.read_exact(&mut prefix) else {
+        return true;
+    };
+    prefix.starts_with(b"#!")
+        || prefix.starts_with(&[0x7F, b'E', b'L', b'F'])
+        || prefix.starts_with(b"MZ")
+}
+
 #[allow(dead_code)]
 pub fn external_command_for_program(
     program: &Path,

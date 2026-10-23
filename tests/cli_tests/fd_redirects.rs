@@ -234,6 +234,19 @@ fn c_external_command_reports_write_error_for_closed_stdout() {
 
     assert!(output.status.success());
     assert_eq!(stream_text(&output.stdout), "status:1\n");
+    // rubash#1035: the helper has no `#!`, so the kernel could not exec it
+    // and GNU runs it as a shell script in-process (shell_execve ENOEXEC
+    // fallback) — the write error surfaces as the script-internal `echo`
+    // diagnostic, byte-matching bash
+    // (`<path>/emitout: line 1: echo: write error: ...`; $0 keeps the
+    // invoked spelling here). Windows keeps the shell-spawn path, where
+    // the parent reports the command-level write error as before.
+    #[cfg(unix)]
+    assert_eq!(
+        stream_text(&output.stderr),
+        "emitout: line 1: echo: write error: Bad file descriptor\n"
+    );
+    #[cfg(not(unix))]
     assert_eq!(
         stream_text(&output.stderr),
         "bash: line 1: emitout: write error: Bad file descriptor\n"
